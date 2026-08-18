@@ -1,7 +1,8 @@
 import { createActivityEvent, type ActivityEvent } from "./protocol.js";
 import type { ReplayScenario } from "./evaluation.js";
 
-const source = { kind: "synthetic" as const, instanceId: "evaluation-fixture" };
+const syntheticSource = { kind: "synthetic" as const, instanceId: "evaluation-fixture" };
+const filesystemSource = { kind: "filesystem" as const, instanceId: "evaluation-filesystem" };
 const sessionId = "evaluation-session";
 
 function event<TPayload>(input: {
@@ -10,8 +11,9 @@ function event<TPayload>(input: {
   occurredAt: string;
   kind: Parameters<typeof createActivityEvent<TPayload>>[0]["kind"];
   payload: TPayload;
+  source?: ActivityEvent["source"];
 }): ActivityEvent<TPayload> {
-  return createActivityEvent({ ...input, source, sessionId });
+  return createActivityEvent({ ...input, source: input.source ?? syntheticSource, sessionId });
 }
 
 export const heuristicEvaluationScenarios: readonly ReplayScenario[] = [
@@ -124,6 +126,36 @@ export const heuristicEvaluationScenarios: readonly ReplayScenario[] = [
       eventIndex: 0,
       expectedKind: "inspect_error",
       description: "A failed terminal command should prompt error inspection.",
+    }],
+  },
+  {
+    // Exercises a real source: the write is observed by the filesystem watcher,
+    // which knows the path but not the application. The coding context comes
+    // from a separate source, so the two must combine through the projection.
+    id: "filesystem-save-run-tests",
+    title: "Run tests after a watched filesystem save",
+    events: [
+      event({
+        eventId: "filesystem-save",
+        sequence: 0,
+        occurredAt: "2026-08-18T10:05:01.000Z",
+        kind: "file_saved",
+        payload: { path: "src/squid-core.ts", applicationId: "filesystem" },
+        source: filesystemSource,
+      }),
+      event({
+        eventId: "filesystem-code-app",
+        sequence: 0,
+        occurredAt: "2026-08-18T10:05:00.000Z",
+        kind: "application_activated",
+        payload: { applicationId: "vscode", applicationName: "Visual Studio Code" },
+      }),
+    ],
+    cutPoints: [{
+      id: "after-watched-save",
+      eventIndex: 1,
+      expectedKind: "run_tests",
+      description: "A filesystem-observed save plus an active coding app should suggest tests.",
     }],
   },
   {

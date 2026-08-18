@@ -24,6 +24,7 @@ bun test
 bun run build
 bun run dev
 bun run evaluate
+bun run watch:files -- /absolute/project/root
 ```
 
 ## Architecture
@@ -32,6 +33,9 @@ bun run evaluate
 - `src/chronicle-ordering.ts` — canonical event identity and stable replay ordering.
 - `src/event-store.ts` — in-memory and JSONL append-only event stores, including recovery diagnostics for an interrupted final JSONL record.
 - `src/world-state.ts` — deterministic, ownership-safe reducer from events to world state.
+- `src/activity-source.ts` — the source contract every capture adapter implements.
+- `src/filesystem-source.ts` — filesystem watcher that emits validated file activity for one project root.
+- `src/watch-files.ts` — live filesystem ingestion entry point.
 - `src/baseline-predictor.ts` — offline heuristic predictor used for evaluation.
 - `src/evaluation.ts` — deterministic replay runner and prediction metrics.
 - `src/evaluation-fixtures.ts` — versioned synthetic replay scenarios with labeled cut points.
@@ -45,6 +49,22 @@ bun run evaluate
 `PiRuntime` is optional. It uses `@earendil-works/pi-coding-agent` with a terminating structured-output tool (`emit_prediction`). The model provider is configured via `PI_MODEL_PROVIDER` (default `bifrost`) and `PI_MODEL_ID` (default `deepseek-v4-flash`).
 
 If the model provider is unreachable, the baseline predictor continues to function. Pi is not the source of truth for timeline or memory — the event store and world-state reducer are.
+
+## Activity sources
+
+Every capture adapter implements `ActivitySource` (`src/activity-source.ts`): `start(emit)` begins observation, `stop()` drains buffered events and resolves once quiet. Sources never touch the event store or projection directly — they only hand validated events to the emitter, so ingestion, ordering, and idempotency stay owned by the Chronicle core.
+
+`FilesystemActivitySource` is the first real source. It watches one explicitly configured absolute root and emits `file_opened` for a newly seen path and `file_saved` for subsequent writes. Paths are reported root-relative with POSIX separators so a timeline stays replayable on another machine. `.git/`, `node_modules/`, `dist/`, `build/`, `.cache/`, and `.DS_Store` are excluded by default; a caller-supplied `include` predicate can narrow further but cannot widen past those defaults. Repeated notifications for the same path coalesce within a debounce window, and deliveries are serialized so per-source sequence order is stable even when the emitter is slow.
+
+The source reports a path, not an application, so every payload carries `applicationId: "filesystem"`. Attributing a write to the editor that made it needs a future IDE or native source; the `filesystem-save-run-tests` fixture shows the two contexts combining through the projection rather than being guessed by one source.
+
+Watcher, probe, and delivery failures are recorded as diagnostics instead of thrown from async listeners, so one bad path cannot kill the watch.
+
+```bash
+bun run watch:files -- /absolute/project/root
+```
+
+File contents are never read; only paths, kinds, and timestamps enter the timeline.
 
 ## Replay evaluation
 
@@ -63,6 +83,10 @@ Tests use `bun:test`. The test suite covers:
 - `SquidCore` ingestion, idempotency, conflict detection, late-event handling, immutable snapshots, and deterministic restore.
 - `JsonlEventStore` persistence, write recovery, mutation isolation, filtering, and interrupted-tail recovery.
 - Pi prediction normalization, expiry validation, and evidence provenance.
+- Deterministic replay evaluation: cut-point ranking, MRR, coverage, future-leakage guard, and report stability.
+- `FilesystemActivitySource` root validation, lifecycle, default and caller filtering, path normalization, event mapping, debounce, ordering under a slow emitter, shutdown drain, diagnostics, and end-to-end ingestion through `SquidCore`.
+
+Source tests inject a fake watcher and file probe, so they never depend on kernel watch timing. Real-watcher behavior is verified by the `bun run watch:files` smoke run in the release gate.
 
 ## What is not yet implemented
 

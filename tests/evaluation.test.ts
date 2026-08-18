@@ -34,8 +34,21 @@ describe("Replay evaluation", () => {
       "run_tests",
       "draft_completion",
       "inspect_error",
+      "run_tests",
       "none",
     ]);
+  });
+
+  it("scores a filesystem-sourced save through the same projection", async () => {
+    const scenario = heuristicEvaluationScenarios
+      .find((candidate) => candidate.id === "filesystem-save-run-tests");
+    if (scenario === undefined) throw new Error("Missing filesystem evaluation scenario.");
+
+    const report = await evaluateScenarios([scenario], new HeuristicPredictor());
+
+    expect(scenario.events.some((event) => event.source.kind === "filesystem")).toBe(true);
+    expect(report.results[0]?.rank).toBe(1);
+    expect(report.results[0]?.candidateKinds).toEqual(["run_tests"]);
   });
 
   it("produces identical reports across runs", async () => {

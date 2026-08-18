@@ -9,6 +9,7 @@
     "dev": "bun run src/main.ts",
     "evaluate": "bun run src/evaluate.ts",
     "test": "bun test",
+    "watch:files": "bun run src/watch-files.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
