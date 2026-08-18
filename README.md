@@ -96,3 +96,7 @@ Source tests inject a fake watcher and file probe, so they never depend on kerne
 - Overlay / suggestion UI.
 - Action execution.
 - Privacy filtering and policy gateway.
+
+## Archived documents
+
+`docs/archive/` holds earlier exploration notes kept for provenance only. They describe designs this implementation did not follow and are not a source of requirements.
