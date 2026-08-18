@@ -23,6 +23,7 @@ bun run typecheck
 bun test
 bun run build
 bun run dev
+bun run evaluate
 ```
 
 ## Architecture
@@ -32,6 +33,9 @@ bun run dev
 - `src/event-store.ts` — in-memory and JSONL append-only event stores, including recovery diagnostics for an interrupted final JSONL record.
 - `src/world-state.ts` — deterministic, ownership-safe reducer from events to world state.
 - `src/baseline-predictor.ts` — offline heuristic predictor used for evaluation.
+- `src/evaluation.ts` — deterministic replay runner and prediction metrics.
+- `src/evaluation-fixtures.ts` — versioned synthetic replay scenarios with labeled cut points.
+- `src/evaluate.ts` — evaluation report entry point.
 - `src/pi-runtime.ts` — Pi adapter that requests one typed prediction via a terminating custom tool. Isolated behind an adapter so Node/RPC remains a fallback if deeper Bun incompatibilities appear.
 - `src/squid-core.ts` — orchestrates event ingestion, state reduction, and baseline prediction.
 - `src/main.ts` — demo entry point.
@@ -41,6 +45,14 @@ bun run dev
 `PiRuntime` is optional. It uses `@earendil-works/pi-coding-agent` with a terminating structured-output tool (`emit_prediction`). The model provider is configured via `PI_MODEL_PROVIDER` (default `bifrost`) and `PI_MODEL_ID` (default `deepseek-v4-flash`).
 
 If the model provider is unreachable, the baseline predictor continues to function. Pi is not the source of truth for timeline or memory — the event store and world-state reducer are.
+
+## Replay evaluation
+
+`bun run evaluate` runs the heuristic predictor against the versioned synthetic scenarios in `src/evaluation-fixtures.ts` and prints a deterministic JSON report.
+
+Each cut point replays only the canonical events available at that point; later events are excluded so the report cannot receive future-state leakage. The report includes Top-1/Top-3/Top-5 hit rates, mean reciprocal rank (MRR), prediction coverage, and no-action correctness. Current scores describe only this intentionally small synthetic corpus; they are a regression baseline, not a claim about real-user accuracy.
+
+Any future Pi-backed predictor must be evaluated through the same replay runner and fixture version before it can enter a real-time path.
 
 ## Testing
 
