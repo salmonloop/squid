@@ -2,6 +2,24 @@ import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { parseActivityEvent, type ActivityEvent } from "./protocol.js";
 
+/**
+ * Append-only Chronicle storage.
+ *
+ * `append` stores exactly one copy of each accepted event. An implementation
+ * backed by a uniqueness constraint MAY reject an event whose `eventId` or
+ * source-local identity already exists; the in-memory and JSONL stores do not.
+ * Callers must not depend on duplicate acceptance — `SquidCore.inspectDuplicate`
+ * owns deduplication.
+ *
+ * `all` returns every appended event exactly once. Return order is NOT part of
+ * the contract: it is physical arrival order here, and an implementation is free
+ * to return any permutation. Callers needing a timeline apply
+ * `orderActivityEvents`, which is total on events with distinct `eventId`s.
+ *
+ * `since` keeps events whose `occurredAt` is at or after the threshold, after
+ * decoding both sides to epoch milliseconds so timezone spellings compare
+ * equal. Return order is likewise uncontracted.
+ */
 export interface EventStore {
   append(event: ActivityEvent): Promise<void>;
   all(): Promise<readonly ActivityEvent[]>;
@@ -117,7 +135,7 @@ function cloneEvent(event: ActivityEvent): ActivityEvent {
   return structuredClone(event);
 }
 
-function parseTimestamp(value: string): number {
+export function parseTimestamp(value: string): number {
   const timestamp = new Date(value).getTime();
   if (!Number.isFinite(timestamp)) {
     throw new TypeError("Event query timestamp must be a finite ISO date-time string.");

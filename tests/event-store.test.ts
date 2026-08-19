@@ -4,12 +4,25 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "bun:test";
 import { InMemoryEventStore, JsonlEventStore } from "../src/event-store.js";
 import { createActivityEvent } from "../src/protocol.js";
+import {
+  describeEventStoreConformance,
+  inMemoryHarness,
+  jsonlHarness,
+  sqliteHarness,
+  cleanupConformanceDirs,
+} from "./event-store-conformance.js";
 
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+  await cleanupConformanceDirs();
 });
+
+// Shared conformance suite — run against every EventStore implementation.
+describeEventStoreConformance("InMemoryEventStore", inMemoryHarness);
+describeEventStoreConformance("JsonlEventStore", jsonlHarness);
+describeEventStoreConformance("SqliteEventStore", sqliteHarness);
 
 describe("InMemoryEventStore", () => {
   it("isolates stored events from caller and reader mutations", async () => {

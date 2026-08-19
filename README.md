@@ -31,7 +31,8 @@ bun run watch:files -- /absolute/project/root
 
 - `src/protocol.ts` — versioned activity/prediction contracts plus compiled runtime validation at every Chronicle ingress boundary.
 - `src/chronicle-ordering.ts` — canonical event identity and stable replay ordering.
-- `src/event-store.ts` — in-memory and JSONL append-only event stores, including recovery diagnostics for an interrupted final JSONL record.
+- `src/event-store.ts` — the `EventStore` contract plus in-memory and JSONL append-only stores, including recovery diagnostics for an interrupted final JSONL record.
+- `src/sqlite-event-store.ts` — append-only store on SQLite, with structural uniqueness on both `eventId` and source-local event identity.
 - `src/world-state.ts` — deterministic, ownership-safe reducer from events to world state.
 - `src/activity-source.ts` — the source contract every capture adapter implements.
 - `src/filesystem-source.ts` — filesystem watcher that emits validated file activity for one project root.
@@ -43,6 +44,16 @@ bun run watch:files -- /absolute/project/root
 - `src/pi-runtime.ts` — Pi adapter that requests one typed prediction via a terminating custom tool. Isolated behind an adapter so Node/RPC remains a fallback if deeper Bun incompatibilities appear.
 - `src/squid-core.ts` — orchestrates event ingestion, state reduction, and baseline prediction.
 - `src/main.ts` — demo entry point.
+
+## Persistence
+
+Three `EventStore` implementations satisfy one contract. `all()` returns every appended event exactly once, but **return order is not part of the contract** — callers that need a timeline apply `orderActivityEvents`, which is total on events with distinct `eventId`s. `since()` compares epoch milliseconds on both sides, so timezone spellings of the same instant are equal.
+
+`SqliteEventStore` stores the full event as JSON and rehydrates every read through `parseActivityEvent`, so `ingestedAt`, `correlationId`, and sub-millisecond `occurredAt` spellings survive a round trip. Its scalar columns are a lossy projection kept for filtering and integrity only. A primary key on `eventId` and a unique index mirroring source-local event identity make duplicates a structural error rather than a convention: both raise `EventStoreConstraintError`. That is deliberately one error type rather than two, because a row violating both constraints reports only the identity index's `UNIQUE` violation — the error code cannot tell "same event twice" from "identity reused by a different event".
+
+`journal_mode = WAL` with `synchronous = NORMAL` means committed events survive process death without an explicit checkpoint. They are **not** guaranteed to survive OS or power loss — that would need `synchronous = FULL`.
+
+`main.ts` and `watch-files.ts` both use `InMemoryEventStore`. Neither `SqliteEventStore` nor `JsonlEventStore` has a production caller yet; wiring live ingestion to a durable store first requires the filesystem source to carry a per-process session identity, since it currently restarts every session at sequence `0` under a constant `sessionId` and would collide with itself on second launch.
 
 ## Pi integration boundary
 
@@ -81,7 +92,9 @@ Tests use `bun:test`. The test suite covers:
 - Runtime ActivityEvent validation and source-local sequence generation.
 - Canonical event ordering and source-local event identity.
 - `SquidCore` ingestion, idempotency, conflict detection, late-event handling, immutable snapshots, and deterministic restore.
-- `JsonlEventStore` persistence, write recovery, mutation isolation, filtering, and interrupted-tail recovery.
+- A shared `EventStore` conformance suite (`tests/event-store-conformance.ts`) run against all three implementations: round-trip fidelity, order-independent canonical ordering, mutation isolation, concurrent appends, and `since()` boundary and timezone equivalence.
+- `JsonlEventStore` write recovery and interrupted-tail recovery.
+- `SqliteEventStore` cross-connection durability under WAL, sub-millisecond timestamp fidelity, duplicate and identity-reuse rejection, parent-directory creation, and post-`close()` rejection.
 - Pi prediction normalization, expiry validation, and evidence provenance.
 - Deterministic replay evaluation: cut-point ranking, MRR, coverage, future-leakage guard, and report stability.
 - `FilesystemActivitySource` root validation, lifecycle, default and caller filtering, path normalization, event mapping, debounce, ordering under a slow emitter, shutdown drain, diagnostics, and end-to-end ingestion through `SquidCore`.
