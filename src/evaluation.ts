@@ -7,6 +7,7 @@ import {
   SyncPredictorProvider,
   type PredictionProvider,
 } from "./prediction-provider.js";
+import { PredictionCoordinator } from "./prediction-coordinator.js";
 
 export interface PredictionCutPoint {
   id: string;
@@ -56,6 +57,11 @@ export interface Metric {
 export type PredictorFactory = () => Predictor;
 export type PredictionProviderFactory = () => PredictionProvider;
 
+export interface ProviderEvaluationOptions {
+  /** Hard timeout per prediction request. Defaults to the coordinator timeout. */
+  readonly timeoutMs?: number;
+}
+
 export async function evaluateScenarios(
   scenarios: readonly ReplayScenario[],
   createPredictor: PredictorFactory,
@@ -73,7 +79,9 @@ export async function evaluateScenarios(
 export async function evaluateWithProvider(
   scenarios: readonly ReplayScenario[],
   createProvider: PredictionProviderFactory,
+  options: ProviderEvaluationOptions = {},
 ): Promise<EvaluationReport> {
+  validateScenarioIds(scenarios);
   const results: PredictionEvaluation[] = [];
 
   for (const scenario of [...scenarios].sort(compareScenario)) {
@@ -82,30 +90,32 @@ export async function evaluateWithProvider(
     const cutPointsByIndex = new Map(scenario.cutPoints.map((cutPoint) => [cutPoint.eventIndex, cutPoint]));
     const core = new SquidCore(new InMemoryEventStore());
     const provider = createProvider();
+    let nextRequestId: string | null = null;
+    const coordinator = new PredictionCoordinator({
+      provider,
+      ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      random: () => {
+        if (nextRequestId === null) {
+          throw new Error("Evaluation coordinator requested an ID outside a cut point.");
+        }
+        const requestId = nextRequestId;
+        nextRequestId = null;
+        return requestId;
+      },
+    });
 
-    for (const [eventIndex, event] of events.entries()) {
-      const ingestResult = await core.ingest(event);
-      const cutPoint = cutPointsByIndex.get(eventIndex);
-      if (!cutPoint) continue;
+    try {
+      for (const [eventIndex, event] of events.entries()) {
+        const ingestResult = await core.ingest(event);
+        const cutPoint = cutPointsByIndex.get(eventIndex);
+        if (!cutPoint) continue;
 
-      // Providers may fail or timeout during evaluation. A failure yields no
-      // candidates rather than an unhandled exception — the metrics reflect
-      // the raw provider outcome, including zero-output scenarios.
-      let candidates: readonly PredictionCandidate[] = [];
-      try {
-        candidates = await provider.predict(
-          {
-            id: `eval-${scenario.id}-${cutPoint.id}`,
-            worldState: ingestResult.state,
-            episodeId: ingestResult.state.episode?.id ?? null,
-            triggeredAt: event.occurredAt,
-          },
-          new AbortController().signal,
-        );
-      } catch {
-        candidates = [];
+        nextRequestId = JSON.stringify(["eval", scenario.id, cutPoint.id]);
+        const outcome = await coordinator.request(ingestResult.state);
+        results.push(evaluateCutPoint(scenario.id, cutPoint, outcome.candidates));
       }
-      results.push(evaluateCutPoint(scenario.id, cutPoint, candidates));
+    } finally {
+      coordinator.dispose();
     }
   }
 
@@ -179,6 +189,16 @@ function validateScenario(scenario: ReplayScenario, events: readonly ActivityEve
       throw new Error(`Scenario ${scenario.id} has duplicate cut point index ${cutPoint.eventIndex}.`);
     }
     seenCutPointIndexes.add(cutPoint.eventIndex);
+  }
+}
+
+function validateScenarioIds(scenarios: readonly ReplayScenario[]): void {
+  const seen = new Set<string>();
+  for (const scenario of scenarios) {
+    if (seen.has(scenario.id)) {
+      throw new Error(`Evaluation has duplicate scenario ID ${scenario.id}.`);
+    }
+    seen.add(scenario.id);
   }
 }
 

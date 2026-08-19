@@ -103,7 +103,7 @@ File contents are never read; only paths, kinds, and timestamps enter the timeli
 
 Each cut point replays only the canonical events available at that point; later events are excluded so the report cannot receive future-state leakage. A fresh predictor instance is created per scenario, preventing model sessions or caches from leaking between unrelated timelines. The report includes Top-1/Top-3/Top-5 hit rates, mean reciprocal rank (MRR), prediction coverage, and no-action correctness. The fixtures include stale-context negatives across episode boundaries, a below-threshold continuation guard, and a workflow with multiple distinct cut points. Current scores describe only this intentionally small synthetic corpus; they are a regression baseline, not a claim about real-user accuracy.
 
-Any future Pi-backed predictor must be evaluated through the same replay runner and fixture version before it can enter a real-time path. The evaluation runner supports both sync (`evaluateScenarios`) and async (`evaluateWithProvider`) providers; async providers are isolated per scenario and failures yield zero candidates rather than unhandled exceptions.
+Any future Pi-backed predictor must be evaluated through the same replay runner and fixture version before it can enter a real-time path. The evaluation runner supports both sync (`evaluateScenarios`) and async (`evaluateWithProvider`) providers; async providers are isolated per scenario and run through `PredictionCoordinator`, so timeout and heuristic fallback behavior matches the real-time path. The ranking report describes the end-to-end runtime result and intentionally does not report provider health or fallback reasons.
 
 ## Testing
 
@@ -119,7 +119,7 @@ Tests use `bun:test`. The test suite covers:
 - Pi prediction normalization, kind-specific expiry derivation, evidence provenance, and `PredictionProvider` interface conformance.
 - `PredictionCoordinator`: success, timeout fallback, provider-failure fallback, old-request cancellation, stale-episode discard, explicit cancel, dispose, and idempotent no-op.
 - `PredictionLog`: structured recording of outcomes, cancellations, and field mapping.
-- Async evaluation: provider-based evaluation matching sync results, canned-provider scoring, and failure-yields-zero-candidates.
+- Async evaluation: provider-based evaluation matching sync results, canned-provider scoring, hard timeout, and heuristic fallback.
 - Deterministic replay evaluation: cut-point ranking, MRR, coverage, future-leakage guard, per-scenario predictor isolation, and report stability.
 - `FilesystemActivitySource` root validation, lifecycle, default and caller filtering, path normalization, event mapping, debounce, ordering under a slow emitter, shutdown drain, diagnostics, distinct per-instance session identity, restart against one durable store without an identity collision, and end-to-end ingestion through `SquidCore`.
 

@@ -53,15 +53,7 @@ describe("Async evaluation", () => {
     expect(report.noneCorrectness.hits).toBeGreaterThan(0);
   });
 
-  it("treats provider timeout as failed predictions", async () => {
-    // Provider that always times out (never resolves, signal ignored)
-    const factory = (): PredictionProvider => ({
-      name: "hanging",
-      predict: async () => new Promise<readonly PredictionCandidate[]>( () => undefined),
-    });
-
-    // We can't actually wait for a hanging provider in a test, so we use
-    // a provider that rejects immediately to simulate timeout behaviour.
+  it("uses the production fallback when a provider fails", async () => {
     const failingFactory = (): PredictionProvider => ({
       name: "failing",
       predict: async (request: PredictionRequest, _signal: AbortSignal) => {
@@ -69,12 +61,42 @@ describe("Async evaluation", () => {
       },
     });
 
+    const expected = await evaluateScenarios(
+      heuristicEvaluationScenarios,
+      () => new HeuristicPredictor(),
+    );
     const report = await evaluateWithProvider(
       heuristicEvaluationScenarios,
       failingFactory,
     );
-    // No candidates → coverage is 0
-    expect(report.coverage.hits).toBe(0);
-    expect(report.coverage.rate).toBe(0);
+
+    expect(report).toEqual(expected);
+  });
+
+  it("applies a hard timeout to a provider that never settles", async () => {
+    let signalAborted = false;
+    const hangingFactory = (): PredictionProvider => ({
+      name: "hanging",
+      predict: async (_request, signal) => {
+        signal.addEventListener("abort", () => {
+          signalAborted = true;
+        }, { once: true });
+        return new Promise<readonly PredictionCandidate[]>(() => undefined);
+      },
+    });
+    const failedCommand = heuristicEvaluationScenarios.filter(
+      (scenario) => scenario.id === "failed-command-inspection",
+    );
+
+    const report = await evaluateWithProvider(
+      failedCommand,
+      hangingFactory,
+      { timeoutMs: 5 },
+    );
+
+    expect(report.cutPointCount).toBe(1);
+    expect(report.results[0]?.candidateKinds).toEqual(["inspect_error"]);
+    expect(report.top1.rate).toBe(1);
+    expect(signalAborted).toBe(true);
   });
 });

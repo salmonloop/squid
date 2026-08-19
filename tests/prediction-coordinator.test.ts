@@ -52,6 +52,30 @@ describe("PredictionCoordinator", () => {
     expect(outcomes[0].status).toBe("succeeded");
   });
 
+  it("clears the timeout after a provider succeeds", async () => {
+    let aborted = false;
+    const coordinator = new PredictionCoordinator({
+      provider: {
+        name: "fast",
+        predict: async (_request, signal) => {
+          signal.addEventListener("abort", () => {
+            aborted = true;
+          }, { once: true });
+          return [candidate("run_tests")];
+        },
+      },
+      timeoutMs: 10,
+      random: counter(),
+    });
+
+    const outcome = await coordinator.request(makeState("ep-1"));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(outcome.status).toBe("succeeded");
+    expect(aborted).toBe(false);
+    coordinator.dispose();
+  });
+
   it("falls back to heuristic predictor when the provider fails", async () => {
     const state = makeState("ep-1");
     state.lastCommandOutcome = {

@@ -139,6 +139,9 @@ export class PredictionCoordinator {
   }
 
   private clearActive(): void {
+    if (this.activeTimer !== undefined) {
+      clearTimeout(this.activeTimer);
+    }
     this.activeController = null;
     this.activeRequestId = null;
     this.activeTimer = undefined;
