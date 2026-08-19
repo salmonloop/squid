@@ -44,7 +44,7 @@ bun run watch:files -- /absolute/project/root
 - `src/evaluate.ts` — evaluation report entry point.
 - `src/prediction-provider.ts` — async prediction contract: `PredictionProvider` interface, `PredictionRequest`, `PredictionOutcome`, and `SyncPredictorProvider` adapter.
 - `src/prediction-coordinator.ts` — one-in-flight async coordinator with timeout, cancellation, stale-episode guard, and heuristic fallback.
-- `src/prediction-runtime.ts` — live orchestration boundary that feeds accepted/late core state snapshots into the coordinator without coupling provider latency to event ingestion.
+- `src/prediction-runtime.ts` — live orchestration boundary that feeds accepted/late core state snapshots into the coordinator without coupling provider latency to event ingestion. When a `PredictionLedger` is attached, every outcome is persisted as a durable attempt record; ledger failures are diagnostics and never block prediction delivery, and `dispose` drains in-flight writes so shutdown is durable.
 - `src/prediction-ledger.ts` — append-only prediction attempts and feedback with deterministic candidate envelopes, in-memory tests, and recoverable JSONL persistence.
 - `src/prediction-log.ts` — structured shadow-mode log for prediction outcomes.
 - `src/fake-prediction-provider.ts` — controllable `PredictionProvider` for tests and offline evaluation.
@@ -120,7 +120,7 @@ Tests use `bun:test`. The test suite covers:
 - `SqliteEventStore` cross-connection durability under WAL, sub-millisecond timestamp fidelity, duplicate and identity-reuse rejection, parent-directory creation, post-`close()` rejection, and watch-exclusion paths for a database inside or outside the watched root.
 - Pi prediction normalization, kind-specific expiry derivation, evidence provenance, and `PredictionProvider` interface conformance.
 - `PredictionCoordinator`: success, timeout fallback, provider-failure fallback, old-request cancellation, stale-episode discard, explicit cancel, dispose, and idempotent no-op.
-- `PredictionRuntime`: non-blocking prediction dispatch after projection, duplicate suppression, supersession, restore, and shutdown drain.
+- `PredictionRuntime`: non-blocking prediction dispatch after projection, duplicate suppression, supersession, restore, shutdown drain, and durable attempt recording when a ledger is attached (ledger failures do not block prediction; shutdown waits for in-flight writes).
 - Prediction candidate identity and ledger: deterministic request-scoped IDs, append-only feedback, duplicate/conflict checks, restart recovery, and interrupted-tail handling.
 - `PredictionLog`: structured recording of outcomes, cancellations, and field mapping.
 - Async evaluation: provider-based evaluation matching sync results, canned-provider scoring, hard timeout, and heuristic fallback.

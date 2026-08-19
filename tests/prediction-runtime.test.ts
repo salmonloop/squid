@@ -2,7 +2,15 @@ import { describe, expect, it } from "bun:test";
 import { InMemoryEventStore } from "../src/event-store.js";
 import { FakePredictionProvider, candidate } from "../src/fake-prediction-provider.js";
 import { PredictionCoordinator } from "../src/prediction-coordinator.js";
-import { PredictionRuntime } from "../src/prediction-runtime.js";
+import {
+  InMemoryPredictionLedger,
+  type PredictionAttemptRecord,
+  type PredictionLedger,
+} from "../src/prediction-ledger.js";
+import {
+  PredictionRuntime,
+  type PredictionRuntimeDiagnostic,
+} from "../src/prediction-runtime.js";
 import { createActivityEvent } from "../src/protocol.js";
 import { SquidCore } from "../src/squid-core.js";
 
@@ -216,5 +224,136 @@ describe("PredictionRuntime", () => {
     releaseAppend!();
     await Promise.all([ingest, dispose]);
     expect(disposed).toBe(true);
+  });
+
+  it("records a durable attempt for each prediction outcome", async () => {
+    const ledger = new InMemoryPredictionLedger();
+    const runtime = new PredictionRuntime(
+      new SquidCore(new InMemoryEventStore()),
+      new PredictionCoordinator({
+        provider: new FakePredictionProvider({ candidates: [candidate("run_tests")] }),
+        random: nextRequestId(),
+      }),
+      { ledger, now: () => new Date("2026-08-19T10:00:00.000Z") },
+    );
+
+    const result = await runtime.ingest(savedFile());
+    await result.prediction;
+    await runtime.awaitIdle();
+
+    const records = (await ledger.all()) as PredictionAttemptRecord[];
+    expect(records).toHaveLength(1);
+    expect(records[0].recordType).toBe("attempt");
+    expect(records[0].triggerEventId).toBe("saved-1");
+    expect(records[0].episodeId).not.toBeNull();
+    expect(records[0].status).toBe("succeeded");
+    expect(records[0].candidates[0].candidateId).toBe("runtime-1:candidate:0");
+    expect(records[0].candidates[0].candidate.kind).toBe("run_tests");
+    await runtime.dispose();
+  });
+
+  it("records a stale outcome when a prediction is superseded", async () => {
+    const ledger = new InMemoryPredictionLedger();
+    const runtime = new PredictionRuntime(
+      new SquidCore(new InMemoryEventStore()),
+      new PredictionCoordinator({
+        provider: new FakePredictionProvider({ candidates: [candidate("run_tests")], delayMs: 50 }),
+        random: nextRequestId(),
+      }),
+      { ledger },
+    );
+
+    const first = await runtime.ingest(savedFile("saved-1"));
+    const second = await runtime.ingest(savedFile("saved-2"));
+    await Promise.all([first.prediction, second.prediction]);
+    await runtime.awaitIdle();
+
+    const records = (await ledger.all()) as PredictionAttemptRecord[];
+    expect(records).toHaveLength(2);
+    expect(records.map((r) => r.status).sort()).toEqual(["stale", "succeeded"]);
+    const stale = records.find((r) => r.status === "stale")!;
+    expect(stale.candidates).toEqual([]);
+    await runtime.dispose();
+  });
+
+  it("does not reject the prediction when the ledger fails", async () => {
+    const diagnostics: PredictionRuntimeDiagnostic[] = [];
+    const ledger: PredictionLedger = {
+      appendAttempt: async () => {
+        throw new Error("disk full");
+      },
+      appendFeedback: async () => {},
+      all: async () => [],
+    };
+    const runtime = new PredictionRuntime(
+      new SquidCore(new InMemoryEventStore()),
+      new PredictionCoordinator({
+        provider: new FakePredictionProvider({ candidates: [candidate("run_tests")] }),
+        random: nextRequestId(),
+      }),
+      { ledger, onDiagnostic: (d) => diagnostics.push(d) },
+    );
+
+    const result = await runtime.ingest(savedFile());
+    expect((await result.prediction).status).toBe("succeeded");
+    await runtime.awaitIdle();
+
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0].kind).toBe("ledger_write_failed");
+    expect(diagnostics[0].message).toBe("disk full");
+    await runtime.dispose();
+  });
+
+  it("waits for an in-flight ledger write before dispose resolves", async () => {
+    let releaseAppend: (() => void) | undefined;
+    const ledger: PredictionLedger = {
+      appendAttempt: () => new Promise<void>((resolve) => {
+        releaseAppend = resolve;
+      }),
+      appendFeedback: async () => {},
+      all: async () => [],
+    };
+    const runtime = new PredictionRuntime(
+      new SquidCore(new InMemoryEventStore()),
+      new PredictionCoordinator({
+        provider: new FakePredictionProvider({ candidates: [candidate("run_tests")] }),
+        random: nextRequestId(),
+      }),
+      { ledger },
+    );
+
+    const result = await runtime.ingest(savedFile());
+    await result.prediction;
+    let disposed = false;
+    const dispose = runtime.dispose().then(() => {
+      disposed = true;
+    });
+    await Promise.resolve();
+    expect(disposed).toBe(false);
+
+    releaseAppend!();
+    await dispose;
+    expect(disposed).toBe(true);
+  });
+
+  it("does not record an attempt for a duplicate event", async () => {
+    const ledger = new InMemoryPredictionLedger();
+    const runtime = new PredictionRuntime(
+      new SquidCore(new InMemoryEventStore()),
+      new PredictionCoordinator({
+        provider: new FakePredictionProvider({ candidates: [candidate("run_tests")] }),
+        random: nextRequestId(),
+      }),
+      { ledger },
+    );
+    const event = savedFile();
+
+    const first = await runtime.ingest(event);
+    await runtime.ingest(event);
+    await first.prediction;
+    await runtime.awaitIdle();
+
+    expect(await ledger.all()).toHaveLength(1);
+    await runtime.dispose();
   });
 });
