@@ -11,10 +11,18 @@ export interface PredictionCoordinatorOptions {
   readonly timeoutMs?: number;
   /** Called for every outcome — used in shadow mode to record structured logs. */
   readonly onOutcome?: (outcome: PredictionOutcome) => void;
+  /** Reports non-fatal fallback or observer failures. */
+  readonly onDiagnostic?: (diagnostic: PredictionCoordinatorDiagnostic) => void;
   /** Injected for deterministic tests. */
   readonly now?: () => Date;
   /** Injected for deterministic tests. */
   readonly random?: () => string;
+}
+
+export interface PredictionCoordinatorDiagnostic {
+  readonly kind: "fallback_failed" | "outcome_observer_failed";
+  readonly requestId: string;
+  readonly message: string;
 }
 
 /**
@@ -32,6 +40,7 @@ export class PredictionCoordinator {
   private readonly fallback: Predictor;
   private readonly timeoutMs: number;
   private readonly onOutcome: ((outcome: PredictionOutcome) => void) | undefined;
+  private readonly onDiagnostic: ((diagnostic: PredictionCoordinatorDiagnostic) => void) | undefined;
   private readonly now: () => Date;
   private readonly random: () => string;
 
@@ -40,13 +49,14 @@ export class PredictionCoordinator {
   private activeEpoch = 0;
   private activeTimer: ReturnType<typeof setTimeout> | undefined;
   /** Request IDs cancelled by an explicit `cancelActive` call (vs. supersede). */
-  private readonly explicitlyCancelled = new Set<string>();
+  private readonly explicitCancellationReasons = new Map<string, string>();
 
   public constructor(options: PredictionCoordinatorOptions) {
     this.provider = options.provider;
     this.fallback = options.fallback ?? new HeuristicPredictor();
     this.timeoutMs = options.timeoutMs ?? 15_000;
     this.onOutcome = options.onOutcome;
+    this.onDiagnostic = options.onDiagnostic;
     this.now = options.now ?? (() => new Date());
     this.random = options.random ?? (() => crypto.randomUUID());
   }
@@ -83,36 +93,61 @@ export class PredictionCoordinator {
         reject(new PredictionTimeoutError(requestId));
       }, this.timeoutMs);
     });
+    let rejectAborted: ((error: PredictionAbortedError) => void) | undefined;
+    const aborted = new Promise<never>((_, reject) => {
+      rejectAborted = reject;
+    });
+    const onAbort = () => rejectAborted?.(new PredictionAbortedError(requestId));
+    controller.signal.addEventListener("abort", onAbort, { once: true });
 
     try {
       const candidates = await Promise.race([
         this.provider.predict(request, controller.signal),
         timeout,
+        aborted,
       ]);
       return this.finish(epoch, request, startedAt, "succeeded", candidates);
     } catch (error) {
+      const cancellationReason = this.explicitCancellationReasons.get(requestId);
       const reason = timedOut
         ? "timeout"
-        : this.explicitlyCancelled.has(requestId)
+        : cancellationReason !== undefined
           ? "cancelled"
           : "failed";
-      const message = error instanceof Error ? error.message : String(error);
-      const fallbackCandidates = this.fallback.predict(
-        request.worldState,
-        new Date(request.triggeredAt),
-      );
-      return this.finish(epoch, request, startedAt, reason, fallbackCandidates, message);
+      const message = cancellationReason ?? errorMessage(error);
+      if (this.activeEpoch !== epoch) {
+        return this.finish(epoch, request, startedAt, reason, [], "superseded");
+      }
+      let fallbackCandidates: readonly PredictionCandidate[] = [];
+      let fallbackReason = message;
+      try {
+        fallbackCandidates = this.fallback.predict(
+          request.worldState,
+          new Date(request.triggeredAt),
+        );
+      } catch (fallbackError) {
+        const fallbackMessage = errorMessage(fallbackError);
+        fallbackReason = `${message}; fallback failed: ${fallbackMessage}`;
+        this.reportDiagnostic({
+          kind: "fallback_failed",
+          requestId,
+          message: fallbackMessage,
+        });
+      }
+      return this.finish(epoch, request, startedAt, reason, fallbackCandidates, fallbackReason);
+    } finally {
+      controller.signal.removeEventListener("abort", onAbort);
     }
   }
 
   /** Cancel and discard any in-flight request. Idempotent. */
-  public cancelActive(_reason: string): void {
+  public cancelActive(reason: string): void {
     const requestId = this.activeRequestId;
     const controller = this.activeController;
     if (requestId === null || controller === null) {
       return;
     }
-    this.explicitlyCancelled.add(requestId);
+    this.explicitCancellationReasons.set(requestId, reason);
     this.abortActive();
   }
 
@@ -155,7 +190,7 @@ export class PredictionCoordinator {
     candidates: readonly PredictionCandidate[],
     fallbackReason?: string,
   ): PredictionOutcome {
-    this.explicitlyCancelled.delete(request.id);
+    this.explicitCancellationReasons.delete(request.id);
     const latencyMs = this.now().getTime() - startedAt.getTime();
 
     // A newer request incremented the epoch — this result is stale.
@@ -168,7 +203,7 @@ export class PredictionCoordinator {
         latencyMs,
         fallbackReason: "superseded",
       };
-      this.onOutcome?.(outcome);
+      this.publish(outcome);
       return outcome;
     }
 
@@ -182,8 +217,28 @@ export class PredictionCoordinator {
       latencyMs,
       ...(fallbackReason !== undefined ? { fallbackReason } : {}),
     };
-    this.onOutcome?.(outcome);
+    this.publish(outcome);
     return outcome;
+  }
+
+  private publish(outcome: PredictionOutcome): void {
+    try {
+      this.onOutcome?.(outcome);
+    } catch (error) {
+      this.reportDiagnostic({
+        kind: "outcome_observer_failed",
+        requestId: outcome.requestId,
+        message: errorMessage(error),
+      });
+    }
+  }
+
+  private reportDiagnostic(diagnostic: PredictionCoordinatorDiagnostic): void {
+    try {
+      this.onDiagnostic?.(diagnostic);
+    } catch {
+      // Diagnostics are best-effort and must never change prediction delivery.
+    }
   }
 }
 
@@ -192,4 +247,15 @@ export class PredictionTimeoutError extends Error {
     super(`Prediction request ${requestId} timed out.`);
     this.name = "PredictionTimeoutError";
   }
+}
+
+export class PredictionAbortedError extends Error {
+  public constructor(public readonly requestId: string) {
+    super(`Prediction request ${requestId} completed after it was aborted.`);
+    this.name = "PredictionAbortedError";
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

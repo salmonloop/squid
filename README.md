@@ -44,6 +44,7 @@ bun run watch:files -- /absolute/project/root
 - `src/evaluate.ts` — evaluation report entry point.
 - `src/prediction-provider.ts` — async prediction contract: `PredictionProvider` interface, `PredictionRequest`, `PredictionOutcome`, and `SyncPredictorProvider` adapter.
 - `src/prediction-coordinator.ts` — one-in-flight async coordinator with timeout, cancellation, stale-episode guard, and heuristic fallback.
+- `src/prediction-runtime.ts` — live orchestration boundary that feeds accepted/late core state snapshots into the coordinator without coupling provider latency to event ingestion.
 - `src/prediction-log.ts` — structured shadow-mode log for prediction outcomes.
 - `src/fake-prediction-provider.ts` — controllable `PredictionProvider` for tests and offline evaluation.
 - `src/pi-runtime.ts` — Pi adapter that implements `PredictionProvider`, requests one typed prediction via a terminating custom tool, respects `AbortSignal`, and derives `expiresAt` per kind. Isolated behind an adapter so Node/RPC remains a fallback if deeper Bun incompatibilities appear.
@@ -118,6 +119,7 @@ Tests use `bun:test`. The test suite covers:
 - `SqliteEventStore` cross-connection durability under WAL, sub-millisecond timestamp fidelity, duplicate and identity-reuse rejection, parent-directory creation, post-`close()` rejection, and watch-exclusion paths for a database inside or outside the watched root.
 - Pi prediction normalization, kind-specific expiry derivation, evidence provenance, and `PredictionProvider` interface conformance.
 - `PredictionCoordinator`: success, timeout fallback, provider-failure fallback, old-request cancellation, stale-episode discard, explicit cancel, dispose, and idempotent no-op.
+- `PredictionRuntime`: non-blocking prediction dispatch after projection, duplicate suppression, supersession, restore, and shutdown drain.
 - `PredictionLog`: structured recording of outcomes, cancellations, and field mapping.
 - Async evaluation: provider-based evaluation matching sync results, canned-provider scoring, hard timeout, and heuristic fallback.
 - Deterministic replay evaluation: cut-point ranking, MRR, coverage, future-leakage guard, per-scenario predictor isolation, and report stability.

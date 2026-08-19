@@ -238,6 +238,7 @@ describe("PredictionCoordinator", () => {
     // cancelActive marks the request as explicitly cancelled, so the catch
     // block classifies it as "cancelled" (not "stale" or "failed").
     expect(outcome.status).toBe("cancelled");
+    expect(outcome.fallbackReason).toBe("user-cancelled");
 
     // The explicitly cancelled outcome should also be recorded by onOutcome
     expect(outcomes.some((o) => o.status === "cancelled")).toBe(true);
@@ -272,6 +273,111 @@ describe("PredictionCoordinator", () => {
     // Should not throw
     coordinator.cancelActive("nothing");
     coordinator.dispose();
+  });
+
+  it("does not publish success when an explicitly cancelled provider ignores abort", async () => {
+    let resolveProvider: ((candidates: readonly ReturnType<typeof candidate>[]) => void) | undefined;
+    const coordinator = new PredictionCoordinator({
+      provider: {
+        name: "ignores-abort",
+        predict: async () => new Promise((resolve) => {
+          resolveProvider = resolve;
+        }),
+      },
+      random: counter(),
+    });
+
+    const pending = coordinator.request(makeState("ep-1"));
+    coordinator.cancelActive("user-cancelled");
+    resolveProvider!([candidate("run_tests")]);
+
+    const outcome = await pending;
+    expect(outcome.status).toBe("cancelled");
+  });
+
+  it("settles cancellation when a provider ignores abort and never resolves", async () => {
+    const coordinator = new PredictionCoordinator({
+      provider: {
+        name: "hung",
+        predict: async () => new Promise(() => undefined),
+      },
+      random: counter(),
+    });
+
+    const pending = coordinator.request(makeState("ep-1"));
+    coordinator.cancelActive("shutdown");
+
+    const outcome = await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("cancel did not settle")), 100)),
+    ]);
+    expect(outcome.status).toBe("cancelled");
+    expect(outcome.fallbackReason).toBe("shutdown");
+  });
+
+  it("skips fallback work for a request already superseded", async () => {
+    const diagnostics: string[] = [];
+    let call = 0;
+    const coordinator = new PredictionCoordinator({
+      provider: {
+        name: "supersede",
+        predict: async (request, signal) => {
+          call += 1;
+          if (call === 1) {
+            return new Promise<readonly ReturnType<typeof candidate>[]>((_, reject) => {
+              signal.addEventListener("abort", () => reject(new Error(`aborted ${request.id}`)), { once: true });
+            });
+          }
+          return [candidate("run_tests")];
+        },
+      },
+      fallback: {
+        predict: () => {
+          throw new Error("fallback should not run for stale work");
+        },
+      },
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic.kind),
+      random: counter(),
+    });
+
+    const first = coordinator.request(makeState("ep-1"));
+    const second = coordinator.request(makeState("ep-2"));
+
+    expect((await second).status).toBe("succeeded");
+    expect((await first).status).toBe("stale");
+    expect(diagnostics).toEqual([]);
+  });
+
+  it("contains fallback and observer errors without rejecting", async () => {
+    const diagnostics: string[] = [];
+    const coordinator = new PredictionCoordinator({
+      provider: {
+        name: "failing",
+        predict: async () => {
+          throw new Error("provider failed");
+        },
+      },
+      fallback: {
+        predict: () => {
+          throw new Error("fallback failed");
+        },
+      },
+      onOutcome: () => {
+        throw new Error("observer failed");
+      },
+      onDiagnostic: (diagnostic) => diagnostics.push(`${diagnostic.kind}:${diagnostic.message}`),
+      random: counter(),
+    });
+
+    const outcome = await coordinator.request(makeState("ep-1"));
+
+    expect(outcome.status).toBe("failed");
+    expect(outcome.candidates).toEqual([]);
+    expect(outcome.fallbackReason).toContain("fallback failed");
+    expect(diagnostics).toEqual([
+      "fallback_failed:fallback failed",
+      "outcome_observer_failed:observer failed",
+    ]);
   });
 });
 
