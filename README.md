@@ -36,7 +36,7 @@ bun run watch:files -- /absolute/project/root
 - `src/world-state.ts` — deterministic, ownership-safe reducer from events to world state.
 - `src/activity-source.ts` — the source contract every capture adapter implements.
 - `src/filesystem-source.ts` — filesystem watcher that emits validated file activity for one project root.
-- `src/watch-files.ts` — live filesystem ingestion entry point.
+- `src/watch-files.ts` — live filesystem ingestion entry point; durable when `SQUID_DB` is set.
 - `src/baseline-predictor.ts` — offline heuristic predictor used for evaluation.
 - `src/evaluation.ts` — deterministic replay runner and prediction metrics.
 - `src/evaluation-fixtures.ts` — versioned synthetic replay scenarios with labeled cut points.
@@ -53,7 +53,9 @@ Three `EventStore` implementations satisfy one contract. `all()` returns every a
 
 `journal_mode = WAL` with `synchronous = NORMAL` means committed events survive process death without an explicit checkpoint. They are **not** guaranteed to survive OS or power loss — that would need `synchronous = FULL`.
 
-`main.ts` and `watch-files.ts` both use `InMemoryEventStore`. Neither `SqliteEventStore` nor `JsonlEventStore` has a production caller yet; wiring live ingestion to a durable store first requires the filesystem source to carry a per-process session identity, since it currently restarts every session at sequence `0` under a constant `sessionId` and would collide with itself on second launch.
+`watch-files.ts` uses `SqliteEventStore` when `SQUID_DB` names an absolute path, and `InMemoryEventStore` otherwise. It calls `restore()` before observing, so a restart rebuilds the dedupe index and projection from history instead of re-ingesting it. `main.ts` is a demo and stays in memory. `JsonlEventStore` has no production caller.
+
+A database inside the watched root would feed its own writes back into the timeline: each append updates `-wal`, the watcher reports that write, and ingesting it appends again. `sqliteWatchExclusions` returns the root-relative paths of the database and its two WAL sidecars so the watcher skips them; it returns nothing when the database lives outside the root, so an unrelated sibling path can never be excluded by accident.
 
 ## Pi integration boundary
 
@@ -71,8 +73,11 @@ The source reports a path, not an application, so every payload carries `applica
 
 Watcher, probe, and delivery failures are recorded as diagnostics instead of thrown from async listeners, so one bad path cannot kill the watch.
 
+Each instance defaults to a fresh `sessionId`. `sequence` restarts at `0` for every instance, so the session is the part of the source-local identity tuple that has to change; a constant default would make every run re-emit `(filesystem, filesystem-local, <session>, 0)` and collide with its own history in any store that enforces that identity.
+
 ```bash
 bun run watch:files -- /absolute/project/root
+SQUID_DB=/absolute/path/events.db bun run watch:files -- /absolute/project/root
 ```
 
 File contents are never read; only paths, kinds, and timestamps enter the timeline.
@@ -94,10 +99,10 @@ Tests use `bun:test`. The test suite covers:
 - `SquidCore` ingestion, idempotency, conflict detection, late-event handling, immutable snapshots, and deterministic restore.
 - A shared `EventStore` conformance suite (`tests/event-store-conformance.ts`) run against all three implementations: round-trip fidelity, order-independent canonical ordering, mutation isolation, concurrent appends, and `since()` boundary and timezone equivalence.
 - `JsonlEventStore` write recovery and interrupted-tail recovery.
-- `SqliteEventStore` cross-connection durability under WAL, sub-millisecond timestamp fidelity, duplicate and identity-reuse rejection, parent-directory creation, and post-`close()` rejection.
+- `SqliteEventStore` cross-connection durability under WAL, sub-millisecond timestamp fidelity, duplicate and identity-reuse rejection, parent-directory creation, post-`close()` rejection, and watch-exclusion paths for a database inside or outside the watched root.
 - Pi prediction normalization, expiry validation, and evidence provenance.
 - Deterministic replay evaluation: cut-point ranking, MRR, coverage, future-leakage guard, and report stability.
-- `FilesystemActivitySource` root validation, lifecycle, default and caller filtering, path normalization, event mapping, debounce, ordering under a slow emitter, shutdown drain, diagnostics, and end-to-end ingestion through `SquidCore`.
+- `FilesystemActivitySource` root validation, lifecycle, default and caller filtering, path normalization, event mapping, debounce, ordering under a slow emitter, shutdown drain, diagnostics, distinct per-instance session identity, restart against one durable store without an identity collision, and end-to-end ingestion through `SquidCore`.
 
 Source tests inject a fake watcher and file probe, so they never depend on kernel watch timing. Real-watcher behavior is verified by the `bun run watch:files` smoke run in the release gate.
 

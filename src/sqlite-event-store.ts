@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, relative, sep } from "node:path";
 import { parseTimestamp, type EventStore } from "./event-store.js";
 import { parseActivityEvent, type ActivityEvent } from "./protocol.js";
 
@@ -40,6 +40,9 @@ CREATE INDEX IF NOT EXISTS chronicle_events_occurred_at
 `;
 
 const CONSTRAINT_CODES = new Set(["SQLITE_CONSTRAINT_PRIMARYKEY", "SQLITE_CONSTRAINT_UNIQUE"]);
+
+/** The database itself plus the two files WAL mode maintains beside it. */
+const WAL_SIDECAR_SUFFIXES = ["", "-wal", "-shm"] as const;
 
 /**
  * Durable append-only Chronicle storage on SQLite.
@@ -147,6 +150,20 @@ export class SqliteEventStore implements EventStore {
       throw new Error("SqliteEventStore is closed.");
     }
   }
+}
+
+/**
+ * Root-relative POSIX paths a filesystem watcher must ignore for this database.
+ *
+ * A database inside a watched root feeds its own writes back in: every append
+ * updates `-wal`, the watcher reports that write, ingesting it appends again.
+ * Returns an empty array when the database lives outside the root, so a caller
+ * cannot accidentally exclude an unrelated sibling path.
+ */
+export function sqliteWatchExclusions(root: string, filePath: string): readonly string[] {
+  return WAL_SIDECAR_SUFFIXES
+    .map((suffix) => relative(root, `${filePath}${suffix}`).split(sep).join("/"))
+    .filter((candidate) => candidate.length > 0 && candidate !== ".." && !candidate.startsWith("../"));
 }
 
 function isConstraintViolation(error: unknown): boolean {

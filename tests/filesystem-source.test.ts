@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "bun:test";
 import type { ActivitySourceDiagnostic } from "../src/activity-source.js";
 import { InMemoryEventStore } from "../src/event-store.js";
+import { SqliteEventStore } from "../src/sqlite-event-store.js";
 import {
   FilesystemActivitySource,
   isDefaultIncluded,
@@ -371,6 +372,16 @@ describe("FilesystemActivitySource diagnostics", () => {
   });
 });
 
+describe("FilesystemActivitySource session identity", () => {
+  it("gives each instance a distinct default sessionId", async () => {
+    const root = await temporaryRoot();
+    const first = new FilesystemActivitySource({ root });
+    const second = new FilesystemActivitySource({ root });
+    expect(first.sessionId).not.toBe(second.sessionId);
+  });
+
+});
+
 describe("FilesystemActivitySource with SquidCore", () => {
   it("feeds validated events into the Chronicle projection", async () => {
     const root = await temporaryRoot();
@@ -395,6 +406,44 @@ describe("FilesystemActivitySource with SquidCore", () => {
     expect(state.recentActions.map((action) => action.kind)).toEqual(["file_saved", "file_saved"]);
     expect((await store.all()).map((event) => event.source.kind)).toEqual(["filesystem", "filesystem"]);
     expect(await core.restore()).toEqual(state);
+  });
+});
+
+describe("FilesystemActivitySource durable restart", () => {
+  it("watches the same SQLite store twice without an identity collision", async () => {
+    const root = await temporaryRoot();
+    const databasePath = join(root, ".squid", "events.db");
+
+    // One call is one process's worth of watching: restore history, observe one
+    // write, drain, close. Both calls emit sequence 0 for the same source id, so
+    // only a per-instance sessionId keeps their identities distinct.
+    async function watchOnce(): Promise<void> {
+      const store = new SqliteEventStore(databasePath);
+      const core = new SquidCore(store);
+      await core.restore();
+      const watcher = fakeWatcher();
+      const source = new FilesystemActivitySource({
+        root,
+        watcherFactory: watcher.factory,
+        probeFile: async () => true,
+      });
+      await source.start(async (event) => {
+        await core.ingest(event);
+      });
+      watcher.emit({ eventType: "change", filename: "a.ts" });
+      await source.stop();
+      store.close();
+    }
+
+    await watchOnce();
+    await watchOnce();
+
+    const store = new SqliteEventStore(databasePath);
+    const events = await store.all();
+    expect(events.length).toBe(2);
+    expect(events.every((event) => event.sequence === 0)).toBe(true);
+    expect(new Set(events.map((event) => event.sessionId)).size).toBe(2);
+    store.close();
   });
 });
 

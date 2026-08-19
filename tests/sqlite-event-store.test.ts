@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "bun:test";
-import { SqliteEventStore, EventStoreConstraintError } from "../src/sqlite-event-store.js";
+import { SqliteEventStore, EventStoreConstraintError, sqliteWatchExclusions } from "../src/sqlite-event-store.js";
 import { createActivityEvent } from "../src/protocol.js";
 import { orderActivityEvents } from "../src/chronicle-ordering.js";
 
@@ -133,6 +133,22 @@ describe("SqliteEventStore", () => {
     await expect(
       store.append(createActivityEvent({ kind: "file_opened", payload: { path: "x.ts", applicationId: "editor" } })),
     ).rejects.toThrow("SqliteEventStore is closed.");
+  });
+
+  it("lists watch exclusions for a database inside the watched root", () => {
+    expect(sqliteWatchExclusions("/project", "/project/.squid/events.db")).toEqual([
+      ".squid/events.db",
+      ".squid/events.db-wal",
+      ".squid/events.db-shm",
+    ]);
+  });
+
+  it("excludes nothing when the database lives outside the watched root", () => {
+    expect(sqliteWatchExclusions("/project", "/var/lib/squid/events.db")).toEqual([]);
+    expect(sqliteWatchExclusions("/project", "/project")).toEqual([]);
+    // A prefix sibling is not a child: "/project-other" must not be treated as
+    // inside "/project" just because the string starts the same way.
+    expect(sqliteWatchExclusions("/project", "/project-other/events.db")).toEqual([]);
   });
 
   it("removes -wal and -shm files after close()", async () => {

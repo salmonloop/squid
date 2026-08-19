@@ -28,6 +28,7 @@ export interface FilesystemActivitySourceOptions {
   /** Absolute directory to observe. Canonicalized at start. */
   root: string;
   sourceId?: string;
+  /** Defaults to a fresh identity per instance; see the constructor. */
   sessionId?: string;
   /** Narrows the default artifact filter; receives a root-relative POSIX path. */
   include?: (relativePath: string) => boolean;
@@ -55,8 +56,9 @@ interface PendingChange {
  */
 export class FilesystemActivitySource implements ActivitySource {
   public readonly id: string;
+  /** Part of this source's event identity, alongside `id`; see the constructor. */
+  public readonly sessionId: string;
 
-  private readonly sessionId: string;
   private readonly debounceMs: number;
   private readonly include: (relativePath: string) => boolean;
   private readonly watcherFactory: FilesystemWatcherFactory;
@@ -78,7 +80,11 @@ export class FilesystemActivitySource implements ActivitySource {
   public constructor(options: FilesystemActivitySourceOptions) {
     this.configuredRoot = options.root;
     this.id = options.sourceId ?? "filesystem-local";
-    this.sessionId = options.sessionId ?? "filesystem-session";
+    // `sequence` restarts at 0 for every instance, so the session must be the
+    // part of the identity tuple that changes. A constant default would make
+    // every run re-emit (filesystem, <id>, <session>, 0) and collide with its
+    // own history in any store that enforces source-local identity.
+    this.sessionId = options.sessionId ?? `filesystem-${crypto.randomUUID()}`;
     this.debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS;
     this.include = options.include ?? (() => true);
     this.watcherFactory = options.watcherFactory ?? defaultWatcherFactory;
