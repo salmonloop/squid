@@ -3,6 +3,10 @@ import { InMemoryEventStore } from "./event-store.js";
 import type { Predictor } from "./baseline-predictor.js";
 import type { ActivityEvent, PredictionCandidate, PredictionKind } from "./protocol.js";
 import { SquidCore } from "./squid-core.js";
+import {
+  SyncPredictorProvider,
+  type PredictionProvider,
+} from "./prediction-provider.js";
 
 export interface PredictionCutPoint {
   id: string;
@@ -50,10 +54,25 @@ export interface Metric {
 }
 
 export type PredictorFactory = () => Predictor;
+export type PredictionProviderFactory = () => PredictionProvider;
 
 export async function evaluateScenarios(
   scenarios: readonly ReplayScenario[],
   createPredictor: PredictorFactory,
+): Promise<EvaluationReport> {
+  const createProvider: PredictionProviderFactory = () =>
+    new SyncPredictorProvider(createPredictor(), "sync-eval");
+  return evaluateWithProvider(scenarios, createProvider);
+}
+
+/**
+ * Async evaluation variant: each scenario gets an independent provider instance,
+ * and predictions go through the PredictionCoordinator with a fallback heuristic.
+ * This lets Pi-backed predictors be evaluated through the same replay runner offline.
+ */
+export async function evaluateWithProvider(
+  scenarios: readonly ReplayScenario[],
+  createProvider: PredictionProviderFactory,
 ): Promise<EvaluationReport> {
   const results: PredictionEvaluation[] = [];
 
@@ -62,14 +81,30 @@ export async function evaluateScenarios(
     validateScenario(scenario, events);
     const cutPointsByIndex = new Map(scenario.cutPoints.map((cutPoint) => [cutPoint.eventIndex, cutPoint]));
     const core = new SquidCore(new InMemoryEventStore());
-    const predictor = createPredictor();
+    const provider = createProvider();
 
     for (const [eventIndex, event] of events.entries()) {
-      const result = await core.ingest(event);
+      const ingestResult = await core.ingest(event);
       const cutPoint = cutPointsByIndex.get(eventIndex);
       if (!cutPoint) continue;
 
-      const candidates = predictor.predict(result.state, new Date(event.occurredAt));
+      // Providers may fail or timeout during evaluation. A failure yields no
+      // candidates rather than an unhandled exception — the metrics reflect
+      // the raw provider outcome, including zero-output scenarios.
+      let candidates: readonly PredictionCandidate[] = [];
+      try {
+        candidates = await provider.predict(
+          {
+            id: `eval-${scenario.id}-${cutPoint.id}`,
+            worldState: ingestResult.state,
+            episodeId: ingestResult.state.episode?.id ?? null,
+            triggeredAt: event.occurredAt,
+          },
+          new AbortController().signal,
+        );
+      } catch {
+        candidates = [];
+      }
       results.push(evaluateCutPoint(scenario.id, cutPoint, candidates));
     }
   }

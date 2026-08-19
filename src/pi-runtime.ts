@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { PredictionCandidate, PredictionKind, WorldState } from "./protocol.js";
+import type { PredictionProvider, PredictionRequest } from "./prediction-provider.js";
 
 const predictionKinds = [
   "draft_completion",
@@ -19,6 +20,19 @@ const predictionKinds = [
 const PREDICTION_TTL_MS = 20_000;
 const MAX_PROVENANCE_EVENTS = 5;
 
+/**
+ * TTL per prediction kind, in milliseconds. The model does not decide expiry;
+ * Squid derives it from the action category so context-bound suggestions expire
+ * on a schedule that matches their semantic freshness window.
+ */
+const kindTtlMs: Record<PredictionKind, number> = {
+  draft_completion: 30_000,
+  run_tests: 60_000,
+  inspect_error: 120_000,
+  search_selection: 30_000,
+  none: 10_000,
+};
+
 export interface PiRuntimeOptions {
   provider?: string;
   modelId?: string;
@@ -28,11 +42,11 @@ export interface RawPredictionCandidate {
   kind: string;
   rationale: string;
   confidence: number;
-  expiresAt: string;
   parameters: Record<string, string | number | boolean | null>;
 }
 
-export class PiRuntime {
+export class PiRuntime implements PredictionProvider {
+  public readonly name = "pi";
   private readonly provider: string;
   private readonly modelId: string;
   private readonly modelRuntimePromise: Promise<ModelRuntime>;
@@ -43,12 +57,17 @@ export class PiRuntime {
     this.modelRuntimePromise = ModelRuntime.create({ allowModelNetwork: false });
   }
 
-  public async predict(state: WorldState): Promise<PredictionCandidate | null> {
+  public async predict(
+    request: PredictionRequest,
+    signal: AbortSignal,
+  ): Promise<readonly PredictionCandidate[]> {
     const modelRuntime = await this.modelRuntimePromise;
     const model = modelRuntime.getModel(this.provider, this.modelId);
     if (!model) {
       throw new Error(`Pi model is unavailable: ${this.provider}/${this.modelId}`);
     }
+
+    const now = new Date(request.triggeredAt);
 
     let candidate: PredictionCandidate | null = null;
     const emitPrediction = defineTool({
@@ -59,7 +78,6 @@ export class PiRuntime {
         kind: Type.Union(predictionKinds.map((kind) => Type.Literal(kind))),
         rationale: Type.String(),
         confidence: Type.Number(),
-        expiresAt: Type.String(),
         parameters: Type.Record(Type.String(), Type.Union([
           Type.String(),
           Type.Number(),
@@ -68,7 +86,7 @@ export class PiRuntime {
         ])),
       }),
       execute: async (_toolCallId, params) => {
-        candidate = normalizePredictionCandidate(params, state);
+        candidate = normalizePredictionCandidate(params, request.worldState, now);
         return {
           content: [{ type: "text", text: "Prediction emitted." }],
           details: candidate,
@@ -104,10 +122,27 @@ export class PiRuntime {
       sessionManager: SessionManager.inMemory(),
     });
 
+    // If the signal is already aborted, dispose and abort immediately.
+    if (signal.aborted) {
+      await session.abort().catch(() => undefined);
+      session.dispose();
+      throw new PiPredictionCancelledError(request.id);
+    }
+
+    // Listen for external abort → session.abort() then dispose.
+    const onAbort = () => {
+      session.abort().catch(() => undefined);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+
     try {
-      await session.prompt(JSON.stringify({ worldState: state }));
-      return candidate;
+      await session.prompt(JSON.stringify({ worldState: request.worldState }));
+      if (candidate === null) {
+        return [noneCandidate(deriveSourceEventIds(request.worldState), now)];
+      }
+      return [candidate];
     } finally {
+      signal.removeEventListener("abort", onAbort);
       session.dispose();
     }
   }
@@ -119,12 +154,13 @@ export function normalizePredictionCandidate(
   now = new Date(),
 ): PredictionCandidate {
   const sourceEventIds = deriveSourceEventIds(state);
-  const expiresAt = parseFutureExpiration(params.expiresAt, now);
   const kind = isPredictionKind(params.kind) ? params.kind : null;
 
-  if (kind === null || expiresAt === null) {
+  if (kind === null) {
     return noneCandidate(sourceEventIds, now);
   }
+
+  const expiresAt = new Date(now.getTime() + (kindTtlMs[kind] ?? PREDICTION_TTL_MS)).toISOString();
 
   return {
     kind,
@@ -144,13 +180,6 @@ function deriveSourceEventIds(state: WorldState): string[] {
   )];
 }
 
-function parseFutureExpiration(value: string, now: Date): string | null {
-  const timestamp = new Date(value).getTime();
-  return Number.isFinite(timestamp) && timestamp > now.getTime()
-    ? new Date(timestamp).toISOString()
-    : null;
-}
-
 function isPredictionKind(kind: string): kind is PredictionKind {
   return (predictionKinds as readonly string[]).includes(kind);
 }
@@ -158,10 +187,17 @@ function isPredictionKind(kind: string): kind is PredictionKind {
 function noneCandidate(sourceEventIds: string[], now: Date): PredictionCandidate {
   return {
     kind: "none",
-    rationale: "The model emitted an invalid or expired prediction.",
+    rationale: "The model emitted an invalid or no prediction.",
     confidence: 0,
-    expiresAt: new Date(now.getTime() + PREDICTION_TTL_MS).toISOString(),
+    expiresAt: new Date(now.getTime() + kindTtlMs.none).toISOString(),
     sourceEventIds,
     parameters: {},
-  };
+  }
+}
+
+export class PiPredictionCancelledError extends Error {
+  public constructor(public readonly requestId: string) {
+    super(`Pi prediction request ${requestId} was cancelled.`);
+    this.name = "PiPredictionCancelledError";
+  }
 }

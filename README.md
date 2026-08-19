@@ -42,7 +42,11 @@ bun run watch:files -- /absolute/project/root
 - `src/evaluation.ts` — deterministic replay runner and prediction metrics.
 - `src/evaluation-fixtures.ts` — versioned synthetic replay scenarios with labeled cut points.
 - `src/evaluate.ts` — evaluation report entry point.
-- `src/pi-runtime.ts` — Pi adapter that requests one typed prediction via a terminating custom tool. Isolated behind an adapter so Node/RPC remains a fallback if deeper Bun incompatibilities appear.
+- `src/prediction-provider.ts` — async prediction contract: `PredictionProvider` interface, `PredictionRequest`, `PredictionOutcome`, and `SyncPredictorProvider` adapter.
+- `src/prediction-coordinator.ts` — one-in-flight async coordinator with timeout, cancellation, stale-episode guard, and heuristic fallback.
+- `src/prediction-log.ts` — structured shadow-mode log for prediction outcomes.
+- `src/fake-prediction-provider.ts` — controllable `PredictionProvider` for tests and offline evaluation.
+- `src/pi-runtime.ts` — Pi adapter that implements `PredictionProvider`, requests one typed prediction via a terminating custom tool, respects `AbortSignal`, and derives `expiresAt` per kind. Isolated behind an adapter so Node/RPC remains a fallback if deeper Bun incompatibilities appear.
 - `src/squid-core.ts` — orchestrates event ingestion, state reduction, and baseline prediction.
 - `src/main.ts` — demo entry point.
 
@@ -66,7 +70,11 @@ Opening an episode clears inferred interaction context: foreground application/w
 
 ## Pi integration boundary
 
-`PiRuntime` is optional. It uses `@earendil-works/pi-coding-agent` with a terminating structured-output tool (`emit_prediction`). The model provider is configured via `PI_MODEL_PROVIDER` (default `bifrost`) and `PI_MODEL_ID` (default `deepseek-v4-flash`).
+`PiRuntime` is optional. It implements the `PredictionProvider` interface and uses `@earendil-works/pi-coding-agent` with a terminating structured-output tool (`emit_prediction`). The model provider is configured via `PI_MODEL_PROVIDER` (default `bifrost`) and `PI_MODEL_ID` (default `deepseek-v4-flash`).
+
+`PredictionCoordinator` wraps any `PredictionProvider` with a hard timeout (default 15 seconds), one-in-flight concurrency (new requests cancel old ones), and an automatic fallback to `HeuristicPredictor` when the provider fails, times out, or is cancelled. Outcomes are published exactly once via an `onOutcome` callback for shadow-mode logging.
+
+The model no longer sets `expiresAt`; Squid derives it per kind (`draft_completion`: 30s, `run_tests`: 60s, `inspect_error`: 120s, `search_selection`: 30s, `none`: 10s) so context-bound suggestions expire on a schedule that matches their semantic freshness window.
 
 If the model provider is unreachable, the baseline predictor continues to function. Pi is not the source of truth for timeline or memory — the event store and world-state reducer are.
 
@@ -95,7 +103,7 @@ File contents are never read; only paths, kinds, and timestamps enter the timeli
 
 Each cut point replays only the canonical events available at that point; later events are excluded so the report cannot receive future-state leakage. A fresh predictor instance is created per scenario, preventing model sessions or caches from leaking between unrelated timelines. The report includes Top-1/Top-3/Top-5 hit rates, mean reciprocal rank (MRR), prediction coverage, and no-action correctness. The fixtures include stale-context negatives across episode boundaries, a below-threshold continuation guard, and a workflow with multiple distinct cut points. Current scores describe only this intentionally small synthetic corpus; they are a regression baseline, not a claim about real-user accuracy.
 
-Any future Pi-backed predictor must be evaluated through the same replay runner and fixture version before it can enter a real-time path.
+Any future Pi-backed predictor must be evaluated through the same replay runner and fixture version before it can enter a real-time path. The evaluation runner supports both sync (`evaluateScenarios`) and async (`evaluateWithProvider`) providers; async providers are isolated per scenario and failures yield zero candidates rather than unhandled exceptions.
 
 ## Testing
 
@@ -108,7 +116,10 @@ Tests use `bun:test`. The test suite covers:
 - A shared `EventStore` conformance suite (`tests/event-store-conformance.ts`) run against all three implementations: round-trip fidelity, order-independent canonical ordering, mutation isolation, concurrent appends, and `since()` boundary and timezone equivalence.
 - `JsonlEventStore` write recovery and interrupted-tail recovery.
 - `SqliteEventStore` cross-connection durability under WAL, sub-millisecond timestamp fidelity, duplicate and identity-reuse rejection, parent-directory creation, post-`close()` rejection, and watch-exclusion paths for a database inside or outside the watched root.
-- Pi prediction normalization, expiry validation, and evidence provenance.
+- Pi prediction normalization, kind-specific expiry derivation, evidence provenance, and `PredictionProvider` interface conformance.
+- `PredictionCoordinator`: success, timeout fallback, provider-failure fallback, old-request cancellation, stale-episode discard, explicit cancel, dispose, and idempotent no-op.
+- `PredictionLog`: structured recording of outcomes, cancellations, and field mapping.
+- Async evaluation: provider-based evaluation matching sync results, canned-provider scoring, and failure-yields-zero-candidates.
 - Deterministic replay evaluation: cut-point ranking, MRR, coverage, future-leakage guard, per-scenario predictor isolation, and report stability.
 - `FilesystemActivitySource` root validation, lifecycle, default and caller filtering, path normalization, event mapping, debounce, ordering under a slow emitter, shutdown drain, diagnostics, distinct per-instance session identity, restart against one durable store without an identity collision, and end-to-end ingestion through `SquidCore`.
 
