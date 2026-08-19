@@ -23,10 +23,12 @@ function stubPredictor(kindsByCall: readonly PredictionKind[][]): Predictor {
 
 describe("Replay evaluation", () => {
   it("scores the heuristic baseline on synthetic fixtures", async () => {
-    const report = await evaluateScenarios(heuristicEvaluationScenarios, new HeuristicPredictor());
+    const report = await evaluateScenarios(heuristicEvaluationScenarios, () => new HeuristicPredictor());
 
     expect(report.scenarioCount).toBe(heuristicEvaluationScenarios.length);
-    expect(report.cutPointCount).toBe(heuristicEvaluationScenarios.length);
+    expect(report.cutPointCount).toBe(
+      heuristicEvaluationScenarios.reduce((count, scenario) => count + scenario.cutPoints.length, 0),
+    );
     expect(report.top1.rate).toBe(1);
     expect(report.noneCorrectness.rate).toBe(1);
     expect(report.results.map((result) => result.expectedKind)).toEqual([
@@ -36,7 +38,35 @@ describe("Replay evaluation", () => {
       "inspect_error",
       "run_tests",
       "none",
+      "run_tests",
+      "none",
+      "run_tests",
+      "none",
+      "none",
+      "none",
     ]);
+  });
+
+  it("expires stale context without suppressing resumed work", async () => {
+    const scenarioIds = new Set([
+      "resumed-work-still-predicts",
+      "stale-application-no-tests",
+      "stale-save-no-tests",
+      "stale-text-no-completion",
+    ]);
+    const scenarios = heuristicEvaluationScenarios.filter((scenario) => scenarioIds.has(scenario.id));
+
+    const report = await evaluateScenarios(scenarios, () => new HeuristicPredictor());
+    const kindsByScenario = Object.fromEntries(
+      report.results.map((result) => [result.scenarioId, result.candidateKinds]),
+    );
+
+    expect(kindsByScenario).toEqual({
+      "resumed-work-still-predicts": ["run_tests"],
+      "stale-application-no-tests": [],
+      "stale-save-no-tests": [],
+      "stale-text-no-completion": [],
+    });
   });
 
   it("scores a filesystem-sourced save through the same projection", async () => {
@@ -44,7 +74,7 @@ describe("Replay evaluation", () => {
       .find((candidate) => candidate.id === "filesystem-save-run-tests");
     if (scenario === undefined) throw new Error("Missing filesystem evaluation scenario.");
 
-    const report = await evaluateScenarios([scenario], new HeuristicPredictor());
+    const report = await evaluateScenarios([scenario], () => new HeuristicPredictor());
 
     expect(scenario.events.some((event) => event.source.kind === "filesystem")).toBe(true);
     expect(report.results[0]?.rank).toBe(1);
@@ -52,8 +82,8 @@ describe("Replay evaluation", () => {
   });
 
   it("produces identical reports across runs", async () => {
-    const first = await evaluateScenarios(heuristicEvaluationScenarios, new HeuristicPredictor());
-    const second = await evaluateScenarios(heuristicEvaluationScenarios, new HeuristicPredictor());
+    const first = await evaluateScenarios(heuristicEvaluationScenarios, () => new HeuristicPredictor());
+    const second = await evaluateScenarios(heuristicEvaluationScenarios, () => new HeuristicPredictor());
 
     expect(JSON.stringify(first)).toEqual(JSON.stringify(second));
   });
@@ -92,7 +122,7 @@ describe("Replay evaluation", () => {
       ],
     };
 
-    const report = await evaluateScenarios([scenario], stubPredictor([
+    const report = await evaluateScenarios([scenario], () => stubPredictor([
       ["draft_completion", "run_tests"],
       ["draft_completion", "inspect_error", "search_selection"],
       [],
@@ -130,7 +160,7 @@ describe("Replay evaluation", () => {
       ],
     };
 
-    const report = await evaluateScenarios([scenario], new HeuristicPredictor());
+    const report = await evaluateScenarios([scenario], () => new HeuristicPredictor());
 
     expect(report.results[0]?.candidateKinds).toEqual([]);
     expect(report.results[0]?.top1).toBe(true);
@@ -154,7 +184,68 @@ describe("Replay evaluation", () => {
       ],
     };
 
-    await expect(evaluateScenarios([scenario], new HeuristicPredictor()))
+    await expect(evaluateScenarios([scenario], () => new HeuristicPredictor()))
       .rejects.toThrow("Scenario invalid has an invalid cut point index for out-of-range.");
+  });
+
+  it("rejects duplicate cut point indexes instead of silently dropping a label", async () => {
+    const scenario: ReplayScenario = {
+      id: "duplicate-index",
+      title: "Duplicate index",
+      events: [createActivityEvent({
+        kind: "application_activated",
+        eventId: "duplicate-index-event",
+        sequence: 0,
+        occurredAt: "2026-08-18T11:30:00.000Z",
+        payload: { applicationId: "clock", applicationName: "Clock" },
+      })],
+      cutPoints: [
+        { id: "first", eventIndex: 0, expectedKind: "none", description: "First label." },
+        { id: "second", eventIndex: 0, expectedKind: "none", description: "Second label." },
+      ],
+    };
+
+    await expect(evaluateScenarios([scenario], () => new HeuristicPredictor()))
+      .rejects.toThrow("Scenario duplicate-index has duplicate cut point index 0.");
+  });
+
+  it("creates an isolated predictor for each scenario", async () => {
+    const scenarios: ReplayScenario[] = ["isolation-a", "isolation-b"].map((id, index) => ({
+      id,
+      title: id,
+      events: [createActivityEvent({
+        kind: "application_activated",
+        eventId: `${id}-event`,
+        sequence: index,
+        occurredAt: `2026-08-18T11:4${index}:00.000Z`,
+        payload: { applicationId: "clock", applicationName: "Clock" },
+      })],
+      cutPoints: [{ id: `${id}-cut`, eventIndex: 0, expectedKind: "none", description: "No action." }],
+    }));
+    let instanceCount = 0;
+
+    const report = await evaluateScenarios(scenarios, () => {
+      instanceCount += 1;
+      let called = false;
+      return {
+        predict(_state, now = new Date()) {
+          if (!called) {
+            called = true;
+            return [];
+          }
+          return [{
+            kind: "run_tests" as const,
+            rationale: "State leaked from another scenario.",
+            confidence: 1,
+            expiresAt: new Date(now.getTime() + 20_000).toISOString(),
+            sourceEventIds: [],
+            parameters: {},
+          }];
+        },
+      };
+    });
+
+    expect(instanceCount).toBe(2);
+    expect(report.top1.rate).toBe(1);
   });
 });

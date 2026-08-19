@@ -49,9 +49,11 @@ export interface Metric {
   rate: number;
 }
 
+export type PredictorFactory = () => Predictor;
+
 export async function evaluateScenarios(
   scenarios: readonly ReplayScenario[],
-  predictor: Predictor,
+  createPredictor: PredictorFactory,
 ): Promise<EvaluationReport> {
   const results: PredictionEvaluation[] = [];
 
@@ -60,6 +62,7 @@ export async function evaluateScenarios(
     validateScenario(scenario, events);
     const cutPointsByIndex = new Map(scenario.cutPoints.map((cutPoint) => [cutPoint.eventIndex, cutPoint]));
     const core = new SquidCore(new InMemoryEventStore());
+    const predictor = createPredictor();
 
     for (const [eventIndex, event] of events.entries()) {
       const result = await core.ingest(event);
@@ -128,6 +131,7 @@ function metric(hits: number, total: number): Metric {
 
 function validateScenario(scenario: ReplayScenario, events: readonly ActivityEvent[]): void {
   const seenCutPointIds = new Set<string>();
+  const seenCutPointIndexes = new Set<number>();
   for (const cutPoint of scenario.cutPoints) {
     if (seenCutPointIds.has(cutPoint.id)) {
       throw new Error(`Scenario ${scenario.id} has duplicate cut point ID ${cutPoint.id}.`);
@@ -136,6 +140,10 @@ function validateScenario(scenario: ReplayScenario, events: readonly ActivityEve
     if (!Number.isInteger(cutPoint.eventIndex) || cutPoint.eventIndex < 0 || cutPoint.eventIndex >= events.length) {
       throw new Error(`Scenario ${scenario.id} has an invalid cut point index for ${cutPoint.id}.`);
     }
+    if (seenCutPointIndexes.has(cutPoint.eventIndex)) {
+      throw new Error(`Scenario ${scenario.id} has duplicate cut point index ${cutPoint.eventIndex}.`);
+    }
+    seenCutPointIndexes.add(cutPoint.eventIndex);
   }
 }
 

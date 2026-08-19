@@ -1,5 +1,11 @@
 import { orderActivityEvents } from "./chronicle-ordering.js";
 import {
+  assertEpisodeGap,
+  DEFAULT_EPISODE_GAP_MS,
+  elapsedMs,
+  episodeIdForEvent,
+} from "./episode.js";
+import {
   emptyWorldState,
   parseActivityEvent,
   type ActivityEvent,
@@ -15,14 +21,39 @@ import {
 
 const MAX_RECENT_ITEMS = 20;
 
-export function reduceWorldState(state: WorldState, input: ActivityEvent): WorldState {
+export function reduceWorldState(
+  state: WorldState,
+  input: ActivityEvent,
+  gapMs = DEFAULT_EPISODE_GAP_MS,
+): WorldState {
+  assertEpisodeGap(gapMs);
   const event = parseActivityEvent(input);
+  const opensEpisode = state.episode === null
+    || (state.updatedAt !== null && elapsedMs(state.updatedAt, event.occurredAt) >= gapMs);
+
+  // All inferred interaction context is episode-scoped. The boundary event's
+  // reducer branch can immediately re-establish fields it authoritatively carries.
+  const episodeBase = opensEpisode
+    ? {
+        ...state,
+        activeApplication: null,
+        activeWindow: null,
+        focus: null,
+        currentBrowserPage: null,
+        recentFiles: [],
+        recentActions: [],
+        lastCommandOutcome: null,
+      }
+    : state;
   const next: WorldState = {
-    ...state,
+    ...episodeBase,
     updatedAt: event.occurredAt,
     lastEventKind: event.kind,
-    recentFiles: [...state.recentFiles],
-    recentActions: [...state.recentActions],
+    episode: opensEpisode
+      ? { id: episodeIdForEvent(event), startedAt: event.occurredAt, eventCount: 1 }
+      : { ...state.episode!, eventCount: state.episode!.eventCount + 1 },
+    recentFiles: [...episodeBase.recentFiles],
+    recentActions: [...episodeBase.recentActions],
   };
 
   switch (event.kind) {
@@ -100,8 +131,15 @@ export function reduceWorldState(state: WorldState, input: ActivityEvent): World
   return next;
 }
 
-export function buildWorldState(events: readonly ActivityEvent[]): WorldState {
-  return orderActivityEvents(events.map(parseActivityEvent)).reduce(reduceWorldState, emptyWorldState());
+export function buildWorldState(
+  events: readonly ActivityEvent[],
+  gapMs = DEFAULT_EPISODE_GAP_MS,
+): WorldState {
+  assertEpisodeGap(gapMs);
+  return orderActivityEvents(events.map(parseActivityEvent)).reduce(
+    (state, event) => reduceWorldState(state, event, gapMs),
+    emptyWorldState(),
+  );
 }
 
 export function cloneWorldState(state: WorldState): WorldState {

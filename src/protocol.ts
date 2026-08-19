@@ -98,9 +98,16 @@ export interface FocusState {
   language: string | null;
 }
 
+export interface EpisodeState {
+  id: string;
+  startedAt: string;
+  eventCount: number;
+}
+
 export interface WorldState {
   updatedAt: string | null;
   lastEventKind: ActivityKind | null;
+  episode: EpisodeState | null;
   activeApplication: { id: string; name: string } | null;
   activeWindow: WindowChangedPayload | null;
   focus: FocusState | null;
@@ -286,6 +293,7 @@ export function emptyWorldState(): WorldState {
   return {
     updatedAt: null,
     lastEventKind: null,
+    episode: null,
     activeApplication: null,
     activeWindow: null,
     focus: null,

@@ -30,13 +30,16 @@ describe("SquidCore", () => {
   it("restores state from the event store", async () => {
     const store = new InMemoryEventStore();
     const core = new SquidCore(store);
-    await core.ingest(createActivityEvent({
+    const live = await core.ingest(createActivityEvent({
       kind: "browser_navigated",
+      eventId: "restore-browser",
+      occurredAt: "2026-08-19T14:00:00.000Z",
       payload: { url: "https://example.com", title: "Example", host: "example.com" },
     }));
 
     const restored = await new SquidCore(store).restore();
     expect(restored.currentBrowserPage?.host).toBe("example.com");
+    expect(restored.episode).toEqual(live.state.episode);
   });
 
   it("ignores exact duplicate event IDs", async () => {
@@ -111,6 +114,32 @@ describe("SquidCore", () => {
 
     expect(late.disposition).toBe("late");
     expect(core.currentState.focus?.windowTitle).toBe("newer.ts");
+  });
+
+  it("reprojects late events so live state matches canonical restore", async () => {
+    const store = new InMemoryEventStore();
+    const core = new SquidCore(store);
+    await core.ingest(createActivityEvent({
+      kind: "pointer_action",
+      eventId: "late-latest",
+      sequence: 1,
+      occurredAt: "2026-08-18T10:00:00.000Z",
+      payload: {},
+    }));
+
+    const late = await core.ingest(createActivityEvent({
+      kind: "file_saved",
+      eventId: "late-inserted",
+      sequence: 0,
+      occurredAt: "2026-08-18T09:59:00.000Z",
+      payload: { path: "late.ts", applicationId: "editor" },
+    }));
+    const restored = await new SquidCore(store).restore();
+
+    expect(late.disposition).toBe("late");
+    expect(late.state.recentFiles).toEqual(["late.ts"]);
+    expect(late.state.episode?.eventCount).toBe(2);
+    expect(core.currentState).toEqual(restored);
   });
 
   it("treats equivalent duplicate payload key order as the same event", async () => {

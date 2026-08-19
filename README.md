@@ -5,7 +5,7 @@ Squid is a capability-first desktop assistant prototype built around the Pi agen
 The first implemented vertical is deliberately model-independent:
 
 ```text
-activity event -> append-only store -> world-state reducer -> baseline prediction
+activity event -> append-only store -> episode-scoped world state -> baseline prediction
 ```
 
 Pi is an optional cognition layer. The event store and world state remain usable without a model so that desktop capture, replay, and prediction can be evaluated offline.
@@ -33,6 +33,7 @@ bun run watch:files -- /absolute/project/root
 - `src/chronicle-ordering.ts` — canonical event identity and stable replay ordering.
 - `src/event-store.ts` — the `EventStore` contract plus in-memory and JSONL append-only stores, including recovery diagnostics for an interrupted final JSONL record.
 - `src/sqlite-event-store.ts` — append-only store on SQLite, with structural uniqueness on both `eventId` and source-local event identity.
+- `src/episode.ts` — deterministic, time-gap-based episode projection over canonical events.
 - `src/world-state.ts` — deterministic, ownership-safe reducer from events to world state.
 - `src/activity-source.ts` — the source contract every capture adapter implements.
 - `src/filesystem-source.ts` — filesystem watcher that emits validated file activity for one project root.
@@ -56,6 +57,12 @@ Three `EventStore` implementations satisfy one contract. `all()` returns every a
 `watch-files.ts` uses `SqliteEventStore` when `SQUID_DB` names an absolute path, and `InMemoryEventStore` otherwise. It calls `restore()` before observing, so a restart rebuilds the dedupe index and projection from history instead of re-ingesting it. `main.ts` is a demo and stays in memory. `JsonlEventStore` has no production caller.
 
 A database inside the watched root would feed its own writes back into the timeline: each append updates `-wal`, the watcher reports that write, and ingesting it appends again. `sqliteWatchExclusions` returns the root-relative paths of the database and its two WAL sidecars so the watcher skips them; it returns nothing when the database lives outside the root, so an unrelated sibling path can never be excluded by accident.
+
+## Episode projection
+
+Episodes are a deterministic projection over Chronicle events, not data stamped into immutable history. A gap of five minutes or more starts a new episode. The derived ID uses the first event's timestamp and event ID, so the same timeline produces the same episodes and can be re-segmented later without a storage migration. `correlationId` remains unused by this rule.
+
+Opening an episode clears inferred interaction context: foreground application/window, focus text, browser page, command outcome, recent files, and recent semantic actions. The boundary event can immediately re-establish fields it authoritatively carries. This avoids both stale values and contradictory combinations such as a newly activated application paired with the previous application's window. It also bounds the JSON context passed to Pi and prevents an old save or text prefix from generating a suggestion hours later; it does not replace LLM reasoning or add a second inference system.
 
 ## Pi integration boundary
 
@@ -86,7 +93,7 @@ File contents are never read; only paths, kinds, and timestamps enter the timeli
 
 `bun run evaluate` runs the heuristic predictor against the versioned synthetic scenarios in `src/evaluation-fixtures.ts` and prints a deterministic JSON report.
 
-Each cut point replays only the canonical events available at that point; later events are excluded so the report cannot receive future-state leakage. The report includes Top-1/Top-3/Top-5 hit rates, mean reciprocal rank (MRR), prediction coverage, and no-action correctness. Current scores describe only this intentionally small synthetic corpus; they are a regression baseline, not a claim about real-user accuracy.
+Each cut point replays only the canonical events available at that point; later events are excluded so the report cannot receive future-state leakage. A fresh predictor instance is created per scenario, preventing model sessions or caches from leaking between unrelated timelines. The report includes Top-1/Top-3/Top-5 hit rates, mean reciprocal rank (MRR), prediction coverage, and no-action correctness. The fixtures include stale-context negatives across episode boundaries, a below-threshold continuation guard, and a workflow with multiple distinct cut points. Current scores describe only this intentionally small synthetic corpus; they are a regression baseline, not a claim about real-user accuracy.
 
 Any future Pi-backed predictor must be evaluated through the same replay runner and fixture version before it can enter a real-time path.
 
@@ -96,12 +103,13 @@ Tests use `bun:test`. The test suite covers:
 
 - Runtime ActivityEvent validation and source-local sequence generation.
 - Canonical event ordering and source-local event identity.
-- `SquidCore` ingestion, idempotency, conflict detection, late-event handling, immutable snapshots, and deterministic restore.
+- Deterministic episode segmentation, inclusive gap boundaries, and episode-scoped context clearing.
+- `SquidCore` ingestion, idempotency, conflict detection, canonical late-event re-projection, immutable snapshots, and deterministic restore.
 - A shared `EventStore` conformance suite (`tests/event-store-conformance.ts`) run against all three implementations: round-trip fidelity, order-independent canonical ordering, mutation isolation, concurrent appends, and `since()` boundary and timezone equivalence.
 - `JsonlEventStore` write recovery and interrupted-tail recovery.
 - `SqliteEventStore` cross-connection durability under WAL, sub-millisecond timestamp fidelity, duplicate and identity-reuse rejection, parent-directory creation, post-`close()` rejection, and watch-exclusion paths for a database inside or outside the watched root.
 - Pi prediction normalization, expiry validation, and evidence provenance.
-- Deterministic replay evaluation: cut-point ranking, MRR, coverage, future-leakage guard, and report stability.
+- Deterministic replay evaluation: cut-point ranking, MRR, coverage, future-leakage guard, per-scenario predictor isolation, and report stability.
 - `FilesystemActivitySource` root validation, lifecycle, default and caller filtering, path normalization, event mapping, debounce, ordering under a slow emitter, shutdown drain, diagnostics, distinct per-instance session identity, restart against one durable store without an identity collision, and end-to-end ingestion through `SquidCore`.
 
 Source tests inject a fake watcher and file probe, so they never depend on kernel watch timing. Real-watcher behavior is verified by the `bun run watch:files` smoke run in the release gate.

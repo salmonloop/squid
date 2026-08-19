@@ -57,6 +57,8 @@ export class SquidCore {
     this.remember(event);
 
     if (late) {
+      const canonicalEvents = orderActivityEvents([...this.eventsById.values()]);
+      this.replaceProjection(canonicalEvents);
       return this.result("late");
     }
 
@@ -93,9 +95,13 @@ export class SquidCore {
     for (const event of canonicalEvents) {
       this.remember(event);
     }
+    this.replaceProjection(canonicalEvents);
+    return cloneWorldState(this.state);
+  }
+
+  private replaceProjection(canonicalEvents: readonly ActivityEvent[]): void {
     this.state = buildWorldState(canonicalEvents);
     this.latestProjectedEvent = canonicalEvents.at(-1) ?? null;
-    return cloneWorldState(this.state);
   }
 
   private result(disposition: IngestDisposition, predictionTime = this.state.updatedAt): IngestResult {
