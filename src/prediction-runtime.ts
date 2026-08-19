@@ -5,6 +5,8 @@ import type { IngestDisposition, SquidCore } from "./squid-core.js";
 import {
   candidateEnvelopes,
   createAttemptRecord,
+  createFeedbackRecord,
+  type PredictionFeedbackInput,
   type PredictionLedger,
 } from "./prediction-ledger.js";
 
@@ -138,6 +140,29 @@ export class PredictionRuntime {
     this.disposed = true;
     this.coordinator.dispose();
     await this.awaitIdle();
+  }
+
+  /**
+   * Append a feedback record linked to a candidate by its stable ID. The
+   * ledger validates that the candidate exists and belongs to the request, so
+   * a reference error is thrown to the caller — feedback is an explicit
+   * action, not a best-effort side effect like attempt recording. The write is
+   * tracked for shutdown drain, so an unawaited feedback is not lost on
+   * dispose.
+   */
+  public recordFeedback(input: PredictionFeedbackInput): Promise<void> {
+    this.assertOpen();
+    if (this.ledger === undefined) {
+      throw new Error("PredictionRuntime has no ledger attached.");
+    }
+    const write = this.appendFeedback(input);
+    this.trackLedgerWrite(write);
+    return write;
+  }
+
+  private async appendFeedback(input: PredictionFeedbackInput): Promise<void> {
+    const record = createFeedbackRecord(input, this.now());
+    await this.ledger!.appendFeedback(record);
   }
 
   private track(

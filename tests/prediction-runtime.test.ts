@@ -4,7 +4,9 @@ import { FakePredictionProvider, candidate } from "../src/fake-prediction-provid
 import { PredictionCoordinator } from "../src/prediction-coordinator.js";
 import {
   InMemoryPredictionLedger,
+  PredictionLedgerReferenceError,
   type PredictionAttemptRecord,
+  type PredictionFeedbackInput,
   type PredictionLedger,
 } from "../src/prediction-ledger.js";
 import {
@@ -355,5 +357,142 @@ describe("PredictionRuntime", () => {
 
     expect(await ledger.all()).toHaveLength(1);
     await runtime.dispose();
+  });
+
+  it("records feedback linked to a candidate after an outcome", async () => {
+    const ledger = new InMemoryPredictionLedger();
+    const runtime = new PredictionRuntime(
+      new SquidCore(new InMemoryEventStore()),
+      new PredictionCoordinator({
+        provider: new FakePredictionProvider({ candidates: [candidate("run_tests")] }),
+        random: nextRequestId(),
+      }),
+      { ledger, now: () => new Date("2026-08-19T10:00:00.000Z") },
+    );
+
+    const result = await runtime.ingest(savedFile());
+    const outcome = await result.prediction!;
+    await runtime.awaitIdle();
+    const candidateId = `${outcome.requestId}:candidate:0`;
+    const feedback: PredictionFeedbackInput = {
+      feedbackId: "fb-1",
+      requestId: outcome.requestId,
+      candidateId,
+      feedback: "accepted",
+    };
+    await runtime.recordFeedback(feedback);
+
+    const records = await ledger.all();
+    expect(records).toHaveLength(2);
+    const attempt = records[0] as PredictionAttemptRecord;
+    const feedbackRecord = records[1];
+    expect(feedbackRecord.recordType).toBe("feedback");
+    expect(feedbackRecord.candidateId).toBe(candidateId);
+    expect(feedbackRecord.requestId).toBe(outcome.requestId);
+    expect(feedbackRecord.feedback).toBe("accepted");
+    expect(attempt.candidates[0].candidateId).toBe(candidateId);
+    await runtime.dispose();
+  });
+
+  it("rejects feedback for an unknown candidate", async () => {
+    const ledger = new InMemoryPredictionLedger();
+    const runtime = new PredictionRuntime(
+      new SquidCore(new InMemoryEventStore()),
+      new PredictionCoordinator({
+        provider: new FakePredictionProvider({ candidates: [candidate("run_tests")] }),
+        random: nextRequestId(),
+      }),
+      { ledger },
+    );
+    const result = await runtime.ingest(savedFile());
+    const outcome = await result.prediction!;
+    await runtime.awaitIdle();
+
+    await expect(
+      runtime.recordFeedback({
+        feedbackId: "fb-unknown",
+        requestId: outcome.requestId,
+        candidateId: "runtime-1:candidate:9",
+        feedback: "accepted",
+      }),
+    ).rejects.toBeInstanceOf(PredictionLedgerReferenceError);
+    await runtime.dispose();
+  });
+
+  it("rejects feedback that pairs a candidate with another request", async () => {
+    const ledger = new InMemoryPredictionLedger();
+    const runtime = new PredictionRuntime(
+      new SquidCore(new InMemoryEventStore()),
+      new PredictionCoordinator({
+        provider: new FakePredictionProvider({ candidates: [candidate("run_tests")] }),
+        random: nextRequestId(),
+      }),
+      { ledger },
+    );
+    const result = await runtime.ingest(savedFile());
+    const outcome = await result.prediction!;
+    await runtime.awaitIdle();
+
+    await expect(
+      runtime.recordFeedback({
+        feedbackId: "fb-mismatch",
+        requestId: "some-other-request",
+        candidateId: `${outcome.requestId}:candidate:0`,
+        feedback: "accepted",
+      }),
+    ).rejects.toBeInstanceOf(PredictionLedgerReferenceError);
+    await runtime.dispose();
+  });
+
+  it("throws when recording feedback without a ledger", async () => {
+    const runtime = createRuntime();
+    expect(() =>
+      runtime.recordFeedback({
+        feedbackId: "fb-1",
+        requestId: "req-1",
+        candidateId: "req-1:candidate:0",
+        feedback: "accepted",
+      }),
+    ).toThrow("PredictionRuntime has no ledger attached.");
+    await runtime.dispose();
+  });
+
+  it("waits for an in-flight feedback write before dispose resolves", async () => {
+    let releaseAppend: (() => void) | undefined;
+    const ledger: PredictionLedger = {
+      appendAttempt: async () => {},
+      appendFeedback: () => new Promise<void>((resolve) => {
+        releaseAppend = resolve;
+      }),
+      all: async () => [],
+    };
+    const runtime = new PredictionRuntime(
+      new SquidCore(new InMemoryEventStore()),
+      new PredictionCoordinator({
+        provider: new FakePredictionProvider({ candidates: [candidate("run_tests")] }),
+        random: nextRequestId(),
+      }),
+      { ledger },
+    );
+    const result = await runtime.ingest(savedFile());
+    const outcome = await result.prediction!;
+    await runtime.awaitIdle();
+
+    void runtime.recordFeedback({
+      feedbackId: "fb-1",
+      requestId: outcome.requestId,
+      candidateId: `${outcome.requestId}:candidate:0`,
+      feedback: "accepted",
+    });
+    let disposed = false;
+    const dispose = runtime.dispose().then(() => {
+      disposed = true;
+    });
+    await Promise.resolve();
+    expect(disposed).toBe(false);
+
+    releaseAppend!();
+    await dispose;
+    expect(disposed).toBe(true);
   });
 });
