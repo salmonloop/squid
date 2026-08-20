@@ -24,6 +24,7 @@ bun test
 bun run build
 bun run dev
 bun run evaluate
+bun run gate:pi
 bun run watch:files -- /absolute/project/root
 ```
 
@@ -42,6 +43,8 @@ bun run watch:files -- /absolute/project/root
 - `src/evaluation.ts` — deterministic replay runner and prediction metrics.
 - `src/evaluation-fixtures.ts` — versioned synthetic replay scenarios with labeled cut points.
 - `src/evaluate.ts` — evaluation report entry point.
+- `src/provider-gate.ts` — replay gate that scores a candidate provider against the heuristic baseline on one fixture version and measures provider health, which the ranking report omits.
+- `src/gate-pi.ts` — `bun run gate:pi` entry point for the Pi-backed predictor. Needs a reachable model, so it is separate from the offline suite.
 - `src/prediction-provider.ts` — async prediction contract: `PredictionProvider` interface, `PredictionRequest`, `PredictionOutcome`, and `SyncPredictorProvider` adapter.
 - `src/prediction-coordinator.ts` — one-in-flight async coordinator with timeout, cancellation, stale-episode guard, and heuristic fallback. Applies a `ContextPolicy` to the provider's view of world state.
 - `src/context-policy.ts` — egress boundary for provider context: `ContextPolicy` interface, `PassthroughContextPolicy` (the default), and `RedactingContextPolicy` with a typed allow-list.
@@ -50,7 +53,7 @@ bun run watch:files -- /absolute/project/root
 - `src/capability-gateway.ts` — pluggable capability boundary: `CapabilityGateway` interface, `ActionRequest`/`ActionResult`, a `FakeCapabilityGateway` for offline tests, and a `CapabilityDispatcher` that dispatches a ledger-resolved candidate by ID and records the dispatched→succeeded/failed lifecycle as ledger feedback. A gateway failure is data (a `failed` result); a failed ledger write escapes, because an unrecorded dispatch must not look like a successful one. Dispatcher attribution (`gateway`, `error`) wins over gateway-supplied details. A real MCP server implements the gateway; the base owns intent and recording only. Acceptance policy — expiry, user confirmation — is not enforced here.
 - `src/prediction-log.ts` — structured shadow-mode log for prediction outcomes.
 - `src/fake-prediction-provider.ts` — controllable `PredictionProvider` for tests and offline evaluation.
-- `src/pi-runtime.ts` — Pi adapter that implements `PredictionProvider`, requests one typed prediction via a terminating custom tool, respects `AbortSignal`, and derives `expiresAt` per kind. Isolated behind an adapter so Node/RPC remains a fallback if deeper Bun incompatibilities appear.
+- `src/pi-runtime.ts` — Pi adapter that implements `PredictionProvider`, requests one typed prediction via a terminating custom tool, respects `AbortSignal`, derives `expiresAt` per kind, and reports model reachability via `checkAvailability()`. Isolated behind an adapter so Node/RPC remains a fallback if deeper Bun incompatibilities appear.
 - `src/squid-core.ts` — orchestrates event ingestion, state reduction, and baseline prediction.
 - `src/main.ts` — demo entry point.
 
@@ -81,6 +84,8 @@ Opening an episode clears inferred interaction context: foreground application/w
 The model no longer sets `expiresAt`; Squid derives it per kind (`draft_completion`: 30s, `run_tests`: 60s, `inspect_error`: 120s, `search_selection`: 30s, `none`: 10s) so context-bound suggestions expire on a schedule that matches their semantic freshness window.
 
 If the model provider is unreachable, the baseline predictor continues to function. Pi is not the source of truth for timeline or memory — the event store and world-state reducer are.
+
+`PiRuntime` has been measured and does not currently clear the replay gate; see [Provider gate](#provider-gate). It is wired as a `PredictionProvider` and can be evaluated, but it is not eligible for a real-time path.
 
 ## Provider context policy
 
@@ -129,6 +134,22 @@ File contents are never read; only paths, kinds, and timestamps enter the timeli
 
 Each cut point replays only the canonical events available at that point; later events are excluded so the report cannot receive future-state leakage. A fresh predictor instance is created per scenario, preventing model sessions or caches from leaking between unrelated timelines. The report includes Top-1/Top-3/Top-5 hit rates, mean reciprocal rank (MRR), prediction coverage, and no-action correctness. The fixtures include stale-context negatives across episode boundaries, a below-threshold continuation guard, and a workflow with multiple distinct cut points. Current scores describe only this intentionally small synthetic corpus; they are a regression baseline, not a claim about real-user accuracy.
 
+### Provider gate
+
+`bun run gate:pi` enforces the rule that a model-backed predictor must clear the replay runner before it enters a real-time path. It scores the candidate against the heuristic baseline on the same fixture version and exits non-zero on a regression.
+
+Thresholds are floors relative to the baseline, not absolute quality claims. Top-1 and fallback rate allow one cut point of slack out of twelve — enough for model nondeterminism, not enough to hide a second regression. `none` correctness has zero slack: suggesting an action where none is warranted is the failure that makes an assistant feel broken.
+
+**Skipped and failed are distinct.** An unreachable provider skips with a stated reason and exits 0, because an outage is not evidence about the model. Treating it as a pass is how an unevaluated predictor reaches production; treating it as a failure is how a config problem gets misread as a quality regression.
+
+Reachability is a separate `probeAvailability` hook rather than a check on construction. `PiRuntime` builds fine and only discovers a missing model when its runtime promise settles, so probing the constructor would report every outage as a ranking failure. `PiRuntime.checkAvailability()` resolves the configured model and returns a reason or null; the gate runs it before spending a baseline run.
+
+The gate also measures provider health, which the ranking report deliberately omits. Without it the gate would be trivially defeatable: the coordinator substitutes the heuristic on every provider failure, so a permanently broken model posts baseline-identical rankings. A wrapper counts answered versus fallen-back requests outside the coordinator, since the fallback erases the failure from the outcome the runner keeps. Timeouts count as fallbacks because a conforming provider rejects on abort.
+
+**Current result: the Pi predictor does not pass.** Across three runs it failed every time, on both Top-1 and `none` correctness, while answering all 12 requests with zero fallback — so the failure is measured model behavior, not an outage. Coverage came in at or above the baseline's, which is the shape of a predictor that is too eager rather than too quiet: it proposes an action on negatives where the correct answer is `none`, including on stale context across an episode boundary.
+
+Exact rates and the specific missed cut points differ per run, which is why they are not quoted here — the model is nondeterministic and any figure written down would be stale. Run `bun run gate:pi` for the current numbers. The verdict is what is stable. `PiRuntime` stays out of the real-time path.
+
 Any future Pi-backed predictor must be evaluated through the same replay runner and fixture version before it can enter a real-time path. The evaluation runner supports both sync (`evaluateScenarios`) and async (`evaluateWithProvider`) providers; async providers are isolated per scenario and run through `PredictionCoordinator`, so timeout and heuristic fallback behavior matches the real-time path. The ranking report describes the end-to-end runtime result and intentionally does not report provider health or fallback reasons.
 
 ## Testing
@@ -150,6 +171,7 @@ Tests use `bun:test`. The test suite covers:
 - `CapabilityGateway`: fake-gateway outcomes, failure details, and thrown invocations; `CapabilityDispatcher` dispatch recording succeeded/failed feedback in order, a thrown invocation becoming a failed result, dispatcher attribution winning over conflicting gateway details, and rejection for a candidate absent from the ledger.
 - `PredictionLog`: structured recording of outcomes, cancellations, and field mapping.
 - Async evaluation: provider-based evaluation matching sync results, canned-provider scoring, hard timeout, and heuristic fallback.
+- `runProviderGate`: baseline-equal pass, ranking regression failure, skip (not failure) for an unconstructable provider and for a lazily-resolved provider that reports itself unavailable without spending a baseline run, skip when the probe itself rejects, scoring when the probe reports available, failure for a provider that never answers despite baseline-equal ranking, timeouts counted as fallbacks, full health for a healthy provider, `none`-correctness failure for an over-eager provider, same-corpus comparison, custom slack, and default-threshold bounds.
 - Deterministic replay evaluation: cut-point ranking, MRR, coverage, future-leakage guard, per-scenario predictor isolation, and report stability.
 - `FilesystemActivitySource` root validation, lifecycle, default and caller filtering, path normalization, event mapping, debounce, ordering under a slow emitter, shutdown drain, diagnostics, distinct per-instance session identity, restart against one durable store without an identity collision, and end-to-end ingestion through `SquidCore`.
 

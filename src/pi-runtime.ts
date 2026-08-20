@@ -57,6 +57,25 @@ export class PiRuntime implements PredictionProvider {
     this.modelRuntimePromise = ModelRuntime.create({ allowModelNetwork: false });
   }
 
+  /**
+   * Returns a reason when the configured model cannot be resolved, or null when
+   * it can. The constructor cannot report this: it only starts the model
+   * runtime, so unreachability is not knowable until that promise settles.
+   *
+   * Callers use this to tell an outage apart from a bad prediction. Without it,
+   * an unreachable model looks identical to a model that predicts badly.
+   */
+  public async checkAvailability(): Promise<string | null> {
+    try {
+      const modelRuntime = await this.modelRuntimePromise;
+      return modelRuntime.getModel(this.provider, this.modelId)
+        ? null
+        : `Pi model is unavailable: ${this.provider}/${this.modelId}`;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+
   public async predict(
     request: PredictionRequest,
     signal: AbortSignal,

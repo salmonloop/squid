@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "bun run src/main.ts",
     "evaluate": "bun run src/evaluate.ts",
+    "gate:pi": "bun run src/gate-pi.ts",
     "test": "bun test",
     "watch:files": "bun run src/watch-files.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
