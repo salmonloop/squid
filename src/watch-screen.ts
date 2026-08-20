@@ -1,8 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
-import { HeuristicPredictor } from "./baseline-predictor.js";
 import { createWatchRuntime } from "./create-watch-runtime.js";
-import { SyncPredictorProvider } from "./prediction-provider.js";
 import { createMacosScreenTextReader } from "./screen-text-reader-macos.js";
 import {
   createSyntheticScreenTextReader,
@@ -13,6 +11,7 @@ import {
   type ScreenTextFrame,
   type ScreenTextReaderFactory,
 } from "./screen-text-source.js";
+import { resolveWatchProvider } from "./watch-provider.js";
 
 const readerKind = process.env.SQUID_SCREEN_READER ?? "synthetic";
 if (readerKind !== "darwin" && readerKind !== "synthetic") {
@@ -48,13 +47,28 @@ const readerFactory: ScreenTextReaderFactory = readerKind === "darwin"
     ...(pollMs === undefined ? {} : { intervalMs: pollMs }),
   });
 
+// Choose the primary predictor before opening any sink: a config error or a
+// declined model must not leave a half-created database behind. The default
+// `SQUID_PROVIDER=heuristic` never touches a model.
+const resolved = await resolveWatchProvider();
+if (!resolved.ok) {
+  console.error(resolved.configError);
+  process.exit(2);
+}
+if (resolved.selection.declineReason !== null) {
+  console.error(JSON.stringify({
+    provider: resolved.selection.provider.name,
+    declined: resolved.selection.declineReason,
+  }));
+}
+
 // Store, ledger, projection, and prediction runtime are identical for every watch
 // entry point, so they are built in one place. This entry needs no watcher
 // exclusions: a screen-text reader observes windows, not the tree the store
 // writes into, so its own database can never feed itself.
 const watch = createWatchRuntime({
   ...(databasePath === undefined ? {} : { databasePath }),
-  provider: new SyncPredictorProvider(new HeuristicPredictor()),
+  provider: resolved.selection.provider,
   onDiagnostic: (diagnostic) => {
     console.error(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
   },
@@ -100,6 +114,7 @@ console.error(JSON.stringify({
   watching: "foreground-window-text",
   reader: readerKind,
   source: source.id,
+  provider: resolved.selection.provider.name,
   store: watch.databasePath ?? "memory",
   ledger: watch.ledgerPath ?? "memory",
   restoredActions: restored.recentActions.length,

@@ -50,6 +50,8 @@ bun run watch:screen
 - `src/evaluation-fixtures.ts` — versioned synthetic replay scenarios with labeled cut points.
 - `src/evaluate.ts` — evaluation report entry point.
 - `src/provider-gate.ts` — replay gate that scores a candidate provider against the heuristic baseline on one fixture version and measures provider health, which the ranking report omits.
+- `src/provider-selector.ts` — admission boundary for the live primary provider: chooses heuristic or model, and reports why a model was declined. Pure and fully injected, so it imports no model runtime.
+- `src/watch-provider.ts` — wires the real Pi and replay-gate seams into the selector and reads `SQUID_PROVIDER` / `SQUID_PROVIDER_GATE` for both watch entry points.
 - `src/gate-pi.ts` — `bun run gate:pi` entry point for the Pi-backed predictor. Needs a reachable model, so it is separate from the offline suite.
 - `src/prediction-provider.ts` — async prediction contract: `PredictionProvider` interface, `PredictionRequest`, `PredictionOutcome`, and `SyncPredictorProvider` adapter.
 - `src/prediction-coordinator.ts` — one-in-flight async coordinator with timeout, cancellation, stale-episode guard, and heuristic fallback. Applies a `ContextPolicy` to the provider's view of world state.
@@ -113,7 +115,22 @@ The model no longer sets `expiresAt`; Squid derives it per kind (`draft_completi
 
 If the model provider is unreachable, the baseline predictor continues to function. Pi is not the source of truth for timeline or memory — the event store and world-state reducer are.
 
-`PiRuntime` has been measured and does not currently clear the replay gate; see [Provider gate](#provider-gate). It is wired as a `PredictionProvider` and can be evaluated, but it is not eligible for a real-time path.
+`PiRuntime` has been measured and does not currently clear the replay gate; see [Provider gate](#provider-gate). It is wired as a `PredictionProvider` and can be evaluated, but it is not eligible for a real-time path — so it is not the default one.
+
+### Selecting the live provider
+
+`SQUID_PROVIDER` chooses the primary provider for a live watch run. Absent or `heuristic` is the default and is exactly the behavior that existed before a model was selectable: no probe, no gate, no network, no model — the Pi module graph is not even imported, which is worth about 650ms of startup on the machine this was measured on.
+
+```bash
+SQUID_PROVIDER=pi bun run watch:files -- /absolute/project/root                       # admit on reachability
+SQUID_PROVIDER=pi SQUID_PROVIDER_GATE=replay bun run watch:screen                     # admit only on a gate pass
+```
+
+`SQUID_PROVIDER_GATE` picks the admission check. The default `probe` resolves the model once via `PiRuntime.checkAvailability()` — fast, and enough to tell an outage apart from a bad prediction. `replay` instead runs the same `runProviderGate` that `bun run gate:pi` runs, at startup, and admits the model only on `passed`. A `skipped` gate declines, because an unreachable or unevaluated model must not reach the real-time path just because nothing measured a regression against it.
+
+Whenever the model is declined, the run continues on the heuristic and prints the reason. Silence would be the real failure: a run started with `SQUID_PROVIDER=pi` that quietly predicts with the heuristic looks identical to one where the model is working. Independently of this choice, `PredictionCoordinator` keeps its own heuristic fallback, so a model admitted at startup that then fails, times out, or is cancelled still lands somewhere.
+
+`selectPredictionProvider` takes every model seam by injection and imports no model runtime, so its behavior is unit-tested offline; its options are a union in which the heuristic mode has no seam to a model at all, so the default's isolation is a property of the type. `watch-provider.ts` holds the real Pi and gate wiring both entry points share, and imports it lazily inside the `pi` branch only.
 
 ## Provider context policy
 
@@ -197,7 +214,7 @@ The gate also measures provider health, which the ranking report deliberately om
 
 **Current result: the Pi predictor does not pass.** Across three runs it failed every time, on both Top-1 and `none` correctness, while answering all 12 requests with zero fallback — so the failure is measured model behavior, not an outage. Coverage came in at or above the baseline's, which is the shape of a predictor that is too eager rather than too quiet: it proposes an action on negatives where the correct answer is `none`, including on stale context across an episode boundary.
 
-Exact rates and the specific missed cut points differ per run, which is why they are not quoted here — the model is nondeterministic and any figure written down would be stale. Run `bun run gate:pi` for the current numbers. The verdict is what is stable. `PiRuntime` stays out of the real-time path.
+Exact rates and the specific missed cut points differ per run, which is why they are not quoted here — the model is nondeterministic and any figure written down would be stale. Run `bun run gate:pi` for the current numbers. The verdict is what is stable: on this corpus `PiRuntime` is not eligible, so it is never the default live provider. `SQUID_PROVIDER=pi SQUID_PROVIDER_GATE=replay` runs this same gate at startup and declines on anything but a pass, which is what makes opting in safe rather than a bypass.
 
 Any future Pi-backed predictor must be evaluated through the same replay runner and fixture version before it can enter a real-time path. The evaluation runner supports both sync (`evaluateScenarios`) and async (`evaluateWithProvider`) providers; async providers are isolated per scenario and run through `PredictionCoordinator`, so timeout and heuristic fallback behavior matches the real-time path. The ranking report describes the end-to-end runtime result and intentionally does not report provider health or fallback reasons.
 
@@ -225,7 +242,8 @@ Tests use `bun:test`. The test suite covers:
 - `runProviderGate`: baseline-equal pass, ranking regression failure, skip (not failure) for an unconstructable provider and for a lazily-resolved provider that reports itself unavailable without spending a baseline run, skip when the probe itself rejects, scoring when the probe reports available, failure for a provider that never answers despite baseline-equal ranking, timeouts counted as fallbacks, full health for a healthy provider, `none`-correctness failure for an over-eager provider, same-corpus comparison, custom slack, and default-threshold bounds.
 - Deterministic replay evaluation: cut-point ranking, MRR, coverage, future-leakage guard, per-scenario predictor isolation, and report stability.
 - `FilesystemActivitySource` root validation, lifecycle, default and caller filtering, path normalization, event mapping, debounce, ordering under a slow emitter, shutdown drain, diagnostics, distinct per-instance session identity, restart against one durable store without an identity collision, and end-to-end ingestion through `SquidCore`.
-- `ScreenTextActivitySource` lifecycle, full-frame mapping to four host events, per-payload change detection (title-only, role-only, selection-only, and unchanged frames), degradation for missing application id / name / title / caret context, ordering and sequence under a slow emitter, burst collapsing, shutdown flush of the pending frame, reader and delivery diagnostics including retry of a rejected payload, distinct per-instance session identity, and end-to-end ingestion through `SquidCore`.
+- `ScreenTextActivitySource` lifecycle, full-frame mapping to four host events, per-payload change detection (title-only, role-only, selection-only, and unchanged frames), degradation for missing application id / name / title / caret context, ordering and sequence under a slow emitter, burst collapsing, shutdown flush of the pending frame, reader and delivery diagnostics including retry of a rejected payload, recovery from a backend that fails to initialize, distinct per-instance session identity, and end-to-end ingestion through `SquidCore`.
+- `selectPredictionProvider`: environment parsing and defaults, the heuristic path touching no model seam at all, probe admission on reachable / unreachable / rejecting probes, and replay admission on passed / failed / skipped / rejecting gates.
 
 Source tests inject a fake watcher, file probe, and screen-text reader, so they never depend on kernel watch timing, an accessibility API, or a subprocess. Real-watcher behavior is verified by the `bun run watch:files` smoke run in the release gate; the macOS accessibility backend is verified by hand with `SQUID_SCREEN_READER=darwin bun run watch:screen`.
 

@@ -1,11 +1,10 @@
 import { realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import { HeuristicPredictor } from "./baseline-predictor.js";
 import { createWatchRuntime } from "./create-watch-runtime.js";
 import { FilesystemActivitySource } from "./filesystem-source.js";
-import { SyncPredictorProvider } from "./prediction-provider.js";
 import type { FilePayload } from "./protocol.js";
 import { sqliteWatchExclusions } from "./sqlite-event-store.js";
+import { resolveWatchProvider } from "./watch-provider.js";
 
 const root = process.argv[2];
 if (root === undefined || !isAbsolute(root)) {
@@ -19,12 +18,27 @@ if (databasePath !== undefined && !isAbsolute(databasePath)) {
   process.exit(2);
 }
 
+// Choose the primary predictor before opening any sink: a config error or a
+// declined model must not leave a half-created database behind. The default
+// `SQUID_PROVIDER=heuristic` never touches a model.
+const resolved = await resolveWatchProvider();
+if (!resolved.ok) {
+  console.error(resolved.configError);
+  process.exit(2);
+}
+if (resolved.selection.declineReason !== null) {
+  console.error(JSON.stringify({
+    provider: resolved.selection.provider.name,
+    declined: resolved.selection.declineReason,
+  }));
+}
+
 // Store, ledger, projection, and prediction runtime are identical for every
 // watch entry point, so they are built in one place. Everything below this line
 // is filesystem-specific and stays here.
 const watch = createWatchRuntime({
   ...(databasePath === undefined ? {} : { databasePath }),
-  provider: new SyncPredictorProvider(new HeuristicPredictor()),
+  provider: resolved.selection.provider,
   onDiagnostic: (diagnostic) => {
     console.error(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
   },
@@ -79,6 +93,7 @@ await source.start(async (event) => {
 console.error(JSON.stringify({
   watching: root,
   source: source.id,
+  provider: resolved.selection.provider.name,
   store: watch.databasePath ?? "memory",
   ledger: watch.ledgerPath ?? "memory",
   restoredActions: restored.recentActions.length,
