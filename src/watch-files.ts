@@ -1,6 +1,8 @@
 import { realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { InMemoryEventStore, type EventStore } from "./event-store.js";
+import { InMemoryPredictionLedger } from "./prediction-ledger.js";
+import { SqlitePredictionLedger } from "./sqlite-prediction-ledger.js";
 import { FilesystemActivitySource } from "./filesystem-source.js";
 import type { FilePayload } from "./protocol.js";
 import { HeuristicPredictor } from "./baseline-predictor.js";
@@ -25,12 +27,28 @@ if (databasePath !== undefined && !isAbsolute(databasePath)) {
 const store: EventStore = databasePath === undefined
   ? new InMemoryEventStore()
   : new SqliteEventStore(databasePath);
+
+// The ledger follows the same durability switch as the event store: a run that
+// persists its timeline should also persist why it predicted what it did. It
+// lives in a sibling file rather than the event database so replaying the
+// timeline never contends with prediction writes.
+const ledgerPath = databasePath === undefined ? undefined : `${databasePath}.ledger.db`;
+const ledger = ledgerPath === undefined
+  ? new InMemoryPredictionLedger()
+  : new SqlitePredictionLedger(ledgerPath);
+
 const core = new SquidCore(store);
 const runtime = new PredictionRuntime(
   core,
   new PredictionCoordinator({
     provider: new SyncPredictorProvider(new HeuristicPredictor()),
   }),
+  {
+    ledger,
+    onDiagnostic: (diagnostic) => {
+      console.error(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
+    },
+  },
 );
 
 // Rebuild the dedupe index and projection from history before observing, so a
@@ -41,10 +59,16 @@ const restored = await runtime.restore();
 // `realpath(root)`, so comparing against a symlinked spelling would silently
 // match nothing and let the feedback loop back in. The store constructor above
 // has already created the database file, so it is resolvable here.
+const canonicalRoot = databasePath === undefined ? null : await realpath(root);
 const excludedPaths = new Set(
-  databasePath === undefined
+  canonicalRoot === null
     ? []
-    : sqliteWatchExclusions(await realpath(root), await realpath(databasePath)),
+    : [
+      ...sqliteWatchExclusions(canonicalRoot, await realpath(databasePath!)),
+      // The ledger is a second SQLite database in the same tree, so it needs
+      // the same exclusions or its own writes re-enter the timeline.
+      ...sqliteWatchExclusions(canonicalRoot, await realpath(ledgerPath!)),
+    ],
 );
 
 const source = new FilesystemActivitySource({
@@ -78,6 +102,7 @@ console.error(JSON.stringify({
   watching: root,
   source: source.id,
   store: databasePath ?? "memory",
+  ledger: ledgerPath ?? "memory",
   restoredActions: restored.recentActions.length,
 }));
 
@@ -88,8 +113,12 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     shuttingDown = true;
     // Drain buffered events before exiting so no observed write is lost.
     void source.stop().then(async () => {
+      // Dispose before closing. A prediction whose outcome has not yet been
+      // written still has a ledger write in flight, and `dispose` drains it;
+      // closing first drops that record — measured as 0 records versus 1.
       await runtime.dispose();
       if (store instanceof SqliteEventStore) store.close();
+      if (ledger instanceof SqlitePredictionLedger) ledger.close();
       process.exit(0);
     });
   });

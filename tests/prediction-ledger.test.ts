@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "bun:test";
@@ -14,6 +14,20 @@ import {
   PredictionLedgerReferenceError,
   type PredictionLedger,
 } from "../src/prediction-ledger.js";
+import { describePredictionLedgerConformance } from "./prediction-ledger-conformance.js";
+
+describePredictionLedgerConformance("InMemoryPredictionLedger", async () => ({
+  ledger: new InMemoryPredictionLedger(),
+  dispose: async () => {},
+}));
+
+describePredictionLedgerConformance("JsonlPredictionLedger", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "squid-jsonl-ledger-"));
+  return {
+    ledger: new JsonlPredictionLedger(join(directory, "ledger.jsonl")),
+    dispose: async () => rm(directory, { recursive: true, force: true }),
+  };
+});
 
 const outcome: PredictionOutcome = {
   requestId: "request-1",

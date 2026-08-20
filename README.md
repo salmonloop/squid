@@ -50,6 +50,7 @@ bun run watch:files -- /absolute/project/root
 - `src/context-policy.ts` — egress boundary for provider context: `ContextPolicy` interface, `PassthroughContextPolicy` (the default), and `RedactingContextPolicy` with a typed allow-list.
 - `src/prediction-runtime.ts` — live orchestration boundary that feeds accepted/late core state snapshots into the coordinator without coupling provider latency to event ingestion. When a `PredictionLedger` is attached, every outcome is persisted as a durable attempt record; ledger failures are diagnostics and never block prediction delivery, and `dispose` drains in-flight writes so shutdown is durable.
 - `src/prediction-ledger.ts` — append-only prediction attempts and feedback with deterministic candidate envelopes, in-memory tests, and recoverable JSONL persistence.
+- `src/sqlite-prediction-ledger.ts` — append-only ledger on SQLite that declares its integrity rules as schema constraints instead of process-local checks.
 - `src/capability-gateway.ts` — pluggable capability boundary: `CapabilityGateway` interface, `ActionRequest`/`ActionResult`, a `FakeCapabilityGateway` for offline tests, and a `CapabilityDispatcher` that dispatches a ledger-resolved candidate by ID and records the dispatched→succeeded/failed lifecycle as ledger feedback. A gateway failure is data (a `failed` result); a failed ledger write escapes, because an unrecorded dispatch must not look like a successful one. Dispatcher attribution (`gateway`, `error`) wins over gateway-supplied details. A real MCP server implements the gateway; the base owns intent and recording only. Acceptance policy — expiry, user confirmation — is not enforced here.
 - `src/prediction-log.ts` — structured shadow-mode log for prediction outcomes.
 - `src/fake-prediction-provider.ts` — controllable `PredictionProvider` for tests and offline evaluation.
@@ -65,9 +66,30 @@ Three `EventStore` implementations satisfy one contract. `all()` returns every a
 
 `journal_mode = WAL` with `synchronous = NORMAL` means committed events survive process death without an explicit checkpoint. They are **not** guaranteed to survive OS or power loss — that would need `synchronous = FULL`.
 
-`watch-files.ts` uses `SqliteEventStore` when `SQUID_DB` names an absolute path, and `InMemoryEventStore` otherwise. It calls `restore()` before observing, so a restart rebuilds the dedupe index and projection from history instead of re-ingesting it. `main.ts` is a demo and stays in memory. `JsonlEventStore` has no production caller.
+`JsonlEventStore` has no production caller; `JsonlPredictionLedger` likewise, now that SQLite covers durable prediction recording. Both are kept because they exercise the contracts under a different failure model — partial line writes and crash-tail repair — which the SQLite implementations never encounter.
+
+`watch-files.ts` uses `SqliteEventStore` when `SQUID_DB` names an absolute path, and `InMemoryEventStore` otherwise. It calls `restore()` before observing, so a restart rebuilds the dedupe index and projection from history instead of re-ingesting it. `main.ts` is a demo and stays in memory.
 
 A database inside the watched root would feed its own writes back into the timeline: each append updates `-wal`, the watcher reports that write, and ingesting it appends again. `sqliteWatchExclusions` returns the root-relative paths of the database and its two WAL sidecars so the watcher skips them; it returns nothing when the database lives outside the root, so an unrelated sibling path can never be excluded by accident.
+
+## Prediction ledger persistence
+
+Three `PredictionLedger` implementations satisfy one contract, verified by a shared conformance suite (`tests/prediction-ledger-conformance.ts`): in-memory, JSONL, and SQLite. Unlike `EventStore`, **return order is part of this contract** — `all()` returns records in append order, because a decision log's value is the sequence in which decisions and their feedback arrived. `SqlitePredictionLedger` orders by an autoincrement `seq` rather than a timestamp, since two records can share a timestamp but not an append position.
+
+The reason to prefer SQLite over JSONL is that the invariants become structural. The in-memory index checks them procedurally, and JSONL inherits that index; the SQLite schema declares them:
+
+- `ledger_records.record_id UNIQUE` — one record per ID.
+- `ledger_candidates.candidate_id PRIMARY KEY` — a candidate ID is globally unique, so two requests cannot claim the same candidate. Since the ID is `requestId:candidate:ordinal`, this also makes the `(request_id, ordinal)` pair unique within a request.
+- `ledger_records_one_attempt_per_request` partial unique index on `(request_id) WHERE record_type = 'attempt'` — one attempt per request, even when a second carries a different `recordId`.
+- `candidate_id REFERENCES ledger_candidates` — feedback cannot reference a candidate that was never recorded.
+
+A process-local index forgets these on restart; the schema does not. A reopened database still rejects a duplicate attempt.
+
+Attempt and candidate rows are written in one transaction, because an attempt and its candidates are a single fact: a partial write would leave an attempt that looks complete while its candidates are unaddressable. Ownership is checked before insert rather than left to the foreign key, since the key proves a candidate exists but not that it belongs to the asserting request — those are different errors (`PredictionLedgerReferenceError` versus `PredictionLedgerConflictError`).
+
+`record_json` is authoritative and every read rehydrates through `parsePredictionLedgerRecord`, so optional fields and sub-millisecond timestamp spellings survive a round trip. Scalar columns are a lossy projection kept for integrity and filtering.
+
+`watch-files.ts` attaches a ledger on the same durability switch as the event store: `SQUID_DB` also selects `<SQUID_DB>.ledger.db`, otherwise both stay in memory. The ledger is a sibling database rather than a table in the event database so replaying the timeline never contends with prediction writes; it gets the same watch exclusions, since a second SQLite file in the tree would otherwise feed its own WAL writes back into the timeline.
 
 ## Episode projection
 
@@ -168,6 +190,8 @@ Tests use `bun:test`. The test suite covers:
 - `ContextPolicy`: passthrough fidelity and non-aliasing; redaction of window titles, URL query strings, fragments and userinfo, unparseable URLs, file paths, action targets, and focus labels; per-scheme degradation for `blob:`/`data:`/`file:`/`javascript:` URLs with a retained non-default port; cursor-anchored text capping; short text left untouched; preserved episode/event shape; per-field allow-list passthrough; input immutability and absence of shared nested objects. Coordinator wiring: the provider receives projected state, the default is passthrough, request identity survives projection, a throwing policy denies egress with a diagnostic, and the local fallback still runs on unprojected state.
 - `PredictionRuntime`: non-blocking prediction dispatch after projection, duplicate suppression, supersession, restore, shutdown drain, durable attempt recording when a ledger is attached (ledger failures do not block prediction; shutdown waits for in-flight writes), and `recordFeedback` that appends feedback linked to a candidate by stable ID (the ledger validates the candidate exists and belongs to the request; a missing ledger throws; shutdown waits for in-flight feedback writes).
 - Prediction candidate identity and ledger: deterministic request-scoped IDs, append-only feedback, duplicate/conflict checks, restart recovery, and interrupted-tail handling.
+- A shared `PredictionLedger` conformance suite (`tests/prediction-ledger-conformance.ts`) run against all three implementations: round-trip fidelity, optional-field presence and absence, append ordering, candidate-linked feedback, multiple feedback per candidate, idempotent re-append, duplicate-attempt and reference-error rejection, empty-candidate attempts, multi-candidate addressability, mutation isolation, and concurrent appends.
+- `SqlitePredictionLedger`: cross-connection durability, schema-enforced conflict rejection surviving a reopen, transactional rollback leaving no partial attempt, post-`close()` rejection, idempotent close, parent-directory creation, and sub-millisecond timestamp fidelity.
 - `CapabilityGateway`: fake-gateway outcomes, failure details, and thrown invocations; `CapabilityDispatcher` dispatch recording succeeded/failed feedback in order, a thrown invocation becoming a failed result, dispatcher attribution winning over conflicting gateway details, and rejection for a candidate absent from the ledger.
 - `PredictionLog`: structured recording of outcomes, cancellations, and field mapping.
 - Async evaluation: provider-based evaluation matching sync results, canned-provider scoring, hard timeout, and heuristic fallback.

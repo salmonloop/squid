@@ -399,7 +399,11 @@ function parseLedgerLine(line: string, lineNumber: number): PredictionLedgerReco
   }
 }
 
-function stableJson(value: unknown): string {
+/**
+ * Key-order-independent serialization. Two records are equivalent when this
+ * agrees, so a replayed append is idempotent regardless of key order.
+ */
+export function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   if (value !== null && typeof value === "object") {
     return `{${Object.entries(value)
