@@ -43,7 +43,8 @@ bun run watch:files -- /absolute/project/root
 - `src/evaluation-fixtures.ts` — versioned synthetic replay scenarios with labeled cut points.
 - `src/evaluate.ts` — evaluation report entry point.
 - `src/prediction-provider.ts` — async prediction contract: `PredictionProvider` interface, `PredictionRequest`, `PredictionOutcome`, and `SyncPredictorProvider` adapter.
-- `src/prediction-coordinator.ts` — one-in-flight async coordinator with timeout, cancellation, stale-episode guard, and heuristic fallback.
+- `src/prediction-coordinator.ts` — one-in-flight async coordinator with timeout, cancellation, stale-episode guard, and heuristic fallback. Applies a `ContextPolicy` to the provider's view of world state.
+- `src/context-policy.ts` — egress boundary for provider context: `ContextPolicy` interface, `PassthroughContextPolicy` (the default), and `RedactingContextPolicy` with a typed allow-list.
 - `src/prediction-runtime.ts` — live orchestration boundary that feeds accepted/late core state snapshots into the coordinator without coupling provider latency to event ingestion. When a `PredictionLedger` is attached, every outcome is persisted as a durable attempt record; ledger failures are diagnostics and never block prediction delivery, and `dispose` drains in-flight writes so shutdown is durable.
 - `src/prediction-ledger.ts` — append-only prediction attempts and feedback with deterministic candidate envelopes, in-memory tests, and recoverable JSONL persistence.
 - `src/capability-gateway.ts` — pluggable capability boundary: `CapabilityGateway` interface, `ActionRequest`/`ActionResult`, a `FakeCapabilityGateway` for offline tests, and a `CapabilityDispatcher` that dispatches a ledger-resolved candidate by ID and records the dispatched→succeeded/failed lifecycle as ledger feedback. A gateway failure is data (a `failed` result); a failed ledger write escapes, because an unrecorded dispatch must not look like a successful one. Dispatcher attribution (`gateway`, `error`) wins over gateway-supplied details. A real MCP server implements the gateway; the base owns intent and recording only. Acceptance policy — expiry, user confirmation — is not enforced here.
@@ -80,6 +81,28 @@ Opening an episode clears inferred interaction context: foreground application/w
 The model no longer sets `expiresAt`; Squid derives it per kind (`draft_completion`: 30s, `run_tests`: 60s, `inspect_error`: 120s, `search_selection`: 30s, `none`: 10s) so context-bound suggestions expire on a schedule that matches their semantic freshness window.
 
 If the model provider is unreachable, the baseline predictor continues to function. Pi is not the source of truth for timeline or memory — the event store and world-state reducer are.
+
+## Provider context policy
+
+A `ContextPolicy` projects world state before it reaches a prediction provider. This is an **egress** boundary, not a storage rule: the event store and the prediction ledger keep full fidelity, and the in-process heuristic fallback keeps reading unprojected state, so redacting what an out-of-process model sees never degrades local prediction.
+
+`PassthroughContextPolicy` is the coordinator default, so attaching a provider never silently changes what it already received — choosing to redact is an explicit decision at the call site.
+
+`RedactingContextPolicy` narrows on a content-versus-shape distinction. Content is dropped or capped; shape is kept, because shape is what a predictor reasons over.
+
+| Field | Projected to | Kept |
+| --- | --- | --- |
+| Window titles (`activeWindow.title`, `focus.windowTitle`) | `[redacted]` | that a window is focused, and its `applicationId` |
+| Browser page | `origin + pathname`; title redacted | `host`; query strings, fragments, and userinfo dropped, since that is where session tokens ride |
+| `recentFiles`, action targets | basename | filename and extension |
+| Focus text | capped at `maxTextLength` (default 512) | `role`, `language`; labels redacted |
+| Episode, `lastEventKind`, timestamps | unchanged | carries no user content |
+
+Prefix is capped from its tail and suffix from its head, so the characters nearest the cursor — the ones a completion actually depends on — are the ones retained.
+
+Only `http`/`https` URLs keep a path. Other schemes parse successfully but put their payload where a path would be — `data:` inlines the document, `blob:` carries an opaque capability token, `file:` an absolute local path — so they degrade to `host`, as does a value that does not parse at all. Keeping a parseable non-web URL's "path" would leak precisely what the policy exists to withhold.
+
+The typed `RedactableContextField` allow-list re-enables a field explicitly; making it a union rather than a string means an allow-list entry cannot quietly stop matching after a rename. A policy that throws denies egress: the coordinator reports a `context_policy_failed` diagnostic and answers from the local fallback instead of falling back to raw state.
 
 ## Activity sources
 
@@ -121,6 +144,7 @@ Tests use `bun:test`. The test suite covers:
 - `SqliteEventStore` cross-connection durability under WAL, sub-millisecond timestamp fidelity, duplicate and identity-reuse rejection, parent-directory creation, post-`close()` rejection, and watch-exclusion paths for a database inside or outside the watched root.
 - Pi prediction normalization, kind-specific expiry derivation, evidence provenance, and `PredictionProvider` interface conformance.
 - `PredictionCoordinator`: success, timeout fallback, provider-failure fallback, old-request cancellation, stale-episode discard, explicit cancel, dispose, and idempotent no-op.
+- `ContextPolicy`: passthrough fidelity and non-aliasing; redaction of window titles, URL query strings, fragments and userinfo, unparseable URLs, file paths, action targets, and focus labels; per-scheme degradation for `blob:`/`data:`/`file:`/`javascript:` URLs with a retained non-default port; cursor-anchored text capping; short text left untouched; preserved episode/event shape; per-field allow-list passthrough; input immutability and absence of shared nested objects. Coordinator wiring: the provider receives projected state, the default is passthrough, request identity survives projection, a throwing policy denies egress with a diagnostic, and the local fallback still runs on unprojected state.
 - `PredictionRuntime`: non-blocking prediction dispatch after projection, duplicate suppression, supersession, restore, shutdown drain, durable attempt recording when a ledger is attached (ledger failures do not block prediction; shutdown waits for in-flight writes), and `recordFeedback` that appends feedback linked to a candidate by stable ID (the ledger validates the candidate exists and belongs to the request; a missing ledger throws; shutdown waits for in-flight feedback writes).
 - Prediction candidate identity and ledger: deterministic request-scoped IDs, append-only feedback, duplicate/conflict checks, restart recovery, and interrupted-tail handling.
 - `CapabilityGateway`: fake-gateway outcomes, failure details, and thrown invocations; `CapabilityDispatcher` dispatch recording succeeded/failed feedback in order, a thrown invocation becoming a failed result, dispatcher attribution winning over conflicting gateway details, and rejection for a candidate absent from the ledger.
@@ -138,7 +162,7 @@ Source tests inject a fake watcher and file probe, so they never depend on kerne
 - IDE / LSP integration.
 - Overlay / suggestion UI.
 - Action execution.
-- Privacy filtering and policy gateway.
+- Capture-time privacy filtering. `ContextPolicy` covers provider egress only; nothing filters what enters the event store.
 
 ## Archived documents
 

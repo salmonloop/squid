@@ -1,4 +1,8 @@
 import { HeuristicPredictor, type Predictor } from "./baseline-predictor.js";
+import {
+  PassthroughContextPolicy,
+  type ContextPolicy,
+} from "./context-policy.js";
 import type { PredictionCandidate, WorldState } from "./protocol.js";
 import { cloneWorldState } from "./world-state.js";
 import type { PredictionOutcome, PredictionProvider, PredictionRequest } from "./prediction-provider.js";
@@ -9,6 +13,12 @@ export interface PredictionCoordinatorOptions {
   readonly fallback?: Predictor;
   /** Hard timeout per request. Default 15 seconds. */
   readonly timeoutMs?: number;
+  /**
+   * Projects world state before it reaches the provider. Defaults to
+   * passthrough so attaching a policy is always an explicit decision. The
+   * local fallback keeps reading raw state.
+   */
+  readonly contextPolicy?: ContextPolicy;
   /** Called for every outcome — used in shadow mode to record structured logs. */
   readonly onOutcome?: (outcome: PredictionOutcome) => void;
   /** Reports non-fatal fallback or observer failures. */
@@ -20,7 +30,7 @@ export interface PredictionCoordinatorOptions {
 }
 
 export interface PredictionCoordinatorDiagnostic {
-  readonly kind: "fallback_failed" | "outcome_observer_failed";
+  readonly kind: "fallback_failed" | "outcome_observer_failed" | "context_policy_failed";
   readonly requestId: string;
   readonly message: string;
 }
@@ -39,6 +49,7 @@ export class PredictionCoordinator {
   private readonly provider: PredictionProvider;
   private readonly fallback: Predictor;
   private readonly timeoutMs: number;
+  private readonly contextPolicy: ContextPolicy;
   private readonly onOutcome: ((outcome: PredictionOutcome) => void) | undefined;
   private readonly onDiagnostic: ((diagnostic: PredictionCoordinatorDiagnostic) => void) | undefined;
   private readonly now: () => Date;
@@ -55,6 +66,7 @@ export class PredictionCoordinator {
     this.provider = options.provider;
     this.fallback = options.fallback ?? new HeuristicPredictor();
     this.timeoutMs = options.timeoutMs ?? 15_000;
+    this.contextPolicy = options.contextPolicy ?? new PassthroughContextPolicy();
     this.onOutcome = options.onOutcome;
     this.onDiagnostic = options.onDiagnostic;
     this.now = options.now ?? (() => new Date());
@@ -72,12 +84,27 @@ export class PredictionCoordinator {
     const requestId = this.random();
     const epoch = ++this.activeEpoch;
     const episodeId = worldState.episode?.id ?? null;
+    const triggeredAt = worldState.updatedAt ?? this.now().toISOString();
+    // The fallback is in-process, so it keeps full fidelity. Only the provider
+    // view is projected.
+    const localState = cloneWorldState(worldState);
     const request: PredictionRequest = {
       id: requestId,
-      worldState: cloneWorldState(worldState),
+      worldState: localState,
       episodeId,
-      triggeredAt: worldState.updatedAt ?? this.now().toISOString(),
+      triggeredAt,
     };
+
+    let providerRequest: PredictionRequest;
+    try {
+      providerRequest = { ...request, worldState: this.contextPolicy.project(worldState) };
+    } catch (error) {
+      // A policy that cannot decide what to redact must not fall through to raw
+      // state. Deny egress and answer locally instead.
+      const message = `context policy ${this.contextPolicy.id} failed: ${errorMessage(error)}`;
+      this.reportDiagnostic({ kind: "context_policy_failed", requestId, message });
+      return this.finish(epoch, request, this.now(), "failed", this.runFallback(request, message).candidates, message);
+    }
 
     const controller = new AbortController();
     this.activeController = controller;
@@ -102,7 +129,7 @@ export class PredictionCoordinator {
 
     try {
       const candidates = await Promise.race([
-        this.provider.predict(request, controller.signal),
+        this.provider.predict(providerRequest, controller.signal),
         timeout,
         aborted,
       ]);
@@ -118,23 +145,8 @@ export class PredictionCoordinator {
       if (this.activeEpoch !== epoch) {
         return this.finish(epoch, request, startedAt, reason, [], "superseded");
       }
-      let fallbackCandidates: readonly PredictionCandidate[] = [];
-      let fallbackReason = message;
-      try {
-        fallbackCandidates = this.fallback.predict(
-          request.worldState,
-          new Date(request.triggeredAt),
-        );
-      } catch (fallbackError) {
-        const fallbackMessage = errorMessage(fallbackError);
-        fallbackReason = `${message}; fallback failed: ${fallbackMessage}`;
-        this.reportDiagnostic({
-          kind: "fallback_failed",
-          requestId,
-          message: fallbackMessage,
-        });
-      }
-      return this.finish(epoch, request, startedAt, reason, fallbackCandidates, fallbackReason);
+      const fallback = this.runFallback(request, message);
+      return this.finish(epoch, request, startedAt, reason, fallback.candidates, fallback.reason);
     } finally {
       controller.signal.removeEventListener("abort", onAbort);
     }
@@ -170,6 +182,27 @@ export class PredictionCoordinator {
     const controller = this.activeController;
     if (controller !== null && !controller.signal.aborted) {
       controller.abort();
+    }
+  }
+
+  /**
+   * Runs the heuristic fallback on unprojected state. A fallback failure is
+   * folded into the reason string rather than thrown, so a request always
+   * produces an outcome.
+   */
+  private runFallback(
+    request: PredictionRequest,
+    reason: string,
+  ): { candidates: readonly PredictionCandidate[]; reason: string } {
+    try {
+      return {
+        candidates: this.fallback.predict(request.worldState, new Date(request.triggeredAt)),
+        reason,
+      };
+    } catch (error) {
+      const message = errorMessage(error);
+      this.reportDiagnostic({ kind: "fallback_failed", requestId: request.id, message });
+      return { candidates: [], reason: `${reason}; fallback failed: ${message}` };
     }
   }
 
