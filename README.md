@@ -26,6 +26,7 @@ bun run dev
 bun run evaluate
 bun run gate:pi
 bun run watch:files -- /absolute/project/root
+bun run watch:screen
 ```
 
 ## Architecture
@@ -38,7 +39,12 @@ bun run watch:files -- /absolute/project/root
 - `src/world-state.ts` — deterministic, ownership-safe reducer from events to world state.
 - `src/activity-source.ts` — the source contract every capture adapter implements.
 - `src/filesystem-source.ts` — filesystem watcher that emits validated file activity for one project root.
+- `src/screen-text-source.ts` — the `ScreenTextReader` backend seam, the neutral `ScreenTextFrame` shape, and the `ScreenTextActivitySource` adapter that projects frames onto host activity events.
+- `src/screen-text-reader-macos.ts` — macOS accessibility backend over `osascript`. Real, darwin-only, and not exercised by the offline suite.
+- `src/screen-text-reader-synthetic.ts` — scripted frame replay backend plus the built-in demo script. Zero OS calls, so the screen-text path is demonstrable and reproducible anywhere.
+- `src/create-watch-runtime.ts` — the store, ledger, projection, and prediction runtime every watch entry point needs, built once. Carries no source-specific assumptions.
 - `src/watch-files.ts` — live filesystem ingestion entry point; durable when `SQUID_DB` is set.
+- `src/watch-screen.ts` — live foreground-window-text ingestion entry point; picks a reader backend from `SQUID_SCREEN_READER`.
 - `src/baseline-predictor.ts` — offline heuristic predictor used for evaluation.
 - `src/evaluation.ts` — deterministic replay runner and prediction metrics.
 - `src/evaluation-fixtures.ts` — versioned synthetic replay scenarios with labeled cut points.
@@ -150,6 +156,27 @@ SQUID_DB=/absolute/path/events.db bun run watch:files -- /absolute/project/root
 
 File contents are never read; only paths, kinds, and timestamps enter the timeline.
 
+### Foreground window text
+
+`ScreenTextActivitySource` is the accessibility source. It is deliberately split in two: a `ScreenTextReaderFactory` backend that samples the foreground window, and an adapter that turns those samples into protocol events. The adapter imports no backend, and the backend knows nothing about events — so a future OCR reader or Windows UI Automation reader is one new factory and zero adapter changes. The entry point picks the backend, which is why `readerFactory` is required rather than defaulted: there is no platform-neutral way to read foreground text, and a default would have to couple the adapter to concrete backends.
+
+A backend reports a neutral `ScreenTextFrame` in which every field is optional, and absence carries meaning: a missing field is something the backend could not read, a present-but-empty one is something it read as empty. The adapter projects one frame onto up to four events in reducer order — `application_activated`, `window_changed`, `focus_changed`, `text_context_changed` — under `source.kind: "host"`, with no protocol change. Each event carries the sample's timestamp, so `sequence` is what orders them.
+
+The payload is the dedupe key: an event is emitted only when it would differ from the last one emitted for its kind. Backends sample on a cadence, so without that every tick would re-emit an unchanged desktop. `window_changed` needs a title the frame actually carries; `focus_changed` is unconditional once an application is identified, because a focused element with unreadable attributes is still a focus fact, and its `windowTitle` is included in the comparison since `text_context_changed` carries that field forward in the reducer. `text_context_changed` is skipped entirely for a frame with no `textContext` — synthesizing empty caret context would erase real state. A frame with no application id yields nothing at all. Frames also pass through a debounce window that keeps only the last frame, so a bursty backend cannot outrun the diff.
+
+Reader and delivery failures become diagnostics rather than thrown from async listeners, reusing the existing `watcher_error` / `delivery_error` kinds. A rejected event does not suppress the other facts observed in the same sample, and its payload is not recorded as emitted — so the next unchanged frame retries it. Each instance defaults to a fresh `sessionId` for the same identity reason as the filesystem source.
+
+Frames are emitted raw: this source states what it observed, and credential redaction happens downstream at the capture boundary in `PredictionRuntime`.
+
+```bash
+bun run watch:screen                                    # built-in demo script
+bun run watch:screen -- frames.json                     # scripted frames
+SQUID_SCREEN_READER=darwin bun run watch:screen         # real macOS accessibility
+SQUID_SCREEN_POLL_MS=500 bun run watch:screen           # sampling cadence
+```
+
+The macOS backend is real but not verifiable here: it needs a darwin host with an accessibility grant, so the seam and the adapter are tested through a fake reader and the backend is checked by hand — the same posture as the SQLite conformance suite, which tests the contract rather than the operating system. Its honest scope: `osascript` exposes no stable caret position, so `prefix`/`suffix` stay empty and text context is reported only when the user has a selection. It also cannot distinguish "the title query failed" from "the window has no title", so an empty title is treated as unreadable.
+
 ## Replay evaluation
 
 `bun run evaluate` runs the heuristic predictor against the versioned synthetic scenarios in `src/evaluation-fixtures.ts` and prints a deterministic JSON report.
@@ -198,17 +225,18 @@ Tests use `bun:test`. The test suite covers:
 - `runProviderGate`: baseline-equal pass, ranking regression failure, skip (not failure) for an unconstructable provider and for a lazily-resolved provider that reports itself unavailable without spending a baseline run, skip when the probe itself rejects, scoring when the probe reports available, failure for a provider that never answers despite baseline-equal ranking, timeouts counted as fallbacks, full health for a healthy provider, `none`-correctness failure for an over-eager provider, same-corpus comparison, custom slack, and default-threshold bounds.
 - Deterministic replay evaluation: cut-point ranking, MRR, coverage, future-leakage guard, per-scenario predictor isolation, and report stability.
 - `FilesystemActivitySource` root validation, lifecycle, default and caller filtering, path normalization, event mapping, debounce, ordering under a slow emitter, shutdown drain, diagnostics, distinct per-instance session identity, restart against one durable store without an identity collision, and end-to-end ingestion through `SquidCore`.
+- `ScreenTextActivitySource` lifecycle, full-frame mapping to four host events, per-payload change detection (title-only, role-only, selection-only, and unchanged frames), degradation for missing application id / name / title / caret context, ordering and sequence under a slow emitter, burst collapsing, shutdown flush of the pending frame, reader and delivery diagnostics including retry of a rejected payload, distinct per-instance session identity, and end-to-end ingestion through `SquidCore`.
 
-Source tests inject a fake watcher and file probe, so they never depend on kernel watch timing. Real-watcher behavior is verified by the `bun run watch:files` smoke run in the release gate.
+Source tests inject a fake watcher, file probe, and screen-text reader, so they never depend on kernel watch timing, an accessibility API, or a subprocess. Real-watcher behavior is verified by the `bun run watch:files` smoke run in the release gate; the macOS accessibility backend is verified by hand with `SQUID_SCREEN_READER=darwin bun run watch:screen`.
 
 ## What is not yet implemented
 
-- Native desktop capture (screen, accessibility, focus events).
+- Screen keyframes, OCR, and full caret context. Foreground window text is implemented; pixels are not.
 - Browser extension / CDP integration.
 - IDE / LSP integration.
 - Overlay / suggestion UI.
 - Action execution.
-- Capture-time privacy filtering. `ContextPolicy` covers provider egress only; nothing filters what enters the event store.
+- Capture-time privacy policy beyond credential redaction. `RedactingCapturePolicy` already filters credential content at the ingress boundary in `PredictionRuntime`, and both watch entry points enable it; `ContextPolicy` separately covers provider egress. What is missing is user-facing policy — per-application exclusions, pause, and retention.
 
 ## Archived documents
 
