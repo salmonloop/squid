@@ -3,6 +3,10 @@ import { PredictionCoordinator } from "./prediction-coordinator.js";
 import type { ActivityEvent, PredictionCandidate, WorldState } from "./protocol.js";
 import type { IngestDisposition, SquidCore } from "./squid-core.js";
 import {
+  PassthroughCapturePolicy,
+  type CapturePolicy,
+} from "./capture-policy.js";
+import {
   candidateEnvelopes,
   createAttemptRecord,
   createFeedbackRecord,
@@ -37,6 +41,14 @@ export interface PredictionRuntimeOptions {
   readonly onDiagnostic?: (diagnostic: PredictionRuntimeDiagnostic) => void;
   /** Injected for deterministic tests. */
   readonly now?: () => Date;
+  /**
+   * Ingress filter applied before an event enters the store. Capture is
+   * irreversible — once ingested an event is history — so a policy that redacts
+   * here narrows what is persisted rather than what is merely projected. The
+   * default passes through unchanged, so wiring a runtime never silently filters
+   * what was already being captured; a durable path opts in explicitly.
+   */
+  readonly capturePolicy?: CapturePolicy;
 }
 
 export interface PredictionRuntimeDiagnostic {
@@ -68,6 +80,7 @@ export class PredictionRuntime {
   private readonly ledger: PredictionLedger | undefined;
   private readonly onDiagnostic: ((diagnostic: PredictionRuntimeDiagnostic) => void) | undefined;
   private readonly now: () => Date;
+  private readonly capturePolicy: CapturePolicy;
   private disposed = false;
 
   public constructor(
@@ -78,6 +91,7 @@ export class PredictionRuntime {
     this.ledger = options.ledger;
     this.onDiagnostic = options.onDiagnostic;
     this.now = options.now ?? (() => new Date());
+    this.capturePolicy = options.capturePolicy ?? new PassthroughCapturePolicy();
   }
 
   public get currentState(): WorldState {
@@ -101,12 +115,17 @@ export class PredictionRuntime {
 
   private async ingestInternal(event: ActivityEvent): Promise<PredictionRuntimeIngestResult> {
     this.assertOpen();
-    const result = await this.core.ingest(event);
+    // Capture is the irreversible boundary: this is the last chance to strip
+    // credential content before `core.ingest` writes the event to history. The
+    // captured event — not the input — is what flows into the store and what
+    // the ledger record references, so a redacted marker persists across replay.
+    const captured = this.capturePolicy.capture(event);
+    const result = await this.core.ingest(captured);
     if (this.disposed || result.disposition === "duplicate") {
       return { ingest: result, prediction: null };
     }
     const context: AttemptContext = {
-      triggerEventId: event.eventId,
+      triggerEventId: captured.eventId,
       episodeId: result.state.episode?.id ?? null,
       triggeredAt: result.state.updatedAt ?? this.now().toISOString(),
     };

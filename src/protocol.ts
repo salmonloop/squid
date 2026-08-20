@@ -35,6 +35,13 @@ export interface ActivityEvent<TPayload = unknown> {
   correlationId: string | null;
   kind: ActivityKind;
   payload: TPayload;
+  /**
+   * Present and true only when a `CapturePolicy` redacted credential content
+   * from this event before it entered the store. Absent means the event was not
+   * filtered. Lets a replay or projection distinguish a window title that was
+   * "[redacted]" from one that literally read "[redacted]".
+   */
+  readonly redacted?: boolean;
 }
 
 export interface ApplicationActivatedPayload {
@@ -206,6 +213,7 @@ function activityEventSchema(kind: ActivityKind, payload: TSchema) {
     correlationId: Type.Union([Type.String(), Type.Null()]),
     kind: Type.Literal(kind),
     payload,
+    redacted: Type.Optional(Type.Boolean()),
   }, { additionalProperties: false });
 }
 
@@ -269,6 +277,7 @@ export function createActivityEvent<TPayload>(input: {
   occurredAt?: string;
   eventId?: string;
   correlationId?: string | null;
+  redacted?: boolean;
 }): ActivityEvent<TPayload> {
   const now = new Date().toISOString();
   const source = input.source ?? { kind: "synthetic", instanceId: "local" };
@@ -285,6 +294,7 @@ export function createActivityEvent<TPayload>(input: {
     correlationId: input.correlationId ?? null,
     kind: input.kind,
     payload: input.payload,
+    ...(input.redacted === undefined ? {} : { redacted: input.redacted }),
   };
   return parseActivityEvent(event) as ActivityEvent<TPayload>;
 }

@@ -9,6 +9,7 @@ import { HeuristicPredictor } from "./baseline-predictor.js";
 import { PredictionCoordinator } from "./prediction-coordinator.js";
 import { SyncPredictorProvider } from "./prediction-provider.js";
 import { PredictionRuntime } from "./prediction-runtime.js";
+import { RedactingCapturePolicy } from "./capture-policy.js";
 import { SqliteEventStore, sqliteWatchExclusions } from "./sqlite-event-store.js";
 import { SquidCore } from "./squid-core.js";
 
@@ -45,6 +46,9 @@ const runtime = new PredictionRuntime(
   }),
   {
     ledger,
+    // The durable path persists events, so capture redacts credential content
+    // before it reaches the store — the same opt-in posture as the ledger.
+    capturePolicy: new RedactingCapturePolicy(),
     onDiagnostic: (diagnostic) => {
       console.error(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
     },
