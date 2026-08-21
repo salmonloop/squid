@@ -11,6 +11,16 @@ export function eventIdentity(event: ActivityEvent): ActivityEventIdentity {
   ]);
 }
 
+/**
+ * Total order over events with distinct `eventId`s — `eventId` is the final
+ * tiebreak, so any two such events compare non-zero.
+ *
+ * Two *different* events sharing one `eventId` compare equal, and their relative
+ * order then depends on input order rather than on the timeline. `SquidCore`
+ * makes that unreachable by rejecting a colliding `eventId` at ingest
+ * (`inspectDuplicate`), so anything read back from a store is safely orderable.
+ * A caller assembling events by hand owes itself the same uniqueness.
+ */
 export function compareActivityEvents(left: ActivityEvent, right: ActivityEvent): number {
   return new Date(left.occurredAt).getTime() - new Date(right.occurredAt).getTime()
     || compareStrings(left.source.kind, right.source.kind)

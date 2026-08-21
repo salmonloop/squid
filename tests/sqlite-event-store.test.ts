@@ -140,6 +140,9 @@ describe("SqliteEventStore", () => {
       ".squid/events.db",
       ".squid/events.db-wal",
       ".squid/events.db-shm",
+      // A rollback journal appears if WAL is ever unavailable, so it belongs in
+      // the exclusion set too: an unexcluded sidecar feeds the watcher its own writes.
+      ".squid/events.db-journal",
     ]);
   });
 

@@ -276,11 +276,24 @@ export class ScreenTextActivitySource implements ActivitySource {
     const emit = this.emit;
     if (emit === null) return;
 
-    // One sample is one instant, so every event it produces shares a timestamp;
-    // `sequence` is what orders them.
-    const occurredAt = frame.occurredAt ?? new Date().toISOString();
+    // Reading the frame is itself fallible: a backend that pushes a non-object
+    // — a malformed frames file, a reader bug — makes every field access throw.
+    // An escaping throw would reject the shared delivery tail, which then
+    // rejects every later frame and leaves `stop()` rejecting instead of
+    // draining, so the whole read-and-project step is guarded here.
+    let occurredAt: string;
+    let emissions: ScreenTextEmission[];
+    try {
+      // One sample is one instant, so every event it produces shares a timestamp;
+      // `sequence` is what orders them.
+      occurredAt = frame.occurredAt ?? new Date().toISOString();
+      emissions = projectFrame(frame);
+    } catch (error) {
+      this.record("delivery_error", error);
+      return;
+    }
 
-    for (const emission of projectFrame(frame)) {
+    for (const emission of emissions) {
       const fingerprint = JSON.stringify(emission.payload);
       if (this.lastEmitted.get(emission.kind) === fingerprint) continue;
 

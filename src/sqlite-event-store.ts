@@ -41,8 +41,8 @@ CREATE INDEX IF NOT EXISTS chronicle_events_occurred_at
 
 const CONSTRAINT_CODES = new Set(["SQLITE_CONSTRAINT_PRIMARYKEY", "SQLITE_CONSTRAINT_UNIQUE"]);
 
-/** The database itself plus the two files WAL mode maintains beside it. */
-const WAL_SIDECAR_SUFFIXES = ["", "-wal", "-shm"] as const;
+/** The database itself plus the sidecar files WAL and rollback modes maintain. */
+const WAL_SIDECAR_SUFFIXES = ["", "-wal", "-shm", "-journal"] as const;
 
 /**
  * Durable append-only Chronicle storage on SQLite.
@@ -70,11 +70,19 @@ export class SqliteEventStore implements EventStore {
     // `{ create: true }` must be explicit: `new Database(path, {})` and
     // `{ readonly: false }` both throw SQLITE_MISUSE.
     this.database = new Database(filePath, { create: true });
-    this.database.exec("PRAGMA journal_mode = WAL");
-    this.database.exec("PRAGMA synchronous = NORMAL");
-    this.database.exec("PRAGMA foreign_keys = ON");
-    this.database.exec("PRAGMA busy_timeout = 5000");
-    this.database.exec(SCHEMA);
+    try {
+      this.database.exec("PRAGMA journal_mode = WAL");
+      this.database.exec("PRAGMA synchronous = NORMAL");
+      this.database.exec("PRAGMA foreign_keys = ON");
+      this.database.exec("PRAGMA busy_timeout = 5000");
+      this.database.exec(SCHEMA);
+    } catch (error) {
+      // Any PRAGMA or schema failure leaves the database handle open but
+      // uninitialized; close it so no subsequent call operates on a
+      // half-configured connection.
+      this.database.close();
+      throw error;
+    }
   }
 
   async append(event: ActivityEvent): Promise<void> {

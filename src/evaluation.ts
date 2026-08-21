@@ -152,6 +152,7 @@ function evaluateCutPoint(
 function buildReport(scenarioCount: number, results: readonly PredictionEvaluation[]): EvaluationReport {
   const total = results.length;
   const noneResults = results.filter((result) => result.expectedKind === "none");
+  const actionableResults = results.filter((result) => result.expectedKind !== "none");
 
   return {
     scenarioCount,
@@ -160,7 +161,7 @@ function buildReport(scenarioCount: number, results: readonly PredictionEvaluati
     top3: metric(results.filter((result) => result.top3).length, total),
     top5: metric(results.filter((result) => result.top5).length, total),
     meanReciprocalRank: total === 0 ? 0 : sum(results.map((result) => result.reciprocalRank)) / total,
-    coverage: metric(results.filter((result) => result.covered).length, total),
+    coverage: metric(actionableResults.filter((result) => result.covered).length, actionableResults.length),
     noneCorrectness: metric(noneResults.filter((result) => result.top1).length, noneResults.length),
     results: [...results],
   };

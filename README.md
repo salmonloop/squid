@@ -56,6 +56,7 @@ bun run watch:screen
 - `src/prediction-provider.ts` — async prediction contract: `PredictionProvider` interface, `PredictionRequest`, `PredictionOutcome`, and `SyncPredictorProvider` adapter.
 - `src/prediction-coordinator.ts` — one-in-flight async coordinator with timeout, cancellation, stale-episode guard, and heuristic fallback. Applies a `ContextPolicy` to the provider's view of world state.
 - `src/context-policy.ts` — egress boundary for provider context: `ContextPolicy` interface, `PassthroughContextPolicy` (the default), and `RedactingContextPolicy` with a typed allow-list.
+- `src/capture-policy.ts` — ingress boundary for capture: `CapturePolicy` interface, `PassthroughCapturePolicy` (the default), and `RedactingCapturePolicy`, which strips credential content before an event reaches the store. Capture is irreversible, so this narrows what is persisted rather than what is merely shown to a provider.
 - `src/prediction-runtime.ts` — live orchestration boundary that feeds accepted/late core state snapshots into the coordinator without coupling provider latency to event ingestion. When a `PredictionLedger` is attached, every outcome is persisted as a durable attempt record; ledger failures are diagnostics and never block prediction delivery, and `dispose` drains in-flight writes so shutdown is durable.
 - `src/prediction-ledger.ts` — append-only prediction attempts and feedback with deterministic candidate envelopes, in-memory tests, and recoverable JSONL persistence.
 - `src/sqlite-prediction-ledger.ts` — append-only ledger on SQLite that declares its integrity rules as schema constraints instead of process-local checks.
@@ -253,7 +254,7 @@ Source tests inject a fake watcher, file probe, and screen-text reader, so they 
 - Browser extension / CDP integration.
 - IDE / LSP integration.
 - Overlay / suggestion UI.
-- Action execution.
+- Action execution. `CapabilityGateway` defines the boundary and `CapabilityDispatcher` records the dispatch lifecycle, but only `FakeCapabilityGateway` implements it and no entry point wires a dispatcher — nothing in a live run can act.
 - Capture-time privacy policy beyond credential redaction. `RedactingCapturePolicy` already filters credential content at the ingress boundary in `PredictionRuntime`, and both watch entry points enable it; `ContextPolicy` separately covers provider egress. What is missing is user-facing policy — per-application exclusions, pause, and retention.
 
 ## Archived documents

@@ -130,6 +130,12 @@ export class RedactingCapturePolicy implements CapturePolicy {
     });
   }
 
+  /**
+   * Every kind is listed explicitly rather than falling through a `default`, so
+   * adding a kind to `activityKinds` fails to compile here until someone decides
+   * whether its payload carries credential content. A silent `default` would let
+   * a new free-text field reach the irreversible boundary unredacted.
+   */
   private redactPayload(event: ActivityEvent): unknown {
     switch (event.kind) {
       case "window_changed":
@@ -140,10 +146,21 @@ export class RedactingCapturePolicy implements CapturePolicy {
         return this.redactText(event.payload as TextContextChangedPayload);
       case "browser_navigated":
         return this.redactBrowser(event.payload as BrowserNavigatedPayload);
-      default:
-        // file_opened/file_saved paths are intentionally not redacted; every
-        // other kind carries no free-text content field a credential would ride in.
+      // Structural only — no free-text content field a credential could ride in.
+      // `file_opened`/`file_saved` paths are deliberately kept; see the class doc.
+      case "application_activated":
+      case "pointer_action":
+      case "keyboard_action":
+      case "clipboard_changed":
+      case "dom_changed":
+      case "file_opened":
+      case "file_saved":
+      case "terminal_command_completed":
+      case "screen_keyframe_created":
+      case "idle_state_changed":
         return undefined;
+      default:
+        return assertKindHandled(event.kind);
     }
   }
 
@@ -208,4 +225,13 @@ export class RedactingCapturePolicy implements CapturePolicy {
     // the same way `applicationId` does everywhere else.
     return changed ? result : undefined;
   }
+}
+
+/**
+ * Compile-time exhaustiveness guard for `redactPayload`. Reachable only if a new
+ * `ActivityKind` was added without deciding how capture treats its payload; the
+ * `never` parameter makes that a type error at the call site.
+ */
+function assertKindHandled(kind: never): never {
+  throw new Error(`Capture policy has no redaction decision for activity kind ${String(kind)}.`);
 }

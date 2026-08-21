@@ -132,7 +132,10 @@ describe("Replay evaluation", () => {
     expect(report.top1.hits).toBe(1);
     expect(report.top3.hits).toBe(2);
     expect(report.meanReciprocalRank).toBeCloseTo(0.5 / 3, 10);
-    expect(report.coverage).toEqual({ hits: 2, total: 3, rate: 2 / 3 });
+    // Coverage counts only the actionable cut points: "c-empty" expects "none",
+    // so producing no candidate there is correct behaviour, not a coverage miss.
+    // Folding it into the denominator would penalise a provider for being right.
+    expect(report.coverage).toEqual({ hits: 2, total: 2, rate: 1 });
   });
 
   it("does not leak future events into a cut point's state", async () => {

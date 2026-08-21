@@ -475,3 +475,36 @@ describe("ScreenTextActivitySource with SquidCore", () => {
     expect(await core.restore()).toEqual(state);
   });
 });
+
+describe("ScreenTextActivitySource frame projection failures", () => {
+  it("does not let a malformed frame poison the delivery chain", async () => {
+    // Projection reads fields off the frame, so a backend that pushes a
+    // non-object (a broken JSON frames file, a reader bug) makes it throw.
+    // That throw used to escape `deliver`, rejecting the shared delivery tail —
+    // which then rejected every later frame's delivery and left `stop()`
+    // rejecting instead of draining.
+    const reader = fakeReader();
+    const emitter = recordingEmitter();
+    const source = new ScreenTextActivitySource({
+      readerFactory: reader.factory,
+      debounceMs: 0,
+    });
+
+    await source.start(emitter.emit);
+
+    reader.emit(null as unknown as ScreenTextFrame);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    // A good frame delivered after the bad one must still arrive.
+    reader.emit({ applicationId: "742", applicationName: "Code" });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    await source.stop();
+
+    expect(emitter.events.map((event) => event.kind)).toEqual([
+      "application_activated",
+      "focus_changed",
+    ]);
+    expect(source.diagnostics.map((diagnostic) => diagnostic.kind)).toContain("delivery_error");
+  });
+});

@@ -235,7 +235,20 @@ export const ActivityEventSchema = Type.Union([
 ]);
 
 const activityEventValidator = Compile(ActivityEventSchema);
+/**
+ * Next auto-assigned sequence per `(source kind, instance, session)`. Process-
+ * local by nature: the counter cannot know what a store already holds.
+ *
+ * That is why the default session below is unique per process. `sequence` is
+ * part of an event's persisted identity, so a constant default session would
+ * make a restarted process reserve 0, 1, 2 again and collide with its own
+ * history — the same trap `FilesystemActivitySource` and
+ * `ScreenTextActivitySource` avoid by defaulting to a fresh session each.
+ * A caller that supplies its own `sessionId` and relies on auto-reservation
+ * across restarts owns that reconciliation itself.
+ */
 const nextSequenceBySource = new Map<string, number>();
+const defaultSessionId = `session-${crypto.randomUUID()}`;
 
 export class ActivityEventValidationError extends Error {
   public constructor(public readonly issues: readonly string[]) {
@@ -281,7 +294,7 @@ export function createActivityEvent<TPayload>(input: {
 }): ActivityEvent<TPayload> {
   const now = new Date().toISOString();
   const source = input.source ?? { kind: "synthetic", instanceId: "local" };
-  const sessionId = input.sessionId ?? "default";
+  const sessionId = input.sessionId ?? defaultSessionId;
   const sequence = reserveSequence(source, sessionId, input.sequence);
   const event: ActivityEvent<TPayload> = {
     schemaVersion: 1,

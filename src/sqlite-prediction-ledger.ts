@@ -33,15 +33,20 @@ export class SqlitePredictionLedger implements PredictionLedger {
   public constructor(filePath: string) {
     mkdirSync(dirname(filePath), { recursive: true });
     this.database = new Database(filePath, { create: true });
-    this.database.exec("PRAGMA journal_mode = WAL");
-    this.database.exec("PRAGMA synchronous = NORMAL");
-    // Required: feedback→candidate referential integrity is enforced by the
-    // engine, and SQLite ignores foreign keys unless this is on per connection.
-    this.database.exec("PRAGMA foreign_keys = ON");
-    // A second watch-files process pointing at the same ledger would contend;
-    // single-process access is the norm but the timeout is a cheap safety net.
-    this.database.exec("PRAGMA busy_timeout = 5000");
-    this.database.exec(SCHEMA);
+    try {
+      this.database.exec("PRAGMA journal_mode = WAL");
+      this.database.exec("PRAGMA synchronous = NORMAL");
+      // Required: feedback→candidate referential integrity is enforced by the
+      // engine, and SQLite ignores foreign keys unless this is on per connection.
+      this.database.exec("PRAGMA foreign_keys = ON");
+      // A second watch-files process pointing at the same ledger would contend;
+      // single-process access is the norm but the timeout is a cheap safety net.
+      this.database.exec("PRAGMA busy_timeout = 5000");
+      this.database.exec(SCHEMA);
+    } catch (error) {
+      this.database.close();
+      throw error;
+    }
   }
 
   public async appendAttempt(record: PredictionAttemptRecord): Promise<void> {

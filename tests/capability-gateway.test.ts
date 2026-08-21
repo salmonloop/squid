@@ -165,3 +165,31 @@ describe("CapabilityDispatcher", () => {
     await runtime.dispose();
   });
 });
+
+describe("CapabilityDispatcher ledger failures", () => {
+  it("compensates with a failed record when the terminal write cannot be persisted", async () => {
+    const { runtime, ledger, dispatcher, candidateId } = await setup();
+
+    // Reject only the terminal write, so the dispatch reaches the gateway and
+    // then loses its outcome — the exact shape that would otherwise leave a
+    // dangling "dispatched" and let a retry double-dispatch.
+    const realAppend = ledger.appendFeedback.bind(ledger);
+    let rejectedOnce = false;
+    ledger.appendFeedback = async (record) => {
+      if (record.feedback === "succeeded" && !rejectedOnce) {
+        rejectedOnce = true;
+        throw new Error("ledger disk full");
+      }
+      return realAppend(record);
+    };
+
+    await expect(dispatcher.dispatch(candidateId)).rejects.toThrow("ledger disk full");
+
+    const feedback = (await ledger.all()).filter((r) => r.recordType === "feedback");
+    // "dispatched" plus a compensating "failed": the candidate has a terminal
+    // state, so a retry can tell this apart from a dispatch still in flight.
+    expect(feedback.map((r) => r.feedback)).toEqual(["dispatched", "failed"]);
+    expect(feedback[1].details?.ledgerError).toContain("ledger disk full");
+    await runtime.dispose();
+  });
+});

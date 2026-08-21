@@ -159,13 +159,34 @@ export class CapabilityDispatcher {
       };
     }
 
-    await this.runtime.recordFeedback({
-      feedbackId: feedbackId(result.outcome),
-      requestId,
-      candidateId,
-      feedback: result.outcome,
-      details: this.feedbackDetails(result),
-    });
+    try {
+      await this.runtime.recordFeedback({
+        feedbackId: feedbackId(result.outcome),
+        requestId,
+        candidateId,
+        feedback: result.outcome,
+        details: this.feedbackDetails(result),
+      });
+    } catch (recordError) {
+      // The dispatch happened but its terminal state could not be recorded.
+      // Without a compensating "failed", the ledger is left with only
+      // "dispatched" — a retry would see no terminal state and double-dispatch.
+      try {
+        await this.runtime.recordFeedback({
+          feedbackId: feedbackId("failed"),
+          requestId,
+          candidateId,
+          feedback: "failed",
+          details: {
+            gateway: this.gateway.id,
+            ledgerError: recordError instanceof Error ? recordError.message : String(recordError),
+          },
+        });
+      } catch {
+        // Best effort — the original error is the real problem.
+      }
+      throw recordError;
+    }
 
     return result;
   }

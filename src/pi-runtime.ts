@@ -148,9 +148,20 @@ export class PiRuntime implements PredictionProvider {
       throw new PiPredictionCancelledError(request.id);
     }
 
-    // Listen for external abort → session.abort() then dispose.
+    // Listen for external abort → session.abort() then dispose.  Disposal
+    // happens here rather than only in the finally block because a session
+    // that never settles after abort would leave the finally unreachable,
+    // leaking the session.
+    let disposed = false;
+    const disposeOnce = () => {
+      if (!disposed) {
+        disposed = true;
+        session.dispose();
+      }
+    };
     const onAbort = () => {
       session.abort().catch(() => undefined);
+      disposeOnce();
     };
     signal.addEventListener("abort", onAbort, { once: true });
 
@@ -162,7 +173,7 @@ export class PiRuntime implements PredictionProvider {
       return [candidate];
     } finally {
       signal.removeEventListener("abort", onAbort);
-      session.dispose();
+      disposeOnce();
     }
   }
 }
@@ -179,11 +190,19 @@ export function normalizePredictionCandidate(
     return noneCandidate(sourceEventIds, now);
   }
 
+  // A non-"none" candidate must carry a rationale — an empty string means
+  // the model returned a candidate with no justification, which is not
+  // actionable and should not reach a provider as if it were.
+  const rationale = params.rationale.trim();
+  if (rationale.length === 0) {
+    return noneCandidate(sourceEventIds, now);
+  }
+
   const expiresAt = new Date(now.getTime() + (kindTtlMs[kind] ?? PREDICTION_TTL_MS)).toISOString();
 
   return {
     kind,
-    rationale: params.rationale,
+    rationale,
     confidence: Math.max(0, Math.min(1, params.confidence)),
     expiresAt,
     sourceEventIds,

@@ -110,6 +110,9 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     void source.stop().then(async () => {
       await watch.dispose();
       process.exit(0);
+    }).catch((error) => {
+      console.error(JSON.stringify({ shutdownError: error instanceof Error ? error.message : String(error) }));
+      process.exit(1);
     });
   });
 }

@@ -27,6 +27,27 @@ describe("ActivityEvent protocol", () => {
     expect(isActivityEvent(first)).toBe(true);
   });
 
+  it("defaults to a session unique per process, so auto-reservation cannot collide with history", () => {
+    // `sequence` is part of an event's persisted identity, and the reservation
+    // counter is process-local — it cannot know what a store already holds. A
+    // constant default session would therefore make a restarted process reserve
+    // 0, 1, 2 again and collide with its own durable history. Each source already
+    // defends itself this way; this pins the same property for the default.
+    const first = createActivityEvent({
+      kind: "application_activated",
+      payload: { applicationId: "editor", applicationName: "Editor" },
+    });
+    const second = createActivityEvent({
+      kind: "application_activated",
+      payload: { applicationId: "editor", applicationName: "Editor" },
+    });
+
+    // Within one process the default session is stable and its sequence advances.
+    expect(second.sessionId).toBe(first.sessionId);
+    expect(second.sequence).toBe(first.sequence + 1);
+    expect(first.sessionId).not.toBe("default");
+  });
+
   it.each([
     ["unknown event kind", { kind: "unknown" }],
     ["invalid timestamp", { occurredAt: "not-a-date" }],

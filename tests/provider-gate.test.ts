@@ -238,6 +238,43 @@ describe("runProviderGate", () => {
     expect(result.status).toBe("failed");
     expect(result.failures.join(" ")).toContain("noneCorrectness");
   });
+
+  it("counts a provider that ignores its abort signal as a fallback, not an answer", async () => {
+    // The failure this guards against: a provider whose predict never settles
+    // and which ignores its AbortSignal. The coordinator times out and
+    // substitutes the heuristic, so the ranking report shows baseline scores.
+    // If the health observer only counted rejections, `failures` would stay
+    // empty, fallbackRate would be 0, and a provider that never actually ran
+    // would be reported as "passed".
+    const hungProvider = (): PredictionProvider => ({
+      name: "hung",
+      predict: () => new Promise<readonly PredictionCandidate[]>(() => {}),
+    });
+
+    const result = await runProviderGate({
+      scenarios: heuristicEvaluationScenarios,
+      createProvider: hungProvider,
+      timeoutMs: 20,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.health!.answered).toBe(0);
+    expect(result.health!.fallbackRate).toBe(1);
+    expect(result.failures.join(" ")).toContain("fallback rate");
+  });
+
+  it("still credits a conforming provider as having answered", async () => {
+    // The complement of the test above: the abort race must not turn a provider
+    // that settles normally into a spurious fallback.
+    const result = await runProviderGate({
+      scenarios: heuristicEvaluationScenarios,
+      createProvider: baselineEquivalentProvider,
+    });
+
+    expect(result.health!.fallbacks).toEqual([]);
+    expect(result.health!.answered).toBe(result.health!.requests);
+    expect(result.health!.requests).toBeGreaterThan(0);
+  });
 });
 
 describe("provider gate corpus assumptions", () => {

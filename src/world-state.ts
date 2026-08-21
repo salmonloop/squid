@@ -131,6 +131,12 @@ export function reduceWorldState(
   return next;
 }
 
+/**
+ * Projects a whole timeline in canonical order. Events must have distinct
+ * `eventId`s, which is what makes that order total — see
+ * `compareActivityEvents`. Events read back from a store satisfy this because
+ * `SquidCore` rejects a colliding `eventId` at ingest.
+ */
 export function buildWorldState(
   events: readonly ActivityEvent[],
   gapMs = DEFAULT_EPISODE_GAP_MS,

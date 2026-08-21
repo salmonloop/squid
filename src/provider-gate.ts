@@ -175,11 +175,12 @@ async function probeAvailability(options: ProviderGateOptions): Promise<string |
  * applied its fallback, the failure is no longer visible in the outcome the
  * evaluation runner keeps.
  *
- * Timeouts are counted because the coordinator aborts the signal and a
- * conforming provider rejects. A provider that ignores its `AbortSignal` and
- * resolves late would be counted as answered — but that already violates the
- * `PredictionProvider` contract, and the resulting candidates are discarded as
- * stale either way.
+ * The observer races the provider's `predict` against the `AbortSignal` so that
+ * a provider which ignores its signal and never settles is still counted as a
+ * failure when the coordinator aborts. Without this race, `this.requests` would
+ * be incremented but the pending `await` would never enter the catch block,
+ * leaving `failures` empty and `fallbackRate` at zero — a hung provider would
+ * pass the gate.
  */
 class ProviderHealthObserver {
   private requests = 0;
@@ -191,7 +192,10 @@ class ProviderHealthObserver {
       predict: async (request, signal) => {
         this.requests += 1;
         try {
-          return await provider.predict(request, signal);
+          return await Promise.race([
+            provider.predict(request, signal),
+            abortNeverSettles(signal),
+          ]);
         } catch (error) {
           this.failures.push(errorMessage(error));
           throw error;
@@ -258,6 +262,25 @@ function compareToBaseline(
 
 function format(rate: number): string {
   return rate.toFixed(4);
+}
+
+/**
+ * Rejects when the signal aborts, so a provider that ignores its `AbortSignal`
+ * and never settles is surfaced as a failure rather than hanging forever.
+ * Resolves only if the signal never aborts (the provider settled first).
+ */
+function abortNeverSettles(signal: AbortSignal): Promise<never> {
+  return new Promise((_, reject) => {
+    if (signal.aborted) {
+      reject(new Error("provider was already aborted"));
+      return;
+    }
+    signal.addEventListener(
+      "abort",
+      () => reject(new Error("provider did not settle before abort")),
+      { once: true },
+    );
+  });
 }
 
 function errorMessage(error: unknown): string {

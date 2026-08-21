@@ -10,6 +10,11 @@ export interface Episode {
 
 export const DEFAULT_EPISODE_GAP_MS = 5 * 60_000;
 
+/**
+ * Segments a whole timeline in canonical order. Events must have distinct
+ * `eventId`s, which is what makes that order total — see
+ * `compareActivityEvents`.
+ */
 export function segmentEpisodes(
   inputs: readonly ActivityEvent[],
   gapMs = DEFAULT_EPISODE_GAP_MS,
