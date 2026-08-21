@@ -90,14 +90,14 @@ describe("McpCapabilityGateway", () => {
         return "ran";
       },
     });
-    const gateway = new McpCapabilityGateway({ client });
+    const gateway = new McpCapabilityGateway({ client, workingDirectory: "/workspace/squid project" });
 
     const result = await gateway.invoke(
-      request("run_tests", { path: "tests/foo.test.ts" }),
+      request("run_tests", { path: "tests/foo bar;$(touch nope).test.ts" }),
     );
 
     expect(result.outcome).toBe("succeeded");
-    expect(seenCommand).toContain("bun test tests/foo.test.ts");
+    expect(seenCommand).toBe("cd '/workspace/squid project' && bun test -- 'tests/foo bar;$(touch nope).test.ts'");
   });
 
   it("refuses prediction kinds with no tool mapping", async () => {

@@ -27,12 +27,12 @@ export interface ProviderGateThresholds {
 }
 
 export const defaultGateThresholds: ProviderGateThresholds = {
-  // A single cut point out of twelve is ~0.083. Allowing one regression admits
-  // normal model nondeterminism; allowing two would admit a real one.
+  // Kept deliberately tight: 0.09 was roughly one cut point on the original
+  // twelve-point corpus and remains a sub-two-cut-point allowance at fifteen.
   top1Slack: 0.09,
   noneCorrectnessSlack: 0,
-  // One transient timeout in a twelve-point corpus is tolerable; a second
-  // means the provider is not reliably answering.
+  // The same bound keeps one transient timeout tolerable without admitting a
+  // provider that regularly fails to answer.
   maxFallbackRate: 0.09,
 };
 

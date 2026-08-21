@@ -11,10 +11,7 @@ import {
   type ScreenTextFrame,
   type ScreenTextReaderFactory,
 } from "./screen-text-source.js";
-import {
-  dispatchTopCandidate,
-  resolveWatchActions,
-} from "./watch-actions.js";
+import { resolveWatchActions } from "./watch-actions.js";
 import { resolveWatchProvider } from "./watch-provider.js";
 
 const readerKind = process.env.SQUID_SCREEN_READER ?? "synthetic";
@@ -85,9 +82,15 @@ const restored = await watch.runtime.restore();
 // The action half of the closed loop, off unless SQUID_ACTIONS opts in. Like
 // the provider above it is resolved before the source starts: a typo in the
 // variable must fail loudly here, not silently disable execution.
-const actions = await resolveWatchActions(watch.runtime, watch.ledger);
+const actions = await resolveWatchActions(
+  watch.runtime,
+  watch.ledger,
+  process.env,
+  { workingDirectory: process.cwd() },
+);
 if (actions !== undefined && "configError" in actions) {
   console.error(actions.configError);
+  await watch.dispose();
   process.exit(2);
 }
 
@@ -120,12 +123,20 @@ await source.start(async (event) => {
         predictions: outcome.candidates.map((prediction) => prediction.kind),
       }));
       if (actions !== undefined) {
-        const action = await dispatchTopCandidate(outcome, outcome.candidates, actions.dispatcher);
-        if (action !== null) {
+        const dispatched = await actions.dispatchTopCandidate(outcome, outcome.candidates);
+        if (dispatched !== null) {
           console.log(JSON.stringify({
-            dispatched: action.candidateId,
-            outcome: action.outcome,
-            ...(action.error !== undefined ? { error: action.error } : {}),
+            candidateId: dispatched.candidateId,
+            ...(dispatched.decision !== null
+              ? { confirmation: dispatched.decision.outcome, reason: dispatched.decision.reason }
+              : {}),
+            ...(dispatched.action !== null
+              ? {
+                  dispatched: dispatched.action.candidateId,
+                  outcome: dispatched.action.outcome,
+                  ...(dispatched.action.error !== undefined ? { error: dispatched.action.error } : {}),
+                }
+              : {}),
           }));
         }
       }
@@ -158,10 +169,10 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     // dispose: a prediction whose outcome has not yet been written still has a
     // ledger write in flight, and closing first drops that record.
     void source.stop().then(async () => {
-      await watch.dispose();
-      // The MCP client transport is closed last so a dispatch still in flight
-      // during drain keeps its connection.
+      // Cancel/settle confirmation and dispatch while the runtime is still
+      // open: rejection and terminal action feedback must reach the ledger.
       if (actions !== undefined) await actions.close();
+      await watch.dispose();
       process.exit(0);
     }).catch((error) => {
       console.error(JSON.stringify({ shutdownError: error instanceof Error ? error.message : String(error) }));
