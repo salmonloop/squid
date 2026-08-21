@@ -41,6 +41,11 @@ describe("Replay evaluation", () => {
       "run_tests",
       "none",
       "run_tests",
+      // The three screen-text scenarios, in scenario-ID order.
+      "run_tests",
+      "search_selection",
+      "none",
+      // The three stale scenarios.
       "none",
       "none",
       "none",

@@ -3,6 +3,7 @@ import type { ReplayScenario } from "./evaluation.js";
 
 const syntheticSource = { kind: "synthetic" as const, instanceId: "evaluation-fixture" };
 const filesystemSource = { kind: "filesystem" as const, instanceId: "evaluation-filesystem" };
+const hostSource = { kind: "host" as const, instanceId: "evaluation-screen-text" };
 const sessionId = "evaluation-session";
 
 function event<TPayload>(input: {
@@ -350,5 +351,136 @@ export const heuristicEvaluationScenarios: readonly ReplayScenario[] = [
         description: "The same workflow becomes actionable after the save.",
       },
     ],
+  },
+  {
+    // Exercises the screen-text source, which no earlier scenario touches. The
+    // events are the shapes a real host accessibility backend emits — the
+    // Linux verification run produced exactly this sequence — and the coding
+    // context must combine across the host and filesystem sources.
+    id: "screen-text-save-run-tests",
+    title: "Run tests after a save observed through screen text plus filesystem",
+    events: [
+      event({
+        eventId: "screen-app",
+        sequence: 0,
+        occurredAt: "2026-08-18T12:00:00.000Z",
+        kind: "application_activated",
+        payload: { applicationId: "code", applicationName: "Code" },
+        source: hostSource,
+      }),
+      event({
+        eventId: "screen-window",
+        sequence: 1,
+        occurredAt: "2026-08-18T12:00:01.000Z",
+        kind: "window_changed",
+        payload: { applicationId: "code", title: "main.ts — squid", bounds: null },
+        source: hostSource,
+      }),
+      event({
+        eventId: "screen-focus",
+        sequence: 2,
+        occurredAt: "2026-08-18T12:00:02.000Z",
+        kind: "focus_changed",
+        payload: { applicationId: "code", windowTitle: "main.ts — squid", role: "editor", label: null },
+        source: hostSource,
+      }),
+      event({
+        eventId: "screen-save",
+        sequence: 0,
+        occurredAt: "2026-08-18T12:00:03.000Z",
+        kind: "file_saved",
+        payload: { path: "src/main.ts", applicationId: null },
+        source: filesystemSource,
+      }),
+    ],
+    cutPoints: [{
+      id: "after-screen-save",
+      eventIndex: 3,
+      expectedKind: "run_tests",
+      description: "An editor-focused host observation plus a filesystem save should suggest tests.",
+    }],
+  },
+  {
+    // The selection-only shape the synthetic demo produces: a reader that sees
+    // selected text but no caret context sends text_context_changed alone.
+    id: "screen-text-selection-search",
+    title: "Search a selection observed through screen text in a browser",
+    events: [
+      event({
+        eventId: "selection-browser-app",
+        sequence: 0,
+        occurredAt: "2026-08-18T12:01:00.000Z",
+        kind: "application_activated",
+        payload: { applicationId: "firefox", applicationName: "Firefox" },
+        source: hostSource,
+      }),
+      event({
+        eventId: "selection-browser-page",
+        sequence: 0,
+        occurredAt: "2026-08-18T12:01:01.000Z",
+        kind: "browser_navigated",
+        payload: { url: "https://docs.example.com/guide", title: "Guide", host: "docs.example.com" },
+      }),
+      event({
+        eventId: "selection-focus",
+        sequence: 1,
+        occurredAt: "2026-08-18T12:01:02.000Z",
+        kind: "focus_changed",
+        payload: { applicationId: "firefox", windowTitle: "Guide — Firefox", role: "text_input", label: null },
+        source: hostSource,
+      }),
+      event({
+        eventId: "selection-text",
+        sequence: 2,
+        occurredAt: "2026-08-18T12:01:03.000Z",
+        kind: "text_context_changed",
+        payload: { prefix: "", suffix: "", selection: "TypeError", language: null },
+        source: hostSource,
+      }),
+    ],
+    cutPoints: [{
+      id: "after-screen-selection",
+      eventIndex: 3,
+      expectedKind: "search_selection",
+      description: "A screen-text selection over an active browser page should suggest a search.",
+    }],
+  },
+  {
+    // Window-title churn is the most common screen-text output — every tab
+    // switch emits one — and none of it is actionable on its own.
+    id: "screen-text-title-churn-none",
+    title: "Predict nothing from window-title churn alone",
+    events: [
+      event({
+        eventId: "churn-app",
+        sequence: 0,
+        occurredAt: "2026-08-18T12:02:00.000Z",
+        kind: "application_activated",
+        payload: { applicationId: "terminal", applicationName: "Terminal" },
+        source: hostSource,
+      }),
+      event({
+        eventId: "churn-window-1",
+        sequence: 1,
+        occurredAt: "2026-08-18T12:02:01.000Z",
+        kind: "window_changed",
+        payload: { applicationId: "terminal", title: "bash — squid", bounds: null },
+        source: hostSource,
+      }),
+      event({
+        eventId: "churn-window-2",
+        sequence: 2,
+        occurredAt: "2026-08-18T12:02:02.000Z",
+        kind: "window_changed",
+        payload: { applicationId: "terminal", title: "bash — squid/src", bounds: null },
+        source: hostSource,
+      }),
+    ],
+    cutPoints: [{
+      id: "after-title-churn",
+      eventIndex: 2,
+      expectedKind: "none",
+      description: "Title changes without editor focus or saves justify no prediction.",
+    }],
   },
 ];
