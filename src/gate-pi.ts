@@ -18,9 +18,11 @@ const result = await runProviderGate({
   // must skip, not fail — otherwise a config outage is indistinguishable from
   // a ranking regression.
   probeAvailability: () => new PiRuntime().checkAvailability(),
-  // Well above the ~7s observed single-call latency, below the point where a
-  // hung provider would stall the whole gate.
-  timeoutMs: 30_000,
+  // Well above the observed 10–35s single-call latency of the bifrost
+  // endpoint (time-to-first-byte varies widely), below the point where a
+  // hung provider would stall the whole gate. The gate measures ranking
+  // quality; endpoint slowness must not read as a wrong answer.
+  timeoutMs: 90_000,
 });
 
 console.log(JSON.stringify(result, null, 2));
