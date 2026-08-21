@@ -11,6 +11,10 @@ import {
   type ScreenTextFrame,
   type ScreenTextReaderFactory,
 } from "./screen-text-source.js";
+import {
+  dispatchTopCandidate,
+  resolveWatchActions,
+} from "./watch-actions.js";
 import { resolveWatchProvider } from "./watch-provider.js";
 
 const readerKind = process.env.SQUID_SCREEN_READER ?? "synthetic";
@@ -78,6 +82,15 @@ const watch = createWatchRuntime({
 // restart cannot re-ingest an event the store already holds.
 const restored = await watch.runtime.restore();
 
+// The action half of the closed loop, off unless SQUID_ACTIONS opts in. Like
+// the provider above it is resolved before the source starts: a typo in the
+// variable must fail loudly here, not silently disable execution.
+const actions = await resolveWatchActions(watch.runtime, watch.ledger);
+if (actions !== undefined && "configError" in actions) {
+  console.error(actions.configError);
+  process.exit(2);
+}
+
 const source = new ScreenTextActivitySource({
   readerFactory,
   onDiagnostic: (diagnostic) => {
@@ -99,13 +112,28 @@ await source.start(async (event) => {
     selection: result.ingest.state.focus?.selection ?? null,
   }));
   if (result.prediction !== null) {
-    void result.prediction.then((outcome) => {
+    void result.prediction.then(async (outcome) => {
       console.log(JSON.stringify({
         requestId: outcome.requestId,
         status: outcome.status,
         provider: outcome.provider,
         predictions: outcome.candidates.map((prediction) => prediction.kind),
       }));
+      if (actions !== undefined) {
+        const action = await dispatchTopCandidate(outcome, outcome.candidates, actions.dispatcher);
+        if (action !== null) {
+          console.log(JSON.stringify({
+            dispatched: action.candidateId,
+            outcome: action.outcome,
+            ...(action.error !== undefined ? { error: action.error } : {}),
+          }));
+        }
+      }
+    }).catch((error) => {
+      // The prediction promise itself never rejects (the coordinator resolves
+      // every request); this guards the dispatch half so one failed dispatch
+      // cannot take down the ingest loop.
+      console.error(JSON.stringify({ dispatchError: error instanceof Error ? error.message : String(error) }));
     });
   }
 });
@@ -115,6 +143,7 @@ console.error(JSON.stringify({
   reader: readerKind,
   source: source.id,
   provider: resolved.selection.provider.name,
+  ...(actions !== undefined ? { actions: actions.gatewayId } : {}),
   store: watch.databasePath ?? "memory",
   ledger: watch.ledgerPath ?? "memory",
   restoredActions: restored.recentActions.length,
@@ -130,6 +159,9 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     // ledger write in flight, and closing first drops that record.
     void source.stop().then(async () => {
       await watch.dispose();
+      // The MCP client transport is closed last so a dispatch still in flight
+      // during drain keeps its connection.
+      if (actions !== undefined) await actions.close();
       process.exit(0);
     }).catch((error) => {
       console.error(JSON.stringify({ shutdownError: error instanceof Error ? error.message : String(error) }));

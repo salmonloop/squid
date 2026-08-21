@@ -64,6 +64,7 @@ bun run watch:screen
 - `src/ledger-report.ts` — shadow-mode report over a persisted ledger: attempts by provider/status, fallback reasons, candidate kinds, latency percentiles. Pure aggregation over ledger records; the CLI tail reads the database a durable watch run wrote.
 - `src/capability-gateway.ts` — pluggable capability boundary: `CapabilityGateway` interface, `ActionRequest`/`ActionResult`, a `FakeCapabilityGateway` for offline tests, and a `CapabilityDispatcher` that dispatches a ledger-resolved candidate by ID and records the dispatched→succeeded/failed lifecycle as ledger feedback. A gateway failure is data (a `failed` result); a failed ledger write escapes, because an unrecorded dispatch must not look like a successful one. Dispatcher attribution (`gateway`, `error`) wins over gateway-supplied details. A real MCP server implements the gateway; the base owns intent and recording only. Acceptance policy — expiry, user confirmation — is not enforced here.
 - `src/mcp-gateway.ts` — the first real `CapabilityGateway`: maps accepted candidates onto calls to a connected MCP client (`@modelcontextprotocol/sdk`). One fixed mapping per supported kind — `search_selection`'s `{selection}` becomes `search_web({query})`, `run_tests`'s `{path}` becomes `run_command({command: "bun test <path>"})` — so candidates that lack what their tool needs are refused as failed results rather than guessed at. Protocol errors (`isError`), thrown invocations, and schema rejections all become `outcome: "failed"`. Transport lifecycle (stdio/HTTP/in-memory connect) stays with the entry point; the gateway owns only translation and reporting.
+- `src/watch-actions.ts` — wires the action half of the closed loop into both watch entry points: `resolveWatchActions` reads `SQUID_ACTIONS` / `SQUID_ACTIONS_MCP_COMMAND` and connects a stdio MCP client (off entirely when unset; a recognized variable with a bad value is a config error before any sink opens), and `dispatchTopCandidate` picks the best still-fresh candidate from a settled outcome and dispatches it. Only kinds in its auto-dispatch list are eligible — currently just `search_selection`, because `run_tests` executes a command on this machine and no confirmation step exists yet. Expiry is enforced here: nothing else in the dispatch path checks `expiresAt`.
 - `src/fake-prediction-provider.ts` — controllable `PredictionProvider` for tests and offline evaluation.
 - `src/pi-runtime.ts` — Pi adapter that implements `PredictionProvider`, requests one typed prediction via a terminating custom tool, respects `AbortSignal`, derives `expiresAt` per kind, and reports model reachability via `checkAvailability()`. Isolated behind an adapter so Node/RPC remains a fallback if deeper Bun incompatibilities appear.
 - `src/squid-core.ts` — orchestrates event ingestion, state reduction, and baseline prediction.
@@ -197,6 +198,16 @@ SQUID_SCREEN_POLL_MS=500 bun run watch:screen           # sampling cadence
 
 The macOS backend is real but not verifiable here: it needs a darwin host with an accessibility grant, so the seam and the adapter are tested through a fake reader and the backend is checked by hand — the same posture as the SQLite conformance suite, which tests the contract rather than the operating system. Its honest scope: `osascript` exposes no stable caret position, so `prefix`/`suffix` stay empty and text context is reported only when the user has a selection. It also cannot distinguish "the title query failed" from "the window has no title", so an empty title is treated as unreadable.
 
+### Dispatching actions
+
+Both watch entry points can close the loop from prediction to action. With `SQUID_ACTIONS=mcp` and an MCP server command, every settled prediction's best still-fresh candidate in the auto-dispatch list is dispatched through the MCP gateway; each dispatch writes `dispatched` and then `succeeded`/`failed` feedback to the ledger, so a run's action history lands next to its prediction history.
+
+```bash
+SQUID_ACTIONS=mcp SQUID_ACTIONS_MCP_COMMAND="bun run /path/to/mcp-server.ts" bun run watch:screen -- frames.json
+```
+
+Absent variables mean actions stay off — identical to the pre-dispatch behavior. A recognized variable holding an unrecognized value (or mcp mode without a command) exits at startup before any sink opens: a typo must fail loudly rather than silently disable execution. Only `search_selection` is auto-dispatched; `run_tests` executes a command on this machine and waits for a confirmation step that does not exist yet, so it is skipped even when ranked highest. Expiry is checked at dispatch time against wall-clock time, so a prediction that settled late acts on fresh context or not at all.
+
 ## Replay evaluation
 
 `bun run evaluate` runs the heuristic predictor against the versioned synthetic scenarios in `src/evaluation-fixtures.ts` and prints a deterministic JSON report.
@@ -249,6 +260,7 @@ Tests use `bun:test`. The test suite covers:
 - `FilesystemActivitySource` root validation, lifecycle, default and caller filtering, path normalization, event mapping, debounce, ordering under a slow emitter, shutdown drain, diagnostics, distinct per-instance session identity, restart against one durable store without an identity collision, and end-to-end ingestion through `SquidCore`.
 - `ScreenTextActivitySource` lifecycle, full-frame mapping to four host events, per-payload change detection (title-only, role-only, selection-only, and unchanged frames), degradation for missing application id / name / title / caret context, ordering and sequence under a slow emitter, burst collapsing, shutdown flush of the pending frame, reader and delivery diagnostics including retry of a rejected payload, recovery from a backend that fails to initialize, distinct per-instance session identity, and end-to-end ingestion through `SquidCore`.
 - `selectPredictionProvider`: environment parsing and defaults, the heuristic path touching no model seam at all, probe admission on reachable / unreachable / rejecting probes, and replay admission on passed / failed / skipped / rejecting gates.
+- `watch-actions`: config resolution (off when unset, config errors before any dependency is touched) and the dispatch loop end-to-end through the production chain — a real MCP server over the in-memory transport, a real `McpCapabilityGateway`, and a real `CapabilityDispatcher` over a ledger seeded with the attempt — covering successful dispatch with both feedback kinds, the `run_tests` skip despite top rank, expired-candidate refusal, and confidence ordering.
 
 Source tests inject a fake watcher, file probe, and screen-text reader, so they never depend on kernel watch timing, an accessibility API, or a subprocess. Real-watcher behavior is verified by the `bun run watch:files` smoke run in the release gate; the macOS accessibility backend is verified by hand with `SQUID_SCREEN_READER=darwin bun run watch:screen`.
 
@@ -258,7 +270,7 @@ Source tests inject a fake watcher, file probe, and screen-text reader, so they 
 - Browser extension / CDP integration.
 - IDE / LSP integration.
 - Overlay / suggestion UI.
-- Action execution beyond the gateway. `McpCapabilityGateway` maps two prediction kinds onto a connected MCP server, but no entry point wires a dispatcher into a live run yet, and the mapping table covers only `search_selection` and `run_tests`.
+- Action execution beyond the auto-dispatch loop. Both watch entry points dispatch a settled prediction's best fresh candidate through the MCP gateway when `SQUID_ACTIONS=mcp`, but only `search_selection` is auto-dispatched — `run_tests` waits for a user-confirmation step — and the mapping table covers only those two kinds.
 - Capture-time privacy policy beyond credential redaction. `RedactingCapturePolicy` already filters credential content at the ingress boundary in `PredictionRuntime`, and both watch entry points enable it; `ContextPolicy` separately covers provider egress. What is missing is user-facing policy — per-application exclusions, pause, and retention.
 
 ## Archived documents
