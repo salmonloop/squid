@@ -25,6 +25,7 @@ bun run build
 bun run dev
 bun run evaluate
 bun run gate:pi
+bun run ledger:report -- /absolute/path.db.ledger.db
 bun run watch:files -- /absolute/project/root
 bun run watch:screen
 ```
@@ -60,8 +61,8 @@ bun run watch:screen
 - `src/prediction-runtime.ts` — live orchestration boundary that feeds accepted/late core state snapshots into the coordinator without coupling provider latency to event ingestion. When a `PredictionLedger` is attached, every outcome is persisted as a durable attempt record; ledger failures are diagnostics and never block prediction delivery, and `dispose` drains in-flight writes so shutdown is durable.
 - `src/prediction-ledger.ts` — append-only prediction attempts and feedback with deterministic candidate envelopes, in-memory tests, and recoverable JSONL persistence.
 - `src/sqlite-prediction-ledger.ts` — append-only ledger on SQLite that declares its integrity rules as schema constraints instead of process-local checks.
+- `src/ledger-report.ts` — shadow-mode report over a persisted ledger: attempts by provider/status, fallback reasons, candidate kinds, latency percentiles. Pure aggregation over ledger records; the CLI tail reads the database a durable watch run wrote.
 - `src/capability-gateway.ts` — pluggable capability boundary: `CapabilityGateway` interface, `ActionRequest`/`ActionResult`, a `FakeCapabilityGateway` for offline tests, and a `CapabilityDispatcher` that dispatches a ledger-resolved candidate by ID and records the dispatched→succeeded/failed lifecycle as ledger feedback. A gateway failure is data (a `failed` result); a failed ledger write escapes, because an unrecorded dispatch must not look like a successful one. Dispatcher attribution (`gateway`, `error`) wins over gateway-supplied details. A real MCP server implements the gateway; the base owns intent and recording only. Acceptance policy — expiry, user confirmation — is not enforced here.
-- `src/prediction-log.ts` — structured shadow-mode log for prediction outcomes.
 - `src/fake-prediction-provider.ts` — controllable `PredictionProvider` for tests and offline evaluation.
 - `src/pi-runtime.ts` — Pi adapter that implements `PredictionProvider`, requests one typed prediction via a terminating custom tool, respects `AbortSignal`, derives `expiresAt` per kind, and reports model reachability via `checkAvailability()`. Isolated behind an adapter so Node/RPC remains a fallback if deeper Bun incompatibilities appear.
 - `src/squid-core.ts` — orchestrates event ingestion, state reduction, and baseline prediction.
@@ -238,7 +239,6 @@ Tests use `bun:test`. The test suite covers:
 - A shared `PredictionLedger` conformance suite (`tests/prediction-ledger-conformance.ts`) run against all three implementations: round-trip fidelity, optional-field presence and absence, append ordering, candidate-linked feedback, multiple feedback per candidate, idempotent re-append, duplicate-attempt and reference-error rejection, empty-candidate attempts, multi-candidate addressability, mutation isolation, and concurrent appends.
 - `SqlitePredictionLedger`: cross-connection durability, schema-enforced conflict rejection surviving a reopen, transactional rollback leaving no partial attempt, post-`close()` rejection, idempotent close, parent-directory creation, and sub-millisecond timestamp fidelity.
 - `CapabilityGateway`: fake-gateway outcomes, failure details, and thrown invocations; `CapabilityDispatcher` dispatch recording succeeded/failed feedback in order, a thrown invocation becoming a failed result, dispatcher attribution winning over conflicting gateway details, and rejection for a candidate absent from the ledger.
-- `PredictionLog`: structured recording of outcomes, cancellations, and field mapping.
 - Async evaluation: provider-based evaluation matching sync results, canned-provider scoring, hard timeout, and heuristic fallback.
 - `runProviderGate`: baseline-equal pass, ranking regression failure, skip (not failure) for an unconstructable provider and for a lazily-resolved provider that reports itself unavailable without spending a baseline run, skip when the probe itself rejects, scoring when the probe reports available, failure for a provider that never answers despite baseline-equal ranking, timeouts counted as fallbacks, full health for a healthy provider, `none`-correctness failure for an over-eager provider, same-corpus comparison, custom slack, and default-threshold bounds.
 - Deterministic replay evaluation: cut-point ranking, MRR, coverage, future-leakage guard, per-scenario predictor isolation, and report stability.

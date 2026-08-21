@@ -9,6 +9,7 @@
     "dev": "bun run src/main.ts",
     "evaluate": "bun run src/evaluate.ts",
     "gate:pi": "bun run src/gate-pi.ts",
+    "ledger:report": "bun run src/ledger-report.ts",
     "test": "bun test",
     "watch:files": "bun run src/watch-files.ts",
     "watch:screen": "bun run src/watch-screen.ts",
