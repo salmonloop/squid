@@ -1,12 +1,12 @@
 import { realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import { createWatchRuntime } from "./create-watch-runtime.js";
 import { FilesystemActivitySource } from "./filesystem-source.js";
 import type { FilePayload } from "./protocol.js";
-import { sqliteWatchExclusions } from "./sqlite-event-store.js";
-import { resolveWatchActions } from "./watch-actions.js";
-import { describeErrorForAudit, resolveSearchEgress } from "./action-egress.js";
-import { resolveWatchProvider } from "./watch-provider.js";
+import {
+  installWatchSignalHandlers,
+  startWatchSession,
+  watchedSinkExclusions,
+} from "./watch-session.js";
 
 const root = process.argv[2];
 if (root === undefined || !isAbsolute(root)) {
@@ -20,160 +20,31 @@ if (databasePath !== undefined && !isAbsolute(databasePath)) {
   process.exit(2);
 }
 
-// Choose the primary predictor before opening any sink: a config error or a
-// declined model must not leave a half-created database behind. The default
-// `SQUID_PROVIDER=heuristic` never touches a model.
-const resolved = await resolveWatchProvider();
-if (!resolved.ok) {
-  console.error(resolved.configError);
-  process.exit(2);
-}
-if (resolved.selection.declineReason !== null) {
-  console.error(JSON.stringify({
-    provider: resolved.selection.provider.name,
-    declined: resolved.selection.declineReason,
-  }));
-}
-
-// Store, ledger, projection, and prediction runtime are identical for every
-// watch entry point, so they are built in one place. Everything below this line
-// is filesystem-specific and stays here.
-// One egress resolution for the whole process: the runtime stamps its id onto
-// every attempt and admission compares that id against the policy the dispatcher
-// presents. Resolving twice could stamp deny and dispatch allow, which refuses
-// every action — including kinds unrelated to egress.
-const egress = resolveSearchEgress(process.env.SQUID_SEARCH_EGRESS);
-if ("configError" in egress) {
-  console.error(egress.configError);
-  process.exit(2);
-}
-
-const watch = createWatchRuntime({
-  ...(databasePath === undefined ? {} : { databasePath }),
-  provider: resolved.selection.provider,
-  contextPolicy: resolved.selection.contextPolicy,
-  actionTrust: resolved.selection.actionTrust,
-  egressPolicy: egress,
-  onDiagnostic: (diagnostic) => {
-    console.error(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
-  },
-});
-
-// Rebuild the dedupe index and projection from history before observing, so a
-// restart cannot re-ingest an event the store already holds.
-const restored = await watch.runtime.restore();
-
 const canonicalRoot = await realpath(root);
 
-// The action half of the closed loop, off unless SQUID_ACTIONS opts in. Like
-// the provider above it is resolved before the source starts: a typo in the
-// variable must fail loudly here, not silently disable execution.
-const actions = await resolveWatchActions(
-  watch.runtime,
-  watch.ledger,
-  process.env,
-  {
-    workingDirectory: canonicalRoot,
-    actionTrust: resolved.selection.actionTrust,
-    egressPolicy: egress,
+const started = await startWatchSession({
+  ...(databasePath === undefined ? {} : { databasePath }),
+  workingDirectory: canonicalRoot,
+  banner: { watching: root },
+  createSources: async (context) => {
+    const excludedPaths = await watchedSinkExclusions(context, canonicalRoot);
+    return [new FilesystemActivitySource({
+      root,
+      include: (relativePath) => !excludedPaths.has(relativePath),
+      onDiagnostic: context.onDiagnostic,
+    })];
   },
-);
-if (actions !== undefined && "configError" in actions) {
-  console.error(actions.configError);
-  await watch.dispose();
-  process.exit(2);
-}
-
-// Both sides must be canonical: the source reports paths relative to
-// `realpath(root)`, so comparing against a symlinked spelling would silently
-// match nothing and let the feedback loop back in. The store constructor above
-// has already created the database file, so it is resolvable here. The ledger is
-// a second SQLite database in the same tree and needs the same exclusions.
-const excludedPaths = new Set<string>();
-if (databasePath !== undefined && watch.ledgerPath !== undefined) {
-  for (const sinkPath of [databasePath, watch.ledgerPath]) {
-    for (const excluded of sqliteWatchExclusions(canonicalRoot, await realpath(sinkPath))) {
-      excludedPaths.add(excluded);
-    }
-  }
-}
-
-const source = new FilesystemActivitySource({
-  root,
-  include: (relativePath) => !excludedPaths.has(relativePath),
-  onDiagnostic: (diagnostic) => {
-    console.error(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
-  },
-});
-
-await source.start(async (event) => {
-  const result = await watch.runtime.ingest(event);
-  console.log(JSON.stringify({
+  describeEvent: (event, result) => ({
     kind: event.kind,
     path: (event.payload as FilePayload).path,
     disposition: result.ingest.disposition,
-  }));
-  if (result.prediction !== null) {
-    void result.prediction.then(async (outcome) => {
-      console.log(JSON.stringify({
-        requestId: outcome.requestId,
-        status: outcome.status,
-        provider: outcome.provider,
-        predictions: outcome.candidates.map((prediction) => prediction.kind),
-      }));
-      if (actions !== undefined) {
-        const dispatched = await actions.dispatchTopCandidate(
-          outcome,
-          outcome.candidates,
-          result.ingest.disposition,
-        );
-        if (dispatched !== null) {
-          // Status and reason codes only: gateway text may echo user content, so
-          // stdout carries the same sanitized shape the ledger stores.
-          console.log(JSON.stringify({
-            status: dispatched.status,
-            planDigest: dispatched.planDigest,
-            ...(dispatched.reasonCode === undefined ? {} : { reasonCode: dispatched.reasonCode }),
-            ...(dispatched.action === null ? {} : { outcome: dispatched.action.outcome }),
-          }));
-        }
-      }
-    }).catch((error) => {
-      // The prediction promise itself never rejects (the coordinator resolves
-      // every request); this guards the dispatch half so one failed dispatch
-      // cannot take down the ingest loop.
-      console.error(JSON.stringify({ dispatchError: describeErrorForAudit(error) }));
-    });
-  }
+  }),
 });
 
-console.error(JSON.stringify({
-  watching: root,
-  source: source.id,
-  provider: resolved.selection.provider.name,
-  ...(actions !== undefined ? { actions: actions.gatewayId } : {}),
-  store: watch.databasePath ?? "memory",
-  ledger: watch.ledgerPath ?? "memory",
-  restoredActions: restored.recentActions.length,
-}));
-
-let shuttingDown = false;
-for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  process.on(signal, () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    // Drain buffered events before exiting so no observed write is lost, then
-    // dispose: a prediction whose outcome has not yet been written still has a
-    // ledger write in flight, and closing first drops that record.
-    void source.stop().then(async () => {
-      // Cancel/settle confirmation and dispatch while the runtime is still
-      // open: rejection and terminal action feedback must reach the ledger.
-      if (actions !== undefined) await actions.close();
-      await watch.dispose();
-      process.exit(0);
-    }).catch((error) => {
-      console.error(JSON.stringify({ shutdownError: describeErrorForAudit(error) }));
-      process.exit(1);
-    });
-  });
+if ("configError" in started) {
+  console.error(started.configError);
+  process.exit(2);
 }
+
+console.error(JSON.stringify(started.session.banner));
+installWatchSignalHandlers(started.session);
