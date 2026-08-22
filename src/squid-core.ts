@@ -3,12 +3,15 @@ import type { EventStore } from "./event-store.js";
 import { HeuristicPredictor, type Predictor } from "./baseline-predictor.js";
 import { parseActivityEvent, type ActivityEvent, type PredictionCandidate, type WorldState } from "./protocol.js";
 import { buildWorldState, cloneWorldState, reduceWorldState } from "./world-state.js";
+import { digestWorldState } from "./state-digest.js";
 
 export type IngestDisposition = "accepted" | "duplicate" | "late";
 
 export interface IngestResult {
   disposition: IngestDisposition;
   state: WorldState;
+  stateDigest: string;
+  projectionGeneration: number;
   baselinePredictions: readonly PredictionCandidate[];
 }
 
@@ -25,6 +28,7 @@ export class SquidCore {
   private readonly eventsById = new Map<string, ActivityEvent>();
   private readonly eventsByIdentity = new Map<string, ActivityEvent>();
   private operationTail: Promise<void> = Promise.resolve();
+  private generation = 0;
 
   public constructor(
     private readonly eventStore: EventStore,
@@ -33,6 +37,14 @@ export class SquidCore {
 
   public get currentState(): WorldState {
     return cloneWorldState(this.state);
+  }
+
+  public get stateDigest(): string {
+    return digestWorldState(this.state);
+  }
+
+  public get projectionGeneration(): number {
+    return this.generation;
   }
 
   public async ingest(input: ActivityEvent): Promise<IngestResult> {
@@ -59,11 +71,13 @@ export class SquidCore {
     if (late) {
       const canonicalEvents = orderActivityEvents([...this.eventsById.values()]);
       this.replaceProjection(canonicalEvents);
+      this.generation += 1;
       return this.result("late");
     }
 
     this.state = reduceWorldState(this.state, event);
     this.latestProjectedEvent = event;
+    this.generation += 1;
     return this.result("accepted", event.occurredAt);
   }
 
@@ -96,6 +110,7 @@ export class SquidCore {
       this.remember(event);
     }
     this.replaceProjection(canonicalEvents);
+    this.generation += 1;
     return cloneWorldState(this.state);
   }
 
@@ -113,6 +128,8 @@ export class SquidCore {
     return {
       disposition,
       state,
+      stateDigest: digestWorldState(state),
+      projectionGeneration: this.generation,
       baselinePredictions: structuredClone(baselinePredictions),
     };
   }
