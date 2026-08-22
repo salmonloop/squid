@@ -281,15 +281,41 @@ describe("CapabilityDispatcher", () => {
     const confirmation = new ScriptedConfirmation({ outcome: "accepted", reason: "user_accepted" });
     const { runtime, gateway, dispatcher, request } = await setup({ confirmation });
 
+    const unknownPlan = { ...request.plan, attemptId: "never-recorded" };
     const unknown: DispatchRequest = {
       ...request,
-      plan: { ...request.plan, attemptId: "never-recorded" },
+      plan: unknownPlan,
+      planDigest: digestActionPlan(unknownPlan),
     };
     const result = await dispatcher.dispatch(unknown);
 
     expect(result.status).toBe("not_admitted");
     expect(result.reasonCode).toBe("attempt_missing");
     expect(gateway.recordedInvocations).toHaveLength(0);
+    await runtime.dispose();
+  });
+
+  it("refuses a request whose digest does not describe its plan", async () => {
+    const confirmation = new ScriptedConfirmation({ outcome: "accepted", reason: "user_accepted" });
+    const { runtime, ledger, gateway, dispatcher, request } = await setup({ confirmation });
+
+    // The digest is the identity the plan record, the decision, the claim, and
+    // the terminal outcome are all keyed by. A pair that disagrees would leave
+    // an audit trail describing an operation that never ran.
+    const result = await dispatcher.dispatch({
+      ...request,
+      planDigest: `sha256:${"f".repeat(64)}`,
+    });
+
+    expect(result.status).toBe("not_admitted");
+    expect(result.reasonCode).toBe("plan_digest_mismatch");
+    expect(gateway.recordedInvocations).toHaveLength(0);
+    // Refused before anything was written: no plan, no decision, no claim.
+    const records = await ledger.all();
+    expect(records.filter((r) => r.recordType === "plan")).toHaveLength(0);
+    expect(records.filter((r) => r.recordType === "plan_decision")).toHaveLength(0);
+    expect(records.filter((r) => r.recordType === "plan_dispatch")).toHaveLength(0);
+    expect(confirmation.seen).toHaveLength(0);
     await runtime.dispose();
   });
 
@@ -336,9 +362,11 @@ describe("CapabilityDispatcher", () => {
     const confirmation = new ScriptedConfirmation({ outcome: "accepted", reason: "user_accepted" });
     const { runtime, ledger, gateway, dispatcher, request } = await setup({ confirmation });
 
+    const orphanPlan = { ...request.plan, attemptId: "attempt-that-never-persisted" };
     const orphaned: DispatchRequest = {
       ...request,
-      plan: { ...request.plan, attemptId: "attempt-that-never-persisted" },
+      plan: orphanPlan,
+      planDigest: digestActionPlan(orphanPlan),
     };
     const result = await dispatcher.dispatch(orphaned);
 

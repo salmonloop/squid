@@ -176,6 +176,21 @@ export class CapabilityDispatcher {
   public async dispatch(request: DispatchRequest): Promise<DispatchOutcome> {
     const { plan, planDigest } = request;
 
+    // The digest and the plan must be the same fact. Everything downstream — the
+    // recorded plan, the user's decision, the claim, the terminal outcome — is
+    // keyed by the digest while the gateway executes the plan, so a mismatched
+    // pair would produce an audit trail describing an operation that never ran.
+    // Enforced here rather than trusted from the caller: there is one call site
+    // today, and this invariant is what the whole boundary rests on.
+    if (digestActionPlan(plan) !== planDigest) {
+      return {
+        status: "not_admitted",
+        planDigest,
+        reasonCode: "plan_digest_mismatch",
+        action: null,
+      };
+    }
+
     // A plan whose attempt never landed durably cannot be dispatched: the claim
     // would have nothing to validate against. This is the "attempt write failed"
     // path — the prediction was still delivered, but the action is refused with
