@@ -305,4 +305,27 @@ describe("CapabilityDispatcher", () => {
     expect(serialized).not.toContain(root);
     await runtime.dispose();
   });
+
+  it("dispatches nothing when the attempt write failed, with zero capability calls", async () => {
+    // The prediction was delivered but its attempt never landed durably. There
+    // is nothing for a claim to validate against, so the action is refused
+    // outright rather than dispatched on an unauditable basis.
+    const confirmation = new ScriptedConfirmation({ outcome: "accepted", reason: "user_accepted" });
+    const { runtime, ledger, gateway, dispatcher, request } = await setup({ confirmation });
+
+    const orphaned: DispatchRequest = {
+      ...request,
+      plan: { ...request.plan, attemptId: "attempt-that-never-persisted" },
+    };
+    const result = await dispatcher.dispatch(orphaned);
+
+    expect(result.status).toBe("not_admitted");
+    expect(result.reasonCode).toBe("attempt_missing");
+    expect(gateway.recordedInvocations).toHaveLength(0);
+    const records = await ledger.all();
+    expect(records.filter((r) => r.recordType === "plan_dispatch")).toHaveLength(0);
+    // Not even the plan is recorded: its reference could not be validated.
+    expect(records.filter((r) => r.recordType === "plan")).toHaveLength(0);
+    await runtime.dispose();
+  });
 });

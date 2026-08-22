@@ -221,6 +221,111 @@ describe("ledger backend conformance for dispatch records", () => {
   }
 });
 
+describe("concurrent claims", () => {
+  /**
+   * Two dispatches of one candidate racing each other. Exactly one may win: the
+   * claim is what authorizes an outside-world call, so a second winner would
+   * mean the same action runs twice.
+   */
+  it("admits exactly one winner across parallel claims", async () => {
+    for (const create of [
+      async () => new InMemoryPredictionLedger(),
+      async () => new SqlitePredictionLedger(
+        join(await mkdtemp(join(tmpdir(), "squid-race-")), "ledger.db"),
+      ),
+    ]) {
+      const ledger = await seededIn(await create());
+      try {
+        await ledger.recordDecision(createPlanDecisionRecord({
+          planDigest: DIGEST,
+          decision: "accepted",
+          detailsDigest: `sha256:${"d".repeat(64)}`,
+        }));
+
+        const now = new Date().toISOString();
+        const attempts = await Promise.all(
+          Array.from({ length: 8 }, (_unused, index) =>
+            ledger.claimDispatch(baseInputs, now, () => `race-token-${index}`)),
+        );
+
+        const claimed = attempts.filter((result) => result.status === "claimed");
+        expect(claimed).toHaveLength(1);
+        // Everything else is refused, and no refusal is a fabricated success.
+        expect(attempts.filter((r) => r.status === "already_claimed")).toHaveLength(7);
+        const dispatches = (await ledger.all())
+          .filter((record) => record.recordType === "plan_dispatch");
+        expect(dispatches).toHaveLength(1);
+      } finally {
+        if (ledger instanceof SqlitePredictionLedger) ledger.close();
+      }
+    }
+  });
+});
+
+describe("reconciliation across a restart", () => {
+  /**
+   * A claimed dispatch whose process died before completion. On reopen the
+   * record must still be there, still open — that is the reconciliation signal —
+   * and the stale token must not be able to close it.
+   */
+  it("keeps an open dispatched record and refuses a stale token after reopen", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "squid-restart-"));
+    const path = join(dir, "ledger.db");
+
+    const first = await seededIn(new SqlitePredictionLedger(path));
+    let token: string;
+    try {
+      await first.recordDecision(createPlanDecisionRecord({
+        planDigest: DIGEST,
+        decision: "accepted",
+        detailsDigest: `sha256:${"d".repeat(64)}`,
+      }));
+      const claimed = await first.claimDispatch(
+        baseInputs, new Date().toISOString(), () => "survives-restart",
+      );
+      if (claimed.status !== "claimed") throw new Error("expected a claim");
+      token = claimed.claimToken;
+    } finally {
+      (first as SqlitePredictionLedger).close();
+    }
+
+    // Reopen: the crash left a claimed, uncompleted dispatch.
+    const reopened = new SqlitePredictionLedger(path);
+    try {
+      const dispatch = (await reopened.all())
+        .find((record) => record.recordType === "plan_dispatch");
+      expect(dispatch).toBeDefined();
+      expect(dispatch).not.toHaveProperty("completedOutcome");
+
+      // Re-claiming is refused: the action may already have run.
+      const again = await reopened.claimDispatch(
+        baseInputs, new Date().toISOString(), () => "second-token",
+      );
+      expect(again.status).toBe("already_claimed");
+
+      // A wrong token cannot close it; the surviving token still can, because
+      // reconciliation is a decision a human makes with the real outcome.
+      const wrong = await reopened.completeDispatch(
+        { planDigest: DIGEST, claimToken: "not-the-token" },
+        "succeeded",
+        `sha256:${"e".repeat(64)}`,
+        new Date().toISOString(),
+      );
+      expect(wrong).toEqual({ status: "conflict", reasonCode: "token_mismatch" });
+
+      const settled = await reopened.completeDispatch(
+        { planDigest: DIGEST, claimToken: token },
+        "succeeded",
+        `sha256:${"e".repeat(64)}`,
+        new Date().toISOString(),
+      );
+      expect(settled).toEqual({ status: "completed" });
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
 async function seededIn(ledger: PredictionLedger): Promise<PredictionLedger> {
   const source = await seeded();
   for (const record of await source.all()) {
