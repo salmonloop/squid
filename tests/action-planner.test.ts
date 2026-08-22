@@ -15,7 +15,7 @@ async function workspace(): Promise<string> {
 
 describe("planAction", () => {
   it("refuses kinds that have no capability mapping", async () => {
-    for (const kind of ["draft_completion", "inspect_error", "none"] as const) {
+    for (const kind of ["draft_completion", "none"] as const) {
       const result = await planAction({ ...identity, kind, parameters: {} });
       expect(isPlanFailure(result) && result.reasonCode).toBe("kind_not_actionable");
     }

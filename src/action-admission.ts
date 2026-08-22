@@ -31,6 +31,9 @@ export type AdmissionReasonCode =
   | "search_egress_denied"
   | "coding_application_mismatch"
   | "saved_path_mismatch"
+  | "command_outcome_missing"
+  | "command_outcome_changed"
+  | "command_succeeded"
   | "plan_kind_unsupported";
 
 export type AdmissionResult =
@@ -105,6 +108,8 @@ export function admitAction(context: AdmissionContext): AdmissionResult {
       return admitSearch(context);
     case "run_tests":
       return admitRunTests(context);
+    case "inspect_error":
+      return admitInspectError(context);
     default:
       return refuse("plan_kind_unsupported");
   }
@@ -141,6 +146,30 @@ function admitSearch(context: AdmissionContext): AdmissionResult {
   // The selection must have been observed after the page was: a selection older
   // than the current page was made against a document that is no longer shown.
   if (text.observationOrdinal <= page.observationOrdinal) return refuse("observation_out_of_order");
+  return { admitted: true };
+}
+
+/**
+ * inspect_error re-runs a failed check, so its checks are about the failure
+ * still being the current one.
+ *
+ * The class must match what the plan was built for, and the command must still
+ * be *failing*. The second condition is the one that matters in practice: a user
+ * who fixes the problem and re-runs successfully before confirming should not
+ * then have the old failure's re-run executed. Success is not a smaller version
+ * of failure — it is the reason to drop the action.
+ */
+function admitInspectError(context: AdmissionContext): AdmissionResult {
+  const { state, candidate } = context;
+  const outcome = state.lastCommandOutcome;
+  if (outcome === null) return refuse("command_outcome_missing");
+  // Compared against the candidate rather than the plan: the plan holds a
+  // quoted command string, and re-parsing it to recover the class would be a
+  // second implementation of a mapping that already exists.
+  if (candidate?.parameters.commandClass !== outcome.commandClass) {
+    return refuse("command_outcome_changed");
+  }
+  if (outcome.succeeded) return refuse("command_succeeded");
   return { admitted: true };
 }
 

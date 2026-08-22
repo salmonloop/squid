@@ -14,9 +14,39 @@ import type { PredictionCandidate, PredictionKind } from "./protocol.js";
 export const actionablePredictionKinds = [
   "search_selection",
   "run_tests",
+  "inspect_error",
 ] as const satisfies readonly PredictionKind[];
 
 export type ActionablePredictionKind = (typeof actionablePredictionKinds)[number];
+
+/**
+ * Command classes an `inspect_error` plan is allowed to re-run.
+ *
+ * Deliberately a subset of what `classifyCommand` can report. A failed check is
+ * safe to run again — it reads the project and reports — while the excluded
+ * classes are not: `install` touches the network and a lockfile, `vcs` rewrites
+ * history, `container` can deploy, and `other` is by definition unknown. Getting
+ * this list wrong would let a failed `kubectl apply` propose running itself
+ * again.
+ *
+ * `build` is excluded for a weaker but real reason: it writes build output, and
+ * re-running it tells the user nothing the failure did not already.
+ */
+export const reinspectableCommandClasses = ["test", "lint", "typecheck"] as const;
+
+export type ReinspectableCommandClass = (typeof reinspectableCommandClasses)[number];
+
+/** The project script each re-runnable class maps to. */
+export const REINSPECT_COMMANDS: Readonly<Record<ReinspectableCommandClass, readonly string[]>> = {
+  test: ["bun", "test"],
+  lint: ["bun", "run", "lint"],
+  typecheck: ["bun", "run", "typecheck"],
+};
+
+export function isReinspectableCommandClass(value: unknown): value is ReinspectableCommandClass {
+  return typeof value === "string"
+    && (reinspectableCommandClasses as readonly string[]).includes(value);
+}
 
 /**
  * The immutable operation Squid may ask the outside world to perform.

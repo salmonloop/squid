@@ -7,7 +7,9 @@ import type { ActivitySource } from "./activity-source.js";
 import type { FilePayload } from "./protocol.js";
 import { resolveBrowserReader } from "./resolve-browser-reader.js";
 import { resolveScreenReader } from "./resolve-screen-reader.js";
+import { resolveTerminalReader } from "./resolve-terminal-reader.js";
 import { ScreenTextActivitySource } from "./screen-text-source.js";
+import { TerminalCommandActivitySource } from "./terminal-command-source.js";
 import {
   installWatchSignalHandlers,
   startWatchSession,
@@ -65,6 +67,12 @@ if ("configError" in browser) {
   process.exit(2);
 }
 
+const terminal = resolveTerminalReader();
+if ("configError" in terminal) {
+  console.error(terminal.configError);
+  process.exit(2);
+}
+
 const canonicalRoot = await realpath(root);
 
 const started = await startWatchSession({
@@ -76,6 +84,7 @@ const started = await startWatchSession({
     watching: root,
     reader: reader.readerKind,
     browser: browser.enabled ? browser.readerKind : "off",
+    terminal: terminal.enabled ? terminal.readerKind : "off",
   },
   createSources: async (context) => {
     // Only the filesystem source needs exclusions: neither a screen reader nor a
@@ -94,12 +103,19 @@ const started = await startWatchSession({
       }),
     ];
     if (browser.enabled) {
-      // Last, so a page is observed after the foreground it belongs to. The
-      // reducer drops an owner that does not match the current foreground, and
-      // `admitSearch` requires the selection to have been observed *after* the
-      // page, so ordering here decides whether the three ever agree.
+      // Before the terminal source but after the screen source, so a page is
+      // observed once a foreground exists to attribute it to. The reducer drops
+      // an owner that does not match the current foreground, and `admitSearch`
+      // requires the selection to have been observed *after* the page, so
+      // ordering here decides whether the three ever agree.
       sources.push(new BrowserPageActivitySource({
         readerFactory: browser.readerFactory,
+        onDiagnostic: context.onDiagnostic,
+      }));
+    }
+    if (terminal.enabled) {
+      sources.push(new TerminalCommandActivitySource({
+        readerFactory: terminal.readerFactory,
         onDiagnostic: context.onDiagnostic,
       }));
     }
@@ -124,6 +140,11 @@ const started = await startWatchSession({
       // history, and this line goes to stdout. `RedactingContextPolicy` makes the
       // same distinction for what a provider may see.
       browserHost: state.currentBrowserPage?.host ?? null,
+      // Class and exit code only. The raw command line never entered the
+      // timeline, so there is nothing here to withhold — but naming the fields
+      // explicitly keeps that visible at the log boundary.
+      commandClass: state.lastCommandOutcome?.commandClass ?? null,
+      commandExit: state.lastCommandOutcome?.exitCode ?? null,
       selectionLength: selection === null
         ? null
         : sanitizeAuditText(selection, "selection").originalLength,

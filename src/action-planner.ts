@@ -5,6 +5,8 @@ import { sanitizeAuditText } from "./action-egress.js";
 import {
   digestActionPlan,
   digestCandidateParameters,
+  isReinspectableCommandClass,
+  REINSPECT_COMMANDS,
   type ImmutableActionPlan,
 } from "./action-plan.js";
 import type { PredictionCandidate } from "./protocol.js";
@@ -30,7 +32,8 @@ export type PlanFailureReason =
   | "path_absolute"
   | "path_control_characters"
   | "path_escapes_workdir"
-  | "path_unresolvable";
+  | "path_unresolvable"
+  | "workdir_unresolvable";
 
 /**
  * What the planner needs to build one plan: the predicted operation plus the
@@ -178,8 +181,68 @@ export async function planAction(
       }, parameters);
     }
 
+    /**
+     * Re-runs the failed check so its output is in front of the user.
+     *
+     * The mapping is narrow because the captured fact is narrow.
+     * `TerminalCommandCompletedPayload` holds a class, a flag, and an exit code —
+     * no command text, no output, no working directory — because a shell command
+     * line is among the most sensitive text on a developer's machine and capture
+     * is irreversible. So "show me the failing output" cannot be served from
+     * history; the output has to be produced again.
+     *
+     * That rules out the two alternatives. Opening the file at the failing line
+     * needs a line number nothing captured, and re-running with more verbosity
+     * needs the original command. Re-running the project's own script for the
+     * class is the only option the recorded fact actually supports.
+     */
+    case "inspect_error": {
+      const commandClass = parameters.commandClass;
+      if (!isReinspectableCommandClass(commandClass)) {
+        // Includes every class deliberately left out of the re-runnable set:
+        // `install` touches the network, `vcs` rewrites history, `container` can
+        // deploy, `other` is unknown. A failed deploy must not propose itself.
+        return { reasonCode: "parameters_invalid" };
+      }
+      const workdir = context.workingDirectory;
+      if (workdir === undefined) {
+        return { reasonCode: "workdir_missing" };
+      }
+      if (!isAbsolute(workdir)) {
+        return { reasonCode: "workdir_not_absolute" };
+      }
+      if (/[\u0000-\u001F\u007F]/u.test(workdir)) {
+        return { reasonCode: "workdir_control_characters" };
+      }
+      let canonicalWorkdir: string;
+      try {
+        canonicalWorkdir = await resolvePath(workdir);
+      } catch {
+        return { reasonCode: "workdir_unresolvable" };
+      }
+
+      // No path parameter at all, so there is nothing to contain: the command is
+      // fixed by the class and runs at the canonical root. `canonicalTarget` stays
+      // null, which is what tells the gateway there is no path boundary to
+      // re-verify before the call.
+      const command = `cd ${quote([canonicalWorkdir])} && ${quote([...REINSPECT_COMMANDS[commandClass]])}`;
+      return finish({
+        planSchemaVersion: 1,
+        kind,
+        candidateId: identity.candidateId,
+        attemptId: identity.attemptId,
+        tool: "run_command",
+        arguments: { command },
+        summary: command,
+        // Same posture as `run_tests`: this executes locally, so the user sees
+        // the exact command first.
+        confirmation: "required",
+        canonicalWorkingDirectory: canonicalWorkdir,
+        canonicalTarget: null,
+      }, parameters);
+    }
+
     case "draft_completion":
-    case "inspect_error":
     case "none":
       return { reasonCode: "kind_not_actionable" };
 
