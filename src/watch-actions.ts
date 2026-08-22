@@ -20,6 +20,7 @@ import { McpCapabilityGateway } from "./mcp-gateway.js";
 import type { PredictionCandidate } from "./protocol.js";
 import type { PredictionLedger } from "./prediction-ledger.js";
 import type { PredictionRuntime } from "./prediction-runtime.js";
+import type { IngestDisposition } from "./squid-core.js";
 
 export interface WatchActionsResolution {
   readonly gatewayId: string;
@@ -27,6 +28,8 @@ export interface WatchActionsResolution {
   dispatchTopCandidate(
     outcome: { readonly requestId: string },
     candidates: readonly PredictionCandidate[],
+    /** Disposition of the triggering event; late triggers never dispatch. */
+    triggerDisposition?: IngestDisposition,
   ): Promise<DispatchOutcome | null>;
   /** Closes the client transport. */
   close(): Promise<void>;
@@ -154,11 +157,12 @@ export async function resolveWatchActions(
   return {
     gatewayId: gateway.id,
     egressPolicy: egress,
-    dispatchTopCandidate: (outcome, candidates) => {
+    dispatchTopCandidate: (outcome, candidates, triggerDisposition) => {
       if (closing) return Promise.resolve(null);
       const operation = dispatchTopCandidate(outcome, candidates, dispatcher, {
         egressPolicy: egress,
         ...(workingDirectory === undefined ? {} : { workingDirectory }),
+        ...(triggerDisposition === undefined ? {} : { triggerDisposition }),
       });
       pending.add(operation);
       void operation.then(
@@ -192,6 +196,14 @@ export interface DispatchCandidateOptions {
   readonly egressPolicy: EgressPolicy;
   readonly workingDirectory?: string;
   readonly now?: () => Date;
+  /**
+   * Disposition of the event that triggered this prediction. A late event
+   * reprojects history and may still produce a useful prediction, but acting on
+   * one would mean acting on a world that has already moved past it — so late
+   * predictions stay observational. Defaults to "accepted" for callers that only
+   * ever ingest in order.
+   */
+  readonly triggerDisposition?: IngestDisposition;
 }
 
 export async function dispatchTopCandidate(
@@ -201,6 +213,14 @@ export async function dispatchTopCandidate(
   options: DispatchCandidateOptions,
 ): Promise<DispatchOutcome | null> {
   const now = options.now ?? (() => new Date());
+
+  // Refused before any planning work: a late trigger cannot authorize an action
+  // no matter how good its candidate looks. Admission would refuse the claim
+  // anyway, but stopping here means no plan is built and no confirmation is
+  // shown for something that could never run.
+  if ((options.triggerDisposition ?? "accepted") !== "accepted") {
+    return null;
+  }
 
   // Rank first, then take exactly one. `ordinal` is the candidate's position in
   // the original outcome, which is what the ledger's candidate IDs encode.

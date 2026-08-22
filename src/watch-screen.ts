@@ -125,7 +125,11 @@ await source.start(async (event) => {
         predictions: outcome.candidates.map((prediction) => prediction.kind),
       }));
       if (actions !== undefined) {
-        const dispatched = await actions.dispatchTopCandidate(outcome, outcome.candidates);
+        const dispatched = await actions.dispatchTopCandidate(
+          outcome,
+          outcome.candidates,
+          result.ingest.disposition,
+        );
         if (dispatched !== null) {
           // Status and reason codes only: gateway text may echo user content, so
           // stdout carries the same sanitized shape the ledger stores.

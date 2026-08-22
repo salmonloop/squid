@@ -498,6 +498,33 @@ describe("dispatchTopCandidate", () => {
     await close();
   });
 
+  it("never dispatches from a late trigger, even with a perfect candidate", async () => {
+    // A late event reprojects history; its prediction is observational only.
+    const candidates = [candidate("search_selection", {
+      confidence: 0.9,
+      parameters: { selection: "typebox" },
+    })];
+    const { queries, ledger, dispatcher, requestId, egressPolicy, close } = await setup({
+      candidates,
+      events: browserSelection("typebox"),
+    });
+
+    const result = await dispatchTopCandidate(
+      { requestId },
+      candidates,
+      dispatcher,
+      { egressPolicy, triggerDisposition: "late" },
+    );
+
+    // Refused before planning: no plan record, no claim, no tool call.
+    expect(result).toBeNull();
+    expect(queries).toEqual([]);
+    const records = await ledger.all();
+    expect(records.filter((r) => r.recordType === "plan")).toHaveLength(0);
+    expect(records.filter((r) => r.recordType === "plan_dispatch")).toHaveLength(0);
+    await close();
+  });
+
   it("skips an expired candidate instead of acting on stale context", async () => {
     const candidates = [candidate("search_selection", {
       expiresAt: new Date(Date.now() - 1000).toISOString(),
