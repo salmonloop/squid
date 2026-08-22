@@ -9,7 +9,10 @@ import {
 } from "./prediction-ledger.js";
 import type { PredictionRuntime } from "./prediction-runtime.js";
 import type { PredictionCandidate } from "./protocol.js";
-import type { ActionConfirmationPolicy } from "./action-confirmation.js";
+import type {
+  ActionConfirmationDecision,
+  ActionConfirmationPolicy,
+} from "./action-confirmation.js";
 
 /**
  * Result of a capability invocation.
@@ -288,11 +291,20 @@ export class CapabilityDispatcher {
     }
     // The policy sees the whole immutable plan, not a summary copied out of it:
     // whatever it prints is byte-for-byte what `invoke` will execute.
-    const decision = await this.confirmation.confirm({
-      candidateId: plan.candidateId,
-      plan,
-      expiresAt: request.candidate.expiresAt,
-    });
+    let decision: ActionConfirmationDecision;
+    try {
+      decision = await this.confirmation.confirm({
+        candidateId: plan.candidateId,
+        plan,
+        expiresAt: request.candidate.expiresAt,
+      });
+    } catch {
+      // A confirmation policy that throws — a closed stream, a crashed prompt —
+      // is not consent. Treated as a refusal so the caller still gets a
+      // DispatchOutcome rather than an exception, and recorded as one so the
+      // plan does not sit in the ledger as an undecided proposal forever.
+      decision = { outcome: "rejected", reason: "input_closed" };
+    }
     await this.ledger.recordDecision(createPlanDecisionRecord({
       planDigest,
       decision: decision.outcome,

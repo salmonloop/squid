@@ -306,6 +306,29 @@ describe("CapabilityDispatcher", () => {
     await runtime.dispose();
   });
 
+  it("treats a throwing confirmation policy as a refusal, not as consent", async () => {
+    // A crashed prompt or a closed stream is not approval. The caller must still
+    // get a DispatchOutcome, and the plan must not sit in the ledger forever as
+    // an undecided proposal.
+    const confirmation: ActionConfirmationPolicy = {
+      confirm: async () => {
+        throw new Error("stdin vanished");
+      },
+    };
+    const { runtime, ledger, gateway, dispatcher, request } = await setup({ confirmation });
+
+    const result = await dispatcher.dispatch(request);
+
+    expect(result.status).toBe("not_accepted");
+    expect(gateway.recordedInvocations).toHaveLength(0);
+    const records = await ledger.all();
+    const decisions = records.filter((r) => r.recordType === "plan_decision");
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({ decision: "rejected" });
+    expect(records.filter((r) => r.recordType === "plan_dispatch")).toHaveLength(0);
+    await runtime.dispose();
+  });
+
   it("dispatches nothing when the attempt write failed, with zero capability calls", async () => {
     // The prediction was delivered but its attempt never landed durably. There
     // is nothing for a claim to validate against, so the action is refused
