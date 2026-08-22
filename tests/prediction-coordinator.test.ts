@@ -83,6 +83,7 @@ describe("PredictionCoordinator", () => {
       succeeded: false,
       exitCode: 1,
     };
+    state.lastEventKind = "terminal_command_completed";
 
     const provider = new FakePredictionProvider({
       candidates: [],
@@ -112,6 +113,7 @@ describe("PredictionCoordinator", () => {
       succeeded: false,
       exitCode: 1,
     };
+    state.lastEventKind = "terminal_command_completed";
 
     const provider = new FakePredictionProvider({
       candidates: [candidate("run_tests", 0.9)],
@@ -392,6 +394,7 @@ describe("SyncPredictorProvider", () => {
       succeeded: false,
       exitCode: 1,
     };
+    state.lastEventKind = "terminal_command_completed";
 
     const controller = new AbortController();
     controller.abort();
