@@ -13,6 +13,7 @@ import {
 } from "./screen-text-source.js";
 import { resolveWatchActions } from "./watch-actions.js";
 import { resolveWatchProvider } from "./watch-provider.js";
+import { sanitizeAuditText } from "./action-egress.js";
 
 const readerKind = process.env.SQUID_SCREEN_READER ?? "synthetic";
 if (readerKind !== "darwin" && readerKind !== "synthetic") {
@@ -109,12 +110,18 @@ await source.start(async (event) => {
   // The projection is built from the *captured* event, so anything the capture
   // policy redacted stays redacted here; logging `event.payload` would print the
   // raw title this source observed, including one holding a credential.
+  // The selection is the one piece of text that needs explicit consent before it
+  // may leave the machine, so stdout carries only its length — never the text.
+  // Anything else would leak through a log what the egress policy withholds.
+  const selection = result.ingest.state.textContext?.selection ?? null;
   console.log(JSON.stringify({
     kind: event.kind,
     disposition: result.ingest.disposition,
     application: result.ingest.state.activeApplication?.name ?? null,
     window: result.ingest.state.activeWindow?.title ?? null,
-    selection: result.ingest.state.textContext?.selection ?? null,
+    selectionLength: selection === null
+      ? null
+      : sanitizeAuditText(selection, "selection").originalLength,
   }));
   if (result.prediction !== null) {
     void result.prediction.then(async (outcome) => {
