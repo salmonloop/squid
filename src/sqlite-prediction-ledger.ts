@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import {
+  createPlanInvalidationRecord,
   parsePredictionLedgerRecord,
   PlanDispatchStateMachine,
   PredictionLedgerConflictError,
@@ -135,10 +136,17 @@ export class SqlitePredictionLedger implements PredictionLedger {
     inputs: ClaimDispatchInputs,
     reasonCode: "state_changed",
   ): Promise<void> {
-    // Materialized by the dispatcher as an explicit system-owned plan
-    // decision; the ledger stays append-only here.
-    void inputs;
-    void reasonCode;
+    this.assertOpen();
+    const record = createPlanInvalidationRecord({
+      planDigest: inputs.planDigest,
+      reasonCode,
+    });
+    if (this.hasEquivalent(record)) return;
+    try {
+      this.insertRecord(record, "", null);
+    } catch (error) {
+      throw this.translate(error, record);
+    }
   }
 
   public async claimDispatch(

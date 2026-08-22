@@ -221,6 +221,72 @@ describe("ledger backend conformance for dispatch records", () => {
   }
 });
 
+describe("system-side invalidation", () => {
+  /**
+   * The user accepted the plan and the world then moved. That is not a second
+   * user decision — the audit trail must not claim a rejection the user never
+   * made — so it is recorded as a distinct invalidation, and the plan can never
+   * be claimed afterwards.
+   */
+  it("withdraws an accepted plan without forging a user rejection", async () => {
+    const ledger = await seeded();
+    await ledger.recordDecision(createPlanDecisionRecord({
+      planDigest: DIGEST,
+      decision: "accepted",
+      detailsDigest: `sha256:${"d".repeat(64)}`,
+    }));
+
+    await ledger.recordStateRejection(baseInputs, "state_changed");
+
+    const records = await ledger.all();
+    const invalidation = records.find((r) => r.recordType === "plan_invalidation");
+    expect(invalidation).toMatchObject({ planDigest: DIGEST, reasonCode: "state_changed" });
+    // The user's acceptance still stands as what they actually said.
+    const decisions = records.filter((r) => r.recordType === "plan_decision");
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({ decision: "accepted" });
+
+    const claim = await ledger.claimDispatch(
+      baseInputs, new Date().toISOString(), () => "too-late",
+    );
+    expect(claim).toEqual({ status: "rejected", reasonCode: "state_changed" });
+  });
+
+  it("is idempotent and agrees across backends", async () => {
+    for (const create of [
+      async () => new InMemoryPredictionLedger(),
+      async () => new SqlitePredictionLedger(
+        join(await mkdtemp(join(tmpdir(), "squid-invalidate-")), "ledger.db"),
+      ),
+      async () => new JsonlPredictionLedger(
+        join(await mkdtemp(join(tmpdir(), "squid-invalidate-")), "ledger.jsonl"),
+      ),
+    ]) {
+      const ledger = await seededIn(await create());
+      try {
+        await ledger.recordDecision(createPlanDecisionRecord({
+          planDigest: DIGEST,
+          decision: "accepted",
+          detailsDigest: `sha256:${"d".repeat(64)}`,
+        }));
+        await ledger.recordStateRejection(baseInputs, "state_changed");
+        // A replayed invalidation is the same fact, not a conflict.
+        await ledger.recordStateRejection(baseInputs, "state_changed");
+
+        const invalidations = (await ledger.all())
+          .filter((r) => r.recordType === "plan_invalidation");
+        expect(invalidations).toHaveLength(1);
+        const claim = await ledger.claimDispatch(
+          baseInputs, new Date().toISOString(), () => "nope",
+        );
+        expect(claim).toEqual({ status: "rejected", reasonCode: "state_changed" });
+      } finally {
+        if (ledger instanceof SqlitePredictionLedger) ledger.close();
+      }
+    }
+  });
+});
+
 describe("concurrent claims", () => {
   /**
    * Two dispatches of one candidate racing each other. Exactly one may win: the

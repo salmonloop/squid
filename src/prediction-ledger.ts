@@ -173,13 +173,33 @@ export interface PlanDispatchRecord {
   readonly completedAt?: string;
 }
 
+/**
+ * A system-side invalidation of an already-accepted plan.
+ *
+ * Kept distinct from `PlanDecisionRecord` on purpose: the user accepted this
+ * plan, and the world then changed underneath it. Writing that as a second
+ * "user decision" would put words in their mouth and make the audit trail claim
+ * a rejection that never happened. This record says what actually occurred — the
+ * system withdrew the plan — and it is the only legal way out of `accepted`
+ * other than a claim.
+ */
+export interface PlanInvalidationRecord {
+  readonly schemaVersion: 2;
+  readonly recordId: string;
+  readonly recordType: "plan_invalidation";
+  readonly planDigest: string;
+  readonly reasonCode: "state_changed";
+  readonly invalidatedAt: string;
+}
+
 export type PredictionLedgerRecord =
   | PredictionAttemptRecord
   | LegacyPredictionAttemptRecord
   | PredictionFeedbackRecord
   | ActionPlanRecord
   | PlanDecisionRecord
-  | PlanDispatchRecord;
+  | PlanDispatchRecord
+  | PlanInvalidationRecord;
 
 /** Inputs every dispatch-mutating narrow API call must present together. */
 export interface ClaimDispatchInputs {
@@ -345,6 +365,14 @@ const planDecisionSchema = Type.Object({
   detailsDigest: Type.String({ pattern: /^(sha256|hmac):[0-9a-f]{64}$/u }),
   decidedAt: timestamp(),
 }, { additionalProperties: false });
+const planInvalidationSchema = Type.Object({
+  schemaVersion: Type.Literal(2),
+  recordId: nonEmptyString(),
+  recordType: Type.Literal("plan_invalidation"),
+  planDigest: Type.String({ pattern: sha256Pattern }),
+  reasonCode: Type.Literal("state_changed"),
+  invalidatedAt: timestamp(),
+}, { additionalProperties: false });
 const completedDispatchFields = {
   completedOutcome: Type.Optional(Type.Union([Type.Literal("succeeded"), Type.Literal("failed")])),
   completedDetailsDigest: Type.Optional(Type.String({ pattern: /^(sha256|hmac):[0-9a-f]{64}$/u })),
@@ -368,6 +396,7 @@ const recordValidator = Compile(Type.Union([
   actionPlanSchema,
   planDecisionSchema,
   planDispatchSchema,
+  planInvalidationSchema,
 ]));
 
 export class PredictionLedgerConflictError extends Error {
@@ -540,6 +569,13 @@ export class PlanDispatchStateMachine {
     if (plan === undefined || plan.recordType !== "plan") {
       return { status: "rejected", reasonCode: "unknown_plan" };
     }
+    // A system invalidation is terminal: the user accepted this plan, the world
+    // then changed, and the plan was withdrawn. Nothing revives it.
+    const invalidated = records.some((record) =>
+      record.recordType === "plan_invalidation" && record.planDigest === inputs.planDigest);
+    if (invalidated) {
+      return { status: "rejected", reasonCode: "state_changed" };
+    }
     const decision = this.latestDecision(records, inputs.planDigest);
     const dispatch = records.find((record) =>
       record.recordType === "plan_dispatch" && record.claimId === this.claimId(
@@ -675,6 +711,21 @@ export function createPlanDecisionRecord(input: {
   }) as PlanDecisionRecord;
 }
 
+export function createPlanInvalidationRecord(input: {
+  readonly planDigest: string;
+  readonly reasonCode: "state_changed";
+  readonly invalidatedAt?: string;
+}): PlanInvalidationRecord {
+  return parsePredictionLedgerRecord({
+    schemaVersion: 2,
+    recordId: `plan_invalidation:${input.planDigest}:${input.reasonCode}`,
+    recordType: "plan_invalidation",
+    planDigest: input.planDigest,
+    reasonCode: input.reasonCode,
+    invalidatedAt: input.invalidatedAt ?? new Date().toISOString(),
+  }) as PlanInvalidationRecord;
+}
+
 export class InMemoryPredictionLedger implements PredictionLedger {
   private readonly index = new LedgerIndex();
 
@@ -699,13 +750,13 @@ export class InMemoryPredictionLedger implements PredictionLedger {
   }
 
   public async recordStateRejection(
-    _inputs: ClaimDispatchInputs,
+    inputs: ClaimDispatchInputs,
     reasonCode: "state_changed",
   ): Promise<void> {
-    // The rejection is materialized as an expired-style plan decision owned by
-    // the system, not by the user — recorded through the same atomic boundary
-    // as claims so it cannot race one.
-    void reasonCode;
+    this.append(createPlanInvalidationRecord({
+      planDigest: inputs.planDigest,
+      reasonCode,
+    }));
   }
 
   public async claimDispatch(
@@ -779,7 +830,10 @@ export class JsonlPredictionLedger implements PredictionLedger {
   ): Promise<void> {
     // Same serial write-tail as claims: the system-side invalidation cannot
     // interleave with a claim against the same state snapshot.
-    await this.appendSystemRejection(inputs, reasonCode);
+    await this.append(createPlanInvalidationRecord({
+      planDigest: inputs.planDigest,
+      reasonCode,
+    }));
   }
 
   public async claimDispatch(
@@ -822,16 +876,7 @@ export class JsonlPredictionLedger implements PredictionLedger {
   }
 
   private snapshot(): readonly PredictionLedgerRecord[] {
-    void 0;
     return this.index.all();
-  }
-
-  private async appendSystemRejection(
-    _inputs: ClaimDispatchInputs,
-    _reasonCode: "state_changed",
-  ): Promise<void> {
-    // Materialized by the dispatcher as an explicit plan decision with a
-    // system details digest; the ledger itself stays append-only here.
   }
 
   public async all(): Promise<readonly PredictionLedgerRecord[]> {
@@ -1053,6 +1098,10 @@ export function recordIdentity(record: PredictionLedgerRecord): string {
   }
   if (record.recordType === "plan_decision") {
     const { decidedAt: _decidedAt, ...identity } = record;
+    return stableJson(identity);
+  }
+  if (record.recordType === "plan_invalidation") {
+    const { invalidatedAt: _invalidatedAt, ...identity } = record;
     return stableJson(identity);
   }
   return stableJson(record);
