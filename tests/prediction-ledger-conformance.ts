@@ -155,8 +155,8 @@ export function describePredictionLedgerConformance(
           feedbackId: "fb-1",
           requestId: "req-1",
           candidateId: "req-1:candidate:0",
-          feedback: "dispatched",
-          details: { gateway: "fake" },
+          feedback: "accepted",
+          details: { source: "terminal_confirmation" },
         });
         await harness.ledger.appendFeedback(feedback);
 
@@ -171,7 +171,9 @@ export function describePredictionLedgerConformance(
       const harness = await createLedger();
       try {
         await harness.ledger.appendAttempt(attempt());
-        for (const [id, kind] of [["fb-1", "dispatched"], ["fb-2", "succeeded"]] as const) {
+        // Two distinct facts about how one prediction was received; the
+        // dispatch lifecycle is not expressible through this API.
+        for (const [id, kind] of [["fb-1", "accepted"], ["fb-2", "expired"]] as const) {
           await harness.ledger.appendFeedback(
             createFeedbackRecord({
               feedbackId: id,
@@ -183,7 +185,7 @@ export function describePredictionLedgerConformance(
         }
 
         const feedback = (await harness.ledger.all()).filter((r) => r.recordType === "feedback");
-        expect(feedback.map((r) => r.feedback)).toEqual(["dispatched", "succeeded"]);
+        expect(feedback.map((r) => r.feedback)).toEqual(["accepted", "expired"]);
       } finally {
         await harness.dispose();
       }

@@ -6,13 +6,20 @@ import { Type } from "typebox";
 import type { PredictionOutcome } from "./prediction-provider.js";
 import type { PredictionCandidate, PredictionKind } from "./protocol.js";
 
+/**
+ * What a feedback record may say.
+ *
+ * Deliberately limited to how a *prediction* was received. The dispatch
+ * lifecycle — dispatched, succeeded, failed — is owned by the plan state
+ * machine (`recordPlan` → `recordDecision` → `claimDispatch` →
+ * `completeDispatch`) and is not expressible here: a terminal state written
+ * through the generic append would skip the claim, and an action that was never
+ * claimed must never be able to look like one that completed.
+ */
 export const feedbackKinds = [
   "accepted",
   "rejected",
   "expired",
-  "dispatched",
-  "succeeded",
-  "failed",
 ] as const;
 
 export type PredictionFeedbackKind = (typeof feedbackKinds)[number];

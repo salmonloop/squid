@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   createActionPlanRecord,
   createAttemptRecord,
+  createFeedbackRecord,
   createPlanDecisionRecord,
   InMemoryPredictionLedger,
   JsonlPredictionLedger,
@@ -219,6 +220,29 @@ describe("ledger backend conformance for dispatch records", () => {
       }
     });
   }
+});
+
+describe("generic feedback cannot reach the dispatch lifecycle", () => {
+  /**
+   * The narrow API is the only way to a terminal state. If `appendFeedback`
+   * could write "succeeded", an action that was never claimed could be made to
+   * look like one that completed — and a later reconciliation would trust it.
+   */
+  it("rejects dispatch-lifecycle kinds at the schema boundary", async () => {
+    const ledger = await seeded();
+    for (const kind of ["dispatched", "succeeded", "failed"]) {
+      expect(() => createFeedbackRecord({
+        feedbackId: `fb-${kind}`,
+        requestId: "req-1",
+        candidateId: "req-1:candidate:0",
+        // Deliberately outside the permitted vocabulary.
+        feedback: kind as "accepted",
+      })).toThrow();
+    }
+    // No terminal state can exist without a claim.
+    const records = await ledger.all();
+    expect(records.filter((r) => r.recordType === "plan_dispatch")).toHaveLength(0);
+  });
 });
 
 describe("system-side invalidation", () => {
