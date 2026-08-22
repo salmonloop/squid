@@ -1,3 +1,4 @@
+import { describeErrorForAudit } from "./action-egress.js";
 import { HeuristicPredictor } from "./baseline-predictor.js";
 import type { EvaluationReport, PredictionProviderFactory, ReplayScenario } from "./evaluation.js";
 import { evaluateScenarios, evaluateWithProvider } from "./evaluation.js";
@@ -127,7 +128,7 @@ export async function runProviderGate(
   } catch (error) {
     return {
       status: "skipped",
-      skipReason: `provider evaluation could not run: ${errorMessage(error)}`,
+      skipReason: `provider evaluation could not run: ${describeErrorForAudit(error)}`,
       failures: [],
       baseline,
       candidate: null,
@@ -158,7 +159,7 @@ async function probeAvailability(options: ProviderGateOptions): Promise<string |
   try {
     options.createProvider();
   } catch (error) {
-    return errorMessage(error);
+    return describeErrorForAudit(error);
   }
   if (options.probeAvailability === undefined) {
     return null;
@@ -166,7 +167,7 @@ async function probeAvailability(options: ProviderGateOptions): Promise<string |
   try {
     return await options.probeAvailability();
   } catch (error) {
-    return errorMessage(error);
+    return describeErrorForAudit(error);
   }
 }
 
@@ -199,7 +200,7 @@ class ProviderHealthObserver {
             abortNeverSettles(signal),
           ]);
         } catch (error) {
-          this.failures.push(errorMessage(error));
+          this.failures.push(describeErrorForAudit(error));
           throw error;
         }
       },
@@ -283,8 +284,4 @@ function abortNeverSettles(signal: AbortSignal): Promise<never> {
       { once: true },
     );
   });
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

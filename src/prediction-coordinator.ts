@@ -1,3 +1,4 @@
+import { describeErrorForAudit } from "./action-egress.js";
 import { HeuristicPredictor, type Predictor } from "./baseline-predictor.js";
 import {
   PassthroughContextPolicy,
@@ -101,7 +102,7 @@ export class PredictionCoordinator {
     } catch (error) {
       // A policy that cannot decide what to redact must not fall through to raw
       // state. Deny egress and answer locally instead.
-      const message = `context policy ${this.contextPolicy.id} failed: ${errorMessage(error)}`;
+      const message = `context policy ${this.contextPolicy.id} failed: ${describeErrorForAudit(error)}`;
       this.reportDiagnostic({ kind: "context_policy_failed", requestId, message });
       return this.finish(epoch, request, this.now(), "failed", this.runFallback(request, message).candidates, message);
     }
@@ -141,7 +142,7 @@ export class PredictionCoordinator {
         : cancellationReason !== undefined
           ? "cancelled"
           : "failed";
-      const message = cancellationReason ?? errorMessage(error);
+      const message = cancellationReason ?? describeErrorForAudit(error);
       if (this.activeEpoch !== epoch) {
         return this.finish(epoch, request, startedAt, reason, [], "superseded");
       }
@@ -205,7 +206,7 @@ export class PredictionCoordinator {
         reason,
       };
     } catch (error) {
-      const message = errorMessage(error);
+      const message = describeErrorForAudit(error);
       this.reportDiagnostic({ kind: "fallback_failed", requestId: request.id, message });
       return { candidates: [], reason: `${reason}; fallback failed: ${message}` };
     }
@@ -266,7 +267,7 @@ export class PredictionCoordinator {
       this.reportDiagnostic({
         kind: "outcome_observer_failed",
         requestId: outcome.requestId,
-        message: errorMessage(error),
+        message: describeErrorForAudit(error),
       });
     }
   }
@@ -292,8 +293,4 @@ export class PredictionAbortedError extends Error {
     super(`Prediction request ${requestId} completed after it was aborted.`);
     this.name = "PredictionAbortedError";
   }
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

@@ -1,3 +1,4 @@
+import { describeErrorForAudit } from "./action-egress.js";
 import { SqlitePredictionLedger } from "./sqlite-prediction-ledger.js";
 import type {
   PredictionAttemptRecord,
@@ -92,10 +93,7 @@ if (import.meta.main) {
   } catch (error) {
     // A corrupt or non-ledger database should read as an operator error with a
     // stated cause, not an uncaught stack trace from deep inside record parsing.
-    console.error(
-      "Failed to read ledger:",
-      error instanceof Error ? error.message : String(error),
-    );
+    console.error("Failed to read ledger:", describeErrorForAudit(error));
     process.exitCode = 1;
   } finally {
     ledger.close();

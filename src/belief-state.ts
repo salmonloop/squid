@@ -1,5 +1,6 @@
 import { Compile } from "typebox/compile";
 import { Type } from "typebox";
+import { describeErrorForAudit } from "./action-egress.js";
 
 /** The only belief schema shipped in this phase. */
 export const BELIEF_SCHEMA_VERSION = 1 as const;
@@ -142,9 +143,12 @@ export function validateBeliefStateBatch(
   try {
     return { ok: true, value: parseBeliefStateBatch(value, context) };
   } catch (error) {
+    // A schema failure quotes the value that failed, and the value here is model
+    // output that may have echoed a selection back. Sanitized before it becomes
+    // a message any caller is free to log.
     const validationError = error instanceof BeliefStateValidationError
       ? error
-      : new BeliefStateValidationError(error instanceof Error ? error.message : String(error));
+      : new BeliefStateValidationError(describeErrorForAudit(error));
     return { ok: false, error: validationError };
   }
 }

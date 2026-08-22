@@ -20,7 +20,7 @@ import {
   type AdmissionReasonCode,
 } from "./action-admission.js";
 import type { ImmutableActionPlan } from "./action-plan.js";
-import type { EgressPolicy } from "./action-egress.js";
+import { describeErrorForAudit, type EgressPolicy } from "./action-egress.js";
 
 /**
  * Outcome of the runtime's single action gate.
@@ -372,7 +372,7 @@ export class PredictionRuntime {
       this.reportDiagnostic({
         kind: "ledger_write_failed",
         requestId: outcome.requestId,
-        message: error instanceof Error ? error.message : String(error),
+        message: describeErrorForAudit(error),
       });
     }
   }

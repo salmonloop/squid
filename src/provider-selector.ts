@@ -1,3 +1,4 @@
+import { describeErrorForAudit } from "./action-egress.js";
 import type { Predictor } from "./baseline-predictor.js";
 import type { PredictionProvider } from "./prediction-provider.js";
 import { SyncPredictorProvider } from "./prediction-provider.js";
@@ -113,7 +114,7 @@ async function admitModelProvider(options: ModelProviderOptions): Promise<string
       // A probe that throws is evidence about the probe, not about the model —
       // but it is not evidence the model is usable either. Decline, matching the
       // replay gate, which skips rather than passes when it cannot reach one.
-      return `availability probe failed: ${errorMessage(error)}`;
+      return `availability probe failed: ${describeErrorForAudit(error)}`;
     }
   }
 
@@ -121,7 +122,7 @@ async function admitModelProvider(options: ModelProviderOptions): Promise<string
   try {
     result = await options.runGate();
   } catch (error) {
-    return `replay gate could not run: ${errorMessage(error)}`;
+    return `replay gate could not run: ${describeErrorForAudit(error)}`;
   }
 
   if (result.status === "passed") return null;
@@ -130,8 +131,4 @@ async function admitModelProvider(options: ModelProviderOptions): Promise<string
   return result.status === "skipped"
     ? `replay gate skipped: ${result.skipReason ?? "no reason given"}`
     : `replay gate failed: ${result.failures.join("; ") || "no failures reported"}`;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

@@ -5,7 +5,7 @@ import { FilesystemActivitySource } from "./filesystem-source.js";
 import type { FilePayload } from "./protocol.js";
 import { sqliteWatchExclusions } from "./sqlite-event-store.js";
 import { resolveWatchActions } from "./watch-actions.js";
-import { resolveSearchEgress } from "./action-egress.js";
+import { describeErrorForAudit, resolveSearchEgress } from "./action-egress.js";
 import { resolveWatchProvider } from "./watch-provider.js";
 
 const root = process.argv[2];
@@ -142,7 +142,7 @@ await source.start(async (event) => {
       // The prediction promise itself never rejects (the coordinator resolves
       // every request); this guards the dispatch half so one failed dispatch
       // cannot take down the ingest loop.
-      console.error(JSON.stringify({ dispatchError: error instanceof Error ? error.message : String(error) }));
+      console.error(JSON.stringify({ dispatchError: describeErrorForAudit(error) }));
     });
   }
 });
@@ -172,7 +172,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
       await watch.dispose();
       process.exit(0);
     }).catch((error) => {
-      console.error(JSON.stringify({ shutdownError: error instanceof Error ? error.message : String(error) }));
+      console.error(JSON.stringify({ shutdownError: describeErrorForAudit(error) }));
       process.exit(1);
     });
   });

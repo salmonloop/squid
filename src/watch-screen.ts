@@ -13,7 +13,7 @@ import {
 } from "./screen-text-source.js";
 import { resolveWatchActions } from "./watch-actions.js";
 import { resolveWatchProvider } from "./watch-provider.js";
-import { resolveSearchEgress, sanitizeAuditText } from "./action-egress.js";
+import { describeErrorForAudit, resolveSearchEgress, sanitizeAuditText } from "./action-egress.js";
 
 const readerKind = process.env.SQUID_SCREEN_READER ?? "synthetic";
 if (readerKind !== "darwin" && readerKind !== "synthetic") {
@@ -167,7 +167,7 @@ await source.start(async (event) => {
       // The prediction promise itself never rejects (the coordinator resolves
       // every request); this guards the dispatch half so one failed dispatch
       // cannot take down the ingest loop.
-      console.error(JSON.stringify({ dispatchError: error instanceof Error ? error.message : String(error) }));
+      console.error(JSON.stringify({ dispatchError: describeErrorForAudit(error) }));
     });
   }
 });
@@ -198,7 +198,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
       await watch.dispose();
       process.exit(0);
     }).catch((error) => {
-      console.error(JSON.stringify({ shutdownError: error instanceof Error ? error.message : String(error) }));
+      console.error(JSON.stringify({ shutdownError: describeErrorForAudit(error) }));
       process.exit(1);
     });
   });
@@ -218,7 +218,7 @@ async function loadFrames(path: string | undefined): Promise<readonly ScreenText
   try {
     parsed = JSON.parse(await readFile(absolutePath, "utf8"));
   } catch (error) {
-    console.error(`Could not read frames from ${absolutePath}: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`Could not read frames from ${absolutePath}: ${describeErrorForAudit(error)}`);
     process.exit(2);
   }
   if (!Array.isArray(parsed)) {

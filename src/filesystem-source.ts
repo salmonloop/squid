@@ -2,6 +2,7 @@ import { watch } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ActivityEventEmitter, ActivitySource, ActivitySourceDiagnostic } from "./activity-source.js";
+import { describeErrorForAudit } from "./action-egress.js";
 import { createActivityEvent, type ActivityEvent, type FilePayload } from "./protocol.js";
 
 const DEFAULT_DEBOUNCE_MS = 25;
@@ -220,7 +221,7 @@ export class FilesystemActivitySource implements ActivitySource {
   private record(kind: ActivitySourceDiagnostic["kind"], error: unknown): void {
     const diagnostic: ActivitySourceDiagnostic = {
       kind,
-      message: error instanceof Error ? error.message : String(error),
+      message: describeErrorForAudit(error),
       occurredAt: new Date().toISOString(),
     };
     this.recordedDiagnostics.push(diagnostic);

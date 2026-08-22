@@ -9,6 +9,7 @@ import {
 import { Type } from "typebox";
 import type { PredictionCandidate, PredictionKind, WorldState } from "./protocol.js";
 import type { PredictionProvider, PredictionRequest } from "./prediction-provider.js";
+import { describeErrorForAudit } from "./action-egress.js";
 
 const predictionKinds = [
   "draft_completion",
@@ -72,7 +73,7 @@ export class PiRuntime implements PredictionProvider {
         ? null
         : `Pi model is unavailable: ${this.provider}/${this.modelId}`;
     } catch (error) {
-      return error instanceof Error ? error.message : String(error);
+      return describeErrorForAudit(error);
     }
   }
 

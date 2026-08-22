@@ -43,11 +43,16 @@ export function resolveSearchEgress(
 export const AUDIT_TEXT_MAX_LENGTH = 200;
 
 /** What kind of text went in, which decides whether a preview may exist. */
-export type AuditTextClass = "selection" | "summary" | "rationale" | "mcp_summary";
+export type AuditTextClass =
+  | "selection"
+  | "summary"
+  | "rationale"
+  | "mcp_summary"
+  | "diagnostic";
 
 /** Classes whose content is itself the payload, so no preview may ever exist. */
 export type UnpreviewableTextClass = "selection" | "summary";
-export type PreviewableTextClass = "rationale" | "mcp_summary";
+export type PreviewableTextClass = "rationale" | "mcp_summary" | "diagnostic";
 
 interface AuditTextMeasurements {
   /** Original length before truncation, so audits can compare without raw text. */
@@ -119,6 +124,25 @@ export function sanitizeAuditText(
     text: truncated ? `${redacted.slice(0, AUDIT_TEXT_MAX_LENGTH)}…` : redacted,
     previewAllowed: true,
   };
+}
+
+/**
+ * The only sanctioned way to turn a caught error into text a diagnostic, a log
+ * line, or a ledger detail may carry.
+ *
+ * An error message is not trusted prose. It routinely quotes the thing that
+ * failed — a file path, a SQL fragment, a tool's own stderr — and a screen or
+ * MCP failure can quote the selection outright. Every such string therefore
+ * goes through the same sanitizer as model text: control characters stripped,
+ * credentials redacted, length capped.
+ *
+ * Stacks are dropped deliberately. A stack names the machine's directory layout
+ * and pins the exact build, which is more than an audit trail needs and more
+ * than a log should hand to whoever reads it.
+ */
+export function describeErrorForAudit(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  return sanitizeAuditText(raw, "diagnostic").text;
 }
 
 /**

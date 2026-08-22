@@ -3,6 +3,7 @@ import type {
   ActivitySource,
   ActivitySourceDiagnostic,
 } from "./activity-source.js";
+import { describeErrorForAudit } from "./action-egress.js";
 import {
   createActivityEvent,
   type ActivityEvent,
@@ -333,7 +334,7 @@ export class ScreenTextActivitySource implements ActivitySource {
   private record(kind: ActivitySourceDiagnostic["kind"], error: unknown): void {
     const diagnostic: ActivitySourceDiagnostic = {
       kind,
-      message: error instanceof Error ? error.message : String(error),
+      message: describeErrorForAudit(error),
       occurredAt: new Date().toISOString(),
     };
     this.recordedDiagnostics.push(diagnostic);

@@ -1,3 +1,4 @@
+import { describeErrorForAudit } from "./action-egress.js";
 import type {
   ScreenTextFocusRole,
   ScreenTextFrame,
@@ -149,7 +150,7 @@ export function createMacosScreenTextReader(
         lastErrorMessage = null;
         if (frame !== null) onFrame(frame);
       } catch (error) {
-        reportError(error instanceof Error ? error.message : String(error));
+        reportError(describeErrorForAudit(error));
       } finally {
         activeProcess = null;
         sampling = false;
