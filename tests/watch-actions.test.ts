@@ -140,6 +140,18 @@ describe("resolveWatchActions", () => {
     expect(resolution).toBeUndefined();
   });
 
+  it("rejects actions for a provider admitted only in suggestion mode before opening MCP", async () => {
+    const resolution = await resolveWatchActions(
+      unreachable("runtime"),
+      unreachable("ledger"),
+      { SQUID_ACTIONS: "mcp", SQUID_ACTIONS_MCP_COMMAND: "bun server.ts" },
+      { actionTrust: "suggestion_only" },
+    );
+    expect(resolution).toEqual({
+      configError: "The selected provider is suggestion-only; actions require a replay-gated trusted provider.",
+    });
+  });
+
   it("reports a config error for a recognized variable with an unknown value", async () => {
     const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), { SQUID_ACTIONS: "yes" });
     expect(resolution).toHaveProperty("configError");

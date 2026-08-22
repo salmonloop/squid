@@ -70,6 +70,8 @@ if (resolved.selection.declineReason !== null) {
 const watch = createWatchRuntime({
   ...(databasePath === undefined ? {} : { databasePath }),
   provider: resolved.selection.provider,
+  contextPolicy: resolved.selection.contextPolicy,
+  actionTrust: resolved.selection.actionTrust,
   onDiagnostic: (diagnostic) => {
     console.error(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
   },
@@ -86,7 +88,7 @@ const actions = await resolveWatchActions(
   watch.runtime,
   watch.ledger,
   process.env,
-  { workingDirectory: process.cwd() },
+  { workingDirectory: process.cwd(), actionTrust: resolved.selection.actionTrust },
 );
 if (actions !== undefined && "configError" in actions) {
   console.error(actions.configError);
@@ -112,7 +114,7 @@ await source.start(async (event) => {
     disposition: result.ingest.disposition,
     application: result.ingest.state.activeApplication?.name ?? null,
     window: result.ingest.state.activeWindow?.title ?? null,
-    selection: result.ingest.state.focus?.selection ?? null,
+    selection: result.ingest.state.textContext?.selection ?? null,
   }));
   if (result.prediction !== null) {
     void result.prediction.then(async (outcome) => {

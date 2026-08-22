@@ -12,6 +12,7 @@ import {
 import { RedactingCapturePolicy } from "./capture-policy.js";
 import { SqliteEventStore } from "./sqlite-event-store.js";
 import { SquidCore } from "./squid-core.js";
+import type { ContextPolicy } from "./context-policy.js";
 
 /**
  * The shared setup both watch entry points need: a store, a ledger, a core
@@ -58,6 +59,8 @@ export interface CreateWatchRuntimeOptions {
    * behavior is unchanged; module 12 swaps in a selector that may return Pi.
    */
   readonly provider: PredictionProvider;
+  readonly contextPolicy?: ContextPolicy;
+  readonly actionTrust?: "trusted" | "suggestion_only";
   /** Forwards non-fatal runtime diagnostics; omitted in tests. */
   readonly onDiagnostic?: (diagnostic: PredictionRuntimeDiagnostic) => void;
 }
@@ -82,7 +85,10 @@ export function createWatchRuntime(options: CreateWatchRuntimeOptions): WatchRun
     core,
     // The coordinator's own fallback default is the heuristic predictor, so a
     // provider that fails, times out, or is cancelled always lands somewhere.
-    new PredictionCoordinator({ provider: options.provider }),
+    new PredictionCoordinator({
+      provider: options.provider,
+      ...(options.contextPolicy === undefined ? {} : { contextPolicy: options.contextPolicy }),
+    }),
     {
       ledger,
       // The durable path persists events, so capture redacts credential

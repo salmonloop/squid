@@ -94,6 +94,8 @@ describe("selectPredictionProvider in heuristic mode", () => {
 
     expect(selection.provider.name).toBe("heuristic");
     expect(selection.declineReason).toBeNull();
+    expect(selection.actionTrust).toBe("trusted");
+    expect(selection.contextPolicy.id).toBe("passthrough");
   });
 });
 
@@ -104,6 +106,8 @@ describe("selectPredictionProvider behind the availability probe", () => {
 
     expect(selection.provider.name).toBe("pi");
     expect(selection.declineReason).toBeNull();
+    expect(selection.actionTrust).toBe("suggestion_only");
+    expect(selection.contextPolicy.id).toBe("redacting");
     expect(calls).toEqual({ createPi: 1, probePi: 1, runGate: 0 });
   });
 
@@ -137,6 +141,8 @@ describe("selectPredictionProvider behind the replay gate", () => {
 
     expect(selection.provider.name).toBe("pi");
     expect(selection.declineReason).toBeNull();
+    expect(selection.actionTrust).toBe("trusted");
+    expect(selection.contextPolicy.id).toBe("redacting");
     // The gate probes availability itself, so the selector must not probe twice.
     expect(calls).toEqual({ createPi: 1, probePi: 0, runGate: 1 });
   });

@@ -5,6 +5,7 @@ import {
   selectPredictionProvider,
   type ProviderSelection,
 } from "./provider-selector.js";
+import { DEFAULT_PROVIDER_GATE_TIMEOUT_MS } from "./provider-gate.js";
 
 /**
  * Wires the real Pi and replay-gate seams into `selectPredictionProvider` and
@@ -69,7 +70,7 @@ export async function resolveWatchProvider(
       probeAvailability: () => new PiRuntime().checkAvailability(),
       // Matches `gate:pi`: well above the observed single-call latency, below
       // the point where a hung provider would stall startup indefinitely.
-      timeoutMs: 30_000,
+      timeoutMs: DEFAULT_PROVIDER_GATE_TIMEOUT_MS,
     }),
   });
 

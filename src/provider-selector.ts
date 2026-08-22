@@ -2,6 +2,7 @@ import type { Predictor } from "./baseline-predictor.js";
 import type { PredictionProvider } from "./prediction-provider.js";
 import { SyncPredictorProvider } from "./prediction-provider.js";
 import type { ProviderGateResult } from "./provider-gate.js";
+import { PassthroughContextPolicy, RedactingContextPolicy, type ContextPolicy } from "./context-policy.js";
 
 export const providerModes = ["heuristic", "pi"] as const;
 export type ProviderMode = (typeof providerModes)[number];
@@ -52,6 +53,8 @@ export type SelectPredictionProviderOptions = HeuristicProviderOptions | ModelPr
 
 export interface ProviderSelection {
   readonly provider: PredictionProvider;
+  readonly contextPolicy: ContextPolicy;
+  readonly actionTrust: "trusted" | "suggestion_only";
   /**
    * Why the model-backed provider was not selected, or `null` when it was.
    *
@@ -76,13 +79,29 @@ export async function selectPredictionProvider(
   const heuristic = new SyncPredictorProvider(options.heuristic);
   if (options.mode === "heuristic") {
     // The default path: no probe, no gate, no network, no model.
-    return { provider: heuristic, declineReason: null };
+    return {
+      provider: heuristic,
+      contextPolicy: new PassthroughContextPolicy(),
+      actionTrust: "trusted",
+      declineReason: null,
+    };
   }
 
   const declineReason = await admitModelProvider(options);
-  return declineReason === null
-    ? { provider: options.createPi(), declineReason: null }
-    : { provider: heuristic, declineReason };
+  if (declineReason !== null) {
+    return {
+      provider: heuristic,
+      contextPolicy: new PassthroughContextPolicy(),
+      actionTrust: "trusted",
+      declineReason,
+    };
+  }
+  return {
+    provider: options.createPi(),
+    contextPolicy: new RedactingContextPolicy(),
+    actionTrust: options.gate === "replay" ? "trusted" : "suggestion_only",
+    declineReason: null,
+  };
 }
 
 /** Returns `null` to admit the model provider, or the reason to decline it. */

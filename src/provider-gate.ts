@@ -36,6 +36,8 @@ export const defaultGateThresholds: ProviderGateThresholds = {
   maxFallbackRate: 0.09,
 };
 
+export const DEFAULT_PROVIDER_GATE_TIMEOUT_MS = 90_000;
+
 export type GateStatus = "passed" | "failed" | "skipped";
 
 export interface ProviderGateResult {

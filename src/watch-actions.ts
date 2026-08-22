@@ -79,7 +79,10 @@ export async function resolveWatchActions(
   runtime: PredictionRuntime,
   ledger: PredictionLedger,
   env: Record<string, string | undefined> = process.env,
-  options: { readonly workingDirectory?: string } = {},
+  options: {
+    readonly workingDirectory?: string;
+    readonly actionTrust?: "trusted" | "suggestion_only";
+  } = {},
 ): Promise<WatchActionsResolution | undefined | { readonly configError: string }> {
   const mode = env.SQUID_ACTIONS;
   if (mode === undefined) {
@@ -87,6 +90,9 @@ export async function resolveWatchActions(
   }
   if (mode !== "mcp") {
     return { configError: 'SQUID_ACTIONS must be "mcp" or unset.' };
+  }
+  if (options.actionTrust === "suggestion_only") {
+    return { configError: "The selected provider is suggestion-only; actions require a replay-gated trusted provider." };
   }
 
   const command = env.SQUID_ACTIONS_MCP_COMMAND?.trim();

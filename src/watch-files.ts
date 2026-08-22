@@ -40,6 +40,8 @@ if (resolved.selection.declineReason !== null) {
 const watch = createWatchRuntime({
   ...(databasePath === undefined ? {} : { databasePath }),
   provider: resolved.selection.provider,
+  contextPolicy: resolved.selection.contextPolicy,
+  actionTrust: resolved.selection.actionTrust,
   onDiagnostic: (diagnostic) => {
     console.error(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
   },
@@ -58,7 +60,7 @@ const actions = await resolveWatchActions(
   watch.runtime,
   watch.ledger,
   process.env,
-  { workingDirectory: canonicalRoot },
+  { workingDirectory: canonicalRoot, actionTrust: resolved.selection.actionTrust },
 );
 if (actions !== undefined && "configError" in actions) {
   console.error(actions.configError);
