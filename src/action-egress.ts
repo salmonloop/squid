@@ -45,18 +45,33 @@ export const AUDIT_TEXT_MAX_LENGTH = 200;
 /** What kind of text went in, which decides whether a preview may exist. */
 export type AuditTextClass = "selection" | "summary" | "rationale" | "mcp_summary";
 
-export interface SanitizedAuditText {
-  /** Truncated, control-character-free, credential-redacted text. */
-  readonly text: string;
+/** Classes whose content is itself the payload, so no preview may ever exist. */
+export type UnpreviewableTextClass = "selection" | "summary";
+export type PreviewableTextClass = "rationale" | "mcp_summary";
+
+interface AuditTextMeasurements {
   /** Original length before truncation, so audits can compare without raw text. */
   readonly originalLength: number;
   readonly truncated: boolean;
-  /**
-   * Selection and plan summaries are never previewed — their content is the
-   * payload that would leave the machine. Rationale and MCP summaries may
-   * show a redacted preview.
-   */
-  readonly previewAllowed: boolean;
+}
+
+/**
+ * A selection or plan summary that has been measured but never previewed.
+ *
+ * `text` is absent by type, not by convention: for these classes the content is
+ * the payload that would leave the machine, so there is no legitimate reader.
+ * A caller reaching for a preview fails to compile instead of quietly logging
+ * the selection it was supposed to withhold.
+ */
+export interface MeasuredAuditText extends AuditTextMeasurements {
+  readonly previewAllowed: false;
+}
+
+/** Rationale or tool output, which may carry a redacted preview. */
+export interface SanitizedAuditText extends AuditTextMeasurements {
+  /** Truncated, control-character-free, credential-redacted text. */
+  readonly text: string;
+  readonly previewAllowed: true;
 }
 
 const CREDENTIAL_PATTERNS: readonly RegExp[] = [
@@ -83,15 +98,26 @@ function redactCredentials(text: string): string {
  * digests remain comparable across processes. Raw text never survives this
  * function into persistence — callers log the returned object only.
  */
-export function sanitizeAuditText(text: string, kind: AuditTextClass): SanitizedAuditText {
+export function sanitizeAuditText(text: string, kind: PreviewableTextClass): SanitizedAuditText;
+export function sanitizeAuditText(text: string, kind: UnpreviewableTextClass): MeasuredAuditText;
+export function sanitizeAuditText(
+  text: string,
+  kind: AuditTextClass,
+): SanitizedAuditText | MeasuredAuditText {
   const stripped = text.replace(/[\u0000-\u001F\u007F]/gu, " ").replace(/\s+/gu, " ").trim();
   const redacted = redactCredentials(stripped);
   const truncated = redacted.length > AUDIT_TEXT_MAX_LENGTH;
+  const measurements = { originalLength: text.length, truncated } as const;
+  // The unpreviewable branch still computes the sanitized string, then drops it:
+  // both branches must agree on `truncated`, and deciding that needs the redacted
+  // length. The string itself never leaves this function.
+  if (kind === "selection" || kind === "summary") {
+    return { ...measurements, previewAllowed: false };
+  }
   return {
+    ...measurements,
     text: truncated ? `${redacted.slice(0, AUDIT_TEXT_MAX_LENGTH)}…` : redacted,
-    originalLength: text.length,
-    truncated,
-    previewAllowed: kind === "rationale" || kind === "mcp_summary",
+    previewAllowed: true,
   };
 }
 

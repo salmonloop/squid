@@ -327,9 +327,11 @@ export class CapabilityDispatcher {
     await this.ledger.recordDecision(createPlanDecisionRecord({
       planDigest,
       decision: decision.outcome,
-      detailsDigest: auditTextDigest(
-        sanitizeAuditText(decision.reason, "summary").text,
-      ),
+      // `reason` is a closed set of identifiers (`user_rejected`, `timed_out`,
+      // …), never user text, so it is digested directly. Running it through the
+      // audit sanitizer would suggest it might carry a payload, and the "summary"
+      // class deliberately has no readable output for exactly that reason.
+      detailsDigest: auditTextDigest(decision.reason),
       decidedAt: this.now().toISOString(),
     }));
     if (decision.outcome !== "accepted") {
