@@ -4,34 +4,30 @@ import { isAbsolute } from "node:path";
 import { parse } from "shell-quote";
 import {
   CapabilityDispatcher,
-  type ActionRequest,
-  type ActionResult,
+  type DispatchOutcome,
 } from "./capability-gateway.js";
 import {
   TerminalActionConfirmation,
-  type ActionConfirmationDecision,
   type ActionConfirmationPolicy,
 } from "./action-confirmation.js";
 import {
-  isActionPlanFailure,
-  planCapabilityAction,
-  type CapabilityActionPlan,
-  type CapabilityActionPlanFailure,
-} from "./action-plan.js";
+  isPlanFailure,
+  planAction,
+  type ActionPlanningContext,
+} from "./action-planner.js";
+import { resolveSearchEgress, type EgressPolicy } from "./action-egress.js";
 import { McpCapabilityGateway } from "./mcp-gateway.js";
 import type { PredictionCandidate } from "./protocol.js";
-import type {
-  PredictionFeedbackInput,
-  PredictionLedger,
-} from "./prediction-ledger.js";
+import type { PredictionLedger } from "./prediction-ledger.js";
 import type { PredictionRuntime } from "./prediction-runtime.js";
 
 export interface WatchActionsResolution {
   readonly gatewayId: string;
+  readonly egressPolicy: EgressPolicy;
   dispatchTopCandidate(
     outcome: { readonly requestId: string },
     candidates: readonly PredictionCandidate[],
-  ): Promise<DispatchCandidateResult | null>;
+  ): Promise<DispatchOutcome | null>;
   /** Closes the client transport. */
   close(): Promise<void>;
 }
@@ -126,6 +122,13 @@ export async function resolveWatchActions(
   if (confirmationMode === "terminal" && workingDirectory === undefined) {
     return { configError: "SQUID_ACTION_CONFIRM=terminal requires an action working directory." };
   }
+  // Egress is resolved before any transport opens: an invalid value must fail
+  // startup rather than surface once a server is already running. Unset means
+  // deny, so search actions stay off unless explicitly enabled.
+  const egress = resolveSearchEgress(env.SQUID_SEARCH_EGRESS);
+  if ("configError" in egress) {
+    return egress;
+  }
 
   const client = new Client({ name: "squid", version: "0.1.0" });
   await client.connect(new StdioClientTransport({
@@ -137,20 +140,25 @@ export async function resolveWatchActions(
     client,
     ...(workingDirectory === undefined ? {} : { workingDirectory }),
   });
-  const dispatcher = new CapabilityDispatcher({ runtime, gateway, ledger });
   const confirmation = confirmationMode === "terminal"
     ? new TerminalActionConfirmation(timeoutMs === undefined ? {} : { timeoutMs })
     : undefined;
-  const pending = new Set<Promise<DispatchCandidateResult | null>>();
+  const dispatcher = new CapabilityDispatcher({
+    runtime,
+    gateway,
+    ledger,
+    ...(confirmation === undefined ? {} : { confirmation }),
+  });
+  const pending = new Set<Promise<DispatchOutcome | null>>();
   let closing = false;
   return {
     gatewayId: gateway.id,
+    egressPolicy: egress,
     dispatchTopCandidate: (outcome, candidates) => {
       if (closing) return Promise.resolve(null);
       const operation = dispatchTopCandidate(outcome, candidates, dispatcher, {
-        ...(confirmation === undefined ? {} : { confirmation }),
-        planner: (request) => gateway.plan(request),
-        recordFeedback: (input) => runtime.recordFeedback(input),
+        egressPolicy: egress,
+        ...(workingDirectory === undefined ? {} : { workingDirectory }),
       });
       pending.add(operation);
       void operation.then(
@@ -169,127 +177,69 @@ export async function resolveWatchActions(
 }
 
 /**
- * The action half of the closed loop: after a prediction outcome settles,
- * dispatch its best still-fresh planned candidate through the given dispatcher,
- * optionally passing confirmation-required plans through the configured policy.
+ * The action half of the closed loop: after a prediction outcome settles, try to
+ * dispatch its single best candidate.
  *
- * Expiry is enforced here because nothing else does — the coordinator ranks
- * candidates but never checks `expiresAt`, so an expired candidate that sat at
- * the top would otherwise execute on stale context. Confirmation-required
- * plans are ignored unless both a policy and feedback recorder are present.
+ * Only the top-confidence candidate is ever considered. Falling back to a
+ * lower-confidence candidate when the best one is refused would mean the system
+ * quietly does something the ranking did not choose, so a refusal ends the
+ * attempt rather than starting a search for something that passes.
  *
- * The candidate ID format (`requestId:candidate:ordinal`) is derived from the
- * candidate's position in the outcome rather than carried separately — the
- * dispatcher re-resolves it against the ledger and refuses unknown IDs, so a
- * wrong derivation surfaces as a failed dispatch, not a silent no-op.
+ * Planning happens exactly once here. The resulting immutable plan — not the
+ * candidate — is what the dispatcher confirms, claims, and invokes.
  */
-export interface DispatchCandidateResult {
-  readonly candidateId: string;
-  readonly decision: ActionConfirmationDecision | null;
-  readonly action: ActionResult | null;
-}
-
 export interface DispatchCandidateOptions {
-  readonly confirmation?: ActionConfirmationPolicy;
+  readonly egressPolicy: EgressPolicy;
+  readonly workingDirectory?: string;
   readonly now?: () => Date;
-  readonly recordFeedback?: (input: PredictionFeedbackInput) => Promise<void>;
-  readonly planner?: (
-    request: ActionRequest,
-  ) => CapabilityActionPlan | CapabilityActionPlanFailure;
 }
 
 export async function dispatchTopCandidate(
   outcome: { readonly requestId: string },
   candidates: readonly PredictionCandidate[],
   dispatcher: CapabilityDispatcher,
-  options: DispatchCandidateOptions = {},
-): Promise<DispatchCandidateResult | null> {
-  const confirmation = options.confirmation;
+  options: DispatchCandidateOptions,
+): Promise<DispatchOutcome | null> {
   const now = options.now ?? (() => new Date());
-  const recordFeedback = options.recordFeedback;
-  const planner = options.planner ?? ((request: ActionRequest) =>
-    planCapabilityAction(request.kind, request.parameters));
-  const nowMs = now().getTime();
-  const eligible = candidates
-    .map((candidate, ordinal) => ({
-      candidate,
-      ordinal,
-      candidateId: `${outcome.requestId}:candidate:${ordinal}`,
-    }))
-    .map((item) => ({
-      ...item,
-      plan: planner({
-        candidateId: item.candidateId,
-        kind: item.candidate.kind,
-        parameters: item.candidate.parameters,
-      }),
-    }))
-    .filter((item): item is typeof item & { plan: Exclude<typeof item.plan, { readonly error: string }> } =>
-      !isActionPlanFailure(item.plan))
-    .filter(({ plan }) =>
-      plan.confirmation !== "required" ||
-      (confirmation !== undefined && recordFeedback !== undefined))
-    .filter(({ candidate }) => Date.parse(candidate.expiresAt) > nowMs)
-    .sort((left, right) => right.candidate.confidence - left.candidate.confidence);
 
-  const chosen = eligible[0];
-  if (chosen === undefined) {
+  // Rank first, then take exactly one. `ordinal` is the candidate's position in
+  // the original outcome, which is what the ledger's candidate IDs encode.
+  const ranked = candidates
+    .map((candidate, ordinal) => ({ candidate, ordinal }))
+    .sort((left, right) => right.candidate.confidence - left.candidate.confidence);
+  const top = ranked[0];
+  if (top === undefined) {
     return null;
   }
 
-  const { candidateId } = chosen;
-  if (isActionPlanFailure(chosen.plan)) {
-    throw new TypeError("Filtered action plan unexpectedly failed.");
-  }
-  if (chosen.plan.confirmation === "required") {
-    if (confirmation === undefined || recordFeedback === undefined) {
-      throw new TypeError("Confirmation-required action reached dispatch without its policy and feedback recorder.");
-    }
-    const decision = await confirmation.confirm({
-      candidateId,
-      plan: chosen.plan,
-      expiresAt: chosen.candidate.expiresAt,
-    });
-    await recordConfirmation(outcome.requestId, candidateId, decision, chosen.plan.summary, recordFeedback);
-    if (decision.outcome !== "accepted") {
-      return { candidateId, decision, action: null };
-    }
-    // Confirmation may have taken long enough for the candidate to go stale.
-    if (Date.parse(chosen.candidate.expiresAt) <= now().getTime()) {
-      const expired: ActionConfirmationDecision = {
-        outcome: "expired",
-        reason: "candidate_expired",
-      };
-      await recordConfirmation(outcome.requestId, candidateId, expired, chosen.plan.summary, recordFeedback);
-      return { candidateId, decision: expired, action: null };
-    }
-    return {
-      candidateId,
-      decision,
-      action: await dispatcher.dispatch(candidateId),
-    };
+  // Expiry is checked here and again inside admission. Checking early avoids
+  // planning work for a dead candidate; checking late is what actually protects
+  // the dispatch, because confirmation can take longer than the TTL.
+  if (Date.parse(top.candidate.expiresAt) <= now().getTime()) {
+    return null;
   }
 
-  return {
-    candidateId,
-    decision: null,
-    action: await dispatcher.dispatch(candidateId),
-  };
-}
+  const candidateId = `${outcome.requestId}:candidate:${top.ordinal}`;
+  const planned = await planAction(
+    {
+      candidateId,
+      attemptId: outcome.requestId,
+      kind: top.candidate.kind,
+      parameters: top.candidate.parameters,
+    },
+    options.workingDirectory === undefined ? {} : { workingDirectory: options.workingDirectory },
+  );
+  if (isPlanFailure(planned)) {
+    // An unmappable top candidate is not an error and not a reason to try the
+    // next one: there is simply no action to take for this prediction.
+    return null;
+  }
 
-async function recordConfirmation(
-  requestId: string,
-  candidateId: string,
-  decision: ActionConfirmationDecision,
-  action: string,
-  recordFeedback: (input: PredictionFeedbackInput) => Promise<void>,
-): Promise<void> {
-  const input: PredictionFeedbackInput = {
-    feedbackId: `${candidateId}:${decision.outcome}:confirmation:${crypto.randomUUID()}`,
-    requestId,
-    candidateId,
-    feedback: decision.outcome,
-    details: { source: "terminal_confirmation", reason: decision.reason, action },
-  };
-  await recordFeedback(input);
+  return dispatcher.dispatch({
+    plan: planned.plan,
+    planDigest: planned.planDigest,
+    candidateParametersDigest: planned.candidateParametersDigest,
+    candidate: top.candidate,
+    egressPolicy: options.egressPolicy,
+  });
 }

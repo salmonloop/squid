@@ -6,7 +6,7 @@ import {
   digestActionPlan,
   digestCandidateParameters,
   type ImmutableActionPlan,
-} from "./action-admission.js";
+} from "./action-plan.js";
 import type { PredictionCandidate } from "./protocol.js";
 
 export interface PlannedAction {

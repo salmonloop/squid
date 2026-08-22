@@ -1,10 +1,10 @@
 import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
-import type { CapabilityActionPlan } from "./action-plan.js";
+import type { ImmutableActionPlan } from "./action-plan.js";
 
 export interface ActionConfirmationRequest {
   readonly candidateId: string;
-  readonly plan: CapabilityActionPlan;
+  readonly plan: ImmutableActionPlan;
   readonly expiresAt: string;
 }
 

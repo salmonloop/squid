@@ -127,18 +127,13 @@ await source.start(async (event) => {
       if (actions !== undefined) {
         const dispatched = await actions.dispatchTopCandidate(outcome, outcome.candidates);
         if (dispatched !== null) {
+          // Status and reason codes only: gateway text may echo user content, so
+          // stdout carries the same sanitized shape the ledger stores.
           console.log(JSON.stringify({
-            candidateId: dispatched.candidateId,
-            ...(dispatched.decision !== null
-              ? { confirmation: dispatched.decision.outcome, reason: dispatched.decision.reason }
-              : {}),
-            ...(dispatched.action !== null
-              ? {
-                  dispatched: dispatched.action.candidateId,
-                  outcome: dispatched.action.outcome,
-                  ...(dispatched.action.error !== undefined ? { error: dispatched.action.error } : {}),
-                }
-              : {}),
+            status: dispatched.status,
+            planDigest: dispatched.planDigest,
+            ...(dispatched.reasonCode === undefined ? {} : { reasonCode: dispatched.reasonCode }),
+            ...(dispatched.action === null ? {} : { outcome: dispatched.action.outcome }),
           }));
         }
       }

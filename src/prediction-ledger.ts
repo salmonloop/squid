@@ -161,14 +161,16 @@ export interface PlanDispatchRecord {
   readonly claimTokenHash: string;
   readonly egressPolicyId: string;
   readonly claimedAt: string;
+  /**
+   * Absent until a structured tool outcome is confirmed. An open dispatched
+   * record — claimed, never completed — *is* the reconciliation signal: a
+   * transport timeout, a disconnect, or a crash all leave exactly this shape,
+   * and a crash could never have written a marker anyway. Nothing fabricates a
+   * terminal outcome to close it.
+   */
   readonly completedOutcome?: "succeeded" | "failed";
   readonly completedDetailsDigest?: string;
   readonly completedAt?: string;
-  /**
-   * Set when a claimed dispatch could not reach a structured tool outcome
-   * (transport timeout, disconnect, crash). Never fabricated into `failed`.
-   */
-  readonly reconciliationRequired?: true;
 }
 
 export type PredictionLedgerRecord =
@@ -358,7 +360,6 @@ const planDispatchSchema = Type.Object({
   egressPolicyId: nonEmptyString(),
   claimedAt: timestamp(),
   ...completedDispatchFields,
-  reconciliationRequired: Type.Optional(Type.Literal(true)),
 }, { additionalProperties: false });
 const recordValidator = Compile(Type.Union([
   attemptSchema,
@@ -615,9 +616,6 @@ export class PlanDispatchStateMachine {
     }
     if (dispatch.claimTokenHash !== this.hashClaimToken(inputs.claimToken)) {
       return { status: "conflict", reasonCode: "token_mismatch" };
-    }
-    if (dispatch.reconciliationRequired === true) {
-      return { status: "conflict", reasonCode: "outcome_conflict" };
     }
     if (dispatch.completedOutcome !== undefined) {
       return dispatch.completedOutcome === outcome &&
@@ -911,9 +909,22 @@ class LedgerIndex {
   private readonly candidateIds = new Set<string>();
   private readonly requestByCandidateId = new Map<string, string>();
 
+  /**
+   * True when this exact fact was already appended, making a replayed write a
+   * no-op instead of a conflict.
+   *
+   * Observation timestamps are excluded from the comparison for plan and
+   * decision records: the fact is *which* plan was proposed and *what* the user
+   * decided, not the millisecond the write happened. Comparing wall-clock time
+   * would turn every idempotent retry — a re-dispatch of the same plan, a
+   * replayed confirmation — into a false conflict. Everything that carries
+   * meaning (digests, decision, confirmation mode, egress policy) is still
+   * compared, so a genuinely different fact under the same ID still conflicts.
+   */
   public hasEquivalent(record: PredictionLedgerRecord): boolean {
     const existing = this.byRecordId.get(record.recordId);
-    return existing !== undefined && stableJson(existing) === stableJson(record);
+    if (existing === undefined) return false;
+    return recordIdentity(existing) === recordIdentity(record);
   }
 
   public assertCanAccept(record: PredictionLedgerRecord): void {
@@ -1023,6 +1034,28 @@ export function stableJson(value: unknown): string {
       .join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+/**
+ * The subset of a record that decides whether two appends are the same fact.
+ *
+ * Observation timestamps are excluded for plan and decision records: a retried
+ * `recordPlan` or a replayed `recordDecision` describes one event that happened
+ * once, and the wall clock at the moment of the retry is metadata about the
+ * write rather than part of the fact. Including it would turn every idempotent
+ * replay into a spurious conflict. Everything that could change meaning —
+ * digests, the decision itself, the egress policy — stays in the identity.
+ */
+export function recordIdentity(record: PredictionLedgerRecord): string {
+  if (record.recordType === "plan") {
+    const { createdAt: _createdAt, ...identity } = record;
+    return stableJson(identity);
+  }
+  if (record.recordType === "plan_decision") {
+    const { decidedAt: _decidedAt, ...identity } = record;
+    return stableJson(identity);
+  }
+  return stableJson(record);
 }
 
 function isMissingFile(error: unknown): boolean {

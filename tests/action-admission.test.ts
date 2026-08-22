@@ -1,12 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import {
   admitAction,
-  digestActionPlan,
-  digestCandidateParameters,
   type AdmissionContext,
   type AdmissionReasonCode,
-  type ImmutableActionPlan,
 } from "../src/action-admission.js";
+import {
+  digestActionPlan,
+  digestCandidateParameters,
+  type ImmutableActionPlan,
+} from "../src/action-plan.js";
 import {
   SEARCH_EGRESS_ALLOW_ID,
   SEARCH_EGRESS_DENY_ID,

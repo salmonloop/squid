@@ -82,6 +82,7 @@ export class PredictionCancelledError extends Error {
 export function candidate(
   kind: PredictionKind,
   confidence = 0.5,
+  parameters: PredictionCandidate["parameters"] = {},
 ): PredictionCandidate {
   return {
     kind,
@@ -89,6 +90,6 @@ export function candidate(
     confidence,
     expiresAt: new Date(Date.now() + 20_000).toISOString(),
     sourceEventIds: [],
-    parameters: {},
+    parameters,
   };
 }

@@ -102,5 +102,7 @@ export function sanitizeAuditText(text: string, kind: AuditTextClass): Sanitized
  */
 export function auditTextDigest(text: string, key?: Uint8Array): string {
   const digest = createHmac("sha256", key ?? new Uint8Array(0)).update(text).digest("hex");
-  return key === undefined ? digest : `hmac:${digest}`;
+  // The prefix is part of the contract: ledger schemas accept `sha256:` or
+  // `hmac:` and reject a bare hex string, so a keyless digest is still tagged.
+  return key === undefined ? `sha256:${digest}` : `hmac:${digest}`;
 }

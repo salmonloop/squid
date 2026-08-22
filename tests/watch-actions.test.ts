@@ -2,20 +2,23 @@ import { describe, expect, it } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { z } from "zod";
 import { InMemoryEventStore } from "../src/event-store.js";
 import { CapabilityDispatcher } from "../src/capability-gateway.js";
 import type { ActionConfirmationPolicy } from "../src/action-confirmation.js";
+import {
+  SEARCH_EGRESS_ALLOW_ID,
+  SEARCH_EGRESS_DENY_ID,
+  type EgressPolicy,
+} from "../src/action-egress.js";
 import { McpCapabilityGateway } from "../src/mcp-gateway.js";
 import { PredictionCoordinator } from "../src/prediction-coordinator.js";
-import {
-  candidateEnvelopes,
-  createAttemptRecord,
-  InMemoryPredictionLedger,
-  type PredictionLedger,
-} from "../src/prediction-ledger.js";
+import { InMemoryPredictionLedger } from "../src/prediction-ledger.js";
 import { PredictionRuntime } from "../src/prediction-runtime.js";
-import type { PredictionCandidate } from "../src/protocol.js";
+import { createActivityEvent, type ActivityEvent, type PredictionCandidate } from "../src/protocol.js";
 import { SquidCore } from "../src/squid-core.js";
 import {
   dispatchTopCandidate,
@@ -23,16 +26,20 @@ import {
   resolveWatchActions,
 } from "../src/watch-actions.js";
 
+const SESSION = "watch-session";
+const ALLOW: EgressPolicy = { id: SEARCH_EGRESS_ALLOW_ID, searchEgress: "allow" };
+const DENY: EgressPolicy = { id: SEARCH_EGRESS_DENY_ID, searchEgress: "deny" };
+
 const nextRequestId = () => {
   let sequence = 0;
   return () => `dispatch-${++sequence}`;
 };
 
 /**
- * The dispatch loop is tested end-to-end through the production objects: a
- * real MCP server over the in-memory transport, a real McpCapabilityGateway,
- * a real CapabilityDispatcher over a real ledger seeded with the attempt —
- * the same chain a live run executes, minus only the stdio wire.
+ * The dispatch loop is tested end-to-end through the production objects: a real
+ * MCP server over the in-memory transport, a real gateway, a real dispatcher,
+ * and a real runtime whose projection is built by ingesting real events — the
+ * same chain a live run executes, minus only the stdio wire.
  */
 async function connectCapabilityServer(queries: string[], commands: string[]): Promise<Client> {
   const server = new McpServer({ name: "test-server", version: "0.0.1" });
@@ -61,6 +68,68 @@ async function connectCapabilityServer(queries: string[], commands: string[]): P
   return client;
 }
 
+/** Events that put a selection in a browser window, owned end to end. */
+function browserSelection(selection: string): readonly ActivityEvent[] {
+  return [
+    createActivityEvent({
+      kind: "application_activated",
+      eventId: "b-app",
+      payload: { applicationId: "chrome", applicationName: "Chrome" },
+    }),
+    createActivityEvent({
+      kind: "window_changed",
+      eventId: "b-window",
+      payload: { applicationId: "chrome", title: "Docs", bounds: null },
+    }),
+    createActivityEvent({
+      kind: "browser_navigated",
+      eventId: "b-page",
+      payload: {
+        url: "https://example.com/docs",
+        title: "Docs",
+        host: "example.com",
+        owner: { applicationId: "chrome", windowTitle: "Docs" },
+      },
+    }),
+    createActivityEvent({
+      kind: "focus_changed",
+      eventId: "b-focus",
+      payload: {
+        applicationId: "chrome",
+        windowTitle: "Docs",
+        role: "text_input",
+        label: null,
+      },
+    }),
+    createActivityEvent({
+      kind: "text_context_changed",
+      eventId: "b-text",
+      payload: { prefix: "", suffix: "", selection, language: null },
+    }),
+  ];
+}
+
+/** Events that make a coding application the owner of the newest save. */
+function editorSave(path: string): readonly ActivityEvent[] {
+  return [
+    createActivityEvent({
+      kind: "application_activated",
+      eventId: "e-app",
+      payload: { applicationId: "vscode", applicationName: "Code" },
+    }),
+    createActivityEvent({
+      kind: "window_changed",
+      eventId: "e-window",
+      payload: { applicationId: "vscode", title: "main.ts", bounds: null },
+    }),
+    createActivityEvent({
+      kind: "file_saved",
+      eventId: "e-save",
+      payload: { path, applicationId: "vscode" },
+    }),
+  ];
+}
+
 function candidate(
   kind: PredictionCandidate["kind"],
   overrides: Partial<PredictionCandidate> = {},
@@ -76,64 +145,69 @@ function candidate(
   };
 }
 
-/** Seeds the ledger with the attempt a live prediction run would have written. */
-async function seedAttempt(
-  ledger: PredictionLedger,
-  requestId: string,
-  candidates: readonly PredictionCandidate[],
-): Promise<void> {
-  await ledger.appendAttempt(createAttemptRecord({
-    triggerEventId: "evt-1",
-    episodeId: null,
-    triggeredAt: new Date().toISOString(),
-    completedAt: new Date().toISOString(),
-    runtimeSessionId: "test-runtime",
-    stateDigest: `sha256:${"a".repeat(64)}`,
-    projectionGeneration: 1,
-    triggerDisposition: "accepted",
-    contextPolicyId: "passthrough",
-    actionTrust: "trusted",
-    egressPolicyId: "search-egress-deny-v1",
-    outcome: {
-      requestId,
-      provider: "heuristic",
-      status: "succeeded",
-      candidates,
-      latencyMs: 1,
-    },
-    candidates: candidateEnvelopes(requestId, candidates),
-  }));
-}
-
-async function setup(candidates: readonly PredictionCandidate[]) {
+/**
+ * Builds the live chain and drives the runtime through `events` so the attempt
+ * the dispatcher validates against was produced by a real projection rather
+ * than hand-written into the ledger.
+ */
+async function setup(options: {
+  readonly candidates: readonly PredictionCandidate[];
+  readonly events: readonly ActivityEvent[];
+  readonly confirmation?: ActionConfirmationPolicy;
+  readonly workingDirectory?: string;
+  /**
+   * The one egress policy this runtime is built with. Production resolves a
+   * single policy in `resolveWatchActions` and hands the same object to both
+   * the runtime and every dispatch, so the fixture mirrors that: tests read
+   * `egressPolicy` back from setup rather than passing their own.
+   */
+  readonly egressPolicy?: EgressPolicy;
+}) {
+  const egressPolicy = options.egressPolicy ?? ALLOW;
   const queries: string[] = [];
   const commands: string[] = [];
   const client = await connectCapabilityServer(queries, commands);
   const ledger = new InMemoryPredictionLedger();
-  await seedAttempt(ledger, "req-1", candidates);
   const runtime = new PredictionRuntime(
     new SquidCore(new InMemoryEventStore()),
-    // No event is ever ingested in these tests, so the coordinator never
-    // requests a prediction; it exists only because the runtime owns one.
     new PredictionCoordinator({
-      provider: { name: "unused", predict: () => Promise.resolve([]) },
+      provider: {
+        name: "scripted",
+        predict: () => Promise.resolve(options.candidates),
+      },
       random: nextRequestId(),
     }),
-    { ledger },
+    {
+      ledger,
+      runtimeSessionId: SESSION,
+      actionTrust: "trusted",
+      egressPolicyId: egressPolicy.id,
+    },
   );
-  const gateway = new McpCapabilityGateway({ client, workingDirectory: "/workspace" });
+  const gateway = new McpCapabilityGateway({ client });
   const dispatcher = new CapabilityDispatcher({
     runtime,
     gateway,
     ledger,
+    ...(options.confirmation === undefined ? {} : { confirmation: options.confirmation }),
   });
+
+  let requestId = "";
+  for (const event of options.events) {
+    const ingested = await runtime.ingest(event);
+    if (ingested.prediction !== null) {
+      requestId = (await ingested.prediction).requestId;
+    }
+  }
+  await runtime.awaitIdle();
+
   return {
     queries,
     commands,
     ledger,
     dispatcher,
-    planner: (request: Parameters<typeof gateway.plan>[0]) => gateway.plan(request),
-    recordFeedback: (input: Parameters<typeof runtime.recordFeedback>[0]) => runtime.recordFeedback(input),
+    requestId,
+    egressPolicy,
     close: async () => {
       await runtime.dispose();
       await client.close();
@@ -157,6 +231,21 @@ describe("resolveWatchActions", () => {
     expect(resolution).toEqual({
       configError: "The selected provider is suggestion-only; actions require a replay-gated trusted provider.",
     });
+  });
+
+  it("rejects an invalid SQUID_SEARCH_EGRESS value before opening MCP", async () => {
+    for (const value of ["Allow", "allowed", "deny", "yes"]) {
+      const resolution = await resolveWatchActions(
+        unreachable("runtime"),
+        unreachable("ledger"),
+        {
+          SQUID_ACTIONS: "mcp",
+          SQUID_ACTIONS_MCP_COMMAND: "bun server.ts",
+          SQUID_SEARCH_EGRESS: value,
+        },
+      );
+      expect(resolution).toHaveProperty("configError");
+    }
   });
 
   it("reports a config error for a recognized variable with an unknown value", async () => {
@@ -245,144 +334,185 @@ describe("parseLiteralCommand", () => {
 });
 
 describe("dispatchTopCandidate", () => {
-  it("dispatches the search_selection candidate through the real gateway and records both feedback kinds", async () => {
-    const candidates = [
-      candidate("run_tests"),
-      candidate("search_selection", { parameters: { selection: "typebox" }, confidence: 0.2 }),
-    ];
-    const { queries, ledger, dispatcher, planner, close } = await setup(candidates);
+  it("dispatches the search_selection candidate when egress is allowed", async () => {
+    const candidates = [candidate("search_selection", {
+      confidence: 0.8,
+      parameters: { selection: "typebox" },
+    })];
+    const { queries, dispatcher, requestId, egressPolicy, close } = await setup({
+      candidates,
+      events: browserSelection("typebox"),
+    });
 
     const result = await dispatchTopCandidate(
-      { requestId: "req-1" },
+      { requestId },
       candidates,
       dispatcher,
-      { planner },
+      { egressPolicy },
     );
 
+    expect(result?.status).toBe("dispatched");
     expect(result?.action?.outcome).toBe("succeeded");
     expect(queries).toEqual(["typebox"]);
-    const feedback = (await ledger.all())
-      .filter((record) => record.recordType === "feedback");
-    expect(feedback.map((record) => record.feedback)).toEqual(["dispatched", "succeeded"]);
     await close();
   });
 
-  it("keeps run_tests disabled when terminal confirmation is not configured", async () => {
-    const candidates = [candidate("run_tests", { confidence: 0.9 })];
-    const { queries, dispatcher, planner, close } = await setup(candidates);
+  it("refuses a search with zero tool calls when egress is denied", async () => {
+    const candidates = [candidate("search_selection", {
+      confidence: 0.8,
+      parameters: { selection: "typebox" },
+    })];
+    const { queries, dispatcher, requestId, egressPolicy, close } = await setup({
+      candidates,
+      events: browserSelection("typebox"),
+      egressPolicy: DENY,
+    });
 
     const result = await dispatchTopCandidate(
-      { requestId: "req-1" },
+      { requestId },
       candidates,
       dispatcher,
-      { planner },
+      { egressPolicy },
     );
 
-    expect(result).toBeNull();
+    expect(result?.status).toBe("not_admitted");
     expect(queries).toEqual([]);
     await close();
   });
 
-  it("records acceptance, then dispatches run_tests through the real dispatcher", async () => {
+  it("refuses a search whose selection changed since the prediction", async () => {
+    const candidates = [candidate("search_selection", {
+      confidence: 0.8,
+      parameters: { selection: "stale text" },
+    })];
+    const { queries, dispatcher, requestId, egressPolicy, close } = await setup({
+      candidates,
+      // The world holds a different selection than the candidate predicted on.
+      events: browserSelection("current text"),
+    });
+
+    const result = await dispatchTopCandidate(
+      { requestId },
+      candidates,
+      dispatcher,
+      { egressPolicy },
+    );
+
+    expect(result?.status).toBe("not_admitted");
+    expect(result?.reasonCode).toBe("selection_changed");
+    expect(queries).toEqual([]);
+    await close();
+  });
+
+  it("keeps run_tests off when no confirmation policy is configured", async () => {
+    const root = await mkdtemp(join(tmpdir(), "squid-watch-"));
+    await mkdir(join(root, "tests"), { recursive: true });
+    await writeFile(join(root, "tests", "foo.test.ts"), "", "utf8");
     const candidates = [candidate("run_tests", {
       confidence: 0.9,
       parameters: { path: "tests/foo.test.ts" },
     })];
-    const { commands, ledger, dispatcher, planner, recordFeedback, close } = await setup(candidates);
+    const { commands, dispatcher, requestId, egressPolicy, close } = await setup({
+      candidates,
+      events: editorSave("tests/foo.test.ts"),
+      workingDirectory: root,
+      egressPolicy: DENY,
+    });
+
+    const result = await dispatchTopCandidate(
+      { requestId },
+      candidates,
+      dispatcher,
+      { egressPolicy, workingDirectory: root },
+    );
+
+    expect(result?.status).toBe("not_accepted");
+    expect(result?.reasonCode).toBe("confirmation_policy_missing");
+    expect(commands).toEqual([]);
+    await close();
+  });
+
+  it("runs the confirmed run_tests command exactly as planned", async () => {
+    const root = await mkdtemp(join(tmpdir(), "squid-watch-"));
+    await mkdir(join(root, "tests"), { recursive: true });
+    await writeFile(join(root, "tests", "foo.test.ts"), "", "utf8");
+    const candidates = [candidate("run_tests", {
+      confidence: 0.9,
+      parameters: { path: "tests/foo.test.ts" },
+    })];
     const confirmation: ActionConfirmationPolicy = {
       confirm: async () => ({ outcome: "accepted", reason: "user_accepted" }),
     };
+    const { commands, dispatcher, requestId, egressPolicy, close } = await setup({
+      candidates,
+      events: editorSave("tests/foo.test.ts"),
+      confirmation,
+      workingDirectory: root,
+      egressPolicy: DENY,
+    });
 
     const result = await dispatchTopCandidate(
-      { requestId: "req-1" },
+      { requestId },
       candidates,
       dispatcher,
-      { confirmation, planner, recordFeedback },
+      { egressPolicy, workingDirectory: root },
     );
 
-    expect(result?.decision).toEqual({ outcome: "accepted", reason: "user_accepted" });
-    expect(result?.action?.outcome).toBe("succeeded");
-    expect(commands).toEqual(["cd /workspace && bun test -- tests/foo.test.ts"]);
-    const feedback = (await ledger.all())
-      .filter((record) => record.recordType === "feedback");
-    expect(feedback.map((record) => record.feedback)).toEqual([
-      "accepted",
-      "dispatched",
-      "succeeded",
-    ]);
+    expect(result?.status).toBe("dispatched");
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toContain("bun test -- tests/foo.test.ts");
     await close();
   });
 
   it("records rejection and never invokes the gateway", async () => {
+    const root = await mkdtemp(join(tmpdir(), "squid-watch-"));
+    await mkdir(join(root, "tests"), { recursive: true });
+    await writeFile(join(root, "tests", "foo.test.ts"), "", "utf8");
     const candidates = [candidate("run_tests", {
+      confidence: 0.9,
       parameters: { path: "tests/foo.test.ts" },
     })];
-    const { ledger, dispatcher, planner, recordFeedback, close } = await setup(candidates);
     const confirmation: ActionConfirmationPolicy = {
       confirm: async () => ({ outcome: "rejected", reason: "user_rejected" }),
     };
+    const { commands, ledger, dispatcher, requestId, egressPolicy, close } = await setup({
+      candidates,
+      events: editorSave("tests/foo.test.ts"),
+      confirmation,
+      workingDirectory: root,
+      egressPolicy: DENY,
+    });
 
     const result = await dispatchTopCandidate(
-      { requestId: "req-1" },
+      { requestId },
       candidates,
       dispatcher,
-      { confirmation, planner, recordFeedback },
+      { egressPolicy, workingDirectory: root },
     );
 
-    expect(result?.action).toBeNull();
-    const feedback = (await ledger.all())
-      .filter((record) => record.recordType === "feedback");
-    expect(feedback.map((record) => record.feedback)).toEqual(["rejected"]);
-    await close();
-  });
-
-  it("rechecks expiry after an accepted confirmation", async () => {
-    const candidates = [candidate("run_tests", {
-      expiresAt: "2030-01-01T00:00:10.000Z",
-      parameters: { path: "tests/foo.test.ts" },
-    })];
-    const { ledger, dispatcher, planner, recordFeedback, close } = await setup(candidates);
-    let call = 0;
-    const confirmation: ActionConfirmationPolicy = {
-      confirm: async () => ({ outcome: "accepted", reason: "user_accepted" }),
-    };
-
-    const result = await dispatchTopCandidate(
-      { requestId: "req-1" },
-      candidates,
-      dispatcher,
-      {
-        confirmation,
-        planner,
-        recordFeedback,
-        now: () => new Date(call++ === 0
-          ? "2030-01-01T00:00:00.000Z"
-          : "2030-01-01T00:00:11.000Z"),
-      },
-    );
-
-    expect(result?.decision).toEqual({ outcome: "expired", reason: "candidate_expired" });
-    expect(result?.action).toBeNull();
-    const feedback = (await ledger.all())
-      .filter((record) => record.recordType === "feedback");
-    expect(feedback.map((record) => record.feedback)).toEqual(["accepted", "expired"]);
+    expect(result?.status).toBe("not_accepted");
+    expect(commands).toEqual([]);
+    const records = await ledger.all();
+    expect(records.filter((r) => r.recordType === "plan_decision")).toHaveLength(1);
+    expect(records.filter((r) => r.recordType === "plan_dispatch")).toHaveLength(0);
     await close();
   });
 
   it("skips an expired candidate instead of acting on stale context", async () => {
-    const candidates = [
-      candidate("search_selection", {
-        expiresAt: new Date(Date.now() - 1000).toISOString(),
-        parameters: { selection: "stale" },
-      }),
-    ];
-    const { queries, dispatcher, planner, close } = await setup(candidates);
+    const candidates = [candidate("search_selection", {
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+      parameters: { selection: "stale" },
+    })];
+    const { queries, dispatcher, requestId, egressPolicy, close } = await setup({
+      candidates,
+      events: browserSelection("stale"),
+    });
 
     const result = await dispatchTopCandidate(
-      { requestId: "req-1" },
+      { requestId },
       candidates,
       dispatcher,
-      { planner },
+      { egressPolicy },
     );
 
     expect(result).toBeNull();
@@ -390,22 +520,49 @@ describe("dispatchTopCandidate", () => {
     await close();
   });
 
-  it("prefers the higher-confidence of two eligible candidates", async () => {
+  it("considers only the top candidate and never downgrades to a lower one", async () => {
+    // The top candidate is unmappable; a system that fell back would run the
+    // search instead, quietly doing something the ranking did not choose.
     const candidates = [
-      candidate("search_selection", { parameters: { selection: "low" }, confidence: 0.1 }),
-      candidate("search_selection", { parameters: { selection: "high" }, confidence: 0.8 }),
+      candidate("draft_completion", { confidence: 0.9, parameters: { prefix: "x" } }),
+      candidate("search_selection", { confidence: 0.2, parameters: { selection: "typebox" } }),
     ];
-    const { queries, dispatcher, planner, close } = await setup(candidates);
+    const { queries, dispatcher, requestId, egressPolicy, close } = await setup({
+      candidates,
+      events: browserSelection("typebox"),
+    });
 
     const result = await dispatchTopCandidate(
-      { requestId: "req-1" },
+      { requestId },
       candidates,
       dispatcher,
-      { planner },
+      { egressPolicy },
     );
 
-    expect(result?.action?.outcome).toBe("succeeded");
-    expect(queries).toEqual(["high"]);
+    expect(result).toBeNull();
+    expect(queries).toEqual([]);
+    await close();
+  });
+
+  it("picks the higher-confidence candidate when several are actionable", async () => {
+    const candidates = [
+      candidate("search_selection", { confidence: 0.1, parameters: { selection: "low" } }),
+      candidate("search_selection", { confidence: 0.8, parameters: { selection: "typebox" } }),
+    ];
+    const { queries, dispatcher, requestId, egressPolicy, close } = await setup({
+      candidates,
+      events: browserSelection("typebox"),
+    });
+
+    const result = await dispatchTopCandidate(
+      { requestId },
+      candidates,
+      dispatcher,
+      { egressPolicy },
+    );
+
+    expect(result?.status).toBe("dispatched");
+    expect(queries).toEqual(["typebox"]);
     await close();
   });
 });

@@ -11,9 +11,27 @@ import {
   createAttemptRecord,
   createFeedbackRecord,
   type AttemptRecordMetadataInput,
+  type DispatchClaimResult,
   type PredictionFeedbackInput,
   type PredictionLedger,
 } from "./prediction-ledger.js";
+import {
+  admitAction,
+  type AdmissionReasonCode,
+} from "./action-admission.js";
+import type { ImmutableActionPlan } from "./action-plan.js";
+import type { EgressPolicy } from "./action-egress.js";
+
+/**
+ * Outcome of the runtime's single action gate.
+ *
+ * `not_admitted` means the world moved and the action must be dropped; the
+ * ledger was not touched. `claim` carries the ledger's verdict, and only a
+ * `claimed` status inside it authorizes a capability invocation.
+ */
+export type AdmitAndClaimResult =
+  | { readonly status: "not_admitted"; readonly reasonCode: AdmissionReasonCode }
+  | { readonly status: "claim"; readonly claim: DispatchClaimResult };
 
 /**
  * Result of ingesting an event through the live assistant runtime.
@@ -209,6 +227,75 @@ export class PredictionRuntime {
     const write = this.appendFeedback(input);
     this.trackLedgerWrite(write);
     return write;
+  }
+
+  /**
+   * The linearization point for action dispatch.
+   *
+   * Admission and the ledger claim run together inside the core's critical
+   * section, so no ingest can land between "the state still matches" and "this
+   * claim is recorded". Splitting them — checking first, claiming after — is the
+   * race this method exists to close: an event arriving in that window would
+   * make the dispatched action reference a projection that no longer exists.
+   *
+   * Deliberately narrow: callers cannot pass arbitrary work into the queue, and
+   * everything the verdict depends on is read inside it rather than supplied by
+   * the caller. Only `claimed` authorizes an outside-world invocation.
+   */
+  public async admitAndClaim(input: {
+    readonly plan: ImmutableActionPlan;
+    readonly planDigest: string;
+    readonly candidate: PredictionCandidate;
+    readonly egressPolicy: EgressPolicy;
+  }): Promise<AdmitAndClaimResult> {
+    this.assertOpen();
+    const ledger = this.ledger;
+    if (ledger === undefined) {
+      throw new Error("PredictionRuntime has no ledger attached.");
+    }
+    return this.core.runWithProjection(async (snapshot) => {
+      const records = await ledger.all();
+      const attempt = records.find((record) =>
+        record.recordType === "attempt" &&
+        record.requestId === input.plan.attemptId &&
+        record.schemaVersion === 2);
+      const admission = admitAction({
+        plan: input.plan,
+        attempt: attempt?.recordType === "attempt" && attempt.schemaVersion === 2
+          ? attempt
+          : undefined,
+        candidate: input.candidate,
+        state: snapshot.state,
+        runtimeSessionId: this.runtimeSessionId,
+        stateDigest: snapshot.stateDigest,
+        projectionGeneration: snapshot.projectionGeneration,
+        contextPolicyId: this.coordinator.contextPolicyId,
+        actionTrust: this.actionTrust,
+        egressPolicy: input.egressPolicy,
+        now: this.now(),
+      });
+      if (!admission.admitted) {
+        return { status: "not_admitted", reasonCode: admission.reasonCode };
+      }
+      const claim = await ledger.claimDispatch(
+        {
+          attemptId: input.plan.attemptId,
+          candidateId: input.plan.candidateId,
+          runtimeSessionId: this.runtimeSessionId,
+          projectionGeneration: snapshot.projectionGeneration,
+          stateDigest: snapshot.stateDigest,
+          episodeId: snapshot.state.episode?.id ?? null,
+          triggerDisposition: "accepted",
+          contextPolicyId: this.coordinator.contextPolicyId,
+          actionTrust: this.actionTrust,
+          egressPolicyId: input.egressPolicy.id,
+          planDigest: input.planDigest,
+        },
+        this.now().toISOString(),
+        () => crypto.randomUUID(),
+      );
+      return { status: "claim", claim };
+    });
   }
 
   private async appendFeedback(input: PredictionFeedbackInput): Promise<void> {

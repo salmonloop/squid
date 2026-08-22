@@ -55,6 +55,32 @@ export class SquidCore {
     return this.enqueue(() => this.restoreInternal());
   }
 
+  /**
+   * Runs one operation while the projection is held still, handing it a
+   * consistent `(state, digest, generation)` triple.
+   *
+   * This is the linearization primitive behind action dispatch: an admission
+   * check that reads state outside the queue can be invalidated by an ingest
+   * before its claim lands, which is precisely the race that would let an
+   * action run against a world that already moved. Nothing else in the system
+   * needs it, so it is deliberately shaped around a snapshot rather than
+   * offered as a general "run this serialized" escape hatch — the queue's
+   * invariants are not something callers should be able to borrow.
+   */
+  public async runWithProjection<TResult>(
+    operation: (projection: {
+      readonly state: WorldState;
+      readonly stateDigest: string;
+      readonly projectionGeneration: number;
+    }) => Promise<TResult>,
+  ): Promise<TResult> {
+    return this.enqueue(async () => operation({
+      state: cloneWorldState(this.state),
+      stateDigest: digestWorldState(this.state),
+      projectionGeneration: this.generation,
+    }));
+  }
+
   private async ingestInternal(input: ActivityEvent): Promise<IngestResult> {
     const event = parseActivityEvent(input);
     const duplicate = this.inspectDuplicate(event);

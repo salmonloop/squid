@@ -1,56 +1,7 @@
-import { createHash } from "node:crypto";
-import { canonicalJson } from "./state-digest.js";
 import type { EgressPolicy } from "./action-egress.js";
-import type { ActionablePredictionKind } from "./action-plan.js";
+import type { ImmutableActionPlan } from "./action-plan.js";
 import type { PredictionAttemptRecord } from "./prediction-ledger.js";
 import type { PredictionCandidate, WorldState } from "./protocol.js";
-
-/**
- * The immutable plan a single admitted candidate will execute.
- *
- * Everything that could still vary — a relative path, a symlinked working
- * directory, a selection read from a stale projection — is already resolved
- * by the planner. Admission only validates; it never re-plans. Confirmation,
- * claim, and gateway invocation all reference this exact object, so the user
- * cannot approve one operation while another is dispatched.
- */
-export interface ImmutableActionPlan {
-  readonly planSchemaVersion: 1;
-  readonly kind: ActionablePredictionKind;
-  readonly candidateId: string;
-  readonly attemptId: string;
-  readonly tool: string;
-  readonly arguments: Readonly<Record<string, string | number | boolean | null>>;
-  /**
-   * Operator-facing description. Never contains selection text: a summary that
-   * quoted the selection would put user text into logs and the ledger, which is
-   * exactly what the audit rules forbid.
-   */
-  readonly summary: string;
-  readonly confirmation: "none" | "required";
-  /** Canonical realpath of the directory a command runs in, or null for non-command plans. */
-  readonly canonicalWorkingDirectory: string | null;
-  /** Canonical realpath of the file a command targets, or null when there is none. */
-  readonly canonicalTarget: string | null;
-}
-
-/** Stable digest over the canonical plan. Shared by confirm, claim, and invoke. */
-export function digestActionPlan(plan: ImmutableActionPlan): string {
-  const hash = createHash("sha256")
-    .update(canonicalJson({ algorithmVersion: "action-plan-v1", plan }))
-    .digest("hex");
-  return `sha256:${hash}`;
-}
-
-/** Digest over candidate parameters, so the ledger can prove sameness without raw text. */
-export function digestCandidateParameters(
-  parameters: PredictionCandidate["parameters"],
-): string {
-  const hash = createHash("sha256")
-    .update(canonicalJson({ algorithmVersion: "candidate-parameters-v1", parameters }))
-    .digest("hex");
-  return `sha256:${hash}`;
-}
 
 /**
  * Fixed vocabulary of admission refusals. Reason codes are stable identifiers

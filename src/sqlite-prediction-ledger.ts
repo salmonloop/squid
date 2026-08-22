@@ -6,7 +6,7 @@ import {
   PlanDispatchStateMachine,
   PredictionLedgerConflictError,
   PredictionLedgerReferenceError,
-  stableJson,
+  recordIdentity,
   type ActionPlanRecord,
   type ClaimDispatchInputs,
   type CompleteDispatchResult,
@@ -248,7 +248,7 @@ export class SqlitePredictionLedger implements PredictionLedger {
       .query(`SELECT record_json FROM ledger_records WHERE record_id = ?`)
       .get(record.recordId) as { record_json: string } | null;
     if (row === null) return false;
-    return stableJson(JSON.parse(row.record_json)) === stableJson(record);
+    return recordIdentity(parsePredictionLedgerRecord(JSON.parse(row.record_json))) === recordIdentity(record);
   }
 
   private translate(error: unknown, record: PredictionLedgerRecord): unknown {

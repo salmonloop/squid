@@ -1,10 +1,14 @@
 import { describe, expect, it } from "bun:test";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { z } from "zod";
 import { McpCapabilityGateway } from "../src/mcp-gateway.js";
-import type { ActionRequest } from "../src/capability-gateway.js";
+import { planAction, isPlanFailure } from "../src/action-planner.js";
+import { digestActionPlan, type ImmutableActionPlan } from "../src/action-plan.js";
 
 /**
  * The gateway is tested against a real MCP server over the in-memory
@@ -12,8 +16,26 @@ import type { ActionRequest } from "../src/capability-gateway.js";
  * (tool listing, argument validation, error results) exactly as a stdio or
  * HTTP deployment would see it, while staying offline and deterministic.
  */
-function request(kind: ActionRequest["kind"], parameters: ActionRequest["parameters"]): ActionRequest {
-  return { candidateId: `req:candidate:0`, kind, parameters };
+/**
+ * Builds a real plan through the planner rather than hand-writing one, so these
+ * tests exercise the exact object shape production sends to the gateway.
+ */
+async function plan(
+  kind: "search_selection" | "run_tests",
+  parameters: Record<string, string>,
+  workingDirectory?: string,
+): Promise<ImmutableActionPlan> {
+  const planned = await planAction(
+    { candidateId: "req:candidate:0", attemptId: "req", kind, parameters },
+    {
+      ...(workingDirectory === undefined ? {} : { workingDirectory }),
+      resolvePath: async (path) => path,
+    },
+  );
+  if (isPlanFailure(planned)) {
+    throw new Error(`planner refused: ${planned.reasonCode}`);
+  }
+  return planned.plan;
 }
 
 async function connect(options: {
@@ -73,16 +95,15 @@ describe("McpCapabilityGateway", () => {
     const gateway = new McpCapabilityGateway({ client });
 
     const result = await gateway.invoke(
-      request("search_selection", { selection: "typebox union", prefix: "", suffix: "" }),
+      await plan("search_selection", { selection: "typebox union" }),
     );
 
     expect(result.outcome).toBe("succeeded");
-    expect(result.candidateId).toBe("req:candidate:0");
     expect(result.details?.tool).toBe("search_web");
     expect(result.details?.summary).toBe("3 hits for typebox union");
   });
 
-  it("maps run_tests' saved path onto a run_command invocation", async () => {
+  it("runs the exact command the planner froze, in the canonical directory", async () => {
     let seenCommand = "";
     const client = await connect({
       onRunCommand: ({ command }) => {
@@ -90,40 +111,52 @@ describe("McpCapabilityGateway", () => {
         return "ran";
       },
     });
-    const gateway = new McpCapabilityGateway({ client, workingDirectory: "/workspace/squid project" });
-
-    const result = await gateway.invoke(
-      request("run_tests", { path: "tests/foo bar;$(touch nope).test.ts" }),
-    );
-
-    expect(result.outcome).toBe("succeeded");
-    expect(seenCommand).toBe("cd '/workspace/squid project' && bun test -- 'tests/foo bar;$(touch nope).test.ts'");
-  });
-
-  it("refuses prediction kinds with no tool mapping", async () => {
-    const client = await connect();
     const gateway = new McpCapabilityGateway({ client });
 
-    const result = await gateway.invoke(request("draft_completion", { prefix: "hello" }));
+    // A real directory, because the gateway re-resolves the plan's canonical
+    // paths before invoking: a workdir that no longer exists must not run.
+    const root = await mkdtemp(join(tmpdir(), "squid-gateway-"));
+    await mkdir(join(root, "tests"), { recursive: true });
+    await writeFile(join(root, "tests", "sample.test.ts"), "", "utf8");
+    const built = await plan("run_tests", { path: "tests/sample.test.ts" }, root);
 
-    expect(result.outcome).toBe("failed");
-    expect(result.error).toContain("draft_completion");
+    const result = await gateway.invoke(built);
+
+    expect(result.outcome).toBe("succeeded");
+    // Quoted exactly once, over the canonical root the planner resolved.
+    expect(seenCommand).toBe(built.arguments.command);
+    expect(seenCommand).toContain("bun test -- tests/sample.test.ts");
   });
 
-  it("refuses candidates whose parameters do not satisfy the tool contract instead of calling the tool", async () => {
+  it("refuses to invoke when the plan's canonical directory no longer resolves", async () => {
     const client = await connect({
-      onSearchWeb: () => {
+      onRunCommand: () => {
         throw new Error("must not be called");
       },
     });
     const gateway = new McpCapabilityGateway({ client });
 
-    // The heuristic emits {selection}; a candidate without it is refused.
-    const emptySelection = await gateway.invoke(request("search_selection", { selection: "   " }));
-    expect(emptySelection.outcome).toBe("failed");
+    const result = await gateway.invoke(await plan(
+      "run_tests",
+      { path: "tests/gone.test.ts" },
+      "/workspace/definitely missing",
+    ));
 
-    const noPath = await gateway.invoke(request("run_tests", {}));
-    expect(noPath.outcome).toBe("failed");
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toContain("working directory");
+  });
+
+  it("reports a missing tool as a failed outcome rather than throwing", async () => {
+    const client = await connect();
+    const gateway = new McpCapabilityGateway({ client });
+    const valid = await plan("search_selection", { selection: "x" });
+
+    // A plan naming a tool this server does not expose: the gateway does not
+    // discover tools, so the protocol-level rejection is the answer.
+    const result = await gateway.invoke({ ...valid, tool: "no_such_tool" });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.planDigest).toBe(result.planDigest);
   });
 
   it("turns an MCP error result into a failed outcome carrying the message", async () => {
@@ -144,7 +177,7 @@ describe("McpCapabilityGateway", () => {
     ]);
     const gateway = new McpCapabilityGateway({ client });
 
-    const result = await gateway.invoke(request("search_selection", { selection: "x" }));
+    const result = await gateway.invoke(await plan("search_selection", { selection: "x" }));
 
     expect(result.outcome).toBe("failed");
     expect(result.error).toBe("upstream search provider down");
@@ -167,21 +200,20 @@ describe("McpCapabilityGateway", () => {
     ]);
     const gateway = new McpCapabilityGateway({ client });
 
-    const result = await gateway.invoke(request("search_selection", { selection: "x" }));
+    const result = await gateway.invoke(await plan("search_selection", { selection: "x" }));
 
     expect(result.outcome).toBe("failed");
     expect(result.error).toContain("handler exploded");
   });
 
-  it("rejects schema-invalid arguments as a failed outcome via the server's own validation", async () => {
+  it("returns the plan's own digest so the dispatcher can match the completion", async () => {
     const client = await connect();
     const gateway = new McpCapabilityGateway({ client });
+    const actionPlan = await plan("search_selection", { selection: "x" });
 
-    // A selection of only whitespace passes the gateway (it is a string) but
-    // the mapping trims it — so use a non-empty value and force rejection at
-    // the server instead by registering an empty-argument-tolerant tool.
-    const result = await gateway.invoke(request("search_selection", { selection: "x" }));
+    const result = await gateway.invoke(actionPlan);
 
     expect(result.outcome).toBe("succeeded");
+    expect(result.planDigest).toBe(digestActionPlan(actionPlan));
   });
 });

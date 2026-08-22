@@ -1,39 +1,42 @@
-import type { PredictionCandidate, PredictionKind } from "./protocol.js";
-import type {
-  PredictionFeedbackKind,
-  PredictionLedger,
+import { sanitizeAuditText, auditTextDigest } from "./action-egress.js";
+import type { EgressPolicy } from "./action-egress.js";
+import { digestActionPlan, type ImmutableActionPlan } from "./action-plan.js";
+import {
+  createActionPlanRecord,
+  createPlanDecisionRecord,
+  PredictionLedgerReferenceError,
+  type PredictionLedger,
 } from "./prediction-ledger.js";
 import type { PredictionRuntime } from "./prediction-runtime.js";
+import type { PredictionCandidate } from "./protocol.js";
+import type { ActionConfirmationPolicy } from "./action-confirmation.js";
 
 /**
- * A capability the base wants the outside world to perform. The base owns the
- * intent; the gateway owns the concrete desktop/browser/IDE operation.
- */
-export interface ActionRequest {
-  readonly candidateId: string;
-  readonly kind: PredictionKind;
-  readonly parameters: PredictionCandidate["parameters"];
-}
-
-/**
- * Result of a capability invocation. The base records this as feedback and
- * never re-derives success from a side channel.
+ * Result of a capability invocation.
+ *
+ * `outcome` distinguishes two very different things. A `failed` result means the
+ * tool ran and reported a structured failure — a fact the ledger may record as
+ * terminal. A thrown invocation means nobody knows whether the tool ran, which
+ * the dispatcher turns into `reconciliation_required` rather than a fabricated
+ * failure.
  */
 export interface ActionResult {
-  readonly candidateId: string;
+  readonly planDigest: string;
   readonly outcome: "succeeded" | "failed";
   readonly details?: Record<string, string | number | boolean | null>;
   readonly error?: string;
 }
 
 /**
- * Pluggable boundary for dispatching accepted candidates. A real MCP server
- * (or any mature adapter) implements this interface; the base never assumes a
- * concrete capability.
+ * Pluggable boundary for executing one already-approved plan.
+ *
+ * The gateway receives a finished `ImmutableActionPlan` and never sees a
+ * candidate, so a model cannot choose the tool or the command: those were fixed
+ * by the planner and approved by the user before this interface is reached.
  */
 export interface CapabilityGateway {
   readonly id: string;
-  invoke(request: ActionRequest): Promise<ActionResult>;
+  invoke(plan: ImmutableActionPlan): Promise<ActionResult>;
 }
 
 export interface FakeCapabilityGatewayOptions {
@@ -47,17 +50,14 @@ export interface FakeCapabilityGatewayOptions {
   readonly delayMs?: number;
 }
 
-/**
- * A controllable gateway for offline tests. It can simulate success, failure,
- * latency, and a thrown invocation.
- */
+/** A controllable gateway for offline tests: success, structured failure, latency, or a throw. */
 export class FakeCapabilityGateway implements CapabilityGateway {
   public readonly id: string;
   private readonly outcome: ActionResult["outcome"];
   private readonly error: Error | undefined;
   private readonly details: ActionResult["details"] | undefined;
   private readonly delayMs: number;
-  private readonly invocations: ActionRequest[] = [];
+  private readonly invocations: ImmutableActionPlan[] = [];
 
   public constructor(options: FakeCapabilityGatewayOptions = {}) {
     this.id = options.id ?? "fake-capability";
@@ -67,12 +67,12 @@ export class FakeCapabilityGateway implements CapabilityGateway {
     this.delayMs = options.delayMs ?? 0;
   }
 
-  public get recordedInvocations(): readonly ActionRequest[] {
+  public get recordedInvocations(): readonly ImmutableActionPlan[] {
     return this.invocations;
   }
 
-  public async invoke(request: ActionRequest): Promise<ActionResult> {
-    this.invocations.push(structuredClone(request));
+  public async invoke(plan: ImmutableActionPlan): Promise<ActionResult> {
+    this.invocations.push(structuredClone(plan) as ImmutableActionPlan);
     if (this.delayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.delayMs));
     }
@@ -80,7 +80,7 @@ export class FakeCapabilityGateway implements CapabilityGateway {
       throw this.error;
     }
     return {
-      candidateId: request.candidateId,
+      planDigest: digestActionPlan(plan),
       outcome: this.outcome,
       ...(this.outcome === "failed" && this.details !== undefined
         ? { details: this.details }
@@ -89,133 +89,239 @@ export class FakeCapabilityGateway implements CapabilityGateway {
   }
 }
 
+/**
+ * Every way a dispatch attempt can end.
+ *
+ * Only `dispatched` means the capability ran and its terminal state was
+ * recorded. `reconciliation_required` is the honest answer when the claim
+ * succeeded but the outcome is unknowable — a transport timeout, a crash, or a
+ * terminal write that failed. It never becomes `failed`, because a fabricated
+ * failure would invite an automatic retry of an action that may have run.
+ */
+export type DispatchStatus =
+  | "dispatched"
+  | "not_admitted"
+  | "not_accepted"
+  | "expired"
+  | "already_claimed"
+  | "terminal"
+  | "reconciliation_required";
+
+export interface DispatchOutcome {
+  readonly status: DispatchStatus;
+  readonly planDigest: string;
+  /** Stable refusal identifier. Never carries user text. */
+  readonly reasonCode?: string;
+  /** Present only when the capability actually ran. */
+  readonly action: ActionResult | null;
+}
+
+export interface DispatchRequest {
+  readonly plan: ImmutableActionPlan;
+  readonly planDigest: string;
+  readonly candidateParametersDigest: string;
+  readonly candidate: PredictionCandidate;
+  readonly egressPolicy: EgressPolicy;
+}
+
 export interface CapabilityDispatcherOptions {
   readonly runtime: PredictionRuntime;
   readonly gateway: CapabilityGateway;
   readonly ledger: PredictionLedger;
-  /** Injected for deterministic feedback IDs. */
-  readonly random?: () => string;
-}
-
-interface ResolvedCandidate {
-  readonly requestId: string;
-  readonly candidate: PredictionCandidate;
+  /** Required for plans whose confirmation is "required". */
+  readonly confirmation?: ActionConfirmationPolicy;
+  /** Injected for deterministic tests. */
+  readonly now?: () => Date;
 }
 
 /**
- * Dispatches an accepted candidate through a capability gateway and records
- * the lifecycle (dispatched → succeeded/failed) as ledger feedback. The
- * dispatcher owns sequencing and recording; the gateway owns the operation.
+ * The only path from an approved plan to an executed capability.
  *
- * A thrown gateway invocation becomes a "failed" result rather than escaping —
- * the caller learns the outcome from the returned `ActionResult` and the
- * recorded feedback, not from a thrown error.
+ * The order is fixed and each step exists to close one hole:
  *
- * A failed *ledger* write is different and does escape: an unresolvable
- * candidate or a disposed runtime rejects `dispatch`. Only the gateway's own
- * failure is data; losing the record is an error, because a dispatch that was
- * not recorded must not look like one that succeeded.
+ * 1. `recordPlan` — the plan is durable before the user is asked, so the thing
+ *    they approve is the thing the ledger can prove was proposed.
+ * 2. confirmation — for plans that need it, recorded as a user decision.
+ * 3. `admitAndClaim` — re-validates against the *current* projection and claims
+ *    atomically inside the runtime's serial queue. This is the linearization
+ *    point: a verdict computed before confirmation says nothing about the world
+ *    after it, and two concurrent dispatches of one candidate cannot both win.
+ * 4. `invoke` — only a `claimed` status gets here, and no further check may
+ *    reject: after the claim, refusing would leave a dispatched record with no
+ *    terminal state.
+ * 5. `completeDispatch` — records the terminal state under the opaque claim
+ *    token.
+ *
+ * Nothing in this class re-derives a tool or a command; it moves one immutable
+ * plan through the state machine.
  */
 export class CapabilityDispatcher {
   private readonly runtime: PredictionRuntime;
   private readonly gateway: CapabilityGateway;
   private readonly ledger: PredictionLedger;
-  private readonly random: () => string;
+  private readonly confirmation: ActionConfirmationPolicy | undefined;
+  private readonly now: () => Date;
 
   public constructor(options: CapabilityDispatcherOptions) {
     this.runtime = options.runtime;
     this.gateway = options.gateway;
     this.ledger = options.ledger;
-    this.random = options.random ?? (() => crypto.randomUUID());
+    this.confirmation = options.confirmation;
+    this.now = options.now ?? (() => new Date());
   }
 
-  public async dispatch(candidateId: string): Promise<ActionResult> {
-    const resolved = await this.findCandidate(candidateId);
-    if (resolved === undefined) {
-      throw new Error(`No prediction candidate ${candidateId} recorded in the ledger.`);
-    }
-    const { requestId, candidate } = resolved;
-    const feedbackId = (kind: PredictionFeedbackKind) => `${candidateId}:${kind}:${this.random()}`;
+  public async dispatch(request: DispatchRequest): Promise<DispatchOutcome> {
+    const { plan, planDigest } = request;
 
-    await this.runtime.recordFeedback({
-      feedbackId: feedbackId("dispatched"),
-      requestId,
-      candidateId,
-      feedback: "dispatched",
-    });
-
-    let result: ActionResult;
+    // A plan whose attempt never landed durably cannot be dispatched: the claim
+    // would have nothing to validate against. This is the "attempt write failed"
+    // path — the prediction was still delivered, but the action is refused with
+    // zero capability calls rather than dispatched on an unauditable basis.
     try {
-      result = await this.gateway.invoke({
-        candidateId,
-        kind: candidate.kind,
-        parameters: structuredClone(candidate.parameters),
-      });
+      await this.ledger.recordPlan(createActionPlanRecord({
+        attemptId: plan.attemptId,
+        requestId: plan.attemptId,
+        candidateId: plan.candidateId,
+        planDigest,
+        candidateParametersDigest: request.candidateParametersDigest,
+        confirmation: plan.confirmation,
+        egressPolicyId: request.egressPolicy.id,
+        createdAt: this.now().toISOString(),
+      }));
     } catch (error) {
-      result = {
-        candidateId,
-        outcome: "failed",
-        error: error instanceof Error ? error.message : String(error),
+      return {
+        status: "not_admitted",
+        planDigest,
+        reasonCode: error instanceof PredictionLedgerReferenceError
+          ? "attempt_missing"
+          : "plan_conflict",
+        action: null,
       };
     }
 
+    if (plan.confirmation === "required") {
+      const refusal = await this.confirmPlan(request);
+      if (refusal !== null) return refusal;
+    }
+
+    // The linearization point. Everything before this may still be refused;
+    // nothing after it may be.
+    const claimed = await this.runtime.admitAndClaim({
+      plan,
+      planDigest,
+      candidate: request.candidate,
+      egressPolicy: request.egressPolicy,
+    });
+    if (claimed.status === "not_admitted") {
+      return { status: "not_admitted", planDigest, reasonCode: claimed.reasonCode, action: null };
+    }
+    const claim = claimed.claim;
+    if (claim.status !== "claimed") {
+      return {
+        status: claim.status === "rejected" ? "not_accepted" : claim.status,
+        planDigest,
+        ...(claim.status === "rejected" ? { reasonCode: claim.reasonCode } : {}),
+        action: null,
+      };
+    }
+
+    let result: ActionResult;
     try {
-      await this.runtime.recordFeedback({
-        feedbackId: feedbackId(result.outcome),
-        requestId,
-        candidateId,
-        feedback: result.outcome,
-        details: this.feedbackDetails(result),
-      });
-    } catch (recordError) {
-      // The dispatch happened but its terminal state could not be recorded.
-      // Without a compensating "failed", the ledger is left with only
-      // "dispatched" — a retry would see no terminal state and double-dispatch.
-      try {
-        await this.runtime.recordFeedback({
-          feedbackId: feedbackId("failed"),
-          requestId,
-          candidateId,
-          feedback: "failed",
-          details: {
-            gateway: this.gateway.id,
-            ledgerError: recordError instanceof Error ? recordError.message : String(recordError),
-          },
-        });
-      } catch {
-        // Best effort — the original error is the real problem.
-      }
-      throw recordError;
+      result = { ...(await this.gateway.invoke(plan)), planDigest };
+    } catch (error) {
+      // The call may or may not have reached the tool. Recording `failed` here
+      // would assert something unknown, so the dispatch stays open for a human.
+      return {
+        status: "reconciliation_required",
+        planDigest,
+        reasonCode: "transport_failure",
+        action: null,
+      };
     }
 
-    return result;
-  }
-
-  private async findCandidate(candidateId: string): Promise<ResolvedCandidate | undefined> {
-    const records = await this.ledger.all();
-    for (const record of records) {
-      if (record.recordType !== "attempt") continue;
-      const envelope = record.candidates.find((item) => item.candidateId === candidateId);
-      if (envelope !== undefined) {
-        return { requestId: record.requestId, candidate: envelope.candidate };
+    const details = this.auditDetails(result);
+    try {
+      const completed = await this.ledger.completeDispatch(
+        { planDigest, claimToken: claim.claimToken },
+        result.outcome,
+        auditTextDigest(details),
+        this.now().toISOString(),
+      );
+      if (completed.status !== "completed") {
+        return {
+          status: "reconciliation_required",
+          planDigest,
+          reasonCode: completed.status,
+          action: result,
+        };
       }
+    } catch {
+      // The capability ran but its terminal state is not durable. Same rule as
+      // a transport failure: report, never fabricate.
+      return {
+        status: "reconciliation_required",
+        planDigest,
+        reasonCode: "terminal_write_failed",
+        action: result,
+      };
     }
-    return undefined;
+
+    return { status: "dispatched", planDigest, action: result };
   }
 
   /**
-   * Gateway-supplied details are merged first so the dispatcher's own
-   * attribution wins: which gateway ran, and whether it threw, are facts the
-   * base observed, not fields a gateway may overwrite.
+   * Runs the confirmation policy and records the decision. Returns `null` when
+   * the plan may proceed, or the terminal outcome when it may not.
    */
-  private feedbackDetails(result: ActionResult): Record<string, string | number | boolean | null> {
-    const details: Record<string, string | number | boolean | null> = {
-      ...result.details,
-      gateway: this.gateway.id,
-    };
-    if (result.error !== undefined) {
-      details.error = result.error;
+  private async confirmPlan(request: DispatchRequest): Promise<DispatchOutcome | null> {
+    const { plan, planDigest } = request;
+    if (this.confirmation === undefined) {
+      return {
+        status: "not_accepted",
+        planDigest,
+        reasonCode: "confirmation_policy_missing",
+        action: null,
+      };
     }
-    return details;
+    // The policy sees the whole immutable plan, not a summary copied out of it:
+    // whatever it prints is byte-for-byte what `invoke` will execute.
+    const decision = await this.confirmation.confirm({
+      candidateId: plan.candidateId,
+      plan,
+      expiresAt: request.candidate.expiresAt,
+    });
+    await this.ledger.recordDecision(createPlanDecisionRecord({
+      planDigest,
+      decision: decision.outcome,
+      detailsDigest: auditTextDigest(
+        sanitizeAuditText(decision.reason, "summary").text,
+      ),
+      decidedAt: this.now().toISOString(),
+    }));
+    if (decision.outcome !== "accepted") {
+      return {
+        status: decision.outcome === "expired" ? "expired" : "not_accepted",
+        planDigest,
+        reasonCode: decision.reason,
+        action: null,
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Collapses a gateway result into a single sanitized audit line. Tool output
+   * may echo user text, so it passes through the same sanitizer as everything
+   * else that reaches the ledger, and only its digest is persisted.
+   */
+  private auditDetails(result: ActionResult): string {
+    const summary = typeof result.details?.summary === "string" ? result.details.summary : "";
+    const error = result.error ?? "";
+    return [
+      this.gateway.id,
+      result.outcome,
+      sanitizeAuditText(summary, "mcp_summary").text,
+      sanitizeAuditText(error, "mcp_summary").text,
+    ].join("|");
   }
 }

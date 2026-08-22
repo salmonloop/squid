@@ -1,77 +1,163 @@
 import { describe, expect, it } from "bun:test";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { InMemoryEventStore } from "../src/event-store.js";
 import { FakePredictionProvider, candidate } from "../src/fake-prediction-provider.js";
 import { PredictionCoordinator } from "../src/prediction-coordinator.js";
 import {
   CapabilityDispatcher,
   FakeCapabilityGateway,
+  type DispatchRequest,
 } from "../src/capability-gateway.js";
+import { digestActionPlan, type ImmutableActionPlan } from "../src/action-plan.js";
+import { isPlanFailure, planAction } from "../src/action-planner.js";
+import { SEARCH_EGRESS_DENY_ID, type EgressPolicy } from "../src/action-egress.js";
 import { InMemoryPredictionLedger } from "../src/prediction-ledger.js";
 import { PredictionRuntime } from "../src/prediction-runtime.js";
-import { createActivityEvent } from "../src/protocol.js";
+import { createActivityEvent, type PredictionCandidate } from "../src/protocol.js";
 import { SquidCore } from "../src/squid-core.js";
+import type {
+  ActionConfirmationDecision,
+  ActionConfirmationPolicy,
+} from "../src/action-confirmation.js";
+
+const RUNTIME_SESSION = "session-dispatch";
+const DENY_POLICY: EgressPolicy = { id: SEARCH_EGRESS_DENY_ID, searchEgress: "deny" };
 
 const nextRequestId = () => {
   let sequence = 0;
   return () => `dispatch-${++sequence}`;
 };
 
-const nextFeedbackId = () => {
-  let sequence = 0;
-  return () => `seq-${++sequence}`;
-};
+/** Accepts or refuses every plan without touching a terminal. */
+class ScriptedConfirmation implements ActionConfirmationPolicy {
+  public readonly seen: ImmutableActionPlan[] = [];
 
-function savedFile(eventId = "saved-1") {
-  return createActivityEvent({
-    kind: "file_saved",
-    eventId,
-    payload: { path: "src/main.ts", applicationId: "editor" },
-  });
+  public constructor(private readonly decision: ActionConfirmationDecision) {}
+
+  public async confirm(request: { readonly plan: ImmutableActionPlan }) {
+    this.seen.push(request.plan);
+    return this.decision;
+  }
 }
 
-async function setup(opts: {
-  gatewayOutcome?: "succeeded" | "failed";
-  gatewayError?: Error;
-  gatewayDetails?: Record<string, string | number | boolean | null>;
+/**
+ * A world where `run_tests` admission passes: a coding app in front, and the
+ * newest save naming the file the plan targets.
+ */
+async function savedInEditor(root: string, eventId = "saved-1") {
+  return [
+    createActivityEvent({
+      kind: "application_activated",
+      eventId: `${eventId}-app`,
+      payload: { applicationId: "vscode", applicationName: "Code" },
+    }),
+    createActivityEvent({
+      kind: "window_changed",
+      eventId: `${eventId}-window`,
+      payload: {
+        applicationId: "vscode",
+        title: "main.ts",
+        bounds: { x: 0, y: 0, width: 100, height: 100 },
+      },
+    }),
+    createActivityEvent({
+      kind: "file_saved",
+      eventId,
+      payload: { path: "tests/x.test.ts", applicationId: "vscode" },
+    }),
+  ];
+}
+
+async function setup(options: {
+  readonly gatewayOutcome?: "succeeded" | "failed";
+  readonly gatewayError?: Error;
+  readonly gatewayDetails?: Record<string, string | number | boolean | null>;
+  readonly confirmation?: ActionConfirmationPolicy;
 } = {}) {
+  const root = await mkdtemp(join(tmpdir(), "squid-dispatch-"));
   const ledger = new InMemoryPredictionLedger();
   const runtime = new PredictionRuntime(
     new SquidCore(new InMemoryEventStore()),
     new PredictionCoordinator({
-      provider: new FakePredictionProvider({ candidates: [candidate("run_tests")] }),
+      provider: new FakePredictionProvider({
+        candidates: [candidate("run_tests", 0.9, { path: "tests/x.test.ts" })],
+      }),
       random: nextRequestId(),
     }),
-    { ledger, now: () => new Date("2026-08-19T10:00:00.000Z") },
+    {
+      ledger,
+      runtimeSessionId: RUNTIME_SESSION,
+      actionTrust: "trusted",
+      egressPolicyId: SEARCH_EGRESS_DENY_ID,
+    },
   );
   const gateway = new FakeCapabilityGateway({
-    outcome: opts.gatewayOutcome,
-    error: opts.gatewayError,
-    details: opts.gatewayDetails,
+    ...(options.gatewayOutcome === undefined ? {} : { outcome: options.gatewayOutcome }),
+    ...(options.gatewayError === undefined ? {} : { error: options.gatewayError }),
+    ...(options.gatewayDetails === undefined ? {} : { details: options.gatewayDetails }),
   });
   const dispatcher = new CapabilityDispatcher({
     runtime,
     gateway,
     ledger,
-    random: nextFeedbackId(),
+    ...(options.confirmation === undefined ? {} : { confirmation: options.confirmation }),
   });
-  const result = await runtime.ingest(savedFile());
-  const outcome = await result.prediction!;
+
+  let outcome!: { readonly requestId: string; readonly candidates: readonly PredictionCandidate[] };
+  for (const event of await savedInEditor(root)) {
+    const ingested = await runtime.ingest(event);
+    if (ingested.prediction !== null) {
+      outcome = await ingested.prediction;
+    }
+  }
   await runtime.awaitIdle();
-  return { runtime, ledger, gateway, dispatcher, candidateId: `${outcome.requestId}:candidate:0` };
+
+  const top = outcome.candidates[0]!;
+  const candidateId = `${outcome.requestId}:candidate:0`;
+  const planned = await planAction(
+    {
+      candidateId,
+      attemptId: outcome.requestId,
+      kind: top.kind,
+      parameters: top.parameters,
+    },
+    { workingDirectory: root },
+  );
+  if (isPlanFailure(planned)) throw new Error(`planning failed: ${planned.reasonCode}`);
+
+  const request: DispatchRequest = {
+    plan: planned.plan,
+    planDigest: planned.planDigest,
+    candidateParametersDigest: planned.candidateParametersDigest,
+    candidate: top,
+    egressPolicy: DENY_POLICY,
+  };
+  return { runtime, ledger, gateway, dispatcher, request, candidateId, root };
 }
 
 describe("FakeCapabilityGateway", () => {
-  it("records invocations and returns the configured outcome", async () => {
+  const plan: ImmutableActionPlan = {
+    planSchemaVersion: 1,
+    kind: "run_tests",
+    candidateId: "c-1",
+    attemptId: "req-1",
+    tool: "run_command",
+    arguments: { command: "bun test" },
+    summary: "bun test",
+    confirmation: "required",
+    canonicalWorkingDirectory: "/tmp",
+    canonicalTarget: null,
+  };
+
+  it("records the exact plan it was given and returns the configured outcome", async () => {
     const gateway = new FakeCapabilityGateway({ id: "test" });
-    const result = await gateway.invoke({
-      candidateId: "c-1",
-      kind: "run_tests",
-      parameters: { target: "src/main.ts" },
-    });
+    const result = await gateway.invoke(plan);
     expect(result.outcome).toBe("succeeded");
-    expect(result.candidateId).toBe("c-1");
+    expect(result.planDigest).toBe(digestActionPlan(plan));
     expect(gateway.recordedInvocations).toHaveLength(1);
-    expect(gateway.recordedInvocations[0].kind).toBe("run_tests");
+    expect(gateway.recordedInvocations[0]!.tool).toBe("run_command");
   });
 
   it("returns failure details when configured to fail", async () => {
@@ -79,117 +165,144 @@ describe("FakeCapabilityGateway", () => {
       outcome: "failed",
       details: { reason: "no terminal" },
     });
-    const result = await gateway.invoke({ candidateId: "c-1", kind: "run_tests", parameters: {} });
+    const result = await gateway.invoke(plan);
     expect(result.outcome).toBe("failed");
     expect(result.details).toEqual({ reason: "no terminal" });
   });
 
   it("rejects when configured to throw", async () => {
     const gateway = new FakeCapabilityGateway({ error: new Error("mcp down") });
-    await expect(gateway.invoke({ candidateId: "c-1", kind: "run_tests", parameters: {} }))
-      .rejects.toThrow("mcp down");
+    await expect(gateway.invoke(plan)).rejects.toThrow("mcp down");
   });
 });
 
 describe("CapabilityDispatcher", () => {
-  it("dispatches an accepted candidate and records succeeded feedback", async () => {
-    const { runtime, ledger, gateway, dispatcher, candidateId } = await setup();
+  it("records the plan, confirms, claims, and invokes exactly once", async () => {
+    const confirmation = new ScriptedConfirmation({ outcome: "accepted", reason: "user_accepted" });
+    const { runtime, ledger, gateway, dispatcher, request } = await setup({ confirmation });
 
-    const result = await dispatcher.dispatch(candidateId);
+    const result = await dispatcher.dispatch(request);
 
-    expect(result.outcome).toBe("succeeded");
+    expect(result.status).toBe("dispatched");
+    expect(result.action?.outcome).toBe("succeeded");
+    // The gateway saw the same frozen plan the user approved.
     expect(gateway.recordedInvocations).toHaveLength(1);
-    expect(gateway.recordedInvocations[0].candidateId).toBe(candidateId);
-    expect(gateway.recordedInvocations[0].kind).toBe("run_tests");
+    expect(digestActionPlan(gateway.recordedInvocations[0]!)).toBe(request.planDigest);
+    expect(confirmation.seen[0]!.summary).toBe(request.plan.summary);
 
-    const feedback = (await ledger.all()).filter((r) => r.recordType === "feedback");
-    expect(feedback.map((r) => r.feedback)).toEqual(["dispatched", "succeeded"]);
-    expect(feedback.every((r) => r.candidateId === candidateId)).toBe(true);
+    const records = await ledger.all();
+    expect(records.filter((r) => r.recordType === "plan")).toHaveLength(1);
+    expect(records.filter((r) => r.recordType === "plan_decision")).toHaveLength(1);
+    const dispatch = records.filter((r) => r.recordType === "plan_dispatch");
+    expect(dispatch).toHaveLength(1);
+    expect(dispatch[0]).toMatchObject({ completedOutcome: "succeeded" });
     await runtime.dispose();
   });
 
-  it("records failed feedback when the gateway fails", async () => {
-    const { runtime, ledger, dispatcher, candidateId } = await setup({
+  it("never invokes the gateway when the user rejects the plan", async () => {
+    const confirmation = new ScriptedConfirmation({ outcome: "rejected", reason: "user_rejected" });
+    const { runtime, ledger, gateway, dispatcher, request } = await setup({ confirmation });
+
+    const result = await dispatcher.dispatch(request);
+
+    expect(result.status).toBe("not_accepted");
+    expect(result.reasonCode).toBe("user_rejected");
+    expect(gateway.recordedInvocations).toHaveLength(0);
+    const records = await ledger.all();
+    expect(records.filter((r) => r.recordType === "plan_dispatch")).toHaveLength(0);
+    expect(records.filter((r) => r.recordType === "plan_decision")).toHaveLength(1);
+    await runtime.dispose();
+  });
+
+  it("refuses a confirmation-required plan when no policy is wired", async () => {
+    const { runtime, gateway, dispatcher, request } = await setup();
+
+    const result = await dispatcher.dispatch(request);
+
+    expect(result.status).toBe("not_accepted");
+    expect(result.reasonCode).toBe("confirmation_policy_missing");
+    expect(gateway.recordedInvocations).toHaveLength(0);
+    await runtime.dispose();
+  });
+
+  it("records a structured tool failure as a terminal failed dispatch", async () => {
+    const confirmation = new ScriptedConfirmation({ outcome: "accepted", reason: "user_accepted" });
+    const { runtime, ledger, dispatcher, request } = await setup({
+      confirmation,
       gatewayOutcome: "failed",
       gatewayDetails: { reason: "configured failure" },
     });
 
-    const result = await dispatcher.dispatch(candidateId);
+    const result = await dispatcher.dispatch(request);
 
-    expect(result.outcome).toBe("failed");
-    const feedback = (await ledger.all()).filter((r) => r.recordType === "feedback");
-    expect(feedback.map((r) => r.feedback)).toEqual(["dispatched", "failed"]);
-    const failed = feedback.find((r) => r.feedback === "failed")!;
-    expect(failed.details.gateway).toBe("fake-capability");
-    expect(failed.details.reason).toBe("configured failure");
+    expect(result.status).toBe("dispatched");
+    expect(result.action?.outcome).toBe("failed");
+    const dispatch = (await ledger.all()).find((r) => r.recordType === "plan_dispatch");
+    expect(dispatch).toMatchObject({ completedOutcome: "failed" });
     await runtime.dispose();
   });
 
-  it("turns a thrown gateway invocation into a failed result", async () => {
-    const { runtime, ledger, dispatcher, candidateId } = await setup({
+  it("reports reconciliation_required — not failed — when the gateway throws after the claim", async () => {
+    const confirmation = new ScriptedConfirmation({ outcome: "accepted", reason: "user_accepted" });
+    const { runtime, ledger, dispatcher, request } = await setup({
+      confirmation,
       gatewayError: new Error("mcp connection reset"),
     });
 
-    const result = await dispatcher.dispatch(candidateId);
+    const result = await dispatcher.dispatch(request);
 
-    expect(result.outcome).toBe("failed");
-    expect(result.error).toBe("mcp connection reset");
-    const feedback = (await ledger.all()).filter((r) => r.recordType === "feedback");
-    expect(feedback.map((r) => r.feedback)).toEqual(["dispatched", "failed"]);
-    expect(feedback.find((r) => r.feedback === "failed")!.details.error).toBe("mcp connection reset");
+    // The claim happened, so the action may have run. Fabricating "failed"
+    // here would invite an automatic retry of a possibly-completed action.
+    expect(result.status).toBe("reconciliation_required");
+    expect(result.action).toBeNull();
+    // A claimed record with no terminal state *is* the reconciliation signal:
+    // it survives a crash, whereas a flag written after the fact would not.
+    const dispatch = (await ledger.all()).find((r) => r.recordType === "plan_dispatch");
+    expect(dispatch).toBeDefined();
+    expect(dispatch).not.toHaveProperty("completedOutcome");
     await runtime.dispose();
   });
 
-  it("keeps its own attribution when a gateway reports conflicting details", async () => {
-    const { runtime, ledger, dispatcher, candidateId } = await setup({
-      gatewayOutcome: "failed",
-      gatewayDetails: { gateway: "impersonated", reason: "kept" },
-    });
+  it("claims once and refuses the second dispatch of the same plan", async () => {
+    const confirmation = new ScriptedConfirmation({ outcome: "accepted", reason: "user_accepted" });
+    const { runtime, gateway, dispatcher, request } = await setup({ confirmation });
 
-    await dispatcher.dispatch(candidateId);
+    const first = await dispatcher.dispatch(request);
+    const second = await dispatcher.dispatch(request);
 
-    const failed = (await ledger.all())
-      .filter((r) => r.recordType === "feedback")
-      .find((r) => r.feedback === "failed")!;
-    expect(failed.details.gateway).toBe("fake-capability");
-    expect(failed.details.reason).toBe("kept");
+    expect(first.status).toBe("dispatched");
+    expect(second.status).toBe("terminal");
+    // One claim means exactly one capability invocation, never two.
+    expect(gateway.recordedInvocations).toHaveLength(1);
     await runtime.dispose();
   });
 
-  it("rejects when the candidate is not in the ledger", async () => {
-    const { runtime, dispatcher } = await setup();
+  it("refuses to claim when the attempt was never persisted", async () => {
+    const confirmation = new ScriptedConfirmation({ outcome: "accepted", reason: "user_accepted" });
+    const { runtime, gateway, dispatcher, request } = await setup({ confirmation });
 
-    await expect(dispatcher.dispatch("missing:candidate:0")).rejects.toThrow(
-      "No prediction candidate missing:candidate:0 recorded in the ledger.",
-    );
-    await runtime.dispose();
-  });
-});
-
-describe("CapabilityDispatcher ledger failures", () => {
-  it("compensates with a failed record when the terminal write cannot be persisted", async () => {
-    const { runtime, ledger, dispatcher, candidateId } = await setup();
-
-    // Reject only the terminal write, so the dispatch reaches the gateway and
-    // then loses its outcome — the exact shape that would otherwise leave a
-    // dangling "dispatched" and let a retry double-dispatch.
-    const realAppend = ledger.appendFeedback.bind(ledger);
-    let rejectedOnce = false;
-    ledger.appendFeedback = async (record) => {
-      if (record.feedback === "succeeded" && !rejectedOnce) {
-        rejectedOnce = true;
-        throw new Error("ledger disk full");
-      }
-      return realAppend(record);
+    const unknown: DispatchRequest = {
+      ...request,
+      plan: { ...request.plan, attemptId: "never-recorded" },
     };
+    const result = await dispatcher.dispatch(unknown);
 
-    await expect(dispatcher.dispatch(candidateId)).rejects.toThrow("ledger disk full");
+    expect(result.status).toBe("not_admitted");
+    expect(result.reasonCode).toBe("attempt_missing");
+    expect(gateway.recordedInvocations).toHaveLength(0);
+    await runtime.dispose();
+  });
 
-    const feedback = (await ledger.all()).filter((r) => r.recordType === "feedback");
-    // "dispatched" plus a compensating "failed": the candidate has a terminal
-    // state, so a retry can tell this apart from a dispatch still in flight.
-    expect(feedback.map((r) => r.feedback)).toEqual(["dispatched", "failed"]);
-    expect(feedback[1].details?.ledgerError).toContain("ledger disk full");
+  it("keeps raw command text out of the ledger", async () => {
+    const confirmation = new ScriptedConfirmation({ outcome: "accepted", reason: "user_accepted" });
+    const { runtime, ledger, dispatcher, request, root } = await setup({ confirmation });
+
+    await dispatcher.dispatch(request);
+
+    // The plan's command names the temp root; no ledger record may contain it.
+    const serialized = JSON.stringify(await ledger.all());
+    expect(request.plan.summary).toContain(root);
+    expect(serialized).not.toContain(root);
     await runtime.dispose();
   });
 });
