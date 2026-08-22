@@ -13,6 +13,7 @@ import { RedactingCapturePolicy } from "./capture-policy.js";
 import { SqliteEventStore } from "./sqlite-event-store.js";
 import { SquidCore } from "./squid-core.js";
 import type { ContextPolicy } from "./context-policy.js";
+import { SEARCH_EGRESS_DENY_ID, type EgressPolicy } from "./action-egress.js";
 
 /**
  * The shared setup both watch entry points need: a store, a ledger, a core
@@ -61,6 +62,14 @@ export interface CreateWatchRuntimeOptions {
   readonly provider: PredictionProvider;
   readonly contextPolicy?: ContextPolicy;
   readonly actionTrust?: "trusted" | "suggestion_only";
+  /**
+   * The egress policy governing search actions. Attempt records are stamped with
+   * its id, and admission compares that id against the policy the dispatcher
+   * presents — so this must be the *same* resolved policy the action layer uses.
+   * Passing one here and resolving another there would make every action fail
+   * `egress_policy_mismatch`, including kinds that have nothing to do with egress.
+   */
+  readonly egressPolicy?: EgressPolicy;
   /** Forwards non-fatal runtime diagnostics; omitted in tests. */
   readonly onDiagnostic?: (diagnostic: PredictionRuntimeDiagnostic) => void;
 }
@@ -98,7 +107,7 @@ export function createWatchRuntime(options: CreateWatchRuntimeOptions): WatchRun
       capturePolicy: new RedactingCapturePolicy(),
       runtimeSessionId: `watch-${crypto.randomUUID()}`,
       ...(options.actionTrust === undefined ? {} : { actionTrust: options.actionTrust }),
-      egressPolicyId: "search-egress-deny-v1",
+      egressPolicyId: (options.egressPolicy ?? { id: SEARCH_EGRESS_DENY_ID }).id,
       ...(options.onDiagnostic !== undefined ? { onDiagnostic: options.onDiagnostic } : {}),
     },
   );

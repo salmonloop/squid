@@ -81,6 +81,12 @@ export async function resolveWatchActions(
   options: {
     readonly workingDirectory?: string;
     readonly actionTrust?: "trusted" | "suggestion_only";
+    /**
+     * The policy the runtime was built with. Supplying it here keeps one
+     * resolution for the whole process; omitting it re-resolves from `env`,
+     * which is only safe when no runtime stamped a different id.
+     */
+    readonly egressPolicy?: EgressPolicy;
   } = {},
 ): Promise<WatchActionsResolution | undefined | { readonly configError: string }> {
   const mode = env.SQUID_ACTIONS;
@@ -128,7 +134,7 @@ export async function resolveWatchActions(
   // Egress is resolved before any transport opens: an invalid value must fail
   // startup rather than surface once a server is already running. Unset means
   // deny, so search actions stay off unless explicitly enabled.
-  const egress = resolveSearchEgress(env.SQUID_SEARCH_EGRESS);
+  const egress = options.egressPolicy ?? resolveSearchEgress(env.SQUID_SEARCH_EGRESS);
   if ("configError" in egress) {
     return egress;
   }

@@ -5,6 +5,7 @@ import { FilesystemActivitySource } from "./filesystem-source.js";
 import type { FilePayload } from "./protocol.js";
 import { sqliteWatchExclusions } from "./sqlite-event-store.js";
 import { resolveWatchActions } from "./watch-actions.js";
+import { resolveSearchEgress } from "./action-egress.js";
 import { resolveWatchProvider } from "./watch-provider.js";
 
 const root = process.argv[2];
@@ -37,11 +38,22 @@ if (resolved.selection.declineReason !== null) {
 // Store, ledger, projection, and prediction runtime are identical for every
 // watch entry point, so they are built in one place. Everything below this line
 // is filesystem-specific and stays here.
+// One egress resolution for the whole process: the runtime stamps its id onto
+// every attempt and admission compares that id against the policy the dispatcher
+// presents. Resolving twice could stamp deny and dispatch allow, which refuses
+// every action — including kinds unrelated to egress.
+const egress = resolveSearchEgress(process.env.SQUID_SEARCH_EGRESS);
+if ("configError" in egress) {
+  console.error(egress.configError);
+  process.exit(2);
+}
+
 const watch = createWatchRuntime({
   ...(databasePath === undefined ? {} : { databasePath }),
   provider: resolved.selection.provider,
   contextPolicy: resolved.selection.contextPolicy,
   actionTrust: resolved.selection.actionTrust,
+  egressPolicy: egress,
   onDiagnostic: (diagnostic) => {
     console.error(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
   },
@@ -60,7 +72,11 @@ const actions = await resolveWatchActions(
   watch.runtime,
   watch.ledger,
   process.env,
-  { workingDirectory: canonicalRoot, actionTrust: resolved.selection.actionTrust },
+  {
+    workingDirectory: canonicalRoot,
+    actionTrust: resolved.selection.actionTrust,
+    egressPolicy: egress,
+  },
 );
 if (actions !== undefined && "configError" in actions) {
   console.error(actions.configError);

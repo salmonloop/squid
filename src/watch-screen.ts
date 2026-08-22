@@ -13,7 +13,7 @@ import {
 } from "./screen-text-source.js";
 import { resolveWatchActions } from "./watch-actions.js";
 import { resolveWatchProvider } from "./watch-provider.js";
-import { sanitizeAuditText } from "./action-egress.js";
+import { resolveSearchEgress, sanitizeAuditText } from "./action-egress.js";
 
 const readerKind = process.env.SQUID_SCREEN_READER ?? "synthetic";
 if (readerKind !== "darwin" && readerKind !== "synthetic") {
@@ -68,11 +68,22 @@ if (resolved.selection.declineReason !== null) {
 // entry point, so they are built in one place. This entry needs no watcher
 // exclusions: a screen-text reader observes windows, not the tree the store
 // writes into, so its own database can never feed itself.
+// One egress resolution for the whole process: the runtime stamps its id onto
+// every attempt and admission compares that id against the policy the dispatcher
+// presents. Resolving twice could stamp deny and dispatch allow, which refuses
+// every action — including kinds unrelated to egress.
+const egress = resolveSearchEgress(process.env.SQUID_SEARCH_EGRESS);
+if ("configError" in egress) {
+  console.error(egress.configError);
+  process.exit(2);
+}
+
 const watch = createWatchRuntime({
   ...(databasePath === undefined ? {} : { databasePath }),
   provider: resolved.selection.provider,
   contextPolicy: resolved.selection.contextPolicy,
   actionTrust: resolved.selection.actionTrust,
+  egressPolicy: egress,
   onDiagnostic: (diagnostic) => {
     console.error(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
   },
@@ -89,7 +100,11 @@ const actions = await resolveWatchActions(
   watch.runtime,
   watch.ledger,
   process.env,
-  { workingDirectory: process.cwd(), actionTrust: resolved.selection.actionTrust },
+  {
+    workingDirectory: process.cwd(),
+    actionTrust: resolved.selection.actionTrust,
+    egressPolicy: egress,
+  },
 );
 if (actions !== undefined && "configError" in actions) {
   console.error(actions.configError);

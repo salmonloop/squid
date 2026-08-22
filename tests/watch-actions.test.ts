@@ -10,6 +10,7 @@ import { InMemoryEventStore } from "../src/event-store.js";
 import { CapabilityDispatcher } from "../src/capability-gateway.js";
 import type { ActionConfirmationPolicy } from "../src/action-confirmation.js";
 import {
+  resolveSearchEgress,
   SEARCH_EGRESS_ALLOW_ID,
   SEARCH_EGRESS_DENY_ID,
   type EgressPolicy,
@@ -330,6 +331,51 @@ describe("parseLiteralCommand", () => {
     ]) {
       expect(parseLiteralCommand(command)).toHaveProperty("configError");
     }
+  });
+});
+
+describe("egress policy agreement", () => {
+  /**
+   * The runtime stamps its egress policy id onto every attempt, and admission
+   * compares that id against the policy the dispatcher presents. If the two were
+   * resolved independently, enabling search egress would stamp one id and
+   * dispatch another, refusing *every* action — including run_tests, which has
+   * nothing to do with egress. This asserts the whole chain agrees when built
+   * the way the entry points build it.
+   */
+  it("admits a run_tests action when search egress is enabled", async () => {
+    const root = await mkdtemp(join(tmpdir(), "squid-egress-"));
+    await mkdir(join(root, "tests"), { recursive: true });
+    await writeFile(join(root, "tests", "foo.test.ts"), "", "utf8");
+    const resolvedEgress = resolveSearchEgress("allow");
+    if ("configError" in resolvedEgress) throw new Error("expected a policy");
+
+    const candidates = [candidate("run_tests", {
+      confidence: 0.9,
+      parameters: { path: "tests/foo.test.ts" },
+    })];
+    const confirmation: ActionConfirmationPolicy = {
+      confirm: async () => ({ outcome: "accepted", reason: "user_accepted" }),
+    };
+    const { commands, dispatcher, requestId, egressPolicy, close } = await setup({
+      candidates,
+      events: editorSave("tests/foo.test.ts"),
+      confirmation,
+      workingDirectory: root,
+      // Built exactly as an entry point would: one policy for both sides.
+      egressPolicy: resolvedEgress,
+    });
+
+    const result = await dispatchTopCandidate(
+      { requestId },
+      candidates,
+      dispatcher,
+      { egressPolicy, workingDirectory: root },
+    );
+
+    expect(result?.status).toBe("dispatched");
+    expect(commands).toHaveLength(1);
+    await close();
   });
 });
 
