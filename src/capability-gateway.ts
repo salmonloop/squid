@@ -17,11 +17,15 @@ import type {
 /**
  * Result of a capability invocation.
  *
- * `outcome` distinguishes two very different things. A `failed` result means the
- * tool ran and reported a structured failure — a fact the ledger may record as
- * terminal. A thrown invocation means nobody knows whether the tool ran, which
- * the dispatcher turns into `reconciliation_required` rather than a fabricated
- * failure.
+ * `outcome` distinguishes two very different things. A `failed` result is a
+ * *known* terminal state: either the tool ran and reported a structured failure,
+ * or the gateway refused before invoking anything, so it is certain no work
+ * happened. Both are facts the ledger may record as terminal. A thrown
+ * invocation means nobody knows whether the tool ran, which the dispatcher turns
+ * into `reconciliation_required` rather than a fabricated failure.
+ *
+ * The rule for a gateway implementation follows from that: return `failed` only
+ * when you can prove the outcome, and throw whenever you cannot.
  */
 export interface ActionResult {
   readonly planDigest: string;

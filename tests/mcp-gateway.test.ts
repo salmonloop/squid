@@ -183,7 +183,10 @@ describe("McpCapabilityGateway", () => {
     expect(result.error).toBe("upstream search provider down");
   });
 
-  it("turns a thrown tool invocation into a failed outcome", async () => {
+  it("turns a tool handler that throws into a failed outcome", async () => {
+    // The handler threw on the *server* side, so MCP delivers a well-formed
+    // error result. The tool ran and reported failure, which is terminal — quite
+    // different from the transport case below.
     const server = new McpServer({ name: "throwing-server", version: "0.0.1" });
     server.registerTool(
       "search_web",
@@ -215,5 +218,21 @@ describe("McpCapabilityGateway", () => {
 
     expect(result.outcome).toBe("succeeded");
     expect(result.planDigest).toBe(digestActionPlan(actionPlan));
+  });
+
+  /**
+   * The distinction the whole reconciliation path rests on. A server-side error
+   * result is terminal: the tool ran and said no. A dead transport is not — the
+   * request may have reached the tool and completed. The gateway must therefore
+   * throw rather than return `failed`, because `failed` in the ledger invites an
+   * automatic retry of an action that may already have run.
+   */
+  it("throws rather than fabricating a failure when the transport is closed", async () => {
+    const client = await connect();
+    const gateway = new McpCapabilityGateway({ client });
+    const actionPlan = await plan("search_selection", { selection: "x" });
+    await client.close();
+
+    await expect(gateway.invoke(actionPlan)).rejects.toThrow();
   });
 });
