@@ -1,8 +1,11 @@
 import { realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { sanitizeAuditText } from "./action-egress.js";
+import { BrowserPageActivitySource } from "./browser-page-source.js";
 import { FilesystemActivitySource } from "./filesystem-source.js";
+import type { ActivitySource } from "./activity-source.js";
 import type { FilePayload } from "./protocol.js";
+import { resolveBrowserReader } from "./resolve-browser-reader.js";
 import { resolveScreenReader } from "./resolve-screen-reader.js";
 import { ScreenTextActivitySource } from "./screen-text-source.js";
 import {
@@ -14,19 +17,24 @@ import {
 /**
  * The only entry point where an action can actually be admitted.
  *
- * `watch:files` and `watch:screen` each observe one half of the desktop, and
- * several admission rules need both halves at once. `run_tests` compares the
+ * `watch:files` and `watch:screen` each observe one part of the desktop, and
+ * every admission rule reads the whole projection. `run_tests` compares the
  * owner of the newest save against the foreground application: the filesystem
  * source knows the path and reports `applicationId: null`, while the screen
- * source knows which application is in front. Neither alone can satisfy the
- * check, so a single-source run refuses every `run_tests` candidate with
- * `coding_application_mismatch` no matter how the world actually looks.
+ * source knows which application is in front. `search_selection` needs a current
+ * browser page as well, so it takes a third source. No single-source run can
+ * satisfy either rule, whatever the user is actually doing.
  *
  * Combining happens in the projection, not here and not in a source: this entry
- * point only makes both fact streams land in one core. Whether an unattributed
+ * point only makes the fact streams land in one core. Whether an unattributed
  * save may be treated as the foreground application's work stays an admission
  * decision, and today the answer is still no — see the
  * `filesystem-save-run-tests` fixture.
+ *
+ * The browser source is opt-in via `SQUID_BROWSER`. Observing a browser is what
+ * makes search reachable, and search is the one action that sends user text off
+ * the machine, so a run gets it by asking rather than by default. Egress remains
+ * a separate decision: `SQUID_SEARCH_EGRESS=allow` is still required.
  */
 
 const root = process.argv[2];
@@ -49,6 +57,14 @@ if ("configError" in reader) {
   process.exit(2);
 }
 
+const browser = await resolveBrowserReader(
+  process.argv[4] === undefined ? {} : { framesPath: process.argv[4] },
+);
+if ("configError" in browser) {
+  console.error(browser.configError);
+  process.exit(2);
+}
+
 const canonicalRoot = await realpath(root);
 
 const started = await startWatchSession({
@@ -56,12 +72,17 @@ const started = await startWatchSession({
   // Commands run in the watched root, matching `watch:files`. The screen source
   // contributes no paths, so it has no claim on the working directory.
   workingDirectory: canonicalRoot,
-  banner: { watching: root, reader: reader.readerKind },
+  banner: {
+    watching: root,
+    reader: reader.readerKind,
+    browser: browser.enabled ? browser.readerKind : "off",
+  },
   createSources: async (context) => {
-    // Only the filesystem source needs exclusions: a screen reader observes
-    // windows, not the tree the store writes into, so it cannot feed itself.
+    // Only the filesystem source needs exclusions: neither a screen reader nor a
+    // browser reader observes the tree the store writes into, so they cannot
+    // feed themselves.
     const excludedPaths = await watchedSinkExclusions(context, canonicalRoot);
-    return [
+    const sources: ActivitySource[] = [
       new FilesystemActivitySource({
         root,
         include: (relativePath) => !excludedPaths.has(relativePath),
@@ -72,6 +93,17 @@ const started = await startWatchSession({
         onDiagnostic: context.onDiagnostic,
       }),
     ];
+    if (browser.enabled) {
+      // Last, so a page is observed after the foreground it belongs to. The
+      // reducer drops an owner that does not match the current foreground, and
+      // `admitSearch` requires the selection to have been observed *after* the
+      // page, so ordering here decides whether the three ever agree.
+      sources.push(new BrowserPageActivitySource({
+        readerFactory: browser.readerFactory,
+        onDiagnostic: context.onDiagnostic,
+      }));
+    }
+    return sources;
   },
   // One line shape for both sources, read from the projection rather than the
   // raw payload so capture-policy redaction survives into the log. `path` is
@@ -88,6 +120,10 @@ const started = await startWatchSession({
       path,
       application: state.activeApplication?.name ?? null,
       window: state.activeWindow?.title ?? null,
+      // Host only, never the full URL: a path or query string is user browsing
+      // history, and this line goes to stdout. `RedactingContextPolicy` makes the
+      // same distinction for what a provider may see.
+      browserHost: state.currentBrowserPage?.host ?? null,
       selectionLength: selection === null
         ? null
         : sanitizeAuditText(selection, "selection").originalLength,

@@ -47,7 +47,10 @@ bun run watch:screen
 - `src/create-watch-runtime.ts` — the store, ledger, projection, and prediction runtime every watch entry point needs, built once. Carries no source-specific assumptions.
 - `src/watch-session.ts` — everything a watch entry point does apart from choosing sources: provider admission, egress resolution, restore, action wiring, the ingest loop, and shutdown ordering. Takes the sources as a **list**, which is what makes an action admissible at all: `admitRunTests` compares a save's owner against the foreground application, so one source per process left that check unsatisfiable by construction. Sources start one at a time and a failure unwinds the ones already running; stop runs in reverse start order so a later source never emits into a runtime an earlier one has begun tearing down.
 - `src/resolve-screen-reader.ts` — chooses a screen-text backend from `SQUID_SCREEN_READER` / `SQUID_SCREEN_POLL_MS` and loads scripted frames. Separate from the adapter so `screen-text-source.ts` still imports no backend, and separate from the entry points because more than one needs it.
-- `src/watch-desktop.ts` — the only entry point that observes both halves of the desktop: filesystem saves and foreground window text into one core.
+- `src/browser-page-source.ts` — the `BrowserPageReader` backend seam, the neutral `BrowserPageFrame` shape, and the adapter that projects frames onto `browser_navigated` events. This is the source `search_selection` was blocked on: `admitSearch` needs a current browser page, and nothing could produce one. A frame whose URL yields no host is refused rather than given an invented host, and a backend that cannot tell which window owns a tab omits the owner instead of guessing — the reducer then drops a non-matching owner and the next focus change discards the page, so a wrong owner cannot defeat admission.
+- `src/browser-page-reader-synthetic.ts` — scripted page replay backend plus a demo script whose owner matches the screen demo's final window. Zero browser calls, so the search path is demonstrable anywhere.
+- `src/resolve-browser-reader.ts` — resolves `SQUID_BROWSER` / `SQUID_BROWSER_POLL_MS`. Defaults to **off**, unlike the screen reader: browser observation is what makes search reachable, so a run opts in.
+- `src/watch-desktop.ts` — the only entry point that observes more than one part of the desktop: filesystem saves, foreground window text, and (opt-in) browser pages into one core.
 - `src/watch-files.ts` — live filesystem ingestion entry point; durable when `SQUID_DB` is set.
 - `src/watch-screen.ts` — live foreground-window-text ingestion entry point; picks a reader backend from `SQUID_SCREEN_READER`.
 - `src/baseline-predictor.ts` — offline heuristic predictor used for evaluation.
@@ -231,18 +234,34 @@ Absent variables mean actions stay off — identical to the pre-dispatch behavio
 
 ### Which entry point can admit which action
 
-An admission rule reads the *whole* projection, so what a run can do depends on which facts its sources produce. `watch:files` emits `file_opened` / `file_saved`; `watch:screen` emits `application_activated`, `window_changed`, `focus_changed`, `text_context_changed`. Neither alone satisfies `run_tests`, which compares the newest save's owner against the foreground application — that is why `watch:desktop` exists.
+An admission rule reads the *whole* projection, so what a run can do depends on which facts its sources produce. `watch:files` emits `file_opened` / `file_saved`; `watch:screen` emits `application_activated`, `window_changed`, `focus_changed`, `text_context_changed`; a browser source emits `browser_navigated`. No single source satisfies either action — that is why `watch:desktop` exists.
 
 | Entry point | Sources | `search_selection` | `run_tests` |
 | --- | --- | --- | --- |
 | `watch:files` | filesystem | no foreground or selection facts | no `activeApplication` |
-| `watch:screen` | screen text | needs `browser_navigated` (no source yet) | no `file_saved` |
-| `watch:desktop` | filesystem + screen text | needs `browser_navigated` (no source yet) | both facts present; owner still unattributed |
+| `watch:screen` | screen text | no browser page | no `file_saved` |
+| `watch:desktop` | filesystem + screen text | no browser page | both facts present; owner still unattributed |
+| `watch:desktop` with `SQUID_BROWSER=synthetic` | + browser page | **dispatches**, with `SQUID_SEARCH_EGRESS=allow` | unchanged |
 
-Two gaps remain, and both are honest refusals rather than bugs in the checks:
+Browser observation is opt-in rather than on by default. It is the capability that makes search reachable, and search is the one action that sends user text off the machine, so a run gets it by asking. Egress stays a separate decision: `SQUID_BROWSER` lets Squid *see* a page, `SQUID_SEARCH_EGRESS=allow` lets it *send* text, and both are required.
 
-- **`browser_navigated` has no source.** `admitSearch` requires a current browser page so it can verify that the selection, the page, and the foreground all belong to the same window; without that check, Squid could send text selected in one window into a browser showing another document. No capture adapter emits the event yet, so search refuses with `browser_page_missing`.
+```bash
+# Search end to end: observe pages, allow egress, and give it a tool to call.
+SQUID_BROWSER=synthetic SQUID_SEARCH_EGRESS=allow SQUID_ACTIONS=mcp \
+SQUID_ACTIONS_MCP_COMMAND="bun run /path/to/mcp-server.ts" \
+bun run watch:desktop -- /absolute/project/root
+
+# Scripted pages instead of the built-in demo (third positional argument).
+SQUID_BROWSER=synthetic bun run watch:desktop -- /absolute/project/root frames.json pages.json
+```
+
+`SQUID_BROWSER` has the same three outcomes as `SQUID_SEARCH_EGRESS`: unset means no browser source, exactly `synthetic` replays scripted pages, anything else is a startup configuration error. `SQUID_BROWSER_POLL_MS` sets the sampling cadence.
+
+One gap remains, and it is an honest refusal rather than a bug in the check:
+
 - **A filesystem save has no owner.** `FilesystemActivitySource` reports `applicationId: null` because a path-only watcher cannot know which process performed a write, and `admitRunTests` requires the save's owner to *equal* the foreground application. Treating an unattributed save as the foreground application's work would authorize running tests on a file written by a background formatter — the `filesystem-save-run-tests` fixture asserts `none` for exactly this case. Closing it needs a source that knows what it saved.
+
+A note on the synthetic demos: the screen and browser readers run on independent timers, so their interleaving is not fixed. The search rule requires the selection to be observed *after* the page, and whether that ordering falls out of a given demo run is a race. The demos show that a page becomes observable and is correctly attributed to a window; the end-to-end guarantee is pinned deterministically by `tests/browser-search-admission.test.ts`, which drives the real source in the order a live desktop produces.
 
 ## Replay evaluation
 
@@ -302,6 +321,9 @@ Tests use `bun:test`. The test suite covers:
 - `watch-actions`: config resolution (off when unset, config errors — including invalid `SQUID_SEARCH_EGRESS` — before any dependency is touched), literal stdio command parsing, and the dispatch loop end-to-end through the production chain built from real ingested events: search dispatched when egress allows, refused with zero tool calls when denied or when the selection changed, `run_tests` gated on confirmation and running the exact planned command, rejection recording a decision without a dispatch, expired candidates skipped, late triggers never dispatched, and no downgrade to a lower-confidence candidate when the top one is unmappable.
 - `startWatchSession`: sources started in order and stopped in reverse, two independent sources projecting into one world state (with the save's owner still unattributed), one shared store/ledger/runtime across sources, the same diagnostic sink handed to every source, a session with no sources refused, already-started sources unwound when a later one fails, a malformed egress value refused before any source is constructed, every source named in the banner, idempotent stop, and one described line per ingested event.
 - `resolveScreenReader`: synthetic default, unrecognized reader values refused rather than defaulted, the darwin backend refused off macOS, a non-positive or non-integer poll interval refused ahead of backend selection, scripted frame files read, and unreadable or non-array frame files reported as config errors.
+- `BrowserPageActivitySource` and `projectBrowserFrame`: host derivation including a non-default port, absent title and owner collapsing to the protocol's neutral values, URLs with no origin refused (`data:`, `about:blank`, unparseable), owner copied rather than aliased, unchanged pages emitting nothing while a fragment or owner change emits, sequence numbers assigned only to emitted events, burst collapsing, pending-frame flush on stop, reader failures as diagnostics, a rejected event retried rather than deduped away, a non-object frame leaving the delivery tail usable, restartable failed start, distinct per-instance session identity, and end-to-end ingestion where the reducer correctly nulls an owner with no matching foreground.
+- Search admission through the real browser source (`tests/browser-search-admission.test.ts`): a page the source produced reaching an actual `search_web` call with the selection intact, neither the selection nor the URL path appearing in the ledger, and refusals for denied egress, a page owned by another window, a page the backend could not attribute, a URL with no host, and a selection that changed after the prediction.
+- `resolveBrowserReader`: off when unset, enabled only on the exact value, near-miss values refused as config errors, a bad poll interval refused, and an unused poll interval or absent frames file ignored when the source is off.
 
 Source tests inject a fake watcher, file probe, and screen-text reader, so they never depend on kernel watch timing, an accessibility API, or a subprocess. Session tests use scripted sources for the same reason: what is under test is the wiring, not any backend. Real-watcher behavior is verified by the `bun run watch:files` smoke run in the release gate, and multi-source ingestion by a `bun run watch:desktop` run against a temporary root; the macOS accessibility backend is verified by hand with `SQUID_SCREEN_READER=darwin bun run watch:screen`.
 
@@ -310,7 +332,7 @@ Source tests inject a fake watcher, file probe, and screen-text reader, so they 
 Tracked as issues; the entry-point table under [Dispatching actions](#which-entry-point-can-admit-which-action) shows which of these currently block an action.
 
 - Screen keyframes, OCR, and full caret context. Foreground window text is implemented; pixels are not.
-- Browser extension / CDP integration, so no source emits `browser_navigated`. `search_selection` therefore always refuses with `browser_page_missing` in a real run.
+- A real browser backend. `BrowserPageActivitySource` and its contract exist and `search_selection` dispatches through them, but the only backend is the synthetic replay reader. A browser extension or CDP attachment is what turns that into observation of the user's actual browsing.
 - IDE / LSP integration, so no source can attribute a file save to the editor that wrote it. `run_tests` has both required facts available in `watch:desktop` but the save's owner stays `null`, which admission correctly refuses.
 - Overlay / suggestion UI. The only way to see or answer a suggestion is a terminal prompt.
 - Action execution beyond the current two MCP mappings. `draft_completion` and `inspect_error` have no capability mapping, and `inspect_error` additionally has no capture source for `terminal_command_completed`.
