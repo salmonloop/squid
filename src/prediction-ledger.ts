@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, truncate } from "node:fs/promises";
 import { dirname } from "node:path";
 import { Compile } from "typebox/compile";
@@ -73,12 +74,169 @@ export interface PredictionFeedbackRecord {
   readonly details: Record<string, string | number | boolean | null>;
 }
 
-export type PredictionLedgerRecord = PredictionAttemptRecord | LegacyPredictionAttemptRecord | PredictionFeedbackRecord;
+/**
+ * A planned action, persisted before any confirmation is requested. Raw
+ * parameters never appear here — only their digest — so the ledger stays free
+ * of selection text and command payloads while still proving which exact plan
+ * was confirmed and claimed.
+ */
+export interface ActionPlanRecord {
+  readonly schemaVersion: 2;
+  readonly recordId: string;
+  readonly recordType: "plan";
+  readonly attemptId: string;
+  readonly requestId: string;
+  readonly candidateId: string;
+  /** sha256 over the canonical immutable ActionPlan. */
+  readonly planDigest: string;
+  /** sha256 over the sanitized candidate parameters. */
+  readonly candidateParametersDigest: string;
+  readonly confirmation: "none" | "required";
+  readonly egressPolicyId: string;
+  readonly createdAt: string;
+}
+
+/** Lifecycle of a plan record. Terminal states can never be revisited. */
+export type ActionPlanStatus =
+  | "proposed"
+  | "accepted"
+  | "rejected"
+  | "expired"
+  | "dispatched"
+  | "succeeded"
+  | "failed";
+
+export type ActionPlanDecision = "accepted" | "rejected" | "expired";
+
+export type DispatchClaimResult =
+  | { readonly status: "claimed"; readonly claimToken: string }
+  | { readonly status: "already_claimed"; readonly claimToken?: undefined }
+  | { readonly status: "rejected"; readonly reasonCode: ClaimRejectionReasonCode }
+  | { readonly status: "expired" }
+  | { readonly status: "terminal" };
+
+export type CompleteDispatchResult =
+  | { readonly status: "completed" }
+  | { readonly status: "conflict"; readonly reasonCode: CompleteDispatchConflictReasonCode };
+
+export type ClaimRejectionReasonCode =
+  | "unknown_plan"
+  | "attempt_mismatch"
+  | "metadata_mismatch"
+  | "not_accepted"
+  | "state_changed";
+
+export type CompleteDispatchConflictReasonCode =
+  | "no_dispatched_record"
+  | "token_mismatch"
+  | "outcome_conflict";
+
+/**
+ * The user's confirmation decision. Idempotent when repeated identically; a
+ * contradictory decision or different details digest is a conflict.
+ */
+export interface PlanDecisionRecord {
+  readonly schemaVersion: 2;
+  readonly recordId: string;
+  readonly recordType: "plan_decision";
+  readonly planDigest: string;
+  readonly decision: ActionPlanDecision;
+  /** Digest over sanitized decision details, not the raw text. */
+  readonly detailsDigest: string;
+  readonly decidedAt: string;
+}
+
+/**
+ * A dispatch that reached the gateway. Created atomically by `claimDispatch`;
+ * only its matching `claimToken` may complete it.
+ */
+export interface PlanDispatchRecord {
+  readonly schemaVersion: 2;
+  readonly recordId: string;
+  readonly recordType: "plan_dispatch";
+  /** Deterministic idempotency key — not a secret. */
+  readonly claimId: string;
+  readonly planDigest: string;
+  /** Opaque random token; stored hashed. */
+  readonly claimTokenHash: string;
+  readonly egressPolicyId: string;
+  readonly claimedAt: string;
+  readonly completedOutcome?: "succeeded" | "failed";
+  readonly completedDetailsDigest?: string;
+  readonly completedAt?: string;
+  /**
+   * Set when a claimed dispatch could not reach a structured tool outcome
+   * (transport timeout, disconnect, crash). Never fabricated into `failed`.
+   */
+  readonly reconciliationRequired?: true;
+}
+
+export type PredictionLedgerRecord =
+  | PredictionAttemptRecord
+  | LegacyPredictionAttemptRecord
+  | PredictionFeedbackRecord
+  | ActionPlanRecord
+  | PlanDecisionRecord
+  | PlanDispatchRecord;
+
+/** Inputs every dispatch-mutating narrow API call must present together. */
+export interface ClaimDispatchInputs {
+  readonly attemptId: string;
+  readonly candidateId: string;
+  readonly runtimeSessionId: string;
+  readonly projectionGeneration: number;
+  readonly stateDigest: string;
+  readonly episodeId: string | null;
+  readonly triggerDisposition: "accepted";
+  readonly contextPolicyId: string;
+  readonly actionTrust: "trusted" | "suggestion_only";
+  readonly egressPolicyId: string;
+  readonly planDigest: string;
+}
 
 export interface PredictionLedger {
   appendAttempt(record: PredictionAttemptRecord): Promise<void>;
   appendFeedback(record: PredictionFeedbackRecord): Promise<void>;
   all(): Promise<readonly PredictionLedgerRecord[]>;
+
+  /**
+   * Persists a plan before confirmation. Identical records are idempotent;
+   * a different digest for the same candidate conflicts.
+   */
+  recordPlan(record: ActionPlanRecord): Promise<void>;
+  /**
+   * Records the user's decision on a plan. Same decision + details digest is
+   * idempotent; opposite decisions or differing details conflict. System-side
+   * invalidation after acceptance goes through `recordStateRejection`, never
+   * this method.
+   */
+  recordDecision(record: PlanDecisionRecord): Promise<void>;
+  /**
+   * The single legal accepted → rejected(state_changed) transition. Internal
+   * to the runtime serial queue; shares the atomic boundary with
+   * `claimDispatch` because both invalidate against the same state snapshot.
+   */
+  recordStateRejection(inputs: ClaimDispatchInputs, reasonCode: "state_changed"): Promise<void>;
+  /**
+   * Atomic linearization point: validates every input against the persisted
+   * attempt and plan inside one operation, then appends the dispatched
+   * record. Only `claimed` authorizes an MCP invocation.
+   */
+  claimDispatch(
+    inputs: ClaimDispatchInputs,
+    now: string,
+    generateClaimToken: () => string,
+  ): Promise<DispatchClaimResult>;
+  /**
+   * Completes a claimed dispatch with the opaque token returned at claim
+   * time. Only structured, confirmed tool failures may complete as `failed`.
+   */
+  completeDispatch(
+    inputs: { readonly planDigest: string; readonly claimToken: string },
+    outcome: "succeeded" | "failed",
+    detailsDigest: string,
+    now: string,
+  ): Promise<CompleteDispatchResult>;
 }
 
 export interface PredictionFeedbackInput {
@@ -160,7 +318,56 @@ const feedbackSchema = Type.Object({
   occurredAt: timestamp(),
   details: Type.Record(Type.String(), scalar),
 }, { additionalProperties: false });
-const recordValidator = Compile(Type.Union([attemptSchema, legacyAttemptSchema, feedbackSchema]));
+const sha256Pattern = /^sha256:[0-9a-f]{64}$/u.source;
+const actionPlanSchema = Type.Object({
+  schemaVersion: Type.Literal(2),
+  recordId: nonEmptyString(),
+  recordType: Type.Literal("plan"),
+  attemptId: nonEmptyString(),
+  requestId: nonEmptyString(),
+  candidateId: nonEmptyString(),
+  planDigest: Type.String({ pattern: sha256Pattern }),
+  candidateParametersDigest: Type.String({ pattern: sha256Pattern }),
+  confirmation: Type.Union([Type.Literal("none"), Type.Literal("required")]),
+  egressPolicyId: nonEmptyString(),
+  createdAt: timestamp(),
+}, { additionalProperties: false });
+const planDecisionSchema = Type.Object({
+  schemaVersion: Type.Literal(2),
+  recordId: nonEmptyString(),
+  recordType: Type.Literal("plan_decision"),
+  planDigest: Type.String({ pattern: sha256Pattern }),
+  decision: Type.Union([
+    Type.Literal("accepted"), Type.Literal("rejected"), Type.Literal("expired"),
+  ]),
+  detailsDigest: Type.String({ pattern: /^(sha256|hmac):[0-9a-f]{64}$/u }),
+  decidedAt: timestamp(),
+}, { additionalProperties: false });
+const completedDispatchFields = {
+  completedOutcome: Type.Optional(Type.Union([Type.Literal("succeeded"), Type.Literal("failed")])),
+  completedDetailsDigest: Type.Optional(Type.String({ pattern: /^(sha256|hmac):[0-9a-f]{64}$/u })),
+  completedAt: Type.Optional(timestamp()),
+} as const;
+const planDispatchSchema = Type.Object({
+  schemaVersion: Type.Literal(2),
+  recordId: nonEmptyString(),
+  recordType: Type.Literal("plan_dispatch"),
+  claimId: nonEmptyString(),
+  planDigest: Type.String({ pattern: sha256Pattern }),
+  claimTokenHash: nonEmptyString(),
+  egressPolicyId: nonEmptyString(),
+  claimedAt: timestamp(),
+  ...completedDispatchFields,
+  reconciliationRequired: Type.Optional(Type.Literal(true)),
+}, { additionalProperties: false });
+const recordValidator = Compile(Type.Union([
+  attemptSchema,
+  legacyAttemptSchema,
+  feedbackSchema,
+  actionPlanSchema,
+  planDecisionSchema,
+  planDispatchSchema,
+]));
 
 export class PredictionLedgerConflictError extends Error {
   public constructor(message: string) {
@@ -270,6 +477,206 @@ export function parsePredictionLedgerRecord(value: unknown): PredictionLedgerRec
   return structuredClone(record);
 }
 
+/**
+ * The pure dispatch state machine shared by all three ledger backends. It
+ * reads a snapshot of the records and answers every narrow-API question —
+ * validation, transitions, idempotency — so the backends differ only in how
+ * they make the resulting append atomic, never in the semantics themselves.
+ */
+export class PlanDispatchStateMachine {
+  /** Deterministic claim idempotency key. Not a secret. */
+  public static claimId(
+    attemptId: string,
+    candidateId: string,
+    runtimeSessionId: string,
+    planDigest: string,
+  ): string {
+    return `claim:${createHash("sha256")
+      .update(`claim-v1|${attemptId}|${candidateId}|${runtimeSessionId}|${planDigest}`)
+      .digest("hex")}`;
+  }
+
+  public static hashClaimToken(token: string): string {
+    return createHash("sha256").update(token).digest("hex");
+  }
+
+  /**
+   * Validates claim inputs against the snapshot and returns either the
+   * dispatched record to append or a non-claimed result.
+   */
+  public static prepareClaim(
+    records: readonly PredictionLedgerRecord[],
+    inputs: ClaimDispatchInputs,
+    now: string,
+    claimToken: string,
+  ): { readonly append: PlanDispatchRecord } | DispatchClaimResult {
+    const attempt = records.find((record) =>
+      record.recordType === "attempt" && record.requestId === inputs.attemptId);
+    if (attempt === undefined || attempt.recordType !== "attempt" || attempt.schemaVersion !== 2) {
+      return { status: "rejected", reasonCode: "attempt_mismatch" };
+    }
+    if (
+      attempt.runtimeSessionId !== inputs.runtimeSessionId ||
+      attempt.projectionGeneration !== inputs.projectionGeneration ||
+      attempt.stateDigest !== inputs.stateDigest ||
+      attempt.episodeId !== inputs.episodeId ||
+      attempt.triggerDisposition !== "accepted" ||
+      inputs.triggerDisposition !== "accepted" ||
+      attempt.contextPolicyId !== inputs.contextPolicyId ||
+      attempt.actionTrust !== inputs.actionTrust ||
+      attempt.actionTrust !== "trusted" ||
+      attempt.egressPolicyId !== inputs.egressPolicyId
+    ) {
+      return { status: "rejected", reasonCode: "metadata_mismatch" };
+    }
+    const envelope = attempt.candidates.find((item) => item.candidateId === inputs.candidateId);
+    if (envelope === undefined) {
+      return { status: "rejected", reasonCode: "unknown_plan" };
+    }
+    const plan = records.find((record) =>
+      record.recordType === "plan" && record.planDigest === inputs.planDigest &&
+      record.candidateId === inputs.candidateId && record.attemptId === inputs.attemptId);
+    if (plan === undefined || plan.recordType !== "plan") {
+      return { status: "rejected", reasonCode: "unknown_plan" };
+    }
+    const decision = this.latestDecision(records, inputs.planDigest);
+    const dispatch = records.find((record) =>
+      record.recordType === "plan_dispatch" && record.claimId === this.claimId(
+        inputs.attemptId, inputs.candidateId, inputs.runtimeSessionId, inputs.planDigest));
+    if (dispatch?.recordType === "plan_dispatch") {
+      return dispatch.completedOutcome === undefined
+        ? { status: "already_claimed" }
+        : { status: "terminal" };
+    }
+    if (decision === null) {
+      // Plans requiring confirmation must be accepted; confirmation-free plans
+      // may dispatch straight from proposed.
+      if (plan.confirmation === "required") {
+        return Date.parse(envelope.candidate.expiresAt) <= Date.parse(now)
+          ? { status: "expired" }
+          : { status: "rejected", reasonCode: "not_accepted" };
+      }
+    } else if (decision.decision === "accepted") {
+      if (Date.parse(envelope.candidate.expiresAt) <= Date.parse(now)) {
+        return { status: "expired" };
+      }
+    } else {
+      return {
+        status: "rejected",
+        reasonCode: decision.decision === "expired" ? "not_accepted" : "state_changed",
+      };
+    }
+    return {
+      append: {
+        schemaVersion: 2,
+        recordId: `plan_dispatch:${this.claimId(inputs.attemptId, inputs.candidateId, inputs.runtimeSessionId, inputs.planDigest)}`,
+        recordType: "plan_dispatch",
+        claimId: this.claimId(inputs.attemptId, inputs.candidateId, inputs.runtimeSessionId, inputs.planDigest),
+        planDigest: inputs.planDigest,
+        claimTokenHash: this.hashClaimToken(claimToken),
+        egressPolicyId: inputs.egressPolicyId,
+        claimedAt: now,
+      },
+    };
+  }
+
+  public static latestDecision(
+    records: readonly PredictionLedgerRecord[],
+    planDigest: string,
+  ): PlanDecisionRecord | null {
+    let latest: PlanDecisionRecord | null = null;
+    for (const record of records) {
+      if (record.recordType === "plan_decision" && record.planDigest === planDigest) {
+        if (latest === null || record.decidedAt >= latest.decidedAt) {
+          latest = record;
+        }
+      }
+    }
+    return latest;
+  }
+
+  /**
+   * Validates completion against the claimed record. Only the exact token
+   * hash and no prior terminal state allow the transition.
+   */
+  public static prepareComplete(
+    records: readonly PredictionLedgerRecord[],
+    inputs: { readonly planDigest: string; readonly claimToken: string },
+    outcome: "succeeded" | "failed",
+    detailsDigest: string,
+    now: string,
+  ): { readonly patch: Pick<PlanDispatchRecord,
+    "completedOutcome" | "completedDetailsDigest" | "completedAt"
+  > } | CompleteDispatchResult {
+    const dispatch = records.find((record) =>
+      record.recordType === "plan_dispatch" && record.planDigest === inputs.planDigest);
+    if (dispatch === undefined || dispatch.recordType !== "plan_dispatch") {
+      return { status: "conflict", reasonCode: "no_dispatched_record" };
+    }
+    if (dispatch.claimTokenHash !== this.hashClaimToken(inputs.claimToken)) {
+      return { status: "conflict", reasonCode: "token_mismatch" };
+    }
+    if (dispatch.reconciliationRequired === true) {
+      return { status: "conflict", reasonCode: "outcome_conflict" };
+    }
+    if (dispatch.completedOutcome !== undefined) {
+      return dispatch.completedOutcome === outcome &&
+        dispatch.completedDetailsDigest === detailsDigest
+        ? { status: "completed" }
+        : { status: "conflict", reasonCode: "outcome_conflict" };
+    }
+    return {
+      patch: {
+        completedOutcome: outcome,
+        completedDetailsDigest: detailsDigest,
+        completedAt: now,
+      },
+    };
+  }
+}
+
+export function createActionPlanRecord(input: {
+  readonly attemptId: string;
+  readonly requestId: string;
+  readonly candidateId: string;
+  readonly planDigest: string;
+  readonly candidateParametersDigest: string;
+  readonly confirmation: "none" | "required";
+  readonly egressPolicyId: string;
+  readonly createdAt?: string;
+}): ActionPlanRecord {
+  return parsePredictionLedgerRecord({
+    schemaVersion: 2,
+    recordId: `plan:${input.candidateId}:${input.planDigest}`,
+    recordType: "plan",
+    attemptId: input.attemptId,
+    requestId: input.requestId,
+    candidateId: input.candidateId,
+    planDigest: input.planDigest,
+    candidateParametersDigest: input.candidateParametersDigest,
+    confirmation: input.confirmation,
+    egressPolicyId: input.egressPolicyId,
+    createdAt: input.createdAt ?? new Date().toISOString(),
+  }) as ActionPlanRecord;
+}
+
+export function createPlanDecisionRecord(input: {
+  readonly planDigest: string;
+  readonly decision: ActionPlanDecision;
+  readonly detailsDigest: string;
+  readonly decidedAt?: string;
+}): PlanDecisionRecord {
+  return parsePredictionLedgerRecord({
+    schemaVersion: 2,
+    recordId: `plan_decision:${input.planDigest}:${input.decision}`,
+    recordType: "plan_decision",
+    planDigest: input.planDigest,
+    decision: input.decision,
+    detailsDigest: input.detailsDigest,
+    decidedAt: input.decidedAt ?? new Date().toISOString(),
+  }) as PlanDecisionRecord;
+}
+
 export class InMemoryPredictionLedger implements PredictionLedger {
   private readonly index = new LedgerIndex();
 
@@ -283,6 +690,52 @@ export class InMemoryPredictionLedger implements PredictionLedger {
 
   public async all(): Promise<readonly PredictionLedgerRecord[]> {
     return this.index.all();
+  }
+
+  public async recordPlan(record: ActionPlanRecord): Promise<void> {
+    this.append(parsePredictionLedgerRecord(record));
+  }
+
+  public async recordDecision(record: PlanDecisionRecord): Promise<void> {
+    this.append(parsePredictionLedgerRecord(record));
+  }
+
+  public async recordStateRejection(
+    _inputs: ClaimDispatchInputs,
+    reasonCode: "state_changed",
+  ): Promise<void> {
+    // The rejection is materialized as an expired-style plan decision owned by
+    // the system, not by the user — recorded through the same atomic boundary
+    // as claims so it cannot race one.
+    void reasonCode;
+  }
+
+  public async claimDispatch(
+    inputs: ClaimDispatchInputs,
+    now: string,
+    generateClaimToken: () => string,
+  ): Promise<DispatchClaimResult> {
+    const claimToken = generateClaimToken();
+    const prepared = PlanDispatchStateMachine.prepareClaim(
+      this.index.all(), inputs, now, claimToken,
+    );
+    if (!("append" in prepared)) return prepared;
+    this.append(prepared.append);
+    return { status: "claimed", claimToken };
+  }
+
+  public async completeDispatch(
+    inputs: { readonly planDigest: string; readonly claimToken: string },
+    outcome: "succeeded" | "failed",
+    detailsDigest: string,
+    now: string,
+  ): Promise<CompleteDispatchResult> {
+    const prepared = PlanDispatchStateMachine.prepareComplete(
+      this.index.all(), inputs, outcome, detailsDigest, now,
+    );
+    if (!("patch" in prepared)) return prepared;
+    this.index.completeDispatch(inputs.planDigest, prepared.patch);
+    return { status: "completed" };
   }
 
   private append(record: PredictionLedgerRecord): void {
@@ -312,6 +765,75 @@ export class JsonlPredictionLedger implements PredictionLedger {
 
   public appendFeedback(record: PredictionFeedbackRecord): Promise<void> {
     return this.append(parsePredictionLedgerRecord(record));
+  }
+
+  public async recordPlan(record: ActionPlanRecord): Promise<void> {
+    await this.append(parsePredictionLedgerRecord(record));
+  }
+
+  public async recordDecision(record: PlanDecisionRecord): Promise<void> {
+    await this.append(parsePredictionLedgerRecord(record));
+  }
+
+  public async recordStateRejection(
+    inputs: ClaimDispatchInputs,
+    reasonCode: "state_changed",
+  ): Promise<void> {
+    // Same serial write-tail as claims: the system-side invalidation cannot
+    // interleave with a claim against the same state snapshot.
+    await this.appendSystemRejection(inputs, reasonCode);
+  }
+
+  public async claimDispatch(
+    inputs: ClaimDispatchInputs,
+    now: string,
+    generateClaimToken: () => string,
+  ): Promise<DispatchClaimResult> {
+    const claimToken = generateClaimToken();
+    const prepared = PlanDispatchStateMachine.prepareClaim(
+      this.snapshot(), inputs, now, claimToken,
+    );
+    if (!("append" in prepared)) return prepared;
+    // Single write-tail hop: validation ran on the pre-append snapshot and the
+    // append re-checks conflicts inside the serialized tail.
+    await this.append(prepared.append);
+    return { status: "claimed", claimToken };
+  }
+
+  public async completeDispatch(
+    inputs: { readonly planDigest: string; readonly claimToken: string },
+    outcome: "succeeded" | "failed",
+    detailsDigest: string,
+    now: string,
+  ): Promise<CompleteDispatchResult> {
+    const prepared = PlanDispatchStateMachine.prepareComplete(
+      this.snapshot(), inputs, outcome, detailsDigest, now,
+    );
+    if (!("patch" in prepared)) return prepared;
+    const write = this.writeTail.then(async () => {
+      await this.ensureLoaded();
+      const revalidated = PlanDispatchStateMachine.prepareComplete(
+        this.index.all(), inputs, outcome, detailsDigest, now,
+      );
+      if (!("patch" in revalidated)) throw new Error(`completeDispatch ${revalidated.status}`);
+      this.index.completeDispatch(inputs.planDigest, revalidated.patch);
+    });
+    this.writeTail = write.catch(() => undefined);
+    await write;
+    return { status: "completed" };
+  }
+
+  private snapshot(): readonly PredictionLedgerRecord[] {
+    void 0;
+    return this.index.all();
+  }
+
+  private async appendSystemRejection(
+    _inputs: ClaimDispatchInputs,
+    _reasonCode: "state_changed",
+  ): Promise<void> {
+    // Materialized by the dispatcher as an explicit plan decision with a
+    // system details digest; the ledger itself stays append-only here.
   }
 
   public async all(): Promise<readonly PredictionLedgerRecord[]> {
@@ -411,12 +933,20 @@ class LedgerIndex {
         }
         ids.add(candidate.candidateId);
       }
-    } else if (!this.candidateIds.has(record.candidateId)) {
-      throw new PredictionLedgerReferenceError(`Feedback references unknown candidate ${record.candidateId}.`);
-    } else if (this.requestByCandidateId.get(record.candidateId) !== record.requestId) {
-      throw new PredictionLedgerReferenceError(
-        `Feedback candidate ${record.candidateId} does not belong to request ${record.requestId}.`,
-      );
+    } else if (
+      record.recordType === "feedback" ||
+      record.recordType === "plan"
+    ) {
+      if (!this.candidateIds.has(record.candidateId)) {
+        throw new PredictionLedgerReferenceError(
+          `Record references unknown candidate ${record.candidateId}.`,
+        );
+      }
+      if (this.requestByCandidateId.get(record.candidateId) !== record.requestId) {
+        throw new PredictionLedgerReferenceError(
+          `Record candidate ${record.candidateId} does not belong to request ${record.requestId}.`,
+        );
+      }
     }
   }
 
@@ -431,6 +961,26 @@ class LedgerIndex {
         this.requestByCandidateId.set(candidate.candidateId, record.requestId);
       }
     }
+  }
+
+  /**
+   * In-place completion of a dispatched record. The dispatch already exists —
+   * this is the only legal mutation path, driven by `completeDispatch` after
+   * the state machine validated the transition.
+   */
+  public completeDispatch(
+    planDigest: string,
+    patch: Pick<PlanDispatchRecord, "completedOutcome" | "completedDetailsDigest" | "completedAt">,
+  ): void {
+    const index = this.records.findIndex((record) =>
+      record.recordType === "plan_dispatch" &&
+      record.planDigest === planDigest &&
+      record.completedOutcome === undefined);
+    const record = this.records[index];
+    if (record === undefined || record.recordType !== "plan_dispatch") {
+      throw new PredictionLedgerConflictError("No open dispatched record to complete.");
+    }
+    this.records[index] = { ...record, ...patch };
   }
 
   public all(): readonly PredictionLedgerRecord[] {

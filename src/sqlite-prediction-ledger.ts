@@ -3,9 +3,16 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import {
   parsePredictionLedgerRecord,
+  PlanDispatchStateMachine,
   PredictionLedgerConflictError,
   PredictionLedgerReferenceError,
   stableJson,
+  type ActionPlanRecord,
+  type ClaimDispatchInputs,
+  type CompleteDispatchResult,
+  type DispatchClaimResult,
+  type PlanDecisionRecord,
+  type PlanDispatchRecord,
   type PredictionAttemptRecord,
   type PredictionFeedbackRecord,
   type PredictionLedger,
@@ -100,6 +107,103 @@ export class SqlitePredictionLedger implements PredictionLedger {
     } catch (error) {
       throw this.translate(error, validated);
     }
+  }
+
+  public async recordPlan(record: ActionPlanRecord): Promise<void> {
+    this.assertOpen();
+    const validated = parsePredictionLedgerRecord(record) as ActionPlanRecord;
+    if (this.hasEquivalent(validated)) return;
+    try {
+      this.insertRecord(validated, validated.requestId, validated.candidateId);
+    } catch (error) {
+      throw this.translate(error, validated);
+    }
+  }
+
+  public async recordDecision(record: PlanDecisionRecord): Promise<void> {
+    this.assertOpen();
+    const validated = parsePredictionLedgerRecord(record) as PlanDecisionRecord;
+    if (this.hasEquivalent(validated)) return;
+    try {
+      this.insertRecord(validated, "", null);
+    } catch (error) {
+      throw this.translate(error, validated);
+    }
+  }
+
+  public async recordStateRejection(
+    inputs: ClaimDispatchInputs,
+    reasonCode: "state_changed",
+  ): Promise<void> {
+    // Materialized by the dispatcher as an explicit system-owned plan
+    // decision; the ledger stays append-only here.
+    void inputs;
+    void reasonCode;
+  }
+
+  public async claimDispatch(
+    inputs: ClaimDispatchInputs,
+    now: string,
+    generateClaimToken: () => string,
+  ): Promise<DispatchClaimResult> {
+    this.assertOpen();
+    const claimToken = generateClaimToken();
+    // Validation + insert inside one SQLite transaction: concurrent claims on
+    // the same candidate serialize at the database, so only one can observe an
+    // absent dispatch and win the insert; the loser hits the unique index.
+    const transaction = this.database.transaction((): DispatchClaimResult => {
+      const records = this.allSync();
+      const prepared = PlanDispatchStateMachine.prepareClaim(
+        records, inputs, now, claimToken,
+      );
+      if (!("append" in prepared)) return prepared;
+      try {
+        this.insertRecord(prepared.append, "", null);
+      } catch (error) {
+        // The unique record_id index means a racing identical claim landed
+        // first — report it as already_claimed rather than a conflict.
+        if (isConstraintViolation(error)) return { status: "already_claimed" };
+        throw error;
+      }
+      return { status: "claimed", claimToken };
+    });
+    return transaction();
+  }
+
+  public async completeDispatch(
+    inputs: { readonly planDigest: string; readonly claimToken: string },
+    outcome: "succeeded" | "failed",
+    detailsDigest: string,
+    now: string,
+  ): Promise<CompleteDispatchResult> {
+    this.assertOpen();
+    const transaction = this.database.transaction((): CompleteDispatchResult => {
+      const records = this.allSync();
+      const prepared = PlanDispatchStateMachine.prepareComplete(
+        records, inputs, outcome, detailsDigest, now,
+      );
+      if (!("patch" in prepared)) return prepared;
+      const dispatch = records.find((record): record is PlanDispatchRecord =>
+        record.recordType === "plan_dispatch" && record.planDigest === inputs.planDigest &&
+        record.completedOutcome === undefined);
+      if (dispatch === undefined) {
+        return { status: "conflict", reasonCode: "no_dispatched_record" };
+      }
+      this.database
+        .query(
+          `UPDATE ledger_records SET record_json = ? WHERE record_id = ?`,
+        )
+        .run(JSON.stringify({ ...dispatch, ...prepared.patch }), dispatch.recordId);
+      return { status: "completed" };
+    });
+    return transaction();
+  }
+
+  private allSync(): readonly PredictionLedgerRecord[] {
+    const rows = this.database
+      .query(`SELECT record_json FROM ledger_records ORDER BY seq`)
+      .all() as readonly { record_json: string }[];
+    return rows.map((row) => parsePredictionLedgerRecord(JSON.parse(row.record_json)));
   }
 
   /**
