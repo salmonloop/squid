@@ -48,6 +48,22 @@ describe("ActivityEvent protocol", () => {
     expect(first.sessionId).not.toBe("default");
   });
 
+  it("normalizes legacy browser events without an owner to a null owner", () => {
+    const event = createActivityEvent({
+      kind: "browser_navigated",
+      payload: { url: "https://example.com", title: "Example", host: "example.com", owner: null },
+    });
+    const legacy = { ...event, payload: { url: "https://example.com", title: "Example", host: "example.com" } };
+    expect((parseActivityEvent(legacy).payload as { owner: unknown }).owner).toBeNull();
+  });
+
+  it("requires new browser events to state owner explicitly", () => {
+    expect(() => createActivityEvent({
+      kind: "browser_navigated",
+      payload: { url: "https://example.com", title: "Example", host: "example.com" },
+    })).toThrow("must include an explicit owner");
+  });
+
   it.each([
     ["unknown event kind", { kind: "unknown" }],
     ["invalid timestamp", { occurredAt: "not-a-date" }],

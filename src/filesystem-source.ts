@@ -51,8 +51,9 @@ interface PendingChange {
  * Emits validated `file_opened` / `file_saved` activity for one project root.
  *
  * Filesystem writes identify a path, not an application, so every event carries
- * `applicationId: "filesystem"`. Correlating a write with the editor that made
- * it requires a future IDE or native source.
+ * `applicationId: null`. Correlating a write with the editor that made it
+ * requires a future IDE or native source; consumers must fail closed rather
+ * than treating the watcher itself as an application.
  */
 export class FilesystemActivitySource implements ActivitySource {
   public readonly id: string;
@@ -194,7 +195,7 @@ export class FilesystemActivitySource implements ActivitySource {
   private buildEvent(kind: "file_opened" | "file_saved", relativePath: string): ActivityEvent<FilePayload> {
     return createActivityEvent<FilePayload>({
       kind,
-      payload: { path: relativePath, applicationId: "filesystem" },
+      payload: { path: relativePath, applicationId: null },
       source: { kind: "filesystem", instanceId: this.id },
       sessionId: this.sessionId,
       sequence: this.sequence++,

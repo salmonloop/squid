@@ -294,7 +294,16 @@ export class ScreenTextActivitySource implements ActivitySource {
     }
 
     for (const emission of emissions) {
-      const fingerprint = JSON.stringify(emission.payload);
+      const fingerprint = JSON.stringify(emission.kind === "text_context_changed"
+        ? {
+            payload: emission.payload,
+            // Text payloads have no owner by protocol design. Include the observed
+            // foreground identity in the source-local dedupe key so identical text
+            // in two windows is emitted again and can bind to the new focus.
+            applicationId: frame.applicationId ?? null,
+            windowTitle: frame.windowTitle ?? null,
+          }
+        : emission.payload);
       if (this.lastEmitted.get(emission.kind) === fingerprint) continue;
 
       try {

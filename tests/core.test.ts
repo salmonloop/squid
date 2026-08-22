@@ -23,7 +23,8 @@ describe("SquidCore", () => {
 
     expect(result.disposition).toBe("accepted");
     expect(result.state.activeApplication?.id).toBe("editor");
-    expect(result.state.focus?.prefix).toBe("Hello");
+    expect(result.state.textContext?.prefix).toBe("Hello");
+    expect(result.state.textContext?.owner).toEqual({ applicationId: "editor", windowTitle: "draft.md" });
     expect(result.baselinePredictions[0]?.kind).toBe("draft_completion");
   });
 
@@ -34,12 +35,44 @@ describe("SquidCore", () => {
       kind: "browser_navigated",
       eventId: "restore-browser",
       occurredAt: "2026-08-19T14:00:00.000Z",
-      payload: { url: "https://example.com", title: "Example", host: "example.com" },
+      payload: { url: "https://example.com", title: "Example", host: "example.com", owner: null },
     }));
 
     const restored = await new SquidCore(store).restore();
     expect(restored.currentBrowserPage?.host).toBe("example.com");
     expect(restored.episode).toEqual(live.state.episode);
+    expect(new SquidCore(store).stateDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+  });
+
+  it("exposes a deterministic state digest across order, late ingest, and restore", async () => {
+    const events = [
+      createActivityEvent({
+        kind: "application_activated", eventId: "digest-app", sequence: 0,
+        occurredAt: "2026-08-21T09:00:00.000Z",
+        payload: { applicationId: "editor", applicationName: "Editor" },
+      }),
+      createActivityEvent({
+        kind: "file_saved", eventId: "digest-save", sequence: 1,
+        occurredAt: "2026-08-21T09:00:01.000Z",
+        payload: { path: "src/main.ts", applicationId: "editor" },
+      }),
+    ];
+    const orderedStore = new InMemoryEventStore();
+    const ordered = new SquidCore(orderedStore);
+    await ordered.ingest(events[0]!);
+    await ordered.ingest(events[1]!);
+
+    const shuffledStore = new InMemoryEventStore();
+    const shuffled = new SquidCore(shuffledStore);
+    await shuffled.ingest(events[1]!);
+    await shuffled.ingest(events[0]!);
+    const restored = new SquidCore(shuffledStore);
+    await restored.restore();
+
+    expect(ordered.stateDigest).toBe(shuffled.stateDigest);
+    expect(ordered.stateDigest).toBe(restored.stateDigest);
+    expect(ordered.projectionGeneration).toBeGreaterThan(0);
+    expect(restored.projectionGeneration).toBeGreaterThan(0);
   });
 
   it("ignores exact duplicate event IDs", async () => {
@@ -182,7 +215,7 @@ describe("SquidCore", () => {
     const core = new SquidCore(new InMemoryEventStore());
     const result = await core.ingest(createActivityEvent({
       kind: "browser_navigated",
-      payload: { url: "https://example.com", title: "Example", host: "example.com" },
+      payload: { url: "https://example.com", title: "Example", host: "example.com", owner: null },
     }));
 
     result.state.currentBrowserPage!.host = "mutated.example";

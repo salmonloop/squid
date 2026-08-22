@@ -9,24 +9,29 @@ export class HeuristicPredictor implements Predictor {
     const expiresAt = new Date(now.getTime() + 20_000).toISOString();
     const candidates: PredictionCandidate[] = [];
 
-    if (state.focus?.role === "text_input" || state.focus?.role === "editor") {
-      if (state.focus.prefix.trim().length > 0) {
+    const textContext = state.textContext;
+    const textOwnerMatchesFocus = state.focus !== null
+      && textContext?.owner !== null
+      && textContext?.owner.applicationId === state.focus.applicationId
+      && textContext.owner.windowTitle === state.focus.windowTitle;
+    if ((state.focus?.role === "text_input" || state.focus?.role === "editor") && textOwnerMatchesFocus) {
+      if (textContext.prefix.trim().length > 0) {
         candidates.push({
           kind: "draft_completion",
           rationale: "A text input has a non-empty prefix and is eligible for completion.",
           confidence: 0.35,
           expiresAt,
-          sourceEventIds: [],
+          sourceEventIds: [textContext.sourceEventId],
           parameters: {
-            prefix: state.focus.prefix,
-            suffix: state.focus.suffix,
-            language: state.focus.language,
+            prefix: textContext.prefix,
+            suffix: textContext.suffix,
+            language: textContext.language,
           },
         });
       }
     }
 
-    if (state.lastCommandOutcome?.succeeded === false) {
+    if (state.lastEventKind === "terminal_command_completed" && state.lastCommandOutcome?.succeeded === false) {
       candidates.push({
         kind: "inspect_error",
         rationale: "The most recent terminal command failed.",
@@ -41,7 +46,11 @@ export class HeuristicPredictor implements Predictor {
     }
 
     const latestAction = state.recentActions[0];
-    if (latestAction?.kind === "file_saved" && state.activeApplication?.id.includes("code")) {
+    if (
+      latestAction?.kind === "file_saved"
+      && state.activeApplication?.id.includes("code")
+      && latestAction.applicationId === state.activeApplication.id
+    ) {
       candidates.push({
         kind: "run_tests",
         rationale: "A code file was saved while a coding application is active.",
@@ -52,15 +61,30 @@ export class HeuristicPredictor implements Predictor {
       });
     }
 
-    const focus = state.focus;
-    if (focus && focus.selection.trim().length > 0 && state.currentBrowserPage !== null) {
+    const selectionObservedAfterPage = textContext !== null
+      && state.currentBrowserPage !== null
+      && textContext.observationOrdinal > state.currentBrowserPage.observationOrdinal;
+    const selectionOwnerMatchesPage = textContext?.owner !== null
+      && state.currentBrowserPage?.owner !== null
+      && textContext?.owner?.applicationId === state.currentBrowserPage?.owner?.applicationId
+      && textContext?.owner?.windowTitle === state.currentBrowserPage?.owner?.windowTitle;
+    if (
+      textContext !== null
+      && textContext.selection.trim().length > 0
+      && state.currentBrowserPage !== null
+      && selectionObservedAfterPage
+      && selectionOwnerMatchesPage
+    ) {
       candidates.push({
         kind: "search_selection",
         rationale: "Text is selected while a browser page is active.",
         confidence: 0.2,
         expiresAt,
-        sourceEventIds: [],
-        parameters: { selection: focus.selection },
+        sourceEventIds: [
+          state.currentBrowserPage.sourceEventId,
+          textContext.sourceEventId,
+        ],
+        parameters: { selection: textContext.selection },
       });
     }
 

@@ -139,7 +139,7 @@ describe("FilesystemActivitySource event mapping", () => {
       ["file_opened", "src/created.ts"],
       ["file_saved", "src/edited.ts"],
     ]);
-    expect(emitter.events.every((event) => event.payload.applicationId === "filesystem")).toBe(true);
+    expect(emitter.events.every((event) => event.payload.applicationId === null)).toBe(true);
     expect(emitter.events.every((event) => event.source.kind === "filesystem")).toBe(true);
   });
 

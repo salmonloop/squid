@@ -25,15 +25,25 @@ function sensitiveState(): WorldState {
       windowTitle: "salary-2026.xlsx — Private",
       role: "editor",
       label: "Patient name field",
+    },
+    textContext: {
+      owner: { applicationId: "code", windowTitle: "salary-2026.xlsx — Private" },
       prefix: "PREFIX",
       suffix: "SUFFIX",
       selection: "SELECTED",
       language: "typescript",
+      sourceEventId: "text-1",
+      observedAt: "2026-08-19T10:00:00.000Z",
+      observationOrdinal: 2,
     },
     currentBrowserPage: {
       url: "https://mail.example.com/inbox?token=secret-session-abc#msg-1",
       title: "Re: acquisition terms",
       host: "mail.example.com",
+      owner: { applicationId: "code", windowTitle: "salary-2026.xlsx — Private" },
+      sourceEventId: "browser-1",
+      observedAt: "2026-08-19T09:59:59.000Z",
+      observationOrdinal: 1,
     },
     recentFiles: ["/home/alice/private/taxes/return.pdf", "src/main.ts"],
     recentActions: [
@@ -41,6 +51,7 @@ function sensitiveState(): WorldState {
         kind: "file_saved",
         occurredAt: "2026-08-19T10:00:00.000Z",
         sourceEventId: "e-1",
+        applicationId: "code",
         target: "/home/alice/private/taxes/return.pdf",
         outcome: "succeeded",
       },
@@ -148,28 +159,28 @@ describe("RedactingContextPolicy", () => {
 
   it("redacts focus labels and caps text around the cursor", () => {
     const state = sensitiveState();
-    state.focus!.prefix = "a".repeat(20) + "NEAR_CURSOR";
-    state.focus!.suffix = "AFTER_CURSOR" + "b".repeat(20);
-    state.focus!.selection = "c".repeat(40);
+    state.textContext!.prefix = "a".repeat(20) + "NEAR_CURSOR";
+    state.textContext!.suffix = "AFTER_CURSOR" + "b".repeat(20);
+    state.textContext!.selection = "c".repeat(40);
 
     const projected = new RedactingContextPolicy({ maxTextLength: 12 }).project(state);
 
     // Prefix keeps its tail and suffix keeps its head: both sit at the caret.
-    expect(projected.focus!.prefix).toBe("aNEAR_CURSOR");
-    expect(projected.focus!.prefix).toHaveLength(12);
-    expect(projected.focus!.suffix).toBe("AFTER_CURSOR");
-    expect(projected.focus!.selection).toHaveLength(12);
+    expect(projected.textContext!.prefix).toBe("aNEAR_CURSOR");
+    expect(projected.textContext!.prefix).toHaveLength(12);
+    expect(projected.textContext!.suffix).toBe("AFTER_CURSOR");
+    expect(projected.textContext!.selection).toHaveLength(12);
     expect(projected.focus!.label).toBe("[redacted]");
-    expect(projected.focus!.language).toBe("typescript");
+    expect(projected.textContext!.language).toBe("typescript");
     expect(projected.focus!.role).toBe("editor");
   });
 
   it("leaves text shorter than the cap untouched", () => {
     const projected = new RedactingContextPolicy().project(sensitiveState());
 
-    expect(projected.focus!.prefix).toBe("PREFIX");
-    expect(projected.focus!.suffix).toBe("SUFFIX");
-    expect(projected.focus!.selection).toBe("SELECTED");
+    expect(projected.textContext!.prefix).toBe("PREFIX");
+    expect(projected.textContext!.suffix).toBe("SUFFIX");
+    expect(projected.textContext!.selection).toBe("SELECTED");
   });
 
   it("keeps episode and event shape, which carry no user content", () => {
@@ -190,7 +201,8 @@ describe("RedactingContextPolicy", () => {
     }).project(state);
 
     expect(projected.recentFiles).toEqual(state.recentFiles);
-    expect(projected.currentBrowserPage).toEqual(state.currentBrowserPage);
+    expect(projected.currentBrowserPage!.url).toBe(state.currentBrowserPage!.url);
+    expect(projected.currentBrowserPage!.title).toBe(state.currentBrowserPage!.title);
     // Not allow-listed, so still redacted.
     expect(projected.activeWindow!.title).toBe("[redacted]");
     expect(projected.focus!.label).toBe("[redacted]");
@@ -198,7 +210,7 @@ describe("RedactingContextPolicy", () => {
 
   it.each([
     ["windowTitle" as const, (s: WorldState) => s.activeWindow!.title],
-    ["focusText" as const, (s: WorldState) => s.focus!.label],
+    ["focusText" as const, (s: WorldState) => `${s.focus!.label}:${s.textContext!.selection}`],
     ["actionTargets" as const, (s: WorldState) => s.recentActions[0].target],
     ["filePaths" as const, (s: WorldState) => s.recentFiles[0]],
   ])("passes %s through when it alone is allow-listed", (field, read) => {
@@ -230,7 +242,10 @@ describe("RedactingContextPolicy", () => {
 
     expect(projected.activeWindow).not.toBe(state.activeWindow);
     expect(projected.focus).not.toBe(state.focus);
+    expect(projected.textContext).not.toBe(state.textContext);
+    expect(projected.textContext!.owner).not.toBe(state.textContext!.owner);
     expect(projected.currentBrowserPage).not.toBe(state.currentBrowserPage);
+    expect(projected.currentBrowserPage!.owner).not.toBe(state.currentBrowserPage!.owner);
     expect(projected.recentFiles).not.toBe(state.recentFiles);
     expect(projected.recentActions).not.toBe(state.recentActions);
     expect(projected.recentActions[0]).not.toBe(state.recentActions[0]);
@@ -325,6 +340,7 @@ describe("PredictionCoordinator context policy", () => {
     // policy that redacts provider egress must not degrade local prediction.
     const state = sensitiveState();
     state.lastCommandOutcome = { commandClass: "test", succeeded: false, exitCode: 1 };
+    state.lastEventKind = "terminal_command_completed";
     const coordinator = new PredictionCoordinator({
       provider: {
         name: "failing",

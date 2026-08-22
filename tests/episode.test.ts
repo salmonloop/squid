@@ -97,7 +97,7 @@ describe("episode-scoped world state", () => {
         sequence: 4,
         occurredAt: "2026-08-19T11:00:04.000Z",
         kind: "browser_navigated",
-        payload: { url: "https://example.com", title: "Example", host: "example.com" },
+        payload: { url: "https://example.com", title: "Example", host: "example.com", owner: null },
       }),
       event({
         eventId: "save",
@@ -186,7 +186,7 @@ describe("episode-scoped world state", () => {
 
     const state = buildWorldState([first, text, within]);
 
-    expect(state.focus?.prefix).toBe("current");
+    expect(state.textContext?.prefix).toBe("current");
     expect(state.episode).toEqual({
       id: "episode-2026-08-19T13:00:00.000Z-focus-short",
       startedAt: "2026-08-19T13:00:00.000Z",

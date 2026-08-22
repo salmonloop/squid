@@ -221,6 +221,10 @@ export class RedactingCapturePolicy implements CapturePolicy {
       result.title = REDACTED;
       changed = true;
     }
+    if (payload.owner !== undefined && payload.owner !== null && looksLikeCredential(payload.owner.windowTitle)) {
+      result.owner = { ...payload.owner, windowTitle: REDACTED };
+      changed = true;
+    }
     // `host` is a domain — structural, not credential content — so it stays,
     // the same way `applicationId` does everywhere else.
     return changed ? result : undefined;

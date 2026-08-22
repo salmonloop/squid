@@ -36,13 +36,13 @@ describe("Replay evaluation", () => {
       "run_tests",
       "draft_completion",
       "inspect_error",
-      "run_tests",
+      "none",
       "none",
       "run_tests",
       "none",
       "run_tests",
       // The three screen-text scenarios, in scenario-ID order.
-      "run_tests",
+      "none",
       "search_selection",
       "none",
       // The three stale scenarios.
@@ -82,8 +82,8 @@ describe("Replay evaluation", () => {
     const report = await evaluateScenarios([scenario], () => new HeuristicPredictor());
 
     expect(scenario.events.some((event) => event.source.kind === "filesystem")).toBe(true);
-    expect(report.results[0]?.rank).toBe(1);
-    expect(report.results[0]?.candidateKinds).toEqual(["run_tests"]);
+    expect(report.results[0]?.rank).toBeNull();
+    expect(report.results[0]?.candidateKinds).toEqual([]);
   });
 
   it("produces identical reports across runs", async () => {

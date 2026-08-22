@@ -84,12 +84,15 @@ export interface BrowserNavigatedPayload {
   url: string;
   title: string;
   host: string;
+  /** Canonical v1+ shape. Legacy persisted events may omit it; the parser normalizes that to null. */
+  owner: ForegroundOwner | null;
 }
 
 export interface SemanticAction {
   kind: string;
   occurredAt: string;
   sourceEventId: string;
+  applicationId: string | null;
   target: string | null;
   outcome: "unknown" | "succeeded" | "failed";
 }
@@ -99,10 +102,28 @@ export interface FocusState {
   windowTitle: string;
   role: FocusChangedPayload["role"];
   label: string | null;
+}
+
+export interface ForegroundOwner {
+  applicationId: string;
+  windowTitle: string;
+}
+
+export interface TextContextState {
+  owner: ForegroundOwner | null;
   prefix: string;
   suffix: string;
   selection: string;
   language: string | null;
+  sourceEventId: string;
+  observedAt: string;
+  observationOrdinal: number;
+}
+
+export interface BrowserPageState extends BrowserNavigatedPayload {
+  sourceEventId: string;
+  observedAt: string;
+  observationOrdinal: number;
 }
 
 export interface EpisodeState {
@@ -118,7 +139,8 @@ export interface WorldState {
   activeApplication: { id: string; name: string } | null;
   activeWindow: WindowChangedPayload | null;
   focus: FocusState | null;
-  currentBrowserPage: BrowserNavigatedPayload | null;
+  textContext: TextContextState | null;
+  currentBrowserPage: BrowserPageState | null;
   recentFiles: string[];
   recentActions: SemanticAction[];
   lastCommandOutcome: TerminalCommandCompletedPayload | null;
@@ -199,6 +221,10 @@ const browserNavigatedPayloadSchema = Type.Object({
   url: Type.String({ format: "uri", minLength: 1 }),
   title: Type.String(),
   host: nonEmptyString(),
+  owner: Type.Union([Type.Object({
+    applicationId: nonEmptyString(),
+    windowTitle: Type.String(),
+  }, { additionalProperties: false }), Type.Null()]),
 }, { additionalProperties: false });
 
 function activityEventSchema(kind: ActivityKind, payload: TSchema) {
@@ -258,18 +284,32 @@ export class ActivityEventValidationError extends Error {
 }
 
 export function parseActivityEvent(value: unknown): ActivityEvent {
-  if (!activityEventValidator.Check(value)) {
+  const normalized = normalizeLegacyActivityEvent(value);
+  if (!activityEventValidator.Check(normalized)) {
     throw new ActivityEventValidationError(
-      activityEventValidator.Errors(value).map((issue) => issue.message),
+      activityEventValidator.Errors(normalized).map((issue) => issue.message),
     );
   }
 
-  const event = activityEventValidator.Parse(value) as ActivityEvent;
+  const event = activityEventValidator.Parse(normalized) as ActivityEvent;
   if (!isFiniteTimestamp(event.occurredAt) || !isFiniteTimestamp(event.ingestedAt)) {
     throw new ActivityEventValidationError(["occurredAt and ingestedAt must be finite ISO date-time values."]);
   }
 
   return structuredClone(event);
+}
+
+function normalizeLegacyActivityEvent(value: unknown): unknown {
+  if (value === null || typeof value !== "object") return value;
+  const event = value as Record<string, unknown>;
+  if (event.schemaVersion !== 1 || event.kind !== "browser_navigated") return value;
+  const payload = event.payload;
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return value;
+  if (Object.prototype.hasOwnProperty.call(payload, "owner")) return value;
+  return {
+    ...event,
+    payload: { ...(payload as Record<string, unknown>), owner: null },
+  };
 }
 
 export function isActivityEvent(value: unknown): value is ActivityEvent {
@@ -292,6 +332,7 @@ export function createActivityEvent<TPayload>(input: {
   correlationId?: string | null;
   redacted?: boolean;
 }): ActivityEvent<TPayload> {
+  assertCanonicalPayload(input.kind, input.payload);
   const now = new Date().toISOString();
   const source = input.source ?? { kind: "synthetic", instanceId: "local" };
   const sessionId = input.sessionId ?? defaultSessionId;
@@ -312,6 +353,14 @@ export function createActivityEvent<TPayload>(input: {
   return parseActivityEvent(event) as ActivityEvent<TPayload>;
 }
 
+function assertCanonicalPayload(kind: ActivityKind, payload: unknown): void {
+  if (kind !== "browser_navigated") return;
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)
+    || !Object.prototype.hasOwnProperty.call(payload, "owner")) {
+    throw new TypeError("New browser_navigated events must include an explicit owner (use null when unknown).");
+  }
+}
+
 export function emptyWorldState(): WorldState {
   return {
     updatedAt: null,
@@ -320,6 +369,7 @@ export function emptyWorldState(): WorldState {
     activeApplication: null,
     activeWindow: null,
     focus: null,
+    textContext: null,
     currentBrowserPage: null,
     recentFiles: [],
     recentActions: [],

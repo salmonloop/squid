@@ -220,7 +220,7 @@ describe("ScreenTextActivitySource change detection", () => {
     h.reader.emit({ ...fullFrame, windowTitle: "bash — squid/src" });
     await h.source.stop();
 
-    expect(h.kinds().slice(4)).toEqual(["window_changed", "focus_changed"]);
+    expect(h.kinds().slice(4)).toEqual(["window_changed", "focus_changed", "text_context_changed"]);
   });
 
   it("reports a role-only change as a focus change alone", async () => {
@@ -464,13 +464,14 @@ describe("ScreenTextActivitySource with SquidCore", () => {
       windowTitle: "screen-text-source.ts",
       role: "text_input",
       label: null,
-      // The reducer combines focus and text context, so the selection observed
-      // under the previous application survives a focus change.
-      prefix: "const ",
-      suffix: ";",
-      selection: "value",
-      language: "typescript",
     });
+    // The second frame carries the same text again. Its owner changed, so the
+    // source must re-emit it instead of letting payload-only dedupe suppress it.
+    expect(state.textContext?.owner).toEqual({
+      applicationId: "742",
+      windowTitle: "screen-text-source.ts",
+    });
+    expect(state.textContext?.selection).toBe("value");
     expect((await store.all()).every((event) => event.source.kind === "host")).toBe(true);
     expect(await core.restore()).toEqual(state);
   });

@@ -183,6 +183,7 @@ describe("RedactingCapturePolicy", () => {
         url: "https://example.com/login?token=s3cr3t",
         title: "Login",
         host: "example.com",
+        owner: null,
       },
     });
 
@@ -206,6 +207,7 @@ describe("RedactingCapturePolicy", () => {
         url: "https://example.com/dashboard",
         title: "GitHub — token ghp_0123456789abcdef",
         host: "example.com",
+        owner: null,
       },
     });
 
@@ -218,6 +220,26 @@ describe("RedactingCapturePolicy", () => {
     expect(payload.url).toBe("https://example.com/dashboard");
     expect(payload.title).toBe("[redacted]");
     expect(payload.host).toBe("example.com");
+    expect(captured.redacted).toBe(true);
+  });
+
+  it("redacts a credential-bearing browser owner title", () => {
+    const policy = new RedactingCapturePolicy();
+    const event = createActivityEvent({
+      kind: "browser_navigated",
+      payload: {
+        url: "https://example.com/dashboard",
+        title: "Dashboard",
+        host: "example.com",
+        owner: { applicationId: "browser", windowTitle: "password vault" },
+      },
+    });
+
+    const captured = policy.capture(event);
+    expect((captured.payload as BrowserNavigatedPayload).owner).toEqual({
+      applicationId: "browser",
+      windowTitle: "[redacted]",
+    });
     expect(captured.redacted).toBe(true);
   });
 

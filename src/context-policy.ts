@@ -77,6 +77,12 @@ export class RedactingContextPolicy implements ContextPolicy {
       if (projected.focus !== null) {
         projected.focus.windowTitle = REDACTED;
       }
+      if (projected.textContext?.owner !== null && projected.textContext?.owner !== undefined) {
+        projected.textContext.owner.windowTitle = REDACTED;
+      }
+      if (projected.currentBrowserPage?.owner !== null && projected.currentBrowserPage?.owner !== undefined) {
+        projected.currentBrowserPage.owner.windowTitle = REDACTED;
+      }
     }
 
     if (!this.allow.has("browserUrl") && projected.currentBrowserPage !== null) {
@@ -89,15 +95,17 @@ export class RedactingContextPolicy implements ContextPolicy {
       projected.recentFiles = projected.recentFiles.map(basename);
     }
 
-    if (!this.allow.has("focusText") && projected.focus !== null) {
-      const focus = projected.focus;
-      // Keep the end of the prefix and the start of the suffix: those bracket
-      // the cursor, which is where a completion is generated.
-      focus.prefix = keepTail(focus.prefix, this.maxTextLength);
-      focus.suffix = keepHead(focus.suffix, this.maxTextLength);
-      focus.selection = keepHead(focus.selection, this.maxTextLength);
-      if (focus.label !== null) {
-        focus.label = REDACTED;
+    if (!this.allow.has("focusText")) {
+      if (projected.focus !== null) {
+        projected.focus.label = REDACTED;
+      }
+      const textContext = projected.textContext;
+      if (textContext !== null) {
+        // Keep the end of the prefix and the start of the suffix: those bracket
+        // the cursor, which is where a completion is generated.
+        textContext.prefix = keepTail(textContext.prefix, this.maxTextLength);
+        textContext.suffix = keepHead(textContext.suffix, this.maxTextLength);
+        textContext.selection = keepHead(textContext.selection, this.maxTextLength);
       }
     }
 
