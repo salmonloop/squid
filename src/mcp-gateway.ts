@@ -7,6 +7,7 @@ import type {
   CapabilityGateway,
 } from "./capability-gateway.js";
 import { digestActionPlan, type ImmutableActionPlan } from "./action-plan.js";
+import { resolveDeepestAncestor } from "./action-planner.js";
 import { sanitizeAuditText } from "./action-egress.js";
 
 export interface McpCapabilityGatewayOptions {
@@ -105,13 +106,24 @@ export class McpCapabilityGateway implements CapabilityGateway {
     if (resolvedRoot !== root) {
       return "The plan's working directory changed since it was approved.";
     }
-    try {
-      resolvedTarget = await this.resolvePath(target);
-    } catch {
-      // A target that does not exist yet is legitimate — the plan was built for
-      // a file the tests may create — as long as it stays inside the root.
-      resolvedTarget = target;
+    // A target that does not exist yet is legitimate — the plan may name a file
+    // the run creates — but its directories still decide containment, so this
+    // resolves the deepest existing ancestor rather than trusting the literal
+    // path. Same helper the planner used, so the two boundaries cannot drift.
+    const relativeTarget = relative(resolvedRoot, target);
+    if (relativeTarget.length === 0 || isAbsolute(relativeTarget)
+      || relativeTarget === ".." || relativeTarget.startsWith(`..${sep}`)) {
+      return "The plan's target no longer resolves inside its working directory.";
     }
+    const canonical = await resolveDeepestAncestor(
+      resolvedRoot,
+      relativeTarget,
+      (path) => this.resolvePath(path),
+    );
+    if (canonical === null) {
+      return "The plan's target no longer resolves.";
+    }
+    resolvedTarget = canonical;
     const containment = relative(resolvedRoot, resolvedTarget);
     if (
       containment === ".." ||

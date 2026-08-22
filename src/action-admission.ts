@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import type { EgressPolicy } from "./action-egress.js";
 import type { ImmutableActionPlan } from "./action-plan.js";
 import type { PredictionAttemptRecord } from "./prediction-ledger.js";
@@ -149,8 +150,19 @@ function admitRunTests(context: AdmissionContext): AdmissionResult {
   ) {
     return refuse("coding_application_mismatch");
   }
-  if (lastSave.target === null || plan.canonicalTarget === null) return refuse("saved_path_mismatch");
-  if (!plan.canonicalTarget.endsWith(lastSave.target)) return refuse("saved_path_mismatch");
+  if (
+    lastSave.target === null ||
+    plan.canonicalTarget === null ||
+    plan.canonicalWorkingDirectory === null
+  ) {
+    return refuse("saved_path_mismatch");
+  }
+  // Path identity, not a string suffix. `endsWith` would authorize any file whose
+  // path merely *ends* with the saved one — saving `a.ts` would admit a plan
+  // targeting `sub/xa.ts` — and it would accept a target reached through a
+  // symlink, since the resolved path still ends with the saved name.
+  const savedTarget = resolve(plan.canonicalWorkingDirectory, lastSave.target);
+  if (plan.canonicalTarget !== savedTarget) return refuse("saved_path_mismatch");
   return { admitted: true };
 }
 

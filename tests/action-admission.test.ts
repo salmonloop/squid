@@ -338,4 +338,31 @@ describe("admitAction run_tests checks", () => {
     const result = admitAction(testsContext({ state: testsState("src/other.test.ts") }));
     expect(result).toEqual({ admitted: false, reasonCode: "saved_path_mismatch" });
   });
+
+  it("refuses a target that merely ends with the saved path's characters", () => {
+    // "/repo/src/xa.ts".endsWith("a.ts") is true, but they are different files.
+    // Authorization compares resolved paths, not string suffixes: otherwise
+    // saving one file would authorize running any file whose name ends with it.
+    const result = admitAction(testsContext({
+      plan: testsPlan("/repo/src/xa.ts"),
+      state: testsState("src/a.ts"),
+    }));
+    expect(result).toEqual({ admitted: false, reasonCode: "saved_path_mismatch" });
+  });
+
+  it("admits the saved file addressed relative to the canonical root", () => {
+    const result = admitAction(testsContext({
+      plan: testsPlan("/repo/src/a.ts"),
+      state: testsState("src/a.ts"),
+    }));
+    expect(result).toEqual({ admitted: true });
+  });
+
+  it("refuses a target outside the plan's own working directory", () => {
+    const result = admitAction(testsContext({
+      plan: testsPlan("/elsewhere/src/x.test.ts"),
+      state: testsState("src/x.test.ts"),
+    }));
+    expect(result).toEqual({ admitted: false, reasonCode: "saved_path_mismatch" });
+  });
 });

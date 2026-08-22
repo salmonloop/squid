@@ -132,16 +132,25 @@ export async function planAction(
         return { reasonCode: "path_unresolvable" };
       }
 
-      // The target may not exist yet (a test file about to be created), so an
-      // unresolvable target falls back to the lexically-joined path under the
-      // canonical root. What must never happen is a target that resolves
-      // *outside* the canonical root.
+      // The target may not exist yet — a test file about to be created — so an
+      // unresolvable target is not itself a refusal. But falling back to the
+      // lexically-joined path would skip every symlink on the way: a planted
+      // `link -> /outside` plus a not-yet-existing `link/x.test.ts` would look
+      // contained while `bun test` follows the link and executes outside the
+      // root. So the deepest existing ancestor is resolved instead, and the
+      // remaining segments are appended to *that*.
       const joined = resolve(canonicalWorkdir, lexical);
       let canonicalTarget: string;
       try {
         canonicalTarget = await resolvePath(joined);
       } catch {
-        canonicalTarget = joined;
+        const resolvedAncestor = await resolveDeepestAncestor(
+          canonicalWorkdir, lexical, resolvePath,
+        );
+        if (resolvedAncestor === null) {
+          return { reasonCode: "path_unresolvable" };
+        }
+        canonicalTarget = resolvedAncestor;
       }
       const containment = relative(canonicalWorkdir, canonicalTarget);
       if (
@@ -204,4 +213,48 @@ function finish(
 
 function assertNever(value: never): never {
   throw new TypeError(`Unhandled prediction kind: ${String(value)}`);
+}
+
+/**
+ * Canonicalizes a path whose leaf does not exist yet.
+ *
+ * Walks from the full path toward the root until something resolves, then
+ * re-appends the segments that did not. This is what makes a missing target
+ * safe to plan: every existing component — including any symlinked directory
+ * on the way — is traversed by `realpath`, so a link pointing outside the root
+ * surfaces in the returned path and fails the containment check that follows.
+ *
+ * Returns null when not even the canonical root resolves, which means the
+ * working directory vanished mid-plan and there is nothing safe to target.
+ */
+/**
+ * Canonicalizes a target that may not exist yet.
+ *
+ * A missing file is legitimate — the plan may name a test the run will create —
+ * but its *directories* still decide containment. Resolving only the full path
+ * and falling back to the lexical join on failure would skip every symlink on
+ * the way down, so a planted `link/ -> /outside` would pass containment while
+ * the command it produces executes outside the root. Walking up to the deepest
+ * existing ancestor resolves every real component, then re-appends the missing
+ * tail to that canonical base.
+ *
+ * Returns null when not even the working directory resolves.
+ */
+export async function resolveDeepestAncestor(
+  canonicalWorkdir: string,
+  relativeTarget: string,
+  resolvePath: (path: string) => Promise<string>,
+): Promise<string | null> {
+  const segments = relativeTarget.split(sep).filter((segment) => segment.length > 0);
+  for (let depth = segments.length - 1; depth >= 0; depth -= 1) {
+    const ancestor = resolve(canonicalWorkdir, ...segments.slice(0, depth));
+    let resolvedAncestor: string;
+    try {
+      resolvedAncestor = await resolvePath(ancestor);
+    } catch {
+      continue;
+    }
+    return resolve(resolvedAncestor, ...segments.slice(depth));
+  }
+  return null;
 }
