@@ -248,10 +248,13 @@ export class CapabilityDispatcher {
         this.now().toISOString(),
       );
       if (completed.status !== "completed") {
+        // Carry the ledger's own reason rather than a generic "conflict": a
+        // token mismatch and a contradictory outcome need different human
+        // responses, and this code is all the operator will see.
         return {
           status: "reconciliation_required",
           planDigest,
-          reasonCode: completed.status,
+          reasonCode: completed.reasonCode,
           action: result,
         };
       }
