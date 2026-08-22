@@ -87,6 +87,13 @@ async function seedAttempt(
     episodeId: null,
     triggeredAt: new Date().toISOString(),
     completedAt: new Date().toISOString(),
+    runtimeSessionId: "test-runtime",
+    stateDigest: `sha256:${"a".repeat(64)}`,
+    projectionGeneration: 1,
+    triggerDisposition: "accepted",
+    contextPolicyId: "passthrough",
+    actionTrust: "trusted",
+    egressPolicyId: "search-egress-deny-v1",
     outcome: {
       requestId,
       provider: "heuristic",

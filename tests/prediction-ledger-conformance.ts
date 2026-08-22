@@ -51,6 +51,13 @@ export function attempt(
     episodeId: "ep-1",
     triggeredAt: "2026-08-19T10:00:00.000Z",
     completedAt: "2026-08-19T10:00:00.500Z",
+    runtimeSessionId: "test-runtime",
+    stateDigest: `sha256:${"a".repeat(64)}`,
+    projectionGeneration: 1,
+    triggerDisposition: "accepted",
+    contextPolicyId: "passthrough",
+    actionTrust: "trusted",
+    egressPolicyId: "search-egress-deny-v1",
     outcome: resolved,
     candidates: candidateEnvelopes(requestId, resolved.candidates),
   });

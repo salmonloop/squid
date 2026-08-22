@@ -152,6 +152,11 @@ export class PredictionCoordinator {
     }
   }
 
+  /** Identifier of the context policy applied to every outgoing request. */
+  public get contextPolicyId(): string {
+    return this.contextPolicy.id;
+  }
+
   /** Cancel and discard any in-flight request. Idempotent. */
   public cancelActive(reason: string): void {
     const requestId = this.activeRequestId;

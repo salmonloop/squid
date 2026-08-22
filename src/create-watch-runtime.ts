@@ -96,6 +96,9 @@ export function createWatchRuntime(options: CreateWatchRuntimeOptions): WatchRun
       // ledger. The in-memory path redacts too; there is no reason to ever let
       // a credential cross the ingress boundary unredacted.
       capturePolicy: new RedactingCapturePolicy(),
+      runtimeSessionId: `watch-${crypto.randomUUID()}`,
+      ...(options.actionTrust === undefined ? {} : { actionTrust: options.actionTrust }),
+      egressPolicyId: "search-egress-deny-v1",
       ...(options.onDiagnostic !== undefined ? { onDiagnostic: options.onDiagnostic } : {}),
     },
   );

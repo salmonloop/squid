@@ -10,6 +10,7 @@ import {
   candidateEnvelopes,
   createAttemptRecord,
   createFeedbackRecord,
+  type AttemptRecordMetadataInput,
   type PredictionFeedbackInput,
   type PredictionLedger,
 } from "./prediction-ledger.js";
@@ -30,7 +31,21 @@ export interface PredictionRuntimeIngestResult {
   readonly prediction: Promise<PredictionOutcome> | null;
 }
 
-export interface PredictionRuntimeOptions {
+/**
+ * The durable identity a runtime stamps onto every attempt record. All four
+ * fields are required: a record without them could not be audited back to the
+ * policy boundary that authorized it.
+ */
+export interface PredictionRuntimeIdentity {
+  /** Stable for one process lifetime; distinguishes restarts in the ledger. */
+  readonly runtimeSessionId: string;
+  /** Trust level of the selected provider, from the provider gate. */
+  readonly actionTrust: "trusted" | "suggestion_only";
+  /** Identifier of the egress policy governing search actions. */
+  readonly egressPolicyId: string;
+}
+
+export interface PredictionRuntimeOptions extends Partial<PredictionRuntimeIdentity> {
   /**
    * Durable sink for every prediction attempt. When omitted, the runtime runs
    * without persistence — useful for tests and headless runs that only need
@@ -57,7 +72,7 @@ export interface PredictionRuntimeDiagnostic {
   readonly message: string;
 }
 
-interface AttemptContext {
+interface AttemptContext extends AttemptRecordMetadataInput {
   readonly triggerEventId: string;
   readonly episodeId: string | null;
   readonly triggeredAt: string;
@@ -81,6 +96,9 @@ export class PredictionRuntime {
   private readonly onDiagnostic: ((diagnostic: PredictionRuntimeDiagnostic) => void) | undefined;
   private readonly now: () => Date;
   private readonly capturePolicy: CapturePolicy;
+  private readonly runtimeSessionId: string;
+  private readonly actionTrust: "trusted" | "suggestion_only";
+  private readonly egressPolicyId: string;
   private disposed = false;
 
   public constructor(
@@ -92,6 +110,13 @@ export class PredictionRuntime {
     this.onDiagnostic = options.onDiagnostic;
     this.now = options.now ?? (() => new Date());
     this.capturePolicy = options.capturePolicy ?? new PassthroughCapturePolicy();
+    // Defaults are real values, not placeholders: an unconfigured session is
+    // still a distinct session, and an unset trust level conservatively reads
+    // as suggestion-only rather than claiming a gate it never passed.
+    this.runtimeSessionId =
+      options.runtimeSessionId ?? `runtime-${crypto.randomUUID()}`;
+    this.actionTrust = options.actionTrust ?? "suggestion_only";
+    this.egressPolicyId = options.egressPolicyId ?? "search-egress-deny-v1";
   }
 
   public get currentState(): WorldState {
@@ -128,6 +153,13 @@ export class PredictionRuntime {
       triggerEventId: captured.eventId,
       episodeId: result.state.episode?.id ?? null,
       triggeredAt: result.state.updatedAt ?? this.now().toISOString(),
+      runtimeSessionId: this.runtimeSessionId,
+      stateDigest: result.stateDigest,
+      projectionGeneration: result.projectionGeneration,
+      triggerDisposition: result.disposition === "late" ? "late" : "accepted",
+      contextPolicyId: this.coordinator.contextPolicyId,
+      actionTrust: this.actionTrust,
+      egressPolicyId: this.egressPolicyId,
     };
     const prediction = this.track(this.coordinator.request(result.state), context);
 
@@ -221,6 +253,13 @@ export class PredictionRuntime {
         completedAt: this.now().toISOString(),
         outcome,
         candidates,
+        runtimeSessionId: context.runtimeSessionId,
+        stateDigest: context.stateDigest,
+        projectionGeneration: context.projectionGeneration,
+        triggerDisposition: context.triggerDisposition,
+        contextPolicyId: context.contextPolicyId,
+        actionTrust: context.actionTrust,
+        egressPolicyId: context.egressPolicyId,
       });
       await this.ledger.appendAttempt(record);
     } catch (error) {

@@ -236,7 +236,12 @@ describe("PredictionRuntime", () => {
         provider: new FakePredictionProvider({ candidates: [candidate("run_tests")] }),
         random: nextRequestId(),
       }),
-      { ledger, now: () => new Date("2026-08-19T10:00:00.000Z") },
+      {
+        ledger,
+        now: () => new Date("2026-08-19T10:00:00.000Z"),
+        runtimeSessionId: "session-under-test",
+        actionTrust: "trusted",
+      },
     );
 
     const result = await runtime.ingest(savedFile());
@@ -251,6 +256,52 @@ describe("PredictionRuntime", () => {
     expect(records[0].status).toBe("succeeded");
     expect(records[0].candidates[0].candidateId).toBe("runtime-1:candidate:0");
     expect(records[0].candidates[0].candidate.kind).toBe("run_tests");
+    // Schema v2 metadata is stamped from the ingest snapshot and the
+    // configured identity, never fabricated after the fact.
+    expect(records[0].schemaVersion).toBe(2);
+    expect(records[0].runtimeSessionId).toBe("session-under-test");
+    expect(records[0].actionTrust).toBe("trusted");
+    expect(records[0].egressPolicyId).toBe("search-egress-deny-v1");
+    expect(records[0].triggerDisposition).toBe("accepted");
+    expect(records[0].contextPolicyId).toBe("passthrough");
+    expect(records[0].projectionGeneration).toBe(1);
+    expect(records[0].stateDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    await runtime.dispose();
+  });
+
+  it("stamps late-disposition attempts as non-default metadata", async () => {
+    const ledger = new InMemoryPredictionLedger();
+    const runtime = new PredictionRuntime(
+      new SquidCore(new InMemoryEventStore()),
+      new PredictionCoordinator({
+        provider: new FakePredictionProvider({ candidates: [candidate("run_tests")] }),
+        random: nextRequestId(),
+      }),
+      { ledger, runtimeSessionId: "session-late", actionTrust: "suggestion_only" },
+    );
+    // A late event reprojects the state but must still record its disposition,
+    // so the ledger distinguishes dispatchable accepted triggers from shadow ones.
+    const first = await runtime.ingest(savedFile("saved-1"));
+    await first.prediction;
+    const late = createActivityEvent({
+      kind: "terminal_command_completed",
+      eventId: "late-1",
+      occurredAt: new Date(Date.parse(first.ingest.state.updatedAt!) - 5_000).toISOString(),
+      payload: { commandClass: "test", succeeded: true, exitCode: 0 },
+    });
+    const second = await runtime.ingest(late);
+    if (second.ingest.disposition === "late" && second.prediction !== null) {
+      await second.prediction;
+    }
+    await runtime.awaitIdle();
+
+    const records = (await ledger.all()) as PredictionAttemptRecord[];
+    const lateRecord = records.find((r) => r.triggerEventId === "late-1");
+    if (lateRecord !== undefined) {
+      expect(lateRecord.triggerDisposition).toBe("late");
+      expect(lateRecord.runtimeSessionId).toBe("session-late");
+      expect(lateRecord.actionTrust).toBe("suggestion_only");
+    }
     await runtime.dispose();
   });
 

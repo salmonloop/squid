@@ -31,6 +31,13 @@ function attempt(input: {
     episodeId: null,
     triggeredAt: now.toISOString(),
     completedAt: new Date(now.getTime() + input.latencyMs).toISOString(),
+    runtimeSessionId: "test-runtime",
+    stateDigest: `sha256:${"a".repeat(64)}`,
+    projectionGeneration: 1,
+    triggerDisposition: "accepted",
+    contextPolicyId: "passthrough",
+    actionTrust: "trusted",
+    egressPolicyId: "search-egress-deny-v1",
     outcome,
     candidates: candidateEnvelopes(input.requestId, outcome.candidates),
   });

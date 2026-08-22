@@ -23,6 +23,29 @@ export interface PredictionCandidateEnvelope {
 }
 
 export interface PredictionAttemptRecord {
+  readonly schemaVersion: 2;
+  readonly recordId: string;
+  readonly recordType: "attempt";
+  readonly requestId: string;
+  readonly episodeId: string | null;
+  readonly triggerEventId: string;
+  readonly triggeredAt: string;
+  readonly completedAt: string;
+  readonly provider: string;
+  readonly status: PredictionOutcome["status"];
+  readonly latencyMs: number;
+  readonly fallbackReason?: string;
+  readonly runtimeSessionId: string;
+  readonly stateDigest: string;
+  readonly projectionGeneration: number;
+  readonly triggerDisposition: "accepted" | "late";
+  readonly contextPolicyId: string;
+  readonly actionTrust: "trusted" | "suggestion_only";
+  readonly egressPolicyId: string;
+  readonly candidates: readonly PredictionCandidateEnvelope[];
+}
+
+export interface LegacyPredictionAttemptRecord {
   readonly schemaVersion: 1;
   readonly recordId: string;
   readonly recordType: "attempt";
@@ -50,7 +73,7 @@ export interface PredictionFeedbackRecord {
   readonly details: Record<string, string | number | boolean | null>;
 }
 
-export type PredictionLedgerRecord = PredictionAttemptRecord | PredictionFeedbackRecord;
+export type PredictionLedgerRecord = PredictionAttemptRecord | LegacyPredictionAttemptRecord | PredictionFeedbackRecord;
 
 export interface PredictionLedger {
   appendAttempt(record: PredictionAttemptRecord): Promise<void>;
@@ -88,7 +111,7 @@ const envelopeSchema = Type.Object({
   candidate: candidateSchema,
 }, { additionalProperties: false });
 const attemptSchema = Type.Object({
-  schemaVersion: Type.Literal(1),
+  schemaVersion: Type.Literal(2),
   recordId: nonEmptyString(),
   recordType: Type.Literal("attempt"),
   requestId: nonEmptyString(),
@@ -106,6 +129,24 @@ const attemptSchema = Type.Object({
   ]),
   latencyMs: Type.Number({ minimum: 0 }),
   fallbackReason: Type.Optional(Type.String()),
+  runtimeSessionId: nonEmptyString(),
+  stateDigest: Type.String({ pattern: /^sha256:[0-9a-f]{64}$/u.source }),
+  projectionGeneration: Type.Integer({ minimum: 0 }),
+  triggerDisposition: Type.Union([Type.Literal("accepted"), Type.Literal("late")]),
+  contextPolicyId: nonEmptyString(),
+  actionTrust: Type.Union([Type.Literal("trusted"), Type.Literal("suggestion_only")]),
+  egressPolicyId: nonEmptyString(),
+  candidates: Type.Array(envelopeSchema),
+}, { additionalProperties: false });
+const legacyAttemptSchema = Type.Object({
+  schemaVersion: Type.Literal(1),
+  recordId: nonEmptyString(), recordType: Type.Literal("attempt"), requestId: nonEmptyString(),
+  episodeId: Type.Union([Type.String(), Type.Null()]), triggerEventId: nonEmptyString(),
+  triggeredAt: timestamp(), completedAt: timestamp(), provider: nonEmptyString(),
+  status: Type.Union([
+    Type.Literal("succeeded"), Type.Literal("failed"), Type.Literal("timeout"),
+    Type.Literal("cancelled"), Type.Literal("stale"),
+  ]), latencyMs: Type.Number({ minimum: 0 }), fallbackReason: Type.Optional(Type.String()),
   candidates: Type.Array(envelopeSchema),
 }, { additionalProperties: false });
 const feedbackSchema = Type.Object({
@@ -119,7 +160,7 @@ const feedbackSchema = Type.Object({
   occurredAt: timestamp(),
   details: Type.Record(Type.String(), scalar),
 }, { additionalProperties: false });
-const recordValidator = Compile(Type.Union([attemptSchema, feedbackSchema]));
+const recordValidator = Compile(Type.Union([attemptSchema, legacyAttemptSchema, feedbackSchema]));
 
 export class PredictionLedgerConflictError extends Error {
   public constructor(message: string) {
@@ -152,6 +193,19 @@ export function candidateEnvelopes(
   }));
 }
 
+// Schema v2 metadata is required, not defaulted: a record whose digest,
+// generation, or policy identity was silently fabricated would look auditable
+// while describing a state that never existed.
+export interface AttemptRecordMetadataInput {
+  readonly runtimeSessionId: string;
+  readonly stateDigest: string;
+  readonly projectionGeneration: number;
+  readonly triggerDisposition: "accepted" | "late";
+  readonly contextPolicyId: string;
+  readonly actionTrust: "trusted" | "suggestion_only";
+  readonly egressPolicyId: string;
+}
+
 export function createAttemptRecord(input: {
   readonly triggerEventId: string;
   readonly episodeId: string | null;
@@ -159,9 +213,9 @@ export function createAttemptRecord(input: {
   readonly completedAt: string;
   readonly outcome: PredictionOutcome;
   readonly candidates: readonly PredictionCandidateEnvelope[];
-}): PredictionAttemptRecord {
+} & AttemptRecordMetadataInput): PredictionAttemptRecord {
   return parsePredictionLedgerRecord({
-    schemaVersion: 1,
+    schemaVersion: 2,
     recordId: `attempt:${input.outcome.requestId}`,
     recordType: "attempt",
     requestId: input.outcome.requestId,
@@ -173,6 +227,13 @@ export function createAttemptRecord(input: {
     status: input.outcome.status,
     latencyMs: input.outcome.latencyMs,
     ...(input.outcome.fallbackReason !== undefined ? { fallbackReason: input.outcome.fallbackReason } : {}),
+    runtimeSessionId: input.runtimeSessionId,
+    stateDigest: input.stateDigest,
+    projectionGeneration: input.projectionGeneration,
+    triggerDisposition: input.triggerDisposition,
+    contextPolicyId: input.contextPolicyId,
+    actionTrust: input.actionTrust,
+    egressPolicyId: input.egressPolicyId,
     candidates: input.candidates,
   }) as PredictionAttemptRecord;
 }
@@ -324,7 +385,7 @@ export class JsonlPredictionLedger implements PredictionLedger {
 class LedgerIndex {
   private readonly records: PredictionLedgerRecord[] = [];
   private readonly byRecordId = new Map<string, PredictionLedgerRecord>();
-  private readonly byRequestId = new Map<string, PredictionAttemptRecord>();
+  private readonly byRequestId = new Map<string, PredictionAttemptRecord | LegacyPredictionAttemptRecord>();
   private readonly candidateIds = new Set<string>();
   private readonly requestByCandidateId = new Map<string, string>();
 
