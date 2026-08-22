@@ -869,17 +869,41 @@ export class JsonlPredictionLedger implements PredictionLedger {
       this.snapshot(), inputs, outcome, detailsDigest, now,
     );
     if (!("patch" in prepared)) return prepared;
+    let result: CompleteDispatchResult = { status: "completed" };
     const write = this.writeTail.then(async () => {
       await this.ensureLoaded();
       const revalidated = PlanDispatchStateMachine.prepareComplete(
         this.index.all(), inputs, outcome, detailsDigest, now,
       );
-      if (!("patch" in revalidated)) throw new Error(`completeDispatch ${revalidated.status}`);
+      if (!("patch" in revalidated)) {
+        result = revalidated;
+        return;
+      }
+      // The completion must reach the file, not just the index. This backend is
+      // append-only, so the terminal state is written as a new line carrying the
+      // whole record; `loadExisting` lets the later line supersede the open one.
+      // Updating memory alone would lose the outcome on restart, and a completed
+      // action would come back looking like one that still needs reconciliation.
+      const open = this.index.all().find((record): record is PlanDispatchRecord =>
+        record.recordType === "plan_dispatch" &&
+        record.planDigest === inputs.planDigest &&
+        record.completedOutcome === undefined);
+      if (open === undefined) {
+        result = { status: "conflict", reasonCode: "no_dispatched_record" };
+        return;
+      }
+      const completed: PlanDispatchRecord = { ...open, ...revalidated.patch };
+      await mkdir(dirname(this.filePath), { recursive: true });
+      if (this.repairAtBytes !== null) {
+        await truncate(this.filePath, this.repairAtBytes);
+        this.repairAtBytes = null;
+      }
+      await appendFile(this.filePath, `${JSON.stringify(completed)}\n`, "utf8");
       this.index.completeDispatch(inputs.planDigest, revalidated.patch);
     });
     this.writeTail = write.catch(() => undefined);
     await write;
-    return { status: "completed" };
+    return result;
   }
 
   private snapshot(): readonly PredictionLedgerRecord[] {
@@ -934,12 +958,20 @@ export class JsonlPredictionLedger implements PredictionLedger {
     for (const [index, line] of lines.entries()) {
       if (line.length === 0) continue;
       const record = parseLedgerLine(line, index + 1);
-      if (!this.index.hasEquivalent(record)) this.index.add(record);
+      if (this.index.supersedesOpenDispatch(record)) {
+        this.index.supersede(record as PlanDispatchRecord);
+      } else if (!this.index.hasEquivalent(record)) {
+        this.index.add(record);
+      }
     }
     if (terminal !== undefined && terminal.length > 0) {
       try {
         const record = parsePredictionLedgerRecord(JSON.parse(terminal));
-        if (!this.index.hasEquivalent(record)) this.index.add(record);
+        if (this.index.supersedesOpenDispatch(record)) {
+          this.index.supersede(record as PlanDispatchRecord);
+        } else if (!this.index.hasEquivalent(record)) {
+          this.index.add(record);
+        }
       } catch (error) {
         if (error instanceof SyntaxError) {
           this.readDiagnostics.push({ kind: "truncated_final_record", line: lines.length + 1 });
@@ -1011,6 +1043,32 @@ class LedgerIndex {
         );
       }
     }
+  }
+
+  /**
+   * True when this record is the completed form of a dispatch already held open.
+   *
+   * The JSONL backend is append-only, so a completion arrives as a second line
+   * with the same recordId and a terminal outcome. On load that is not a
+   * conflict — it is the later truth about the same claim — so it supersedes the
+   * open record instead of being rejected.
+   */
+  public supersedesOpenDispatch(record: PredictionLedgerRecord): boolean {
+    if (record.recordType !== "plan_dispatch" || record.completedOutcome === undefined) {
+      return false;
+    }
+    const existing = this.byRecordId.get(record.recordId);
+    return existing?.recordType === "plan_dispatch" && existing.completedOutcome === undefined;
+  }
+
+  public supersede(record: PlanDispatchRecord): void {
+    const index = this.records.findIndex((existing) =>
+      existing.recordType === "plan_dispatch" && existing.recordId === record.recordId);
+    if (index < 0) {
+      throw new PredictionLedgerConflictError("No open dispatched record to supersede.");
+    }
+    this.records[index] = structuredClone(record);
+    this.byRecordId.set(record.recordId, record);
   }
 
   public add(record: PredictionLedgerRecord): void {

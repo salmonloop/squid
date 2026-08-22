@@ -222,6 +222,60 @@ describe("ledger backend conformance for dispatch records", () => {
   }
 });
 
+describe("terminal state durability", () => {
+  /**
+   * A completion has to reach the file, not just the in-memory index. If it
+   * did not, a restart would resurrect a finished action as an open dispatch —
+   * and reconciliation exists precisely to be acted on by a human, who would
+   * then re-run something that already succeeded.
+   */
+  it("keeps a completed dispatch terminal across a reopen, for every backend", async () => {
+    const backends: readonly (readonly [string, (dir: string) => PredictionLedger])[] = [
+      ["jsonl", (dir) => new JsonlPredictionLedger(join(dir, "ledger.jsonl"))],
+      ["sqlite", (dir) => new SqlitePredictionLedger(join(dir, "ledger.db"))],
+    ];
+    for (const [name, create] of backends) {
+      const dir = await mkdtemp(join(tmpdir(), `squid-durable-${name}-`));
+      const first = await seededIn(create(dir));
+      try {
+        await first.recordDecision(createPlanDecisionRecord({
+          planDigest: DIGEST,
+          decision: "accepted",
+          detailsDigest: `sha256:${"d".repeat(64)}`,
+        }));
+        const claimed = await first.claimDispatch(
+          baseInputs, new Date().toISOString(), () => "durable-token",
+        );
+        if (claimed.status !== "claimed") throw new Error(`${name}: expected a claim`);
+        const done = await first.completeDispatch(
+          { planDigest: DIGEST, claimToken: claimed.claimToken },
+          "succeeded",
+          `sha256:${"e".repeat(64)}`,
+          new Date().toISOString(),
+        );
+        expect(done).toEqual({ status: "completed" });
+      } finally {
+        if (first instanceof SqlitePredictionLedger) first.close();
+      }
+
+      const reopened = create(dir);
+      try {
+        const dispatches = (await reopened.all())
+          .filter((record) => record.recordType === "plan_dispatch");
+        // One dispatch, and it is terminal — not a second, open one.
+        expect(dispatches).toHaveLength(1);
+        expect(dispatches[0]).toMatchObject({ completedOutcome: "succeeded" });
+        const again = await reopened.claimDispatch(
+          baseInputs, new Date().toISOString(), () => "nope",
+        );
+        expect(again.status).toBe("terminal");
+      } finally {
+        if (reopened instanceof SqlitePredictionLedger) reopened.close();
+      }
+    }
+  });
+});
+
 describe("generic feedback cannot reach the dispatch lifecycle", () => {
   /**
    * The narrow API is the only way to a terminal state. If `appendFeedback`
