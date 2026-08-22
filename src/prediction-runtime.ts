@@ -303,19 +303,38 @@ export class PredictionRuntime {
     await this.ledger!.appendFeedback(record);
   }
 
+  /**
+   * Publishes an outcome only after its attempt record has been written.
+   *
+   * The order matters for actions, not for tidiness: a caller that receives an
+   * outcome may immediately try to dispatch one of its candidates, and the claim
+   * validates against the persisted attempt. Settling first would open a window
+   * where a dispatch is refused as `attempt_missing` purely because the write
+   * had not landed yet.
+   *
+   * A failed write still delivers the prediction — it is a diagnostic, never a
+   * prediction failure — but the attempt is then genuinely absent, so any action
+   * built on it is correctly refused rather than silently unauditable.
+   */
   private track(
     prediction: Promise<PredictionOutcome>,
     context: AttemptContext,
   ): Promise<PredictionOutcome> {
     this.pending.add(prediction);
-    void prediction.then(
-      (outcome) => {
+    const published = prediction.then(
+      async (outcome) => {
         this.pending.delete(prediction);
-        this.trackLedgerWrite(this.recordAttempt(outcome, context));
+        const write = this.recordAttempt(outcome, context);
+        this.trackLedgerWrite(write);
+        await write;
+        return outcome;
       },
-      () => this.pending.delete(prediction),
+      (error: unknown) => {
+        this.pending.delete(prediction);
+        throw error;
+      },
     );
-    return prediction;
+    return published;
   }
 
   private trackLedgerWrite(write: Promise<void>): void {

@@ -228,6 +228,48 @@ describe("PredictionRuntime", () => {
     expect(disposed).toBe(true);
   });
 
+  it("publishes an outcome only after its attempt record is durable", async () => {
+    // A caller that receives an outcome may dispatch one of its candidates
+    // immediately, and the claim validates against the persisted attempt. If the
+    // outcome arrived first, that dispatch would be refused as attempt_missing
+    // purely because the write had not landed yet.
+    const order: string[] = [];
+    let release: (() => void) | undefined;
+    const ledger: PredictionLedger = {
+      appendAttempt: () => new Promise<void>((resolve) => {
+        order.push("write_started");
+        release = () => {
+          order.push("write_finished");
+          resolve();
+        };
+      }),
+      appendFeedback: async () => {},
+      all: async () => [],
+    };
+    const runtime = new PredictionRuntime(
+      new SquidCore(new InMemoryEventStore()),
+      new PredictionCoordinator({
+        provider: new FakePredictionProvider({ candidates: [candidate("run_tests")] }),
+        random: nextRequestId(),
+      }),
+      { ledger },
+    );
+
+    const result = await runtime.ingest(savedFile());
+    void result.prediction!.then(() => order.push("outcome_published"));
+    while (release === undefined) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    expect(order).toEqual(["write_started"]);
+
+    release();
+    await result.prediction;
+    await runtime.awaitIdle();
+
+    expect(order).toEqual(["write_started", "write_finished", "outcome_published"]);
+    await runtime.dispose();
+  });
+
   it("records a durable attempt for each prediction outcome", async () => {
     const ledger = new InMemoryPredictionLedger();
     const runtime = new PredictionRuntime(
@@ -376,7 +418,15 @@ describe("PredictionRuntime", () => {
     );
 
     const result = await runtime.ingest(savedFile());
-    await result.prediction;
+    // Deliberately not awaited: the outcome now publishes only after its attempt
+    // write completes, and this ledger holds that write open. Awaiting here
+    // would wait on the very thing the test is about to release.
+    const prediction = result.prediction;
+    // Wait until the write is actually in flight: it starts only after the
+    // provider resolves, which is several microtasks away from here.
+    while (releaseAppend === undefined) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
     let disposed = false;
     const dispose = runtime.dispose().then(() => {
       disposed = true;
@@ -384,9 +434,11 @@ describe("PredictionRuntime", () => {
     await Promise.resolve();
     expect(disposed).toBe(false);
 
-    releaseAppend!();
+    releaseAppend();
     await dispose;
     expect(disposed).toBe(true);
+    // The prediction is delivered once its record is durable.
+    expect((await prediction!).status).toBe("succeeded");
   });
 
   it("does not record an attempt for a duplicate event", async () => {
