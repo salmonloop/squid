@@ -26,6 +26,7 @@ bun run dev
 bun run evaluate
 bun run gate:pi
 bun run ledger:report -- /absolute/path.db.ledger.db
+bun run watch:desktop -- /absolute/project/root
 bun run watch:files -- /absolute/project/root
 bun run watch:screen
 ```
@@ -44,6 +45,9 @@ bun run watch:screen
 - `src/screen-text-reader-macos.ts` — macOS accessibility backend over `osascript`. Real, darwin-only, and not exercised by the offline suite.
 - `src/screen-text-reader-synthetic.ts` — scripted frame replay backend plus the built-in demo script. Zero OS calls, so the screen-text path is demonstrable and reproducible anywhere.
 - `src/create-watch-runtime.ts` — the store, ledger, projection, and prediction runtime every watch entry point needs, built once. Carries no source-specific assumptions.
+- `src/watch-session.ts` — everything a watch entry point does apart from choosing sources: provider admission, egress resolution, restore, action wiring, the ingest loop, and shutdown ordering. Takes the sources as a **list**, which is what makes an action admissible at all: `admitRunTests` compares a save's owner against the foreground application, so one source per process left that check unsatisfiable by construction. Sources start one at a time and a failure unwinds the ones already running; stop runs in reverse start order so a later source never emits into a runtime an earlier one has begun tearing down.
+- `src/resolve-screen-reader.ts` — chooses a screen-text backend from `SQUID_SCREEN_READER` / `SQUID_SCREEN_POLL_MS` and loads scripted frames. Separate from the adapter so `screen-text-source.ts` still imports no backend, and separate from the entry points because more than one needs it.
+- `src/watch-desktop.ts` — the only entry point that observes both halves of the desktop: filesystem saves and foreground window text into one core.
 - `src/watch-files.ts` — live filesystem ingestion entry point; durable when `SQUID_DB` is set.
 - `src/watch-screen.ts` — live foreground-window-text ingestion entry point; picks a reader backend from `SQUID_SCREEN_READER`.
 - `src/baseline-predictor.ts` — offline heuristic predictor used for evaluation.
@@ -223,7 +227,22 @@ bun run watch:files -- /absolute/project/root
 
 Absent variables mean actions stay off — identical to the pre-dispatch behavior. `SQUID_SEARCH_EGRESS` has exactly three outcomes: unset denies search egress, the exact string `allow` permits it, and any other value is a startup configuration error rather than a silent fallback. Without `SQUID_ACTION_CONFIRM=terminal`, `run_tests` is still skipped even when ranked highest. With terminal confirmation, only `y` or `yes` accepts; empty input, any other answer, timeout, non-interactive stdin, closed input, shutdown, and an expired candidate all refuse execution and record the reason. Expiry is checked before prompting and again after acceptance.
 
-`watch:files` executes tests from the canonical watched root; `watch:screen` uses its launch directory. `SQUID_ACTION_WORKDIR=/absolute/path` overrides either. The predicted path must remain inside that root. The MCP server command is parsed into an executable plus literal arguments and launched directly, never through a shell: quoted spaces are supported, while variables, substitutions, pipes, redirects, comments, and globs are rejected. This protects server startup configuration separately from the deliberately shell-shaped `run_command` string sent to the MCP server.
+`watch:desktop` and `watch:files` execute tests from the canonical watched root; `watch:screen` uses its launch directory. `SQUID_ACTION_WORKDIR=/absolute/path` overrides either. The predicted path must remain inside that root. The MCP server command is parsed into an executable plus literal arguments and launched directly, never through a shell: quoted spaces are supported, while variables, substitutions, pipes, redirects, comments, and globs are rejected. This protects server startup configuration separately from the deliberately shell-shaped `run_command` string sent to the MCP server.
+
+### Which entry point can admit which action
+
+An admission rule reads the *whole* projection, so what a run can do depends on which facts its sources produce. `watch:files` emits `file_opened` / `file_saved`; `watch:screen` emits `application_activated`, `window_changed`, `focus_changed`, `text_context_changed`. Neither alone satisfies `run_tests`, which compares the newest save's owner against the foreground application — that is why `watch:desktop` exists.
+
+| Entry point | Sources | `search_selection` | `run_tests` |
+| --- | --- | --- | --- |
+| `watch:files` | filesystem | no foreground or selection facts | no `activeApplication` |
+| `watch:screen` | screen text | needs `browser_navigated` (no source yet) | no `file_saved` |
+| `watch:desktop` | filesystem + screen text | needs `browser_navigated` (no source yet) | both facts present; owner still unattributed |
+
+Two gaps remain, and both are honest refusals rather than bugs in the checks:
+
+- **`browser_navigated` has no source.** `admitSearch` requires a current browser page so it can verify that the selection, the page, and the foreground all belong to the same window; without that check, Squid could send text selected in one window into a browser showing another document. No capture adapter emits the event yet, so search refuses with `browser_page_missing`.
+- **A filesystem save has no owner.** `FilesystemActivitySource` reports `applicationId: null` because a path-only watcher cannot know which process performed a write, and `admitRunTests` requires the save's owner to *equal* the foreground application. Treating an unattributed save as the foreground application's work would authorize running tests on a file written by a background formatter — the `filesystem-save-run-tests` fixture asserts `none` for exactly this case. Closing it needs a source that knows what it saved.
 
 ## Replay evaluation
 
@@ -281,18 +300,22 @@ Tests use `bun:test`. The test suite covers:
 - `ScreenTextActivitySource` lifecycle, full-frame mapping to four host events, per-payload change detection (title-only, role-only, selection-only, and unchanged frames), degradation for missing application id / name / title / caret context, ordering and sequence under a slow emitter, burst collapsing, shutdown flush of the pending frame, reader and delivery diagnostics including retry of a rejected payload, recovery from a backend that fails to initialize, distinct per-instance session identity, and end-to-end ingestion through `SquidCore`.
 - `selectPredictionProvider`: environment parsing and defaults, the heuristic path touching no model seam at all, probe admission on reachable / unreachable / rejecting probes, and replay admission on passed / failed / skipped / rejecting gates.
 - `watch-actions`: config resolution (off when unset, config errors — including invalid `SQUID_SEARCH_EGRESS` — before any dependency is touched), literal stdio command parsing, and the dispatch loop end-to-end through the production chain built from real ingested events: search dispatched when egress allows, refused with zero tool calls when denied or when the selection changed, `run_tests` gated on confirmation and running the exact planned command, rejection recording a decision without a dispatch, expired candidates skipped, late triggers never dispatched, and no downgrade to a lower-confidence candidate when the top one is unmappable.
+- `startWatchSession`: sources started in order and stopped in reverse, two independent sources projecting into one world state (with the save's owner still unattributed), one shared store/ledger/runtime across sources, the same diagnostic sink handed to every source, a session with no sources refused, already-started sources unwound when a later one fails, a malformed egress value refused before any source is constructed, every source named in the banner, idempotent stop, and one described line per ingested event.
+- `resolveScreenReader`: synthetic default, unrecognized reader values refused rather than defaulted, the darwin backend refused off macOS, a non-positive or non-integer poll interval refused ahead of backend selection, scripted frame files read, and unreadable or non-array frame files reported as config errors.
 
-Source tests inject a fake watcher, file probe, and screen-text reader, so they never depend on kernel watch timing, an accessibility API, or a subprocess. Real-watcher behavior is verified by the `bun run watch:files` smoke run in the release gate; the macOS accessibility backend is verified by hand with `SQUID_SCREEN_READER=darwin bun run watch:screen`.
+Source tests inject a fake watcher, file probe, and screen-text reader, so they never depend on kernel watch timing, an accessibility API, or a subprocess. Session tests use scripted sources for the same reason: what is under test is the wiring, not any backend. Real-watcher behavior is verified by the `bun run watch:files` smoke run in the release gate, and multi-source ingestion by a `bun run watch:desktop` run against a temporary root; the macOS accessibility backend is verified by hand with `SQUID_SCREEN_READER=darwin bun run watch:screen`.
 
 ## What is not yet implemented
 
+Tracked as issues; the entry-point table under [Dispatching actions](#which-entry-point-can-admit-which-action) shows which of these currently block an action.
+
 - Screen keyframes, OCR, and full caret context. Foreground window text is implemented; pixels are not.
-- Browser extension / CDP integration.
-- IDE / LSP integration.
-- Overlay / suggestion UI.
-- Action execution beyond the current two MCP mappings. `search_selection` can auto-dispatch and `run_tests` can dispatch after terminal confirmation; `draft_completion` and `inspect_error` still have no capability mapping, and there is no graphical confirmation UI.
+- Browser extension / CDP integration, so no source emits `browser_navigated`. `search_selection` therefore always refuses with `browser_page_missing` in a real run.
+- IDE / LSP integration, so no source can attribute a file save to the editor that wrote it. `run_tests` has both required facts available in `watch:desktop` but the save's owner stays `null`, which admission correctly refuses.
+- Overlay / suggestion UI. The only way to see or answer a suggestion is a terminal prompt.
+- Action execution beyond the current two MCP mappings. `draft_completion` and `inspect_error` have no capability mapping, and `inspect_error` additionally has no capture source for `terminal_command_completed`.
 - `BeliefState` beyond its validated contract. `src/belief-state.ts` defines and fail-closed-validates a belief batch (`task_intent`, evidence, TTL, episode/digest/generation agreement), but nothing produces or consumes one yet: there is no belief provider, no store, and no runtime wiring. The next phase must land `BeliefProvider`, `CognitionProvider`, a semantic gate, and shadow/suggestion mode together — a prompt change alone would not be it.
-- Capture-time privacy policy beyond credential redaction. `RedactingCapturePolicy` already filters credential content at the ingress boundary in `PredictionRuntime`, and both watch entry points enable it; `ContextPolicy` separately covers provider egress. What is missing is user-facing policy — per-application exclusions, pause, and retention.
+- Capture-time privacy policy beyond credential redaction. `RedactingCapturePolicy` already filters credential content at the ingress boundary in `PredictionRuntime`, and every watch entry point enables it; `ContextPolicy` separately covers provider egress. What is missing is user-facing policy — per-application exclusions, pause, and retention.
 
 ## Archived documents
 
