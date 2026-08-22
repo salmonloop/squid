@@ -62,7 +62,7 @@ export function buildLedgerReport(records: readonly PredictionLedgerRecord[]): L
     byStatus: tally(attempts.map((attempt) => attempt.status)),
     fallbacks: attempts.filter((attempt) => attempt.fallbackReason !== undefined).length,
     fallbackReasons: tally(attempts.map((attempt) => attempt.fallbackReason)),
-    byCandidateKind: tally(attempts.flatMap((attempt) => attempt.candidates.map((c) => c.candidate.kind))),
+    byCandidateKind: tally(attempts.flatMap((attempt) => attempt.candidates.map((c) => c.kind))),
     latencyMs: {
       p50: percentile(0.5),
       p95: percentile(0.95),

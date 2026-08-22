@@ -3,6 +3,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  candidateEnvelopes,
   createActionPlanRecord,
   createAttemptRecord,
   createFeedbackRecord,
@@ -59,18 +60,14 @@ async function seeded(): Promise<PredictionLedger> {
         parameters: { path: "src/x.test.ts" },
       }],
     },
-    candidates: [{
-      candidateId: "req-1:candidate:0",
-      ordinal: 0,
-      candidate: {
-        kind: "run_tests",
-        rationale: "file saved in editor",
-        confidence: 0.9,
-        expiresAt: "2099-01-01T00:00:00.000Z",
-        sourceEventIds: [],
-        parameters: { path: "src/x.test.ts" },
-      },
-    }],
+    candidates: candidateEnvelopes("req-1", [{
+      kind: "run_tests",
+      rationale: "file saved in editor",
+      confidence: 0.9,
+      expiresAt: "2099-01-01T00:00:00.000Z",
+      sourceEventIds: [],
+      parameters: { path: "src/x.test.ts" },
+    }]),
   }));
   await ledger.recordPlan(createActionPlanRecord({
     attemptId: "req-1",

@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import type { EgressPolicy } from "./action-egress.js";
-import type { ImmutableActionPlan } from "./action-plan.js";
+import { digestCandidateParameters, type ImmutableActionPlan } from "./action-plan.js";
 import type { PredictionAttemptRecord } from "./prediction-ledger.js";
 import type { PredictionCandidate, WorldState } from "./protocol.js";
 
@@ -13,6 +13,7 @@ export type AdmissionReasonCode =
   | "attempt_missing"
   | "attempt_schema_unsupported"
   | "candidate_unknown"
+  | "candidate_parameters_mismatch"
   | "runtime_session_mismatch"
   | "episode_mismatch"
   | "state_digest_mismatch"
@@ -72,6 +73,18 @@ export function admitAction(context: AdmissionContext): AdmissionResult {
   if (attempt === undefined) return refuse("attempt_missing");
   if (attempt.schemaVersion !== 2) return refuse("attempt_schema_unsupported");
   if (candidate === undefined) return refuse("candidate_unknown");
+
+  // The ledger keeps only a digest of the parameters it saw, so the in-process
+  // candidate has to prove it is that same one. Without this, a caller could
+  // hand admission a candidate whose parameters differ from the recorded
+  // prediction and every later check would compare against the substitute.
+  const envelope = attempt.candidates.find((item) => item.candidateId === plan.candidateId);
+  if (envelope === undefined) return refuse("candidate_unknown");
+  if (envelope.parametersDigest !== digestCandidateParameters(candidate.parameters)) {
+    return refuse("candidate_parameters_mismatch");
+  }
+  if (envelope.kind !== candidate.kind) return refuse("candidate_parameters_mismatch");
+  if (envelope.expiresAt !== candidate.expiresAt) return refuse("candidate_parameters_mismatch");
 
   if (attempt.runtimeSessionId !== context.runtimeSessionId) return refuse("runtime_session_mismatch");
   if (attempt.episodeId !== (state.episode?.id ?? null)) return refuse("episode_mismatch");

@@ -355,10 +355,11 @@ export function describePredictionLedgerConformance(
       try {
         await harness.ledger.appendAttempt(attempt());
         const first = (await harness.ledger.all())[0] as PredictionAttemptRecord;
-        (first.candidates[0].candidate as { rationale: string }).rationale = "mutated";
+        const original = first.candidates[0]!.parametersDigest;
+        (first.candidates[0] as { parametersDigest: string }).parametersDigest = "mutated";
 
         const second = (await harness.ledger.all())[0] as PredictionAttemptRecord;
-        expect(second.candidates[0].candidate.rationale).toBe("a file was saved");
+        expect(second.candidates[0]!.parametersDigest).toBe(original);
       } finally {
         await harness.dispose();
       }

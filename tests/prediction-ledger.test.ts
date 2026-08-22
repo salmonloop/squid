@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "bun:test";
+import { digestCandidateParameters } from "../src/action-plan.js";
 import { candidate } from "../src/fake-prediction-provider.js";
 import type { PredictionOutcome } from "../src/prediction-provider.js";
 import {
@@ -85,7 +86,31 @@ describe("prediction candidate identity", () => {
       "request-x:candidate:0",
       "request-x:candidate:1",
     ]);
-    expect(envelopes.map((item) => item.candidate)).toEqual(candidates);
+    expect(envelopes.map((item) => item.kind)).toEqual(candidates.map((item) => item.kind));
+  });
+
+  it("keeps candidate prose and parameters out of the envelope", () => {
+    const secret = "quarterly revenue projection";
+    const [envelope] = candidateEnvelopes("request-x", [{
+      ...candidate("search_selection"),
+      rationale: `the user selected ${secret}`,
+      parameters: { selection: secret },
+    }]);
+
+    // Envelope fields are enumerated rather than spot-checked: a future field
+    // carrying user text would slip past `not.toContain` on a serialized copy.
+    expect(Object.keys(envelope!).sort()).toEqual([
+      "candidateId",
+      "confidence",
+      "expiresAt",
+      "kind",
+      "ordinal",
+      "parametersDigest",
+      "sourceEventIds",
+    ]);
+    expect(JSON.stringify(envelope)).not.toContain(secret);
+    // The digest still proves which parameters were seen.
+    expect(envelope!.parametersDigest).toBe(digestCandidateParameters({ selection: secret }));
   });
 });
 

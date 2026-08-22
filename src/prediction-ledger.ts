@@ -3,6 +3,7 @@ import { appendFile, mkdir, readFile, truncate } from "node:fs/promises";
 import { dirname } from "node:path";
 import { Compile } from "typebox/compile";
 import { Type } from "typebox";
+import { digestCandidateParameters } from "./action-plan.js";
 import type { PredictionOutcome } from "./prediction-provider.js";
 import type { PredictionCandidate, PredictionKind } from "./protocol.js";
 
@@ -24,7 +25,33 @@ export const feedbackKinds = [
 
 export type PredictionFeedbackKind = (typeof feedbackKinds)[number];
 
+/**
+ * The persisted shape of one predicted candidate.
+ *
+ * Deliberately not the candidate itself. `parameters` holds a selection, an
+ * editor prefix, or a path — user text that must not reach disk merely because
+ * a prediction observed it — and `rationale` is model prose that can quote the
+ * same text back. What survives here is what an audit needs: which candidate,
+ * what kind, how confident, when it expires, and a digest proving which
+ * parameters were seen. The raw values live only in the in-process candidate and
+ * in the immutable plan built from it.
+ */
 export interface PredictionCandidateEnvelope {
+  readonly candidateId: string;
+  readonly ordinal: number;
+  readonly kind: PredictionKind;
+  readonly confidence: number;
+  readonly expiresAt: string;
+  readonly sourceEventIds: readonly string[];
+  /** sha256 over the candidate's parameters. Proves sameness without the text. */
+  readonly parametersDigest: string;
+}
+
+/**
+ * The v1 envelope, kept only so a ledger written before the audit shape existed
+ * still parses. New records never use it.
+ */
+export interface LegacyPredictionCandidateEnvelope {
   readonly candidateId: string;
   readonly ordinal: number;
   readonly candidate: PredictionCandidate;
@@ -66,7 +93,7 @@ export interface LegacyPredictionAttemptRecord {
   readonly status: PredictionOutcome["status"];
   readonly latencyMs: number;
   readonly fallbackReason?: string;
-  readonly candidates: readonly PredictionCandidateEnvelope[];
+  readonly candidates: readonly LegacyPredictionCandidateEnvelope[];
 }
 
 export interface PredictionFeedbackRecord {
@@ -278,21 +305,33 @@ export interface PredictionFeedbackInput {
 }
 
 const scalar = Type.Union([Type.String(), Type.Number(), Type.Boolean(), Type.Null()]);
+const predictionKindSchema = Type.Union([
+  Type.Literal("draft_completion"),
+  Type.Literal("run_tests"),
+  Type.Literal("inspect_error"),
+  Type.Literal("search_selection"),
+  Type.Literal("none"),
+]);
 const candidateSchema = Type.Object({
-  kind: Type.Union([
-    Type.Literal("draft_completion"),
-    Type.Literal("run_tests"),
-    Type.Literal("inspect_error"),
-    Type.Literal("search_selection"),
-    Type.Literal("none"),
-  ]),
+  kind: predictionKindSchema,
   rationale: Type.String(),
   confidence: Type.Number(),
   expiresAt: Type.String({ minLength: 1 }),
   sourceEventIds: Type.Array(Type.String()),
   parameters: Type.Record(Type.String(), scalar),
 }, { additionalProperties: false });
+// The v2 envelope carries no free text: `rationale` is model prose and
+// `parameters` is user text, so only the digest of the latter survives.
 const envelopeSchema = Type.Object({
+  candidateId: nonEmptyString(),
+  ordinal: Type.Integer({ minimum: 0 }),
+  kind: predictionKindSchema,
+  confidence: Type.Number(),
+  expiresAt: timestamp(),
+  sourceEventIds: Type.Array(Type.String()),
+  parametersDigest: Type.String({ pattern: /^sha256:[0-9a-f]{64}$/u.source }),
+}, { additionalProperties: false });
+const legacyEnvelopeSchema = Type.Object({
   candidateId: nonEmptyString(),
   ordinal: Type.Integer({ minimum: 0 }),
   candidate: candidateSchema,
@@ -334,7 +373,7 @@ const legacyAttemptSchema = Type.Object({
     Type.Literal("succeeded"), Type.Literal("failed"), Type.Literal("timeout"),
     Type.Literal("cancelled"), Type.Literal("stale"),
   ]), latencyMs: Type.Number({ minimum: 0 }), fallbackReason: Type.Optional(Type.String()),
-  candidates: Type.Array(envelopeSchema),
+  candidates: Type.Array(legacyEnvelopeSchema),
 }, { additionalProperties: false });
 const feedbackSchema = Type.Object({
   schemaVersion: Type.Literal(1),
@@ -430,10 +469,18 @@ export function candidateEnvelopes(
   candidates: readonly PredictionCandidate[],
 ): readonly PredictionCandidateEnvelope[] {
   if (requestId.length === 0) throw new TypeError("Prediction request ID must not be empty.");
+  // The candidate's own text stops here. What crosses into the ledger is the
+  // audit shape: identity, kind, confidence, expiry, provenance, and a digest
+  // standing in for the parameters. `rationale` is dropped outright — model
+  // prose can quote the selection it was reasoning about.
   return candidates.map((candidate, ordinal) => ({
     candidateId: `${requestId}:candidate:${ordinal}`,
     ordinal,
-    candidate: structuredClone(candidate),
+    kind: candidate.kind,
+    confidence: candidate.confidence,
+    expiresAt: candidate.expiresAt,
+    sourceEventIds: [...candidate.sourceEventIds],
+    parametersDigest: digestCandidateParameters(candidate.parameters),
   }));
 }
 
@@ -596,12 +643,12 @@ export class PlanDispatchStateMachine {
       // Plans requiring confirmation must be accepted; confirmation-free plans
       // may dispatch straight from proposed.
       if (plan.confirmation === "required") {
-        return Date.parse(envelope.candidate.expiresAt) <= Date.parse(now)
+        return Date.parse(envelope.expiresAt) <= Date.parse(now)
           ? { status: "expired" }
           : { status: "rejected", reasonCode: "not_accepted" };
       }
     } else if (decision.decision === "accepted") {
-      if (Date.parse(envelope.candidate.expiresAt) <= Date.parse(now)) {
+      if (Date.parse(envelope.expiresAt) <= Date.parse(now)) {
         return { status: "expired" };
       }
     } else {

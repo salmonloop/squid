@@ -297,7 +297,7 @@ describe("PredictionRuntime", () => {
     expect(records[0].episodeId).not.toBeNull();
     expect(records[0].status).toBe("succeeded");
     expect(records[0].candidates[0].candidateId).toBe("runtime-1:candidate:0");
-    expect(records[0].candidates[0].candidate.kind).toBe("run_tests");
+    expect(records[0].candidates[0].kind).toBe("run_tests");
     // Schema v2 metadata is stamped from the ingest snapshot and the
     // configured identity, never fabricated after the fact.
     expect(records[0].schemaVersion).toBe(2);

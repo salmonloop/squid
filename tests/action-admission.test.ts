@@ -221,6 +221,40 @@ describe("admitAction general checks", () => {
     expect(refusal({ candidate: undefined })).toBe("candidate_unknown");
   });
 
+  it("refuses a candidate the recorded attempt never contained", () => {
+    // The plan names a candidate ordinal the attempt does not have. Without the
+    // envelope lookup, admission would happily validate the substitute the
+    // caller passed in `candidate`.
+    expect(refusal({ plan: { ...searchPlan(), candidateId: "req-1:candidate:7" } }))
+      .toBe("candidate_unknown");
+  });
+
+  /**
+   * The ledger keeps only a digest of the parameters it saw, so these checks are
+   * what ties the in-process candidate back to the recorded prediction. A caller
+   * that could substitute a candidate would control the text every later check
+   * compares against — the selection, the target path, the query.
+   */
+  it("refuses a candidate whose parameters, kind, or expiry differ from the record", () => {
+    const recorded = searchCandidate();
+
+    expect(refusal({
+      attempt: attemptFor(recorded),
+      candidate: { ...recorded, parameters: { selection: "something else" } },
+    })).toBe("candidate_parameters_mismatch");
+
+    expect(refusal({
+      attempt: attemptFor(recorded),
+      candidate: { ...recorded, kind: "run_tests" },
+    })).toBe("candidate_parameters_mismatch");
+
+    // A later expiry would otherwise revive a candidate the record says is dead.
+    expect(refusal({
+      attempt: attemptFor(recorded),
+      candidate: { ...recorded, expiresAt: "2099-01-01T00:00:00.000Z" },
+    })).toBe("candidate_parameters_mismatch");
+  });
+
   it("refuses when runtime identity, episode, digest, or generation moved", () => {
     expect(refusal({ runtimeSessionId: "session-b" })).toBe("runtime_session_mismatch");
     expect(refusal({ state: { ...searchState(), episode: null } })).toBe("episode_mismatch");
