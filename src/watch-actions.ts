@@ -8,6 +8,8 @@ import {
 } from "./capability-gateway.js";
 import type { ActionConfirmationPolicy } from "./action-confirmation.js";
 import { createTerminalActionConfirmation } from "./confirmation-surface-terminal.js";
+import { createGraphicalActionConfirmation } from "./confirmation-surface-graphical.js";
+import { createStdioGraphicalTransport } from "./graphical-transport-stdio.js";
 import {
   isPlanFailure,
   planAction,
@@ -37,11 +39,20 @@ export type LiteralCommandParseResult =
   | { readonly command: string; readonly args: readonly string[] }
   | { readonly configError: string };
 
-/** Parses a command line without invoking a shell or expanding variables. */
-export function parseLiteralCommand(command: string): LiteralCommandParseResult {
+/**
+ * Parses a command line without invoking a shell or expanding variables.
+ *
+ * `variableName` is required rather than defaulted: more than one environment
+ * variable now holds a spawnable command, and a default would let a new caller
+ * silently blame the wrong variable in its config error.
+ */
+export function parseLiteralCommand(
+  command: string,
+  variableName: string,
+): LiteralCommandParseResult {
   if (command.includes("`") || /[\u0000-\u001F\u007F]/u.test(command)) {
     return {
-      configError: "SQUID_ACTIONS_MCP_COMMAND contains command-substitution or control characters.",
+      configError: `${variableName} contains command-substitution or control characters.`,
     };
   }
   const parsed = parse(command, (name) => ({ environmentVariable: name }));
@@ -53,7 +64,7 @@ export function parseLiteralCommand(command: string): LiteralCommandParseResult 
     executable.length === 0
   ) {
     return {
-      configError: "SQUID_ACTIONS_MCP_COMMAND must be one executable plus literal arguments; shell operators, variables, substitutions, comments, and globs are not allowed.",
+      configError: `${variableName} must be one executable plus literal arguments; shell operators, variables, substitutions, comments, and globs are not allowed.`,
     };
   }
   const literalCommand = parsed as string[];
@@ -103,7 +114,7 @@ export async function resolveWatchActions(
     return { configError: "SQUID_ACTIONS=mcp requires SQUID_ACTIONS_MCP_COMMAND." };
   }
 
-  const parsedCommand = parseLiteralCommand(command);
+  const parsedCommand = parseLiteralCommand(command, "SQUID_ACTIONS_MCP_COMMAND");
   if ("configError" in parsedCommand) {
     return parsedCommand;
   }
@@ -113,11 +124,37 @@ export async function resolveWatchActions(
     return { configError: "SQUID_ACTION_CONFIRM_TIMEOUT_MS must be a positive integer number of milliseconds." };
   }
   const confirmationMode = env.SQUID_ACTION_CONFIRM;
-  if (confirmationMode !== undefined && confirmationMode !== "terminal") {
-    return { configError: 'SQUID_ACTION_CONFIRM must be "terminal" or unset.' };
+  if (
+    confirmationMode !== undefined &&
+    confirmationMode !== "terminal" &&
+    confirmationMode !== "graphical"
+  ) {
+    return { configError: 'SQUID_ACTION_CONFIRM must be "terminal", "graphical", or unset.' };
   }
-  if (rawTimeoutMs !== undefined && confirmationMode !== "terminal") {
-    return { configError: "SQUID_ACTION_CONFIRM_TIMEOUT_MS requires SQUID_ACTION_CONFIRM=terminal." };
+  // The timeout belongs to the confirmation engine, not to any one surface, so
+  // it is legal with every mode and meaningless without one.
+  if (rawTimeoutMs !== undefined && confirmationMode === undefined) {
+    return { configError: "SQUID_ACTION_CONFIRM_TIMEOUT_MS requires SQUID_ACTION_CONFIRM." };
+  }
+
+  // The graphical surface spawns a separate process, so its command goes
+  // through the same no-shell parse as the MCP server command. Parsing happens
+  // here, before any transport opens; the process itself is spawned lazily on
+  // the first prompt so that resolving configuration never opens a window.
+  const graphicalCommand = env.SQUID_GRAPHICAL_UI_COMMAND?.trim();
+  if (graphicalCommand !== undefined && confirmationMode !== "graphical") {
+    return { configError: "SQUID_GRAPHICAL_UI_COMMAND requires SQUID_ACTION_CONFIRM=graphical." };
+  }
+  let parsedGraphicalCommand: { readonly command: string; readonly args: readonly string[] } | undefined;
+  if (confirmationMode === "graphical") {
+    if (graphicalCommand === undefined || graphicalCommand.length === 0) {
+      return { configError: "SQUID_ACTION_CONFIRM=graphical requires SQUID_GRAPHICAL_UI_COMMAND." };
+    }
+    const parsed = parseLiteralCommand(graphicalCommand, "SQUID_GRAPHICAL_UI_COMMAND");
+    if ("configError" in parsed) {
+      return parsed;
+    }
+    parsedGraphicalCommand = parsed;
   }
   const workingDirectory = env.SQUID_ACTION_WORKDIR ?? options.workingDirectory;
   if (workingDirectory !== undefined && !isAbsolute(workingDirectory)) {
@@ -126,8 +163,11 @@ export async function resolveWatchActions(
   if (workingDirectory !== undefined && /[\u0000-\u001F\u007F]/u.test(workingDirectory)) {
     return { configError: "Action working directory must not contain control characters." };
   }
-  if (confirmationMode === "terminal" && workingDirectory === undefined) {
-    return { configError: "SQUID_ACTION_CONFIRM=terminal requires an action working directory." };
+  // Confirmation exists to gate commands, and a command plan is only
+  // canonicalizable against a known directory. That is a property of the plan,
+  // not of the surface showing it, so every confirmation mode requires one.
+  if (confirmationMode !== undefined && workingDirectory === undefined) {
+    return { configError: `SQUID_ACTION_CONFIRM=${confirmationMode} requires an action working directory.` };
   }
   // Egress is resolved before any transport opens: an invalid value must fail
   // startup rather than surface once a server is already running. Unset means
@@ -147,9 +187,23 @@ export async function resolveWatchActions(
     client,
     ...(workingDirectory === undefined ? {} : { workingDirectory }),
   });
-  const confirmation: ActionConfirmationPolicy | undefined = confirmationMode === "terminal"
-    ? createTerminalActionConfirmation(timeoutMs === undefined ? {} : { timeoutMs })
-    : undefined;
+  // Both modes compose the same engine — `SerialConfirmationPolicy` — over a
+  // different surface, so serialization, the double expiry check, and every
+  // fail-closed reason stay in one place instead of forking per surface.
+  // `parsedGraphicalCommand` is defined exactly when the mode is graphical:
+  // the validation above already refused every other combination.
+  const confirmation: ActionConfirmationPolicy | undefined =
+    confirmationMode === "terminal"
+      ? createTerminalActionConfirmation(timeoutMs === undefined ? {} : { timeoutMs })
+      : parsedGraphicalCommand === undefined
+        ? undefined
+        : createGraphicalActionConfirmation({
+            transport: createStdioGraphicalTransport({
+              command: parsedGraphicalCommand.command,
+              args: [...parsedGraphicalCommand.args],
+            }),
+            ...(timeoutMs === undefined ? {} : { timeoutMs }),
+          });
   const dispatcher = new CapabilityDispatcher({
     runtime,
     gateway,
