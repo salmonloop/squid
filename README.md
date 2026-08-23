@@ -54,6 +54,9 @@ bun run watch:screen
 - `src/browser-page-reader-macos.ts` — macOS accessibility backend over `osascript`: owning pid, window title, active-tab URL in one poll. Real, darwin-only, not exercised by the offline suite; the parser is.
 - `src/browser-page-reader-synthetic.ts` — scripted page replay backend plus a demo script whose owner matches the screen demo's final window. Zero browser calls, so the search path is demonstrable anywhere.
 - `src/resolve-browser-reader.ts` — resolves `SQUID_BROWSER` / `SQUID_BROWSER_POLL_MS`. Defaults to **off**, unlike the screen reader: browser observation is what makes search reachable, so a run opts in.
+- `src/editor-save-source.ts` — the `EditorSaveReader` seam and the adapter that projects an editor's own save reports onto `file_saved` events with `source.kind: "ide"`. This is the source issue #7 asked for and the only one that reports *ownership* rather than observation: the editor names itself as writer, so its saves carry a real `applicationId` and satisfy `admitRunTests`'s unchanged equality check. Frames are refused, never repaired — no pid, no event.
+- `src/editor-save-reader-fifo.ts` — reads one save report per line from a path an editor extension appends to, mirroring the terminal FIFO: append-only, so a crashed plugin costs one lost report rather than a broken editor. The module doc carries a working VS Code extension snippet.
+- `src/resolve-editor-save-reader.ts` — resolves `SQUID_EDITOR_SAVES` / `SQUID_EDITOR_FIFO` / `SQUID_EDITOR_POLL_MS`. Off by default like every capability variable: an editor speaking for itself is the strongest ownership claim in the system, so a run gets it by asking.
 - `src/watch-desktop.ts` — the only entry point that observes more than one part of the desktop: filesystem saves, foreground window text, and (opt-in) browser pages into one core.
 - `src/watch-files.ts` — live filesystem ingestion entry point; durable when `SQUID_DB` is set.
 - `src/watch-screen.ts` — live foreground-window-text ingestion entry point; picks a reader backend from `SQUID_SCREEN_READER`.
@@ -282,6 +285,35 @@ One gap remains, and it is an honest refusal rather than a bug in the check:
 - **A filesystem save has no owner.** `FilesystemActivitySource` reports `applicationId: null` because a path-only watcher cannot know which process performed a write, and `admitRunTests` requires the save's owner to *equal* the foreground application. Treating an unattributed save as the foreground application's work would authorize running tests on a file written by a background formatter — the `filesystem-save-run-tests` fixture asserts `none` for exactly this case. Closing it needs a source that knows what it saved.
 
 A note on the synthetic demos: the screen and browser readers run on independent timers, so their interleaving is not fixed. The search rule requires the selection to be observed *after* the page, and whether that ordering falls out of a given demo run is a race. The demos show that a page becomes observable and is correctly attributed to a window; the end-to-end guarantee is pinned deterministically by `tests/browser-search-admission.test.ts`, which drives the real source in the order a live desktop produces.
+
+### Editor-attributed saves
+
+The unattributed-save gap above has a real closure now, without touching `admitRunTests`'s equality check or `FilesystemActivitySource`'s honest `null`: an editor can speak for itself. `SQUID_EDITOR_SAVES=fifo` starts a source that reads save reports an editor extension appends to a file — one JSON object per line:
+
+```json
+{"path":"/home/me/proj/src/a.ts","pid":12345}
+```
+
+`pid` is the *editor's own* `process.pid`, and the macOS screen reader already reports the foreground application's unix pid as its `applicationId`. The pairing is plain equality — no translation layer — so a save written by the editor in front is admitted by the same check that refuses one written by anything else while another editor is in front. A watcher's `null` owner stays refused; ownership comes from whoever actually knows it.
+
+```bash
+SQUID_EDITOR_SAVES=fifo SQUID_EDITOR_FIFO=/absolute/path/saves.fifo \
+  bun run watch:desktop -- /absolute/project/root
+```
+
+A VS Code extension that feeds it (from `extension.js`):
+
+```js
+const fifo = process.env.SQUID_EDITOR_FIFO;
+if (fifo) workspace.onDidSaveTextDocument((document) => {
+  require("fs").appendFile(fifo, JSON.stringify({
+    path: document.uri.fsPath,
+    pid: process.pid,
+  }) + "\n", () => undefined);
+});
+```
+
+One admission heuristic moved from ids to names to make real runs possible at all: "is this a coding application" is now decided on the application's *name*, never its id. On macOS the id is a bare unix pid ("4242"), which cannot carry the signal — matching on it made every live run fail regardless of what was in front. Ownership equality still compares ids exactly as before; only the kind-of-application question changed, and it changed toward the field that actually describes what an application is.
 
 ## Replay evaluation
 

@@ -174,6 +174,18 @@ function admitInspectError(context: AdmissionContext): AdmissionResult {
 }
 
 /**
+ * Whether the foreground application is a coding application, decided on its
+ * *name* and never its id. The id is whatever the platform reports it as — on
+ * macOS the screen reader reports a bare unix pid ("4242"), which cannot carry
+ * the "code" signal — while the name is the one field that describes what kind
+ * of application this is. Matching on the id would make every real macOS run
+ * fail here regardless of what is actually in front.
+ */
+function isCodingApplication(application: { id: string; name: string }): boolean {
+  return /code/i.test(application.name);
+}
+
+/**
  * run_tests executes a command locally, so its checks are about identity of the
  * target: the same coding application must still be in front, and the newest
  * save must still be the file the plan was built for.
@@ -181,7 +193,7 @@ function admitInspectError(context: AdmissionContext): AdmissionResult {
 function admitRunTests(context: AdmissionContext): AdmissionResult {
   const { state, plan } = context;
   const application = state.activeApplication;
-  if (application === null || !application.id.includes("code")) {
+  if (application === null || !isCodingApplication(application)) {
     return refuse("coding_application_mismatch");
   }
   const lastSave = state.recentActions.find((action) => action.kind === "file_saved");

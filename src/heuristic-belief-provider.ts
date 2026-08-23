@@ -112,7 +112,11 @@ function beliefRules(
   }
 
   const save = state.recentActions.find((action) => action.kind === "file_saved");
-  if (save !== undefined && state.activeApplication?.id.includes("code") === true) {
+  if (
+    save !== undefined
+    && state.activeApplication !== null
+    && /code/i.test(state.activeApplication.name)
+  ) {
     rules.push({
       value: "validate_change",
       confidence: 0.5,

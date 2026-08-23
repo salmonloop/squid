@@ -48,7 +48,8 @@ export class HeuristicPredictor implements Predictor {
     const latestAction = state.recentActions[0];
     if (
       latestAction?.kind === "file_saved"
-      && state.activeApplication?.id.includes("code")
+      && state.activeApplication !== null
+      && /code/i.test(state.activeApplication.name)
       && latestAction.applicationId === state.activeApplication.id
     ) {
       candidates.push({

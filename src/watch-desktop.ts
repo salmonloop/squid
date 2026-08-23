@@ -2,10 +2,12 @@ import { realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { sanitizeAuditText } from "./action-egress.js";
 import { BrowserPageActivitySource } from "./browser-page-source.js";
+import { EditorSaveActivitySource } from "./editor-save-source.js";
 import { FilesystemActivitySource } from "./filesystem-source.js";
 import type { ActivitySource } from "./activity-source.js";
 import type { FilePayload } from "./protocol.js";
 import { resolveBrowserReader } from "./resolve-browser-reader.js";
+import { resolveEditorSaveReader } from "./resolve-editor-save-reader.js";
 import { resolveScreenReader } from "./resolve-screen-reader.js";
 import { resolveTerminalReader } from "./resolve-terminal-reader.js";
 import { ScreenTextActivitySource } from "./screen-text-source.js";
@@ -73,6 +75,12 @@ if ("configError" in terminal) {
   process.exit(2);
 }
 
+const editorSaves = resolveEditorSaveReader();
+if ("configError" in editorSaves) {
+  console.error(editorSaves.configError);
+  process.exit(2);
+}
+
 const canonicalRoot = await realpath(root);
 
 const started = await startWatchSession({
@@ -85,6 +93,7 @@ const started = await startWatchSession({
     reader: reader.readerKind,
     browser: browser.enabled ? browser.readerKind : "off",
     terminal: terminal.enabled ? terminal.readerKind : "off",
+    editorSaves: editorSaves.enabled ? editorSaves.readerKind : "off",
   },
   createSources: async (context) => {
     // Only the filesystem source needs exclusions: neither a screen reader nor a
@@ -116,6 +125,19 @@ const started = await startWatchSession({
     if (terminal.enabled) {
       sources.push(new TerminalCommandActivitySource({
         readerFactory: terminal.readerFactory,
+        onDiagnostic: context.onDiagnostic,
+      }));
+    }
+    if (editorSaves.enabled) {
+      // Last, and the only source that reports ownership rather than
+      // observation: the editor names itself as the writer, so its events are
+      // admissible for `run_tests` without the foreground pairing a watcher's
+      // unattributed save can never satisfy. Ordering after the screen source
+      // keeps the projection's foreground current before the strongest claim
+      // lands.
+      sources.push(new EditorSaveActivitySource({
+        readerFactory: editorSaves.readerFactory,
+        root: canonicalRoot,
         onDiagnostic: context.onDiagnostic,
       }));
     }
