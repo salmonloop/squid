@@ -1,8 +1,10 @@
 import { HeuristicPredictor } from "./baseline-predictor.js";
+import { RedactingContextPolicy } from "./context-policy.js";
 import {
   parseProviderGateMode,
   parseProviderMode,
   selectPredictionProvider,
+  type ProviderGateMode,
   type ProviderSelection,
 } from "./provider-selector.js";
 import { DEFAULT_PROVIDER_GATE_TIMEOUT_MS } from "./provider-gate.js";
@@ -32,7 +34,10 @@ export async function resolveWatchProvider(
 ): Promise<WatchProviderResolution> {
   const mode = parseProviderMode(env.SQUID_PROVIDER);
   if (mode === null) {
-    return { ok: false, configError: 'SQUID_PROVIDER must be "heuristic" or "pi".' };
+    return {
+      ok: false,
+      configError: 'SQUID_PROVIDER must be "heuristic", "pi", or "cognition".',
+    };
   }
 
   const gate = parseProviderGateMode(env.SQUID_PROVIDER_GATE);
@@ -48,6 +53,10 @@ export async function resolveWatchProvider(
         heuristic: new HeuristicPredictor(),
       }),
     };
+  }
+
+  if (mode === "cognition") {
+    return { ok: true, selection: await resolveCognitionProvider(gate) };
   }
 
   const [{ PiRuntime }, { runProviderGate }, { heuristicEvaluationScenarios }] = await Promise.all([
@@ -75,4 +84,61 @@ export async function resolveWatchProvider(
   });
 
   return { ok: true, selection };
+}
+
+/**
+ * Assembles the belief-backed cognition provider and the gate that admits it.
+ *
+ * The subtle requirement is that the gate must score *the provider the live run
+ * would use*, which means the belief resolver inside it has to be told the same
+ * `contextPolicyId` the coordinator will apply. Get that wrong and every belief
+ * batch fails `context_policy_mismatch` during the replay: the gate would then
+ * measure a cognition layer that never once saw a belief, pass it for being
+ * indistinguishable from the heuristic, and admit it — after which the live run,
+ * with beliefs flowing, behaves like something the gate never tested.
+ *
+ * `selectPredictionProvider` decides the policy, so its id is read from the class
+ * rather than repeated as a literal here.
+ */
+async function resolveCognitionProvider(
+  gate: ProviderGateMode,
+): Promise<ProviderSelection> {
+  const [
+    { BeliefRerankCognition },
+    { HeuristicBeliefProvider },
+    { createBeliefResolver },
+    { BeliefBackedPredictionProvider },
+    { runSemanticGate },
+    { heuristicEvaluationScenarios },
+  ] = await Promise.all([
+    import("./belief-rerank-cognition.js"),
+    import("./heuristic-belief-provider.js"),
+    import("./belief-resolver.js"),
+    import("./cognition-provider.js"),
+    import("./semantic-gate.js"),
+    import("./evaluation-fixtures.js"),
+  ]);
+
+  const contextPolicyId = new RedactingContextPolicy().id;
+  const createProvider = () => new BeliefBackedPredictionProvider(
+    new BeliefRerankCognition(),
+    createBeliefResolver({
+      beliefProvider: new HeuristicBeliefProvider(),
+      contextPolicyId,
+    }),
+  );
+
+  return selectPredictionProvider({
+    mode: "cognition",
+    gate,
+    heuristic: new HeuristicPredictor(),
+    createCognition: createProvider,
+    // No `probeAvailability`: an in-process provider cannot be unavailable, and
+    // supplying a probe that always succeeds would only add a way for the gate to
+    // skip — which reads as "not evaluated", the one verdict that must not admit.
+    runSemanticGate: () => runSemanticGate({
+      scenarios: heuristicEvaluationScenarios,
+      createProvider,
+    }),
+  });
 }

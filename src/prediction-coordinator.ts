@@ -6,7 +6,12 @@ import {
 } from "./context-policy.js";
 import type { PredictionCandidate, WorldState } from "./protocol.js";
 import { cloneWorldState } from "./world-state.js";
-import type { PredictionOutcome, PredictionProvider, PredictionRequest } from "./prediction-provider.js";
+import type {
+  PredictionOutcome,
+  PredictionProvider,
+  PredictionRequest,
+  ProjectionIdentity,
+} from "./prediction-provider.js";
 
 export interface PredictionCoordinatorOptions {
   readonly provider: PredictionProvider;
@@ -78,8 +83,16 @@ export class PredictionCoordinator {
    * Request a prediction. Cancels any in-flight request first. Resolves with an
    * outcome — never rejects. On any provider failure (timeout, cancel, error)
    * the outcome carries the heuristic fallback candidates and the failure reason.
+   *
+   * `projection` names which projection this state is. Optional because the
+   * coordinator itself never needs it — it is forwarded so a provider that has to
+   * prove it reasoned about *this* world (the belief layer) can, and a caller
+   * without a core projection is not forced to invent a digest.
    */
-  public async request(worldState: WorldState): Promise<PredictionOutcome> {
+  public async request(
+    worldState: WorldState,
+    projection?: ProjectionIdentity,
+  ): Promise<PredictionOutcome> {
     this.abortActive();
 
     const requestId = this.random();
@@ -94,6 +107,7 @@ export class PredictionCoordinator {
       worldState: localState,
       episodeId,
       triggeredAt,
+      ...(projection === undefined ? {} : { projection }),
     };
 
     let providerRequest: PredictionRequest;

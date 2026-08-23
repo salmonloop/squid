@@ -70,8 +70,19 @@ bun run watch:screen
 - `src/evaluation-fixtures.ts` — versioned synthetic replay scenarios with labeled cut points.
 - `src/evaluate.ts` — evaluation report entry point.
 - `src/provider-gate.ts` — replay gate that scores a candidate provider against the heuristic baseline on one fixture version and measures provider health, which the ranking report omits.
-- `src/provider-selector.ts` — admission boundary for the live primary provider: chooses heuristic or model, and reports why a model was declined. Pure and fully injected, so it imports no model runtime.
-- `src/watch-provider.ts` — wires the real Pi and replay-gate seams into the selector and reads `SQUID_PROVIDER` / `SQUID_PROVIDER_GATE` for both watch entry points.
+- `src/semantic-gate.ts` — the gate a cognition path must clear: `runProviderGate` for ranking, then determinism measured directly by replaying the corpus and comparing the top candidate per cut point. A provider whose top-1 answer moves between runs is refused however well it scores on average, which is the failure a mean cannot see.
+- `src/provider-selector.ts` — admission boundary for the live primary provider: chooses heuristic, model, or cognition, and reports why one was declined. Pure and fully injected, so it imports no model runtime. `readGateVerdict` is shared by both gated paths so "a skip is not a pass" is stated once.
+- `src/watch-provider.ts` — wires the real Pi, replay-gate, and cognition seams into the selector and reads `SQUID_PROVIDER` / `SQUID_PROVIDER_GATE` for every watch entry point. Each heavy module graph is imported lazily inside its own branch.
+- `src/belief-provider.ts` — the belief seam: `BeliefRequest` (carrying the projection identity a batch must agree with), `BeliefProvider`, `NoBeliefsError` for "nothing to assert", and `validateBatchAgainstRequest`, which refuses a batch whose episode, digest, generation, or context policy has moved.
+- `src/belief-state.ts` — the belief contract itself: closed intent vocabulary, bounds against an untrusted producer, and semantic validation of TTLs, duplicate IDs, self-reference, and evidence that postdates the belief citing it.
+- `src/heuristic-belief-provider.ts` — deterministic baseline belief producer: four rules over facts the projection already holds, each naming the events it read. A rule that cannot cite evidence contributes nothing rather than poisoning the batch.
+- `src/belief-evidence.ts` — `evidenceTimeline(state)`, the event map a belief's evidence is checked against, derived from the projected state the provider was shown. A provider can only cite what it could see.
+- `src/belief-resolver.ts` — live-path adapter from `PredictionRequest` to a validated batch. Every failure resolves to `null`, so an unreachable belief layer degrades to cognition-from-state; `onOutcome` is how a run says *why* beliefs were absent.
+- `src/cognition-provider.ts` — `CognitionProvider` (state plus beliefs to candidates) and `BeliefBackedPredictionProvider`, the adapter that keeps the belief layer off the critical path.
+- `src/belief-rerank-cognition.ts` — the shipped cognition provider: reorders candidates by asserted intent, cannot invent one, and is deterministic by construction so the stability gate can admit it.
+- `src/shadow-cognition.ts` — runs a cognition path beside the live one and emits a self-describing observation. No dispatcher, no gateway; a shadow run is never awaited, so it cannot delay a real prediction.
+- `src/shadow-ledger.ts` — turns an observation into an attempt record the ledger accepts and no dispatch claim can reach: `:shadow` request-ID suffix, `shadow:` provider prefix, `suggestion_only` trust, and a deliberately unshifted `triggerEventId` so retention deletion removes it alongside the live record.
+- `src/resolve-shadow-cognition.ts` — three-state `SQUID_SHADOW_COGNITION` resolution. Strict, because a typo that silently disabled shadow mode would read as the cognition path agreeing with the heuristic everywhere.
 - `src/gate-pi.ts` — `bun run gate:pi` entry point for the Pi-backed predictor. Needs a reachable model, so it is separate from the offline suite.
 - `src/prediction-provider.ts` — async prediction contract: `PredictionProvider` interface, `PredictionRequest`, `PredictionOutcome`, and `SyncPredictorProvider` adapter.
 - `src/prediction-coordinator.ts` — one-in-flight async coordinator with timeout, cancellation, stale-episode guard, and heuristic fallback. Applies a `ContextPolicy` to the provider's view of world state.
@@ -82,7 +93,7 @@ bun run watch:screen
 - `src/prediction-runtime.ts` — live orchestration boundary that feeds accepted/late core state snapshots into the coordinator without coupling provider latency to event ingestion. An outcome is published only after its attempt record is durable, so a caller can immediately dispatch a candidate without racing the write it claims against; a failed write still delivers the prediction as a diagnostic, and the action is then correctly refused rather than silently unauditable. `admitAndClaim` is the linearization point for actions: admission and the ledger claim run together inside the core's critical section, so no ingest can land between "the state still matches" and "this claim is recorded".
 - `src/prediction-ledger.ts` — append-only prediction attempts, feedback, and the action-plan state machine. Attempts are schema v2: `runtimeSessionId`, `stateDigest`, `projectionGeneration`, `triggerEventId`, `episodeId`, `triggerDisposition`, `contextPolicyId`, `actionTrust`, and `egressPolicyId` are all required, because a record missing them could not be audited back to the boundary that authorized it. Actions move through a narrow API — `recordPlan`, `recordDecision`, `recordStateRejection`, `claimDispatch`, `completeDispatch` — so a terminal state cannot be written through the generic append; feedback is limited to how a *prediction* was received (accepted/rejected/expired). `claimDispatch` validates every metadata field, the recorded plan, the candidate, and the legal predecessor state in one atomic operation, and only `claimed` authorizes an outside-world call.
 - `src/sqlite-prediction-ledger.ts` — append-only ledger on SQLite that declares its integrity rules as schema constraints instead of process-local checks.
-- `src/ledger-report.ts` — shadow-mode report over a persisted ledger: attempts by provider/status, fallback reasons, candidate kinds, latency percentiles. Pure aggregation over ledger records; the CLI tail reads the database a durable watch run wrote.
+- `src/ledger-report.ts` — report over a persisted ledger: attempts by provider/status, fallback reasons, candidate kinds, latency percentiles. Splits live from shadow attempts by provider name, keeping the top level the live path alone so a report predating shadow mode compares the same quantity. Pure aggregation over ledger records; the CLI tail reads the database a durable watch run wrote.
 - `src/capability-gateway.ts` — the only path from a prediction to an executed capability. `CapabilityGateway` receives a finished `ImmutableActionPlan` and never a candidate, so a model cannot choose the tool or the command. `CapabilityDispatcher` runs one fixed order: record the plan, confirm it, admit-and-claim inside the runtime's serial queue, invoke, complete. Nothing after the claim may reject — a refusal there would leave a dispatched record with no terminal state. A structured tool failure is data (`failed`); a *thrown* invocation becomes `reconciliation_required`, never `failed`, because after the claim the tool may have run and a fabricated failure would invite a retry of a possibly-completed action.
 - `src/action-plan.ts` — the shared plan vocabulary: which prediction kinds have a capability mapping, the `ImmutableActionPlan` shape, and the two digests (`digestActionPlan`, `digestCandidateParameters`) that follow a plan everywhere. Both digests live here so the value the planner writes to the ledger is byte-identical to what admission recomputes at claim time.
 - `src/action-planner.ts` — builds a plan once, asynchronously, because canonicalization is a filesystem question: `realpath` is the only way to know whether a path, a symlink, or a bind mount lands inside the working directory. It rejects traversal/absolute/control-character paths, quotes with `shell-quote` over canonical values, and keeps the raw selection out of the summary (only its length appears).
@@ -151,11 +162,14 @@ If the model provider is unreachable, the baseline predictor continues to functi
 `SQUID_PROVIDER` chooses the primary provider for a live watch run. Absent or `heuristic` is the default and is exactly the behavior that existed before a model was selectable: no probe, no gate, no network, no model — the Pi module graph is not even imported, which is worth about 650ms of startup on the machine this was measured on.
 
 ```bash
-SQUID_PROVIDER=pi bun run watch:files -- /absolute/project/root                       # admit on reachability
-SQUID_PROVIDER=pi SQUID_PROVIDER_GATE=replay bun run watch:screen                     # admit only on a gate pass
+SQUID_PROVIDER=pi bun run watch:files -- /absolute/project/root                        # admit on reachability
+SQUID_PROVIDER=pi SQUID_PROVIDER_GATE=replay bun run watch:screen                      # admit only on a gate pass
+SQUID_PROVIDER=cognition SQUID_PROVIDER_GATE=replay bun run watch:desktop              # belief-backed, gated
 ```
 
 `SQUID_PROVIDER_GATE` picks the admission check. The default `probe` resolves the model once via `PiRuntime.checkAvailability()` — fast, and enough to tell an outage apart from a bad prediction. `replay` instead runs the same `runProviderGate` that `bun run gate:pi` runs, at startup, and admits the model only on `passed`. A `skipped` gate declines, because an unreachable or unevaluated model must not reach the real-time path just because nothing measured a regression against it.
+
+`cognition` selects the belief-backed path described under [Beliefs and cognition](#beliefs-and-cognition). It has no probe branch, and the asymmetry is deliberate: reachability is the question worth asking about an out-of-process model, but a cognition provider reorders candidates the heuristic already produced, so it is always reachable and a probe would admit every one of them while measuring nothing. The semantic gate therefore runs in both modes; what `SQUID_PROVIDER_GATE` decides is only whether a pass earns dispatch trust. Under `probe` an admitted cognition provider stays `suggestion_only`, so nothing it proposes can be dispatched — `src/action-admission.ts` refuses a claim unless both the attempt and the runtime are trusted, which is why a provider cannot grant itself what the selector withholds.
 
 Whenever the model is declined, the run continues on the heuristic and prints the reason. Silence would be the real failure: a run started with `SQUID_PROVIDER=pi` that quietly predicts with the heuristic looks identical to one where the model is working. Independently of this choice, `PredictionCoordinator` keeps its own heuristic fallback, so a model admitted at startup that then fails, times out, or is cancelled still lands somewhere.
 
@@ -182,6 +196,69 @@ Prefix is capped from its tail and suffix from its head, so the characters neare
 Only `http`/`https` URLs keep a path. Other schemes parse successfully but put their payload where a path would be — `data:` inlines the document, `blob:` carries an opaque capability token, `file:` an absolute local path — so they degrade to `host`, as does a value that does not parse at all. Keeping a parseable non-web URL's "path" would leak precisely what the policy exists to withhold.
 
 The typed `RedactableContextField` allow-list re-enables a field explicitly; making it a union rather than a string means an allow-list entry cannot quietly stop matching after a rename. A policy that throws denies egress: the coordinator reports a `context_policy_failed` diagnostic and answers from the local fallback instead of falling back to raw state.
+
+## Beliefs and cognition
+
+A prediction answers "what action might help now". A belief answers "what is going on" — longer-lived, and reusable across several predictions. Splitting them is what lets a belief be evaluated for *stability* on its own, which is the property the existing predictor path measurably lacks.
+
+A `BeliefProvider` (`src/belief-provider.ts`) receives already-projected state and returns a `BeliefStateBatch`. The contract is fail-closed and narrow by design: a belief carries an intent value from a closed vocabulary, a confidence, and the event IDs it was inferred from — no command, no tool name, no free-form text, and no reference to another belief. `HeuristicBeliefProvider` is the shipped baseline: four deterministic rules over facts the projection already holds, each naming the events it read.
+
+Every batch is validated against the request it answered, by `validateBatchAgainstRequest`:
+
+| Check | Refusal | Why |
+| --- | --- | --- |
+| Schema, bounds, TTL | `batch_invalid` | An untrusted producer must not turn a batch into a data sink |
+| `episodeId` | `episode_mismatch` | Beliefs never cross episodes |
+| `stateDigest` | `state_digest_mismatch` | A belief about a world that has moved is worse than no belief |
+| `projectionGeneration` | `projection_generation_mismatch` | Same, for a superseded projection |
+| `contextPolicyId` | `context_policy_mismatch` | The same world redacted differently is a different input |
+| Evidence event IDs | rejected batch | A belief citing an unknown event cannot be audited |
+
+Evidence is checked against `evidenceTimeline(state)` (`src/belief-evidence.ts`), derived from the *projected* state the provider was shown rather than from the event store. A provider can only cite what it could see, so an ID outside that map is either a hallucination or a reference to something the policy withheld. Redaction narrows content, not provenance, so the citable set is identical before and after projection — otherwise the belief layer would be dead in exactly the configuration the model path runs under.
+
+`createBeliefResolver` (`src/belief-resolver.ts`) is the live-path adapter: it builds a `BeliefRequest` from the projection identity a `PredictionRequest` carries, asks the provider, validates, and resolves to `null` on any failure. Validation time is the *state's* time, not the wall clock — every belief is inferred at `triggeredAt` and expires a bounded interval after it, so checking against "now" would reject every batch during a replay and the gate would end up admitting a provider that had never once been given a belief.
+
+The projection identity is threaded from `PredictionRuntime` through `PredictionCoordinator.request(state, projection)` as an optional field. Optional rather than required precisely so no caller is ever forced to invent a digest: a fabricated one would let a batch about a world that never existed validate. A request without it gets no beliefs and still gets a prediction.
+
+`BeliefRerankCognition` (`src/belief-rerank-cognition.ts`) is the shipped `CognitionProvider`. It reorders candidates by the intent the beliefs assert, and it cannot invent one — a belief carries no parameters, so there is nothing to build an action out of, and re-ranking is the whole of its authority. Every candidate it emits was already admissible before it ran. A fully-confident belief may add at most 0.25 to a candidate's confidence: enough to overturn a close ranking, not enough to overturn a wide gap the heuristic scored on evidence the belief layer does not have. Beliefs may be absent, in which case it returns exactly the heuristic's ranking — cognition-from-state is a correct answer, not a degraded one.
+
+`sourceEventIds` are passed through untouched. Admission and the ledger read them to decide whether the world has moved since a candidate was formed, so a cognition layer that rewrote them would be editing the audit trail rather than the ranking.
+
+### Semantic gate
+
+`runSemanticGate` (`src/semantic-gate.ts`) is what a cognition path must clear before it can reach a real-time action. It runs `runProviderGate` for ranking, then measures determinism directly: the same scenarios, three times, comparing the top candidate per cut point. `minTop1Stability` defaults to 1 — exactly reproducible.
+
+That second dimension is not decoration. The documented reason `PiRuntime` fails today is that it gives different answers for the same world state, and a ranking score averages that away: a provider can post an acceptable mean while being unusable, because a suggestion that appears only half the time reads as a malfunction rather than as a feature. The gate compares the *kind* rather than the whole candidate, since parameters legitimately carry text that varies and a rationale is prose; what has to be reproducible is which action gets proposed. An empty list is itself an answer — "propose nothing" — and must be reproducible too.
+
+`BeliefRerankCognition` passes both dimensions on the current fifteen-point corpus: top-1 at parity with the baseline, zero fallbacks, and 15/15 stable across three replays. It is deterministic by construction — pure arithmetic over the batch, a stable sort, and an explicit ordinal tie-break rather than reliance on sort stability.
+
+### Shadow mode
+
+`SQUID_SHADOW_COGNITION=on` runs the cognition path beside the live one, records what it would have done, and dispatches nothing.
+
+```bash
+SQUID_SHADOW_COGNITION=on bun run watch:desktop
+bun run ledger:report -- /absolute/path.db.ledger.db
+```
+
+A gate scores a fixed corpus; shadow mode scores the user's actual days, which is where the corpus is wrong. What makes it safe to leave on is that the shadow path cannot cause anything, for three independent reasons:
+
+- **An unreachable request ID.** `claimDispatch` finds an attempt by `record.requestId === plan.attemptId`, and a plan's `attemptId` is a live request ID. A shadow record's ID carries a `:shadow` suffix, so no claim will ever ask for it. This is structural, not a flag someone remembered to check.
+- **`actionTrust: "suggestion_only"`,** whatever the live run was configured with. `src/action-admission.ts` refuses a claim unless both the attempt and the runtime are trusted.
+- **No dispatcher.** `ShadowCognitionRunner` holds no gateway and no confirmation surface.
+
+Shadow runs are never awaited, so a shadow failure cannot delay or fail a real prediction, and the state handed to them is re-projected through the same `ContextPolicy` the live provider saw — passing raw state instead would hand the belief layer fields the policy withheld while still claiming that policy's ID.
+
+Shadow attempts share the live record's `triggerEventId` deliberately. Retention deletion removes ledger records by trigger event, so shifting it would leave shadow records behind after the event they describe was deleted — an attempt pointing at history that no longer exists.
+
+`bun run ledger:report` splits the two. Top-level figures remain the live path alone, so a report from before shadow mode existed is comparing the same quantity; `paths.live` and `paths.shadow` break both out. Each shadow record's `fallbackReason` carries `beliefs=<status>`, because "ran with beliefs" and "ran without them" are different providers in effect and a report that conflated them would average over two populations.
+
+```
+paths.shadow.byProvider  →  { "shadow:belief-rerank": 12 }
+paths.live.byProvider    →  { "heuristic": 12 }
+```
+
+Stdout carries counts and kinds only — belief values are a closed vocabulary and candidate kinds are an enum, so a shadow log line cannot echo a selection or a path.
 
 ## Activity sources
 
@@ -405,6 +482,9 @@ Tests use `bun:test`. The test suite covers:
 - `inspect_error` planning and admission: the project script for each re-runnable class, classes deliberately excluded (`install`, `vcs`, `container`, `other`, `build`) refused, unknown or non-string classes refused, an absolute resolvable workdir required, the canonical root quoted, digest stability, and admission refusing on a missing outcome, a succeeded command, a different failing class, and every general identity check.
 - Retention: `resolveRetention` accepting only strict positive-integer spellings; cross-backend end-to-end prune (sqlite, jsonl+memory, in-memory) removing old events with their full dependent ledger closure while keeping fresh chains byte-intact and no-oping below the cutoff; and session wiring — a malformed `SQUID_RETENTION_HOURS` refused before any source starts, the bound and per-pass removals in the banner, and prune-before-restore observed through a replayed deleted id being accepted rather than deduped.
 
+- Beliefs and cognition: batches produced from projections a real `SquidCore` built — not hand-written fixtures, since a fabricated digest would pass while the live path rejected every batch — and refused on each way a provider can misreport (digest, generation, policy, episode, unknown evidence); the resolver declining rather than inventing a projection identity, and reporting a quiet desktop as `none` rather than as a failure; re-ranking that promotes the action a confident belief supports while inventing no candidate the projection did not already offer; the semantic gate admitting the belief-backed path on both quality and determinism, refusing a provider that alternates its answer on identical state, and propagating an unreachable provider as skipped; and the cognition admission branch withholding dispatch trust under `probe`.
+- Shadow mode: `resolveShadowCognition` accepting only the exact `on` spelling; observations separating nothing-to-assert from a belief outage from a rejected batch; a shadow attempt record coexisting with the live record for the same ingest, carrying `suggestion_only` trust and a request ID outside the namespace `claimDispatch` searches, and being removed together with the live record when its trigger event is deleted; the report splitting `paths.live` from `paths.shadow` while leaving the top level live-only; and end-to-end session wiring — both paths ledgered from one ingest, a malformed variable refused before any source starts, and stdout lines carrying only closed vocabularies.
+
 Source tests inject a fake watcher, file probe, and screen-text reader, so they never depend on kernel watch timing, an accessibility API, or a subprocess. Session tests use scripted sources for the same reason: what is under test is the wiring, not any backend. Real-watcher behavior is verified by the `bun run watch:files` smoke run in the release gate, and multi-source ingestion by a `bun run watch:desktop` run against a temporary root; the macOS accessibility backends are verified by hand with `SQUID_SCREEN_READER=darwin bun run watch:screen` and `SQUID_BROWSER=darwin bun run watch:desktop`.
 
 ## What is not yet implemented
@@ -416,7 +496,8 @@ Tracked as issues; the entry-point table under [Dispatching actions](#which-entr
 - IDE / LSP integration, so no source can attribute a file save to the editor that wrote it. `run_tests` has both required facts available in `watch:desktop` but the save's owner stays `null`, which admission correctly refuses.
 - Overlay / suggestion UI. The only way to see or answer a suggestion is a terminal prompt.
 - A capability mapping for `draft_completion`. It is the one predicted kind with no action: writing text into someone's editor needs an IDE integration that can place it, and a confirmation surface that can show it in place.
-- `BeliefState` beyond its validated contract. `src/belief-state.ts` defines and fail-closed-validates a belief batch (`task_intent`, evidence, TTL, episode/digest/generation agreement), but nothing produces or consumes one yet: there is no belief provider, no store, and no runtime wiring. The next phase must land `BeliefProvider`, `CognitionProvider`, a semantic gate, and shadow/suggestion mode together — a prompt change alone would not be it.
+- A *model-backed* belief producer. The belief seam, a deterministic producer, a re-ranking cognition provider, the semantic gate, and shadow mode all exist and are wired (see [Beliefs and cognition](#beliefs-and-cognition)) — but `HeuristicBeliefProvider` infers from rules over the projection, not from a model, so what the belief layer currently adds over the heuristic is structure and measurability rather than new understanding. A model-backed producer is a drop-in at that seam and must clear the same semantic gate, which no model has yet done: `PiRuntime` fails it on determinism.
+- A belief store. Beliefs live for one prediction and are never persisted, so nothing yet accumulates a picture of what someone was doing across a session — the property that would make a belief genuinely longer-lived than the prediction it informs.
 - Capture-time privacy beyond redaction, exclusion, pause, and retention. Those four exist (`RedactingCapturePolicy`, `SQUID_EXCLUDE`, the `SQUID_CONTROL` gate, `SQUID_RETENTION_HOURS` + `history:delete`); what remains is a retention pass *during* a long-running session — startup-only today — and any interactive surface for choosing ranges by hand.
 
 ## Archived documents

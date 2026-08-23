@@ -4,6 +4,7 @@ import type {
   PredictionAttemptRecord,
   PredictionLedgerRecord,
 } from "./prediction-ledger.js";
+import { isShadowProvider } from "./shadow-ledger.js";
 
 /**
  * Shadow-mode report over a persisted prediction ledger.
@@ -18,7 +19,7 @@ import type {
  * in-memory records and works for any ledger implementation.
  */
 
-export interface LedgerReport {
+export interface PathReport {
   readonly attempts: number;
   readonly byProvider: Readonly<Record<string, number>>;
   readonly byStatus: Readonly<Record<string, number>>;
@@ -34,11 +35,45 @@ export interface LedgerReport {
   };
 }
 
+/**
+ * The live path's figures at the top level, with both paths broken out beneath.
+ *
+ * Shadow attempts are *excluded* from the top-level numbers rather than mixed in,
+ * and that is the whole point of the split. A shadow run is a second opinion about
+ * the same moment, so counting both would double every attempt and average two
+ * different providers' latencies into one meaningless figure. The top level stays
+ * the answer to "what did this run actually do", which is what it meant before
+ * shadow mode existed — so an operator reading an older report and a newer one is
+ * comparing the same quantity.
+ *
+ * `paths.live` repeats the top level by construction. Kept so a reader never has to
+ * know that the outer object silently means "live only".
+ */
+export interface LedgerReport extends PathReport {
+  readonly paths: {
+    readonly live: PathReport;
+    readonly shadow: PathReport;
+  };
+}
+
 export function buildLedgerReport(records: readonly PredictionLedgerRecord[]): LedgerReport {
   const attempts = records.filter(
     (record): record is PredictionAttemptRecord => record.recordType === "attempt",
   );
+  // Split on the provider name, which `createShadowAttemptRecord` prefixes. The
+  // marker lives in the record rather than in a separate field because the ledger
+  // schema is closed (`additionalProperties: false`), and because a name is what
+  // an operator already reads — a shadow row is legible even without this report.
+  const shadow = attempts.filter((attempt) => isShadowProvider(attempt.provider));
+  const live = attempts.filter((attempt) => !isShadowProvider(attempt.provider));
 
+  return {
+    ...buildPathReport(live),
+    paths: { live: buildPathReport(live), shadow: buildPathReport(shadow) },
+  };
+}
+
+function buildPathReport(attempts: readonly PredictionAttemptRecord[]): PathReport {
   const tally = (values: readonly (string | undefined)[]): Record<string, number> => {
     const counts: Record<string, number> = {};
     for (const value of values) {

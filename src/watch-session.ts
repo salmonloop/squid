@@ -4,8 +4,15 @@ import { describeErrorForAudit, resolveSearchEgress } from "./action-egress.js";
 import { CaptureGateActivitySource } from "./capture-gate-source.js";
 import { resolveCaptureGate } from "./resolve-capture-gate.js";
 import { HOUR_MS, resolveRetention } from "./resolve-retention.js";
+import { resolveShadowCognition } from "./resolve-shadow-cognition.js";
+import { evidenceTimeline } from "./belief-evidence.js";
+import { BeliefRerankCognition } from "./belief-rerank-cognition.js";
+import { HeuristicBeliefProvider } from "./heuristic-belief-provider.js";
+import { createShadowAttemptRecord } from "./shadow-ledger.js";
+import { ShadowCognitionRunner } from "./shadow-cognition.js";
 import type { ActivitySource, ActivitySourceDiagnostic } from "./activity-source.js";
 import type { ActivityEvent } from "./protocol.js";
+import type { PredictionOutcome } from "./prediction-provider.js";
 import type { PredictionRuntimeIngestResult } from "./prediction-runtime.js";
 import { runRetentionPrune, type RetentionPruneResult } from "./retention-prune.js";
 import { sqliteWatchExclusions } from "./sqlite-event-store.js";
@@ -123,6 +130,13 @@ export async function startWatchSession(
   const retention = resolveRetention({ env });
   if ("configError" in retention) return { configError: retention.configError };
 
+  // Shadow mode resolves with the rest, before any sink opens. A typo that
+  // silently disabled it would leave an operator reading a ledger with no shadow
+  // attempts and concluding the cognition path agrees with the heuristic
+  // everywhere, when in fact it never ran.
+  const shadow = resolveShadowCognition({ env });
+  if ("configError" in shadow) return { configError: shadow.configError };
+
   const watch = createWatchRuntime({
     ...(options.databasePath === undefined ? {} : { databasePath: options.databasePath }),
     provider: resolved.selection.provider,
@@ -158,6 +172,48 @@ export async function startWatchSession(
   // restart cannot re-ingest an event the store already holds.
   const restored = await watch.runtime.restore();
 
+  // The shadow path is built after the ledger exists and before any source starts.
+  // Its ledger writes are tracked here rather than by the runtime: the runtime
+  // drains what *it* wrote, and a shadow record appended after the sinks closed
+  // would be lost — so `stop` awaits these explicitly, in order.
+  const shadowWrites = new Set<Promise<void>>();
+  const shadowRunner = shadow.enabled
+    ? new ShadowCognitionRunner({
+        beliefProvider: new HeuristicBeliefProvider(),
+        cognition: new BeliefRerankCognition(),
+        onObservation: (observation) => {
+          // Kinds, statuses, and counts only. `beliefValues` is a closed
+          // vocabulary and candidate kinds are an enum, so nothing here can echo
+          // a selection or a path the shadow run happened to read.
+          log(JSON.stringify({
+            shadowProvider: observation.shadowProvider,
+            requestId: observation.requestId,
+            shadowStatus: observation.shadowStatus,
+            beliefStatus: observation.beliefStatus,
+            beliefValues: observation.beliefValues,
+            shadowPredictions: observation.shadowCandidates.map((candidate) => candidate.kind),
+            top1Agrees: observation.top1Agrees,
+          }));
+          const write = watch.ledger.appendAttempt(createShadowAttemptRecord({
+            observation,
+            completedAt: new Date().toISOString(),
+            runtimeSessionId: watch.runtimeSessionId,
+            egressPolicyId: egress.id,
+          })).catch((error: unknown) => {
+            // A shadow record that cannot be written is a diagnostic, never a
+            // failure of the live run — exactly the posture the runtime takes for
+            // its own attempt records.
+            logError(JSON.stringify({ shadowLedgerError: describeErrorForAudit(error) }));
+          });
+          shadowWrites.add(write);
+          void write.then(
+            () => shadowWrites.delete(write),
+            () => shadowWrites.delete(write),
+          );
+        },
+      })
+    : undefined;
+
   // The action half of the closed loop, off unless SQUID_ACTIONS opts in. Like
   // the provider above it resolves before any source starts: a typo must fail
   // loudly here, not silently disable execution.
@@ -190,9 +246,54 @@ export async function startWatchSession(
     }));
   }
   if (sources.length === 0) {
+    await shadowRunner?.dispose();
     await watch.dispose();
     return { configError: "A watch session needs at least one activity source." };
   }
+
+  /**
+   * Hands one live outcome to the shadow path, projected exactly as the live
+   * provider saw it.
+   *
+   * The projection is redone here rather than reused because the coordinator
+   * projects internally and keeps the result: passing the raw state instead would
+   * hand the belief layer fields the policy withheld, while still claiming that
+   * policy's id — a leak and a false claim in one line. A policy that throws is
+   * treated the way the coordinator treats it: no egress, and the shadow run is
+   * skipped rather than run on unprojected state.
+   */
+  const observeInShadow = (
+    outcome: PredictionOutcome,
+    ingested: PredictionRuntimeIngestResult & {
+      readonly ingest: NonNullable<PredictionRuntimeIngestResult["ingest"]>;
+    },
+  ): void => {
+    if (shadowRunner === undefined) return;
+    let projected;
+    try {
+      projected = watch.contextPolicy.project(ingested.ingest.state);
+    } catch (error) {
+      logError(JSON.stringify({ shadowProjectionError: describeErrorForAudit(error) }));
+      return;
+    }
+    shadowRunner.observe({
+      outcome,
+      worldState: projected,
+      context: {
+        triggerEventId: ingested.ingest.triggerEventId,
+        triggeredAt: ingested.ingest.triggeredAt,
+        // A duplicate never reaches here — the runtime returns a null prediction
+        // for one — so the only two dispositions left are the record's own.
+        triggerDisposition: ingested.ingest.disposition === "late" ? "late" : "accepted",
+        stateDigest: ingested.ingest.stateDigest,
+        projectionGeneration: ingested.ingest.projectionGeneration,
+        contextPolicyId: watch.contextPolicy.id,
+      },
+      // Derived from the projected state, so a belief can only cite an event the
+      // provider could actually see.
+      eventOccurredAt: evidenceTimeline(projected),
+    });
+  };
 
   const ingest = async (event: ActivityEvent): Promise<void> => {
     const result = await watch.runtime.ingest(event);
@@ -216,6 +317,10 @@ export async function startWatchSession(
         provider: outcome.provider,
         predictions: outcome.candidates.map((prediction) => prediction.kind),
       }));
+      // Shadow runs after the live outcome is in hand and is never awaited: it
+      // must not be able to delay a real prediction, and it has no dispatcher to
+      // reach even if it wanted one.
+      observeInShadow(outcome, ingested);
       if (actions === undefined) return;
       const dispatched = await actions.dispatchTopCandidate(
         outcome,
@@ -251,6 +356,14 @@ export async function startWatchSession(
     for (const source of started.reverse()) {
       await source.stop().catch(() => {});
     }
+    // A source that failed mid-start may already have emitted, so the shadow runs
+    // it triggered are drained before the ledger closes under them.
+    if (shadowRunner !== undefined) {
+      await shadowRunner.dispose();
+      while (shadowWrites.size > 0) {
+        await Promise.allSettled([...shadowWrites]);
+      }
+    }
     await watch.dispose();
     return { configError: `A source failed to start: ${describeErrorForAudit(error)}` };
   }
@@ -266,6 +379,7 @@ export async function startWatchSession(
       ledger: watch.ledgerPath ?? "memory",
       control: gate.enabled ? gate.readerKind : "off",
       retention: retention.enabled ? retention.hours : "off",
+      shadow: shadowRunner === undefined ? "off" : "cognition",
       ...(pruneSummary === undefined ? {} : {
         prunedEvents: pruneSummary.removedEvents,
         prunedRecords: pruneSummary.removedRecords,
@@ -288,6 +402,17 @@ export async function startWatchSession(
       // Settle confirmation and dispatch while the runtime is still open:
       // rejection and terminal action feedback must reach the ledger.
       if (actions !== undefined) await actions.close();
+      // Then the shadow path, in two steps and in this order: drain the runs so
+      // every observation has fired, then drain the appends those observations
+      // started. Disposing the runtime first would close the ledger under a write
+      // still in flight, and awaiting only the runs would leave the last append
+      // racing the close.
+      if (shadowRunner !== undefined) {
+        await shadowRunner.dispose();
+        while (shadowWrites.size > 0) {
+          await Promise.allSettled([...shadowWrites]);
+        }
+      }
       await watch.dispose();
     },
   };

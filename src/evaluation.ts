@@ -111,7 +111,15 @@ export async function evaluateWithProvider(
         if (!cutPoint) continue;
 
         nextRequestId = JSON.stringify(["eval", scenario.id, cutPoint.id]);
-        const outcome = await coordinator.request(ingestResult.state);
+        // The projection identity travels with the request so a belief-backed
+        // provider can be evaluated through this same runner. Without it the
+        // belief layer would have nothing to validate against and every batch
+        // would be refused — the gate would then measure a provider that never
+        // saw a belief, which is not the provider being admitted.
+        const outcome = await coordinator.request(ingestResult.state, {
+          stateDigest: ingestResult.stateDigest,
+          projectionGeneration: ingestResult.projectionGeneration,
+        });
         results.push(evaluateCutPoint(scenario.id, cutPoint, outcome.candidates));
       }
     } finally {

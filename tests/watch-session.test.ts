@@ -11,6 +11,8 @@ import { createActivityEvent, type ActivityEvent } from "../src/protocol.js";
 import { startWatchSession, type WatchSourceContext } from "../src/watch-session.js";
 import { SqliteEventStore } from "../src/sqlite-event-store.js";
 import { SqlitePredictionLedger } from "../src/sqlite-prediction-ledger.js";
+import { buildLedgerReport } from "../src/ledger-report.js";
+import { isShadowProvider } from "../src/shadow-ledger.js";
 
 /**
  * A source that emits exactly what a test hands it, recording lifecycle so the
@@ -67,6 +69,18 @@ function fileSavedAt(eventId: string, occurredAt: string): ActivityEvent {
   });
 }
 
+/** A failed test run: the world both the heuristic and `debug_failure` fire on. */
+function terminalCommandFailed(eventId: string): ActivityEvent {
+  return createActivityEvent({
+    kind: "terminal_command_completed",
+    eventId,
+    source: { kind: "host", instanceId: "term-1" },
+    sessionId: "term-session",
+    sequence: 0,
+    payload: { commandClass: "test", succeeded: false, exitCode: 1 },
+  });
+}
+
 /** A foreground fact only a screen source can produce. */
 function applicationActivated(eventId: string, applicationId: string): ActivityEvent {
   return createActivityEvent({
@@ -84,13 +98,14 @@ const OFFLINE_ENV: Record<string, string | undefined> = {};
 
 async function startSession(options: {
   readonly sources: readonly ActivitySource[];
+  readonly env?: Record<string, string | undefined>;
   readonly log?: (line: string) => void;
   readonly logError?: (line: string) => void;
 }) {
   const seenContexts: WatchSourceContext[] = [];
   const result = await startWatchSession({
     workingDirectory: "/tmp",
-    env: OFFLINE_ENV,
+    env: options.env ?? OFFLINE_ENV,
     log: options.log ?? (() => {}),
     logError: options.logError ?? (() => {}),
     createSources: async (context) => {
@@ -350,5 +365,131 @@ describe("startWatchSession", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  it("reports a config error rather than starting when shadow mode is malformed", async () => {
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const result = await startWatchSession({
+      workingDirectory: "/tmp",
+      env: { SQUID_SHADOW_COGNITION: "yes" },
+      log: () => {},
+      logError: () => {},
+      createSources: async () => [source],
+      describeEvent: () => ({}),
+    });
+
+    expect("configError" in result).toBe(true);
+    if ("configError" in result) {
+      expect(result.configError).toContain("SQUID_SHADOW_COGNITION");
+    }
+    // A typo that quietly disabled shadow mode would leave an operator reading a
+    // ledger with no shadow attempts and concluding the cognition path agrees with
+    // the heuristic everywhere, when in fact it never ran.
+    expect(source.started).toBe(false);
+  });
+
+  it("says shadow mode is off by default, changing nothing about the ledger", async () => {
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result } = await startSession({ sources: [source] });
+    if ("configError" in result) throw new Error(result.configError);
+
+    expect(result.session.banner.shadow).toBe("off");
+
+    await source.emit!(terminalCommandFailed("term-1"));
+    await result.session.runtime.runtime.awaitIdle();
+    await result.session.stop();
+
+    const attempts = (await result.session.runtime.ledger.all())
+      .filter((record) => record.recordType === "attempt");
+    expect(attempts).toHaveLength(1);
+    expect(attempts.every((attempt) => !isShadowProvider(attempt.provider))).toBe(true);
+  });
+
+  /**
+   * The fourth done-when of issue #4, end to end: both paths run, both are
+   * ledgered, `bun run ledger:report` distinguishes them, and neither shadow
+   * record can be dispatched.
+   */
+  it("runs both paths, ledgers both, and dispatches neither", async () => {
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result } = await startSession({
+      sources: [source],
+      env: { ...OFFLINE_ENV, SQUID_SHADOW_COGNITION: "on" },
+    });
+    if ("configError" in result) throw new Error(result.configError);
+    const { session } = result;
+
+    expect(session.banner.shadow).toBe("cognition");
+
+    await source.emit!(terminalCommandFailed("term-1"));
+    await session.runtime.runtime.awaitIdle();
+    // Drains the shadow runs and their ledger appends, then closes the sinks.
+    await session.stop();
+
+    const report = buildLedgerReport(await session.runtime.ledger.all());
+    // One ingest, two opinions about it, told apart by provider name.
+    expect(report.paths.live.attempts).toBe(1);
+    expect(report.paths.shadow.attempts).toBe(1);
+    expect(report.paths.live.byProvider).toEqual({ heuristic: 1 });
+    expect(report.paths.shadow.byProvider).toEqual({ "shadow:belief-rerank": 1 });
+    // The top level is still the live path alone, so a report predating shadow
+    // mode is comparing the same quantity.
+    expect(report.attempts).toBe(1);
+
+    const records = await session.runtime.ledger.all();
+    const shadow = records.find(
+      (record) => record.recordType === "attempt" && isShadowProvider(record.provider),
+    );
+    const live = records.find(
+      (record) => record.recordType === "attempt" && !isShadowProvider(record.provider),
+    );
+    if (shadow?.recordType !== "attempt" || live?.recordType !== "attempt") {
+      throw new Error("expected one live and one shadow attempt");
+    }
+
+    // Both describe the same ingest, so retention deletion removes them together
+    // rather than orphaning one.
+    expect(shadow.triggerEventId).toBe(live.triggerEventId);
+    expect(shadow.stateDigest).toBe(live.stateDigest);
+    // And the shadow record is unreachable by a claim: its request id is outside
+    // the namespace `claimDispatch` looks in, and its trust level is what
+    // `action-admission.ts` refuses on.
+    expect(shadow.requestId).toBe(`${live.requestId}:shadow`);
+    expect(shadow.actionTrust).toBe("suggestion_only");
+    // The belief layer really ran — the failed command is a world the
+    // `debug_failure` rule fires on.
+    expect(shadow.fallbackReason).toBe("beliefs=succeeded");
+    expect(shadow.candidates.map((candidate) => candidate.kind)).toEqual(["inspect_error"]);
+  });
+
+  it("logs the shadow run in counts and kinds, never in content", async () => {
+    const lines: string[] = [];
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result } = await startSession({
+      sources: [source],
+      env: { ...OFFLINE_ENV, SQUID_SHADOW_COGNITION: "on" },
+      log: (line) => lines.push(line),
+    });
+    if ("configError" in result) throw new Error(result.configError);
+
+    await source.emit!(terminalCommandFailed("term-1"));
+    await result.session.runtime.runtime.awaitIdle();
+    await result.session.stop();
+
+    const shadowLine = lines
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find((line) => line.shadowProvider !== undefined);
+    expect(shadowLine).toBeDefined();
+    expect(shadowLine!.shadowProvider).toBe("belief-rerank");
+    expect(shadowLine!.beliefStatus).toBe("succeeded");
+    // Closed vocabularies only: belief values are an enum and candidate kinds are
+    // an enum, so nothing here can echo a selection or a path.
+    expect(shadowLine!.beliefValues).toEqual(["debug_failure"]);
+    expect(shadowLine!.shadowPredictions).toEqual(["inspect_error"]);
+    expect(shadowLine!.top1Agrees).toBe(true);
   });
 });

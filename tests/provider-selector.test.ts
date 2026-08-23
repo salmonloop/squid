@@ -3,10 +3,12 @@ import { HeuristicPredictor } from "../src/baseline-predictor.js";
 import type { PredictionCandidate } from "../src/protocol.js";
 import type { PredictionProvider } from "../src/prediction-provider.js";
 import type { ProviderGateResult } from "../src/provider-gate.js";
+import type { SemanticGateResult } from "../src/semantic-gate.js";
 import {
   parseProviderGateMode,
   parseProviderMode,
   selectPredictionProvider,
+  type CognitionProviderOptions,
   type ModelProviderOptions,
 } from "../src/provider-selector.js";
 
@@ -68,6 +70,7 @@ describe("parseProviderMode", () => {
     expect(parseProviderMode(undefined)).toBe("heuristic");
     expect(parseProviderMode("heuristic")).toBe("heuristic");
     expect(parseProviderMode("pi")).toBe("pi");
+    expect(parseProviderMode("cognition")).toBe("cognition");
     expect(parseProviderMode("PI")).toBeNull();
     expect(parseProviderMode("")).toBeNull();
   });
@@ -186,5 +189,102 @@ describe("selectPredictionProvider behind the replay gate", () => {
     expect(selection.provider.name).toBe("heuristic");
     expect(selection.declineReason).toBe("replay gate could not run: fixture corpus missing");
     expect(calls.createPi).toBe(0);
+  });
+});
+
+/**
+ * The cognition path has no probe branch, and that asymmetry is the point.
+ * Reachability is the question worth asking about an out-of-process model; a
+ * cognition provider reorders candidates the heuristic already produced, so it is
+ * always reachable and a probe would admit every one of them while measuring
+ * nothing. What `gate` decides here is only whether a pass earns dispatch trust.
+ */
+describe("selectPredictionProvider in cognition mode", () => {
+  const stubCognition: PredictionProvider = {
+    name: "belief-rerank",
+    predict: async (): Promise<readonly PredictionCandidate[]> => [],
+  };
+
+  function cognitionHarness(result: () => Promise<SemanticGateResult>) {
+    const calls = { createCognition: 0, runSemanticGate: 0 };
+    const seams: Omit<CognitionProviderOptions, "mode" | "gate"> = {
+      heuristic: new HeuristicPredictor(),
+      createCognition: () => {
+        calls.createCognition += 1;
+        return stubCognition;
+      },
+      runSemanticGate: async () => {
+        calls.runSemanticGate += 1;
+        return result();
+      },
+    };
+    return { calls, seams };
+  }
+
+  function semanticResult(
+    status: SemanticGateResult["status"],
+    extra: Partial<SemanticGateResult> = {},
+  ): SemanticGateResult {
+    return { status, failures: [], ranking: null, stability: null, ...extra };
+  }
+
+  it("admits the cognition path when the semantic gate passes", async () => {
+    const { calls, seams } = cognitionHarness(async () => semanticResult("passed"));
+    const selection = await selectPredictionProvider({ ...seams, mode: "cognition", gate: "replay" });
+
+    expect(selection.provider.name).toBe("belief-rerank");
+    expect(selection.declineReason).toBeNull();
+    expect(selection.actionTrust).toBe("trusted");
+    expect(selection.contextPolicy.id).toBe("redacting");
+    expect(calls).toEqual({ createCognition: 1, runSemanticGate: 1 });
+  });
+
+  it("runs the gate even in probe mode, but withholds dispatch trust", async () => {
+    // Issue #4's constraint: `actionTrust` stays `suggestion_only` for any
+    // un-gated provider. A probe says only "it answers"; a replay says "it answers
+    // as well as the heuristic, and answers the same way twice". Only the second
+    // is grounds for trust, and `action-admission.ts` refuses a claim whose
+    // runtime is not trusted — so a cognition provider cannot grant itself what
+    // this withholds.
+    const { calls, seams } = cognitionHarness(async () => semanticResult("passed"));
+    const selection = await selectPredictionProvider({ ...seams, mode: "cognition", gate: "probe" });
+
+    expect(selection.provider.name).toBe("belief-rerank");
+    expect(selection.actionTrust).toBe("suggestion_only");
+    expect(calls.runSemanticGate).toBe(1);
+  });
+
+  it("declines with the measured failures when the gate fails", async () => {
+    const { calls, seams } = cognitionHarness(async () => semanticResult("failed", {
+      failures: ["top1_stability 0.533 < 1"],
+    }));
+    const selection = await selectPredictionProvider({ ...seams, mode: "cognition", gate: "replay" });
+
+    expect(selection.provider.name).toBe("heuristic");
+    expect(selection.declineReason).toBe("semantic gate failed: top1_stability 0.533 < 1");
+    expect(selection.actionTrust).toBe("trusted");
+    expect(calls.createCognition).toBe(0);
+  });
+
+  it("declines when the gate skips, because a skip is not a pass", async () => {
+    const { calls, seams } = cognitionHarness(async () => semanticResult("skipped", {
+      skipReason: "provider unavailable: belief service down",
+    }));
+    const selection = await selectPredictionProvider({ ...seams, mode: "cognition", gate: "replay" });
+
+    expect(selection.provider.name).toBe("heuristic");
+    expect(selection.declineReason)
+      .toBe("semantic gate skipped: provider unavailable: belief service down");
+    expect(calls.createCognition).toBe(0);
+  });
+
+  it("declines when the gate itself rejects", async () => {
+    const { calls, seams } = cognitionHarness(() =>
+      Promise.reject(new Error("fixture corpus missing")));
+    const selection = await selectPredictionProvider({ ...seams, mode: "cognition", gate: "replay" });
+
+    expect(selection.provider.name).toBe("heuristic");
+    expect(selection.declineReason).toBe("semantic gate could not run: fixture corpus missing");
+    expect(calls.createCognition).toBe(0);
   });
 });

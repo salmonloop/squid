@@ -50,6 +50,28 @@ export interface PredictionRuntimeIngestResult {
     readonly disposition: IngestDisposition;
     readonly state: WorldState;
     readonly baselinePredictions: readonly PredictionCandidate[];
+    /**
+     * Identity of the projection this ingest produced, and the event that
+     * triggered it — the same three values stamped onto the attempt record.
+     *
+     * Surfaced because a caller running a second predictor beside the live one
+     * cannot reconstruct any of them: a digest is not derivable from the state it
+     * digests, and the trigger id is `captured.eventId`, which is the *policy's*
+     * event rather than the one the caller handed in. Reading `event.eventId` from
+     * outside would agree only as long as no capture policy ever rewrites it — and
+     * on the day one did, a shadow record would point at a trigger the live record
+     * does not, so retention deletion would remove one and orphan the other.
+     */
+    readonly stateDigest: string;
+    readonly projectionGeneration: number;
+    readonly triggerEventId: string;
+    /**
+     * The instant the attempt record calls the trigger. Surfaced rather than
+     * re-derived because it falls back to the runtime's own clock when the
+     * projection has no `updatedAt`, so a caller computing it independently would
+     * disagree with the live record by however long the two calls were apart.
+     */
+    readonly triggeredAt: string;
   } | null;
   readonly prediction: Promise<PredictionOutcome> | null;
 }
@@ -173,13 +195,24 @@ export class PredictionRuntime {
       return { ingest: null, prediction: null };
     }
     const result = await this.core.ingest(captured);
+    // `captured.eventId`, not `event.eventId`: the capture policy is what decided
+    // which event entered history, so this is the id the attempt record carries and
+    // the id retention deletion will match on.
+    const ingest = {
+      ...result,
+      triggerEventId: captured.eventId,
+      // Resolved once, here, and reused by both the attempt record below and any
+      // caller running a second predictor: the fallback reads the clock, so two
+      // independent derivations would differ by however long they were apart.
+      triggeredAt: result.state.updatedAt ?? this.now().toISOString(),
+    };
     if (this.disposed || result.disposition === "duplicate") {
-      return { ingest: result, prediction: null };
+      return { ingest, prediction: null };
     }
     const context: AttemptContext = {
-      triggerEventId: captured.eventId,
+      triggerEventId: ingest.triggerEventId,
       episodeId: result.state.episode?.id ?? null,
-      triggeredAt: result.state.updatedAt ?? this.now().toISOString(),
+      triggeredAt: ingest.triggeredAt,
       runtimeSessionId: this.runtimeSessionId,
       stateDigest: result.stateDigest,
       projectionGeneration: result.projectionGeneration,
@@ -188,10 +221,20 @@ export class PredictionRuntime {
       actionTrust: this.actionTrust,
       egressPolicyId: this.egressPolicyId,
     };
-    const prediction = this.track(this.coordinator.request(result.state), context);
+    // The projection identity travels with the request, not only into the
+    // attempt record: a provider that has to prove it reasoned about this world
+    // — the belief layer — cannot reconstruct a digest from state alone, and
+    // fabricating one would let a stale batch validate.
+    const prediction = this.track(
+      this.coordinator.request(result.state, {
+        stateDigest: result.stateDigest,
+        projectionGeneration: result.projectionGeneration,
+      }),
+      context,
+    );
 
     return {
-      ingest: result,
+      ingest,
       prediction,
     };
   }

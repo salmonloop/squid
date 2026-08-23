@@ -22,8 +22,34 @@ import type { PredictionCandidate, WorldState } from "./protocol.js";
  * awaiting a second provider inline.
  */
 
+/**
+ * The projection and trigger a shadow run answered about.
+ *
+ * Grouped and passed in rather than reconstructed, because none of it can be
+ * recovered from world state alone — a digest is not derivable from the thing it
+ * digests, and which event triggered the ingest is a fact only the ingest knows.
+ * It travels back out on the observation so a shadow run is *self-describing*: an
+ * observation carries everything needed to audit it, with no side-channel map from
+ * request id to context that a caller would have to populate and clean up in the
+ * right order.
+ */
+export interface ShadowProjectionContext {
+  readonly triggerEventId: string;
+  readonly triggeredAt: string;
+  readonly triggerDisposition: "accepted" | "late";
+  readonly stateDigest: string;
+  readonly projectionGeneration: number;
+  readonly contextPolicyId: string;
+}
+
 export interface ShadowObservation {
   readonly requestId: string;
+  /** Name of the cognition provider that ran. Never a live provider's name. */
+  readonly shadowProvider: string;
+  /** Episode the shadow run answered about, from the projection. */
+  readonly episodeId: string;
+  /** Echoed so an observation can be audited without the caller's bookkeeping. */
+  readonly context: ShadowProjectionContext;
   /** What the live path actually produced. */
   readonly liveCandidates: readonly PredictionCandidate[];
   /** What the shadow path would have produced. Empty when it failed. */
@@ -82,9 +108,8 @@ export class ShadowCognitionRunner {
   public observe(input: {
     readonly outcome: PredictionOutcome;
     readonly worldState: WorldState;
-    readonly stateDigest: string;
-    readonly projectionGeneration: number;
-    readonly contextPolicyId: string;
+    /** The projection and trigger this outcome came from. Echoed on the observation. */
+    readonly context: ShadowProjectionContext;
     readonly eventOccurredAt: ReadonlyMap<string, string>;
   }): void {
     if (this.disposed) return;
@@ -117,9 +142,7 @@ export class ShadowCognitionRunner {
   private async run(input: {
     readonly outcome: PredictionOutcome;
     readonly worldState: WorldState;
-    readonly stateDigest: string;
-    readonly projectionGeneration: number;
-    readonly contextPolicyId: string;
+    readonly context: ShadowProjectionContext;
     readonly episodeId: string;
     readonly eventOccurredAt: ReadonlyMap<string, string>;
   }): Promise<void> {
@@ -131,9 +154,9 @@ export class ShadowCognitionRunner {
       id: this.random(),
       worldState: input.worldState,
       episodeId: input.episodeId,
-      stateDigest: input.stateDigest,
-      projectionGeneration: input.projectionGeneration,
-      contextPolicyId: input.contextPolicyId,
+      stateDigest: input.context.stateDigest,
+      projectionGeneration: input.context.projectionGeneration,
+      contextPolicyId: input.context.contextPolicyId,
       triggeredAt: input.worldState.updatedAt ?? new Date(startedAt).toISOString(),
     };
 
@@ -144,10 +167,15 @@ export class ShadowCognitionRunner {
     try {
       const produced = await this.beliefProvider.infer(request, controller.signal);
       const validated = validateBatchAgainstRequest(produced, request, {
-        now: this.now().toISOString(),
+        // The state's own time, not the wall clock: a belief is inferred at
+        // `triggeredAt` and expires a bounded interval after it, so validating a
+        // late-arriving observation against "now" would reject a batch that was
+        // valid for the world it described. Keeping it state-time also matches
+        // the live resolver, so shadow and live agree on what validates.
+        now: request.triggeredAt,
         currentEpisodeId: input.episodeId,
-        currentStateDigest: input.stateDigest,
-        currentProjectionGeneration: input.projectionGeneration,
+        currentStateDigest: input.context.stateDigest,
+        currentProjectionGeneration: input.context.projectionGeneration,
         eventOccurredAt: input.eventOccurredAt,
         maxTtlMs: BELIEF_LIMITS.maxTtlMs,
       });
@@ -191,6 +219,13 @@ export class ShadowCognitionRunner {
     const shadowTop = shadowCandidates[0]?.kind ?? null;
     this.onObservation({
       requestId: input.outcome.requestId,
+      // The cognition provider's own name, never the live provider's. A shadow
+      // record that borrowed the live name would make the two paths
+      // indistinguishable in the ledger, which is the one thing shadow mode has
+      // to keep apart.
+      shadowProvider: this.cognition.name,
+      episodeId: input.episodeId,
+      context: input.context,
       liveCandidates: input.outcome.candidates,
       shadowCandidates,
       beliefStatus,

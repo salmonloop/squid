@@ -3,9 +3,10 @@ import type { Predictor } from "./baseline-predictor.js";
 import type { PredictionProvider } from "./prediction-provider.js";
 import { SyncPredictorProvider } from "./prediction-provider.js";
 import type { ProviderGateResult } from "./provider-gate.js";
+import type { SemanticGateResult } from "./semantic-gate.js";
 import { PassthroughContextPolicy, RedactingContextPolicy, type ContextPolicy } from "./context-policy.js";
 
-export const providerModes = ["heuristic", "pi"] as const;
+export const providerModes = ["heuristic", "pi", "cognition"] as const;
 export type ProviderMode = (typeof providerModes)[number];
 
 export const providerGateModes = ["probe", "replay"] as const;
@@ -45,12 +46,35 @@ export interface ModelProviderOptions {
 }
 
 /**
+ * The belief-backed cognition path.
+ *
+ * Admitted only by the semantic gate, never by a probe. The distinction from `pi`
+ * is not politeness about a second model: a cognition provider *reorders what a
+ * user is offered*, so the question "is it reachable" is not the question that
+ * matters. What matters is whether it answers the same way twice on the same
+ * screen, and only a replay can establish that — see `runSemanticGate`, which
+ * refuses a provider whose top-1 answer moves between runs however well it scores
+ * on average.
+ */
+export interface CognitionProviderOptions {
+  readonly mode: "cognition";
+  readonly gate: ProviderGateMode;
+  /** Basis for the heuristic provider, used whenever cognition is not admitted. */
+  readonly heuristic: Predictor;
+  readonly createCognition: () => PredictionProvider;
+  readonly runSemanticGate: () => Promise<SemanticGateResult>;
+}
+
+/**
  * A union rather than one shape with optional model seams: the heuristic mode
  * needs no way to reach a model, so it must not be handed one. That is what lets
  * a caller in the default mode avoid even importing a model runtime — see
  * `watch-provider.ts`, where the Pi module graph is loaded lazily.
  */
-export type SelectPredictionProviderOptions = HeuristicProviderOptions | ModelProviderOptions;
+export type SelectPredictionProviderOptions =
+  | HeuristicProviderOptions
+  | ModelProviderOptions
+  | CognitionProviderOptions;
 
 export interface ProviderSelection {
   readonly provider: PredictionProvider;
@@ -88,7 +112,9 @@ export async function selectPredictionProvider(
     };
   }
 
-  const declineReason = await admitModelProvider(options);
+  const declineReason = options.mode === "pi"
+    ? await admitModelProvider(options)
+    : await admitCognitionProvider(options);
   if (declineReason !== null) {
     return {
       provider: heuristic,
@@ -98,8 +124,20 @@ export async function selectPredictionProvider(
     };
   }
   return {
-    provider: options.createPi(),
+    // Both admitted paths get the redacting policy, and for the same reason: a
+    // provider that reasons about the projection is an egress boundary whether it
+    // runs out of process or not. Cognition is in-process today, but the belief
+    // producer behind it is a seam a model is meant to fill — and a policy chosen
+    // by where the code happens to run would silently widen the moment it does.
+    provider: options.mode === "pi" ? options.createPi() : options.createCognition(),
     contextPolicy: new RedactingContextPolicy(),
+    // The same rule the model path uses, and it is the constraint issue #4 names:
+    // an un-gated provider stays `suggestion_only`, so nothing it proposes can be
+    // dispatched. A probe says only "it answers"; a replay says "it answers as
+    // well as the heuristic, and answers the same way twice". Only the second is
+    // grounds for trust — and `action-admission.ts` refuses a claim unless both
+    // the attempt and the runtime are trusted, so a provider cannot grant itself
+    // what this line withholds.
     actionTrust: options.gate === "replay" ? "trusted" : "suggestion_only",
     declineReason: null,
   };
@@ -124,11 +162,47 @@ async function admitModelProvider(options: ModelProviderOptions): Promise<string
   } catch (error) {
     return `replay gate could not run: ${describeErrorForAudit(error)}`;
   }
+  return readGateVerdict(result, "replay gate");
+}
 
+/**
+ * Returns `null` to admit the cognition provider, or the reason to decline it.
+ *
+ * There is no probe branch, and that asymmetry is deliberate. Reachability is the
+ * question worth asking about an out-of-process model, because the alternative to
+ * reaching it is silence. A cognition provider is *always* reachable — it reorders
+ * candidates the heuristic already produced — so a probe would admit every one of
+ * them while measuring nothing. The gate runs in both modes; what `gate` decides is
+ * only whether a pass earns dispatch trust.
+ */
+async function admitCognitionProvider(options: CognitionProviderOptions): Promise<string | null> {
+  let result: SemanticGateResult;
+  try {
+    result = await options.runSemanticGate();
+  } catch (error) {
+    return `semantic gate could not run: ${describeErrorForAudit(error)}`;
+  }
+  return readGateVerdict(result, "semantic gate");
+}
+
+/**
+ * The one reading of a gate result both paths share.
+ *
+ * Shared because the rule is the same rule, and stating it twice is how the two
+ * would drift: a skip is not a pass. An unreachable or unevaluated provider must
+ * not reach the real-time path just because nothing measured a regression against
+ * it — that is precisely how an unevaluated predictor gets to production.
+ */
+function readGateVerdict(
+  result: {
+    readonly status: "passed" | "failed" | "skipped";
+    readonly skipReason?: string;
+    readonly failures: readonly string[];
+  },
+  label: string,
+): string | null {
   if (result.status === "passed") return null;
-  // A skip is not a pass. An unreachable or unevaluated model must not reach the
-  // real-time path just because nothing measured a regression against it.
   return result.status === "skipped"
-    ? `replay gate skipped: ${result.skipReason ?? "no reason given"}`
-    : `replay gate failed: ${result.failures.join("; ") || "no failures reported"}`;
+    ? `${label} skipped: ${result.skipReason ?? "no reason given"}`
+    : `${label} failed: ${result.failures.join("; ") || "no failures reported"}`;
 }

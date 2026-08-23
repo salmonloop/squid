@@ -14,6 +14,7 @@ import { resolveCaptureExclusion } from "./capture-exclusion.js";
 import { SqliteEventStore } from "./sqlite-event-store.js";
 import { SquidCore } from "./squid-core.js";
 import type { ContextPolicy } from "./context-policy.js";
+import { PassthroughContextPolicy } from "./context-policy.js";
 import { SEARCH_EGRESS_DENY_ID, type EgressPolicy } from "./action-egress.js";
 
 /**
@@ -40,6 +41,23 @@ export interface WatchRuntime {
    * watched tree would otherwise feed its own writes back into the timeline.
    */
   readonly ledgerPath: string | undefined;
+  /**
+   * The policy every outgoing provider request was projected through.
+   *
+   * Exposed because a second predictor run beside the live one is a second egress,
+   * not an exception to the first: it has to project through the *same* policy, and
+   * name it, or the belief contract refuses its batches as
+   * `context_policy_mismatch` — and a shadow run whose beliefs are all refused
+   * measures the absence of a belief layer rather than the presence of one.
+   */
+  readonly contextPolicy: ContextPolicy;
+  /**
+   * The session id stamped on every attempt record this runtime writes. Generated
+   * here rather than by the caller so the sibling-file rule and the session
+   * identity are decided in the same place; surfaced so a shadow record can claim
+   * the same session as the live record it shadows.
+   */
+  readonly runtimeSessionId: string;
   /**
    * Drain in-flight predictions and ingests, then close durable sinks. Mirrors
    * the shutdown order the watch entries need: a prediction whose outcome has
@@ -106,13 +124,15 @@ export function createWatchRuntime(options: CreateWatchRuntimeOptions): WatchRun
   }
 
   const core = new SquidCore(store);
+  const contextPolicy = options.contextPolicy ?? new PassthroughContextPolicy();
+  const runtimeSessionId = `watch-${crypto.randomUUID()}`;
   const runtime = new PredictionRuntime(
     core,
     // The coordinator's own fallback default is the heuristic predictor, so a
     // provider that fails, times out, or is cancelled always lands somewhere.
     new PredictionCoordinator({
       provider: options.provider,
-      ...(options.contextPolicy === undefined ? {} : { contextPolicy: options.contextPolicy }),
+      contextPolicy,
     }),
     {
       ledger,
@@ -122,7 +142,7 @@ export function createWatchRuntime(options: CreateWatchRuntimeOptions): WatchRun
       // a credential cross the ingress boundary unredacted. Exclusion (when
       // configured) narrows further on top of this policy.
       capturePolicy: captureExclusion,
-      runtimeSessionId: `watch-${crypto.randomUUID()}`,
+      runtimeSessionId,
       ...(options.actionTrust === undefined ? {} : { actionTrust: options.actionTrust }),
       egressPolicyId: (options.egressPolicy ?? { id: SEARCH_EGRESS_DENY_ID }).id,
       ...(options.onDiagnostic !== undefined ? { onDiagnostic: options.onDiagnostic } : {}),
@@ -136,6 +156,8 @@ export function createWatchRuntime(options: CreateWatchRuntimeOptions): WatchRun
     ledger,
     databasePath,
     ledgerPath,
+    contextPolicy,
+    runtimeSessionId,
     async dispose() {
       await runtime.dispose();
       if (store instanceof SqliteEventStore) store.close();
