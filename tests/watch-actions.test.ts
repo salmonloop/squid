@@ -277,7 +277,7 @@ describe("resolveWatchActions", () => {
     expect(resolution).toHaveProperty("configError");
   });
 
-  it("requires terminal mode when a confirmation timeout is configured", async () => {
+  it("requires some confirmation mode when a confirmation timeout is configured", async () => {
     const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), {
       SQUID_ACTIONS: "mcp",
       SQUID_ACTIONS_MCP_COMMAND: "bun run server.ts",
@@ -292,6 +292,62 @@ describe("resolveWatchActions", () => {
       SQUID_ACTIONS_MCP_COMMAND: "bun run server.ts",
       SQUID_ACTION_CONFIRM: "terminal",
       SQUID_ACTION_WORKDIR: "relative/project",
+    });
+    expect(resolution).toHaveProperty("configError");
+  });
+
+  /**
+   * The graphical surface needs a spawnable command, and every one of these
+   * checks has to land before the MCP transport opens — an `unreachable`
+   * runtime and ledger are what prove that. A graphical mode that resolved far
+   * enough to open a server and only then discovered it had no window to draw
+   * in would leave a live connection behind with nothing able to confirm
+   * through it.
+   */
+  it("requires a graphical UI command for graphical confirmation", async () => {
+    const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), {
+      SQUID_ACTIONS: "mcp",
+      SQUID_ACTIONS_MCP_COMMAND: "bun run server.ts",
+      SQUID_ACTION_CONFIRM: "graphical",
+      SQUID_ACTION_WORKDIR: "/workspace",
+    });
+    expect(resolution).toHaveProperty("configError");
+  });
+
+  it("rejects a graphical UI command without graphical confirmation", async () => {
+    for (const confirmationMode of [undefined, "terminal"]) {
+      const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), {
+        SQUID_ACTIONS: "mcp",
+        SQUID_ACTIONS_MCP_COMMAND: "bun run server.ts",
+        SQUID_ACTION_WORKDIR: "/workspace",
+        SQUID_GRAPHICAL_UI_COMMAND: "squid-ui",
+        ...(confirmationMode === undefined ? {} : { SQUID_ACTION_CONFIRM: confirmationMode }),
+      });
+      expect(resolution).toHaveProperty("configError");
+    }
+  });
+
+  it("rejects a graphical UI command that would need a shell", async () => {
+    for (const command of ["squid-ui && echo nope", "squid-ui $HOME", "squid-ui `echo x`"]) {
+      const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), {
+        SQUID_ACTIONS: "mcp",
+        SQUID_ACTIONS_MCP_COMMAND: "bun run server.ts",
+        SQUID_ACTION_CONFIRM: "graphical",
+        SQUID_ACTION_WORKDIR: "/workspace",
+        SQUID_GRAPHICAL_UI_COMMAND: command,
+      });
+      expect(resolution).toMatchObject({
+        configError: expect.stringContaining("SQUID_GRAPHICAL_UI_COMMAND"),
+      });
+    }
+  });
+
+  it("requires a working directory for graphical confirmation", async () => {
+    const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), {
+      SQUID_ACTIONS: "mcp",
+      SQUID_ACTIONS_MCP_COMMAND: "bun run server.ts",
+      SQUID_ACTION_CONFIRM: "graphical",
+      SQUID_GRAPHICAL_UI_COMMAND: "squid-ui",
     });
     expect(resolution).toHaveProperty("configError");
   });
@@ -311,14 +367,14 @@ describe("resolveWatchActions", () => {
 
 describe("parseLiteralCommand", () => {
   it("preserves quoted arguments without starting a shell", () => {
-    expect(parseLiteralCommand('bun run "/tmp/server with spaces.ts"')).toEqual({
+    expect(parseLiteralCommand('bun run "/tmp/server with spaces.ts"', "SQUID_ACTIONS_MCP_COMMAND")).toEqual({
       command: "bun",
       args: ["run", "/tmp/server with spaces.ts"],
     });
   });
 
   it("rejects an empty executable", () => {
-    expect(parseLiteralCommand('\"\"')).toHaveProperty("configError");
+    expect(parseLiteralCommand('\"\"', "SQUID_ACTIONS_MCP_COMMAND")).toHaveProperty("configError");
   });
 
   it("rejects operators, variables, comments, and globs", () => {
@@ -329,7 +385,22 @@ describe("parseLiteralCommand", () => {
       "bun run *.ts",
       "bun run `echo server.ts`",
     ]) {
-      expect(parseLiteralCommand(command)).toHaveProperty("configError");
+      expect(parseLiteralCommand(command, "SQUID_ACTIONS_MCP_COMMAND")).toHaveProperty("configError");
+    }
+  });
+
+  /**
+   * More than one variable now holds a spawnable command. A config error that
+   * blames the wrong one sends the operator to edit a variable that is already
+   * correct, so the message has to name the variable the value came from.
+   */
+  it("blames the variable the command came from", () => {
+    for (const rejected of ["", "bun run `echo ui`", "bun run $HOME/ui"]) {
+      const result = parseLiteralCommand(rejected, "SQUID_GRAPHICAL_UI_COMMAND");
+      expect(result).toHaveProperty("configError");
+      const { configError } = result as { readonly configError: string };
+      expect(configError).toContain("SQUID_GRAPHICAL_UI_COMMAND");
+      expect(configError).not.toContain("SQUID_ACTIONS_MCP_COMMAND");
     }
   });
 });
