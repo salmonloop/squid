@@ -41,11 +41,16 @@ export type AdmitAndClaimResult =
  * await a provider or keep ingestion responsive while the provider runs.
  */
 export interface PredictionRuntimeIngestResult {
+  /**
+   * Null when the capture policy excluded the event before the store. The
+   * caller learns only that nothing was recorded — which event was refused,
+   * and why, is exactly the information exclusion must not surface.
+   */
   readonly ingest: {
     readonly disposition: IngestDisposition;
     readonly state: WorldState;
     readonly baselinePredictions: readonly PredictionCandidate[];
-  };
+  } | null;
   readonly prediction: Promise<PredictionOutcome> | null;
 }
 
@@ -159,10 +164,14 @@ export class PredictionRuntime {
   private async ingestInternal(event: ActivityEvent): Promise<PredictionRuntimeIngestResult> {
     this.assertOpen();
     // Capture is the irreversible boundary: this is the last chance to strip
-    // credential content before `core.ingest` writes the event to history. The
-    // captured event — not the input — is what flows into the store and what
-    // the ledger record references, so a redacted marker persists across replay.
+    // credential content before `core.ingest` writes the event to history. A
+    // null verdict means the policy excluded the event outright — the user's
+    // capture policy refused it, and nothing about it (no stub, no marker)
+    // enters history. The refusal is silent by design; see ExcludingCapturePolicy.
     const captured = this.capturePolicy.capture(event);
+    if (captured === null) {
+      return { ingest: null, prediction: null };
+    }
     const result = await this.core.ingest(captured);
     if (this.disposed || result.disposition === "duplicate") {
       return { ingest: result, prediction: null };

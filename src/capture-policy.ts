@@ -26,13 +26,18 @@ import {
 export interface CapturePolicy {
   readonly id: string;
   /**
-   * Returns the event to ingest. Credential content is replaced with
-   * `"[redacted]"` and the event is marked `redacted: true` so a replay can tell
-   * a filtered value apart from a literal one. An event with no detected
-   * credential content is returned unchanged (a clone, never the input by
-   * reference).
+   * Returns the event to ingest, or null to refuse it entirely.
+   *
+   * Redaction replaces credential content with `"[redacted]"` and marks the
+   * event `redacted: true` so a replay can tell a filtered value apart from a
+   * literal one; an event with no detected credential content is returned
+   * unchanged (a clone, never the input by reference). Null is the exclusion
+   * verdict: the user asked for this application not to be in history at all,
+   * so even the structural fact of the event is dropped — see
+   * `ExcludingCapturePolicy`. A policy that returns null must be able to
+   * justify it from configuration, never from a parse failure.
    */
-  capture(event: ActivityEvent): ActivityEvent;
+  capture(event: ActivityEvent): ActivityEvent | null;
 }
 
 const REDACTED = "[redacted]";

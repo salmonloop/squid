@@ -57,6 +57,10 @@ bun run watch:screen
 - `src/editor-save-source.ts` — the `EditorSaveReader` seam and the adapter that projects an editor's own save reports onto `file_saved` events with `source.kind: "ide"`. This is the source issue #7 asked for and the only one that reports *ownership* rather than observation: the editor names itself as writer, so its saves carry a real `applicationId` and satisfy `admitRunTests`'s unchanged equality check. Frames are refused, never repaired — no pid, no event.
 - `src/editor-save-reader-fifo.ts` — reads one save report per line from a path an editor extension appends to, mirroring the terminal FIFO: append-only, so a crashed plugin costs one lost report rather than a broken editor. The module doc carries a working VS Code extension snippet.
 - `src/resolve-editor-save-reader.ts` — resolves `SQUID_EDITOR_SAVES` / `SQUID_EDITOR_FIFO` / `SQUID_EDITOR_POLL_MS`. Off by default like every capability variable: an editor speaking for itself is the strongest ownership claim in the system, so a run gets it by asking.
+- `src/capture-exclusion.ts` — `ExcludingCapturePolicy`, per-application exclusion at the ingress boundary wrapping `RedactingCapturePolicy`. A matched event is dropped outright and diagnostics carry counts only — recording "excluded app X" would recreate what the user asked to hide. `resolveCaptureExclusion` fails closed on a malformed list.
+- `src/capture-gate-source.ts` — the `CaptureGateReader` seam and the adapter projecting control commands onto `capture_gate_changed`. The pause event is the trace that makes a deliberate gap distinguishable from an idle machine.
+- `src/capture-gate-reader-fifo.ts` — reads one gate command per line from a path a shell alias appends to, mirroring the other FIFOs: append-only, so a crashed control script costs one lost command rather than a broken watcher.
+- `src/resolve-capture-gate.ts` — resolves `SQUID_CONTROL` / `SQUID_CONTROL_FIFO` / `SQUID_CONTROL_POLL_MS`. Off by default; enabling it is declaring this run can be controlled, which is worth asking for.
 - `src/watch-desktop.ts` — the only entry point that observes more than one part of the desktop: filesystem saves, foreground window text, and (opt-in) browser pages into one core.
 - `src/watch-files.ts` — live filesystem ingestion entry point; durable when `SQUID_DB` is set.
 - `src/watch-screen.ts` — live foreground-window-text ingestion entry point; picks a reader backend from `SQUID_SCREEN_READER`.
@@ -315,6 +319,21 @@ if (fifo) workspace.onDidSaveTextDocument((document) => {
 
 One admission heuristic moved from ids to names to make real runs possible at all: "is this a coding application" is now decided on the application's *name*, never its id. On macOS the id is a bare unix pid ("4242"), which cannot carry the signal — matching on it made every live run fail regardless of what was in front. Ownership equality still compares ids exactly as before; only the kind-of-application question changed, and it changed toward the field that actually describes what an application is.
 
+### Capture policy: exclusion and pause
+
+Capture is irreversible by design — once an event is ingested it is history — so both user-facing controls act at the ingress boundary, before the store.
+
+**Per-application exclusion.** `SQUID_EXCLUDE` names applications as a comma-separated list (`SQUID_EXCLUDE=1Password,Banking`). A matched event is dropped outright: not redacted, *absent* — even the structural fact that something happened would recreate the record being hidden, so the timeline shows a plain gap where excluded activity was, and diagnostics report counts only. Matching is case-insensitive against the application **name**, never the platform id (on macOS a pid no user can write a rule against). Exclusion composes with redaction rather than replacing it: `ExcludingCapturePolicy` wraps `RedactingCapturePolicy`, so every kept event is still redacted exactly as before and no bypass can appear by construction. A malformed list (an empty entry) fails startup rather than falling back to capturing everything — capture is the one boundary that cannot undo.
+
+**Pause.** `SQUID_CONTROL=fifo SQUID_CONTROL_FIFO=/absolute/path` starts the gate source. A shell alias appends one JSON command per line:
+
+```sh
+squid-pause()  { echo '{"op":"pause"}'  >> "$SQUID_CONTROL_FIFO"; }
+squid-resume() { echo '{"op":"resume"}' >> "$SQUID_CONTROL_FIFO"; }
+```
+
+Each command becomes a durable `capture_gate_changed` event in the timeline, and the projection keeps the last gate position in `WorldState.captureGate` — global across episodes, so a pause that outlives the episode gap still reads as paused after it. That event is what makes a deliberate gap distinguishable from an idle machine; without it, silence between two stretches of activity is ambiguous and any later analysis reads it wrong. An unknown or malformed command is refused with a diagnostic that names nothing but the failure itself.
+
 ## Replay evaluation
 
 `bun run evaluate` runs the heuristic predictor against the versioned synthetic scenarios in `src/evaluation-fixtures.ts` and prints a deterministic JSON report.
@@ -392,7 +411,7 @@ Tracked as issues; the entry-point table under [Dispatching actions](#which-entr
 - Overlay / suggestion UI. The only way to see or answer a suggestion is a terminal prompt.
 - A capability mapping for `draft_completion`. It is the one predicted kind with no action: writing text into someone's editor needs an IDE integration that can place it, and a confirmation surface that can show it in place.
 - `BeliefState` beyond its validated contract. `src/belief-state.ts` defines and fail-closed-validates a belief batch (`task_intent`, evidence, TTL, episode/digest/generation agreement), but nothing produces or consumes one yet: there is no belief provider, no store, and no runtime wiring. The next phase must land `BeliefProvider`, `CognitionProvider`, a semantic gate, and shadow/suggestion mode together — a prompt change alone would not be it.
-- Capture-time privacy policy beyond credential redaction. `RedactingCapturePolicy` already filters credential content at the ingress boundary in `PredictionRuntime`, and every watch entry point enables it; `ContextPolicy` separately covers provider egress. What is missing is user-facing policy — per-application exclusions, pause, and retention.
+- Capture-time privacy policy beyond credential redaction and exclusion/pause. `RedactingCapturePolicy` filters credential content, `SQUID_EXCLUDE` drops named applications outright, and the `SQUID_CONTROL` gate records pauses into the timeline; what remains is **retention** — bounded history with a stated policy, and range deletion that also reaches the ledger so no attempt survives without its trigger event.
 
 ## Archived documents
 

@@ -10,6 +10,7 @@ import {
   type PredictionRuntimeDiagnostic,
 } from "./prediction-runtime.js";
 import { RedactingCapturePolicy } from "./capture-policy.js";
+import { resolveCaptureExclusion } from "./capture-exclusion.js";
 import { SqliteEventStore } from "./sqlite-event-store.js";
 import { SquidCore } from "./squid-core.js";
 import type { ContextPolicy } from "./context-policy.js";
@@ -70,6 +71,12 @@ export interface CreateWatchRuntimeOptions {
    * `egress_policy_mismatch`, including kinds that have nothing to do with egress.
    */
   readonly egressPolicy?: EgressPolicy;
+  /**
+   * Raw `SQUID_EXCLUDE` value: comma-separated application names to drop at
+   * capture, before the store. Resolved here so a malformed list fails the
+   * run before any sink opens rather than silently capturing everything.
+   */
+  readonly excludeApplications?: string;
   /** Forwards non-fatal runtime diagnostics; omitted in tests. */
   readonly onDiagnostic?: (diagnostic: PredictionRuntimeDiagnostic) => void;
 }
@@ -89,6 +96,15 @@ export function createWatchRuntime(options: CreateWatchRuntimeOptions): WatchRun
     ? new InMemoryPredictionLedger()
     : new SqlitePredictionLedger(ledgerPath);
 
+  // Capture composes here, once per process: exclusion wraps redaction, so an
+  // excluded event is dropped and every kept one is still redacted. A malformed
+  // exclusion list is a startup error — the caller resolves before any sink
+  // opens.
+  const captureExclusion = resolveCaptureExclusion(options.excludeApplications);
+  if ("configError" in captureExclusion) {
+    throw new TypeError(captureExclusion.configError);
+  }
+
   const core = new SquidCore(store);
   const runtime = new PredictionRuntime(
     core,
@@ -103,8 +119,9 @@ export function createWatchRuntime(options: CreateWatchRuntimeOptions): WatchRun
       // The durable path persists events, so capture redacts credential
       // content before it reaches the store — the same opt-in posture as the
       // ledger. The in-memory path redacts too; there is no reason to ever let
-      // a credential cross the ingress boundary unredacted.
-      capturePolicy: new RedactingCapturePolicy(),
+      // a credential cross the ingress boundary unredacted. Exclusion (when
+      // configured) narrows further on top of this policy.
+      capturePolicy: captureExclusion,
       runtimeSessionId: `watch-${crypto.randomUUID()}`,
       ...(options.actionTrust === undefined ? {} : { actionTrust: options.actionTrust }),
       egressPolicyId: (options.egressPolicy ?? { id: SEARCH_EGRESS_DENY_ID }).id,

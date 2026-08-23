@@ -53,11 +53,12 @@ export interface WatchSessionOptions {
    * One stdout line per ingested event. Read the projection (`result.ingest.state`)
    * rather than `event.payload`: the projection is built from the *captured*
    * event, so anything the capture policy redacted stays redacted, and a raw
-   * payload could print a window title holding a credential.
+   * payload could print a window title holding a credential. Only called for
+   * events that survived capture — an excluded event never reaches here.
    */
   readonly describeEvent: (
     event: ActivityEvent,
-    result: PredictionRuntimeIngestResult,
+    result: PredictionRuntimeIngestResult & { readonly ingest: NonNullable<PredictionRuntimeIngestResult["ingest"]> },
   ) => Record<string, string | number | boolean | null>;
   /** Entry-point-specific fields merged into the startup line. */
   readonly banner?: Record<string, string | number | boolean | null>;
@@ -120,6 +121,9 @@ export async function startWatchSession(
     contextPolicy: resolved.selection.contextPolicy,
     actionTrust: resolved.selection.actionTrust,
     egressPolicy: egress,
+    // Resolved inside createWatchRuntime, but the raw value passes through so
+    // a malformed list fails this startup rather than silently capturing all.
+    ...(env.SQUID_EXCLUDE === undefined ? {} : { excludeApplications: env.SQUID_EXCLUDE }),
     onDiagnostic: (diagnostic) => {
       logError(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
     },
@@ -167,7 +171,18 @@ export async function startWatchSession(
 
   const ingest = async (event: ActivityEvent): Promise<void> => {
     const result = await watch.runtime.ingest(event);
-    log(JSON.stringify(options.describeEvent(event, result)));
+    // A capture-policy exclusion lands here as ingest === null: the event was
+    // refused before the store, and the log line says exactly that and nothing
+    // more — naming the event would record what the user asked to hide.
+    if (result.ingest === null) {
+      log(JSON.stringify({ kind: event.kind, disposition: "excluded" }));
+      return;
+    }
+    // Narrowed for the callback below, which also reads the disposition.
+    const ingested = result as PredictionRuntimeIngestResult & {
+      readonly ingest: NonNullable<PredictionRuntimeIngestResult["ingest"]>;
+    };
+    log(JSON.stringify(options.describeEvent(event, ingested)));
     if (result.prediction === null) return;
     void result.prediction.then(async (outcome) => {
       log(JSON.stringify({
@@ -180,7 +195,7 @@ export async function startWatchSession(
       const dispatched = await actions.dispatchTopCandidate(
         outcome,
         outcome.candidates,
-        result.ingest.disposition,
+        ingested.ingest.disposition,
       );
       if (dispatched === null) return;
       // Status and reason codes only: gateway text may echo user content, so
