@@ -2,3 +2,7 @@ node_modules/
 dist/
 data/
 *.log
+# Build output of the Rust confirmation window in `ui/`. Its Cargo.lock *is*
+# tracked: the binary that turns a click into permission to run a command should
+# build from the same dependency graph on every machine.
+ui/target/
