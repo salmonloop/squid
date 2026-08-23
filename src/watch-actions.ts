@@ -6,10 +6,8 @@ import {
   CapabilityDispatcher,
   type DispatchOutcome,
 } from "./capability-gateway.js";
-import {
-  TerminalActionConfirmation,
-  type ActionConfirmationPolicy,
-} from "./action-confirmation.js";
+import type { ActionConfirmationPolicy } from "./action-confirmation.js";
+import { createTerminalActionConfirmation } from "./confirmation-surface-terminal.js";
 import {
   isPlanFailure,
   planAction,
@@ -149,8 +147,8 @@ export async function resolveWatchActions(
     client,
     ...(workingDirectory === undefined ? {} : { workingDirectory }),
   });
-  const confirmation = confirmationMode === "terminal"
-    ? new TerminalActionConfirmation(timeoutMs === undefined ? {} : { timeoutMs })
+  const confirmation: ActionConfirmationPolicy | undefined = confirmationMode === "terminal"
+    ? createTerminalActionConfirmation(timeoutMs === undefined ? {} : { timeoutMs })
     : undefined;
   const dispatcher = new CapabilityDispatcher({
     runtime,
