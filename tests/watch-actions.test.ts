@@ -22,10 +22,12 @@ import { PredictionRuntime } from "../src/prediction-runtime.js";
 import { createActivityEvent, type ActivityEvent, type PredictionCandidate } from "../src/protocol.js";
 import { SquidCore } from "../src/squid-core.js";
 import {
+  createConfirmation,
   dispatchTopCandidate,
   parseLiteralCommand,
   resolveWatchActions,
 } from "../src/watch-actions.js";
+import type { CapabilityActionPlan } from "../src/action-plan.js";
 
 const SESSION = "watch-session";
 const ALLOW: EgressPolicy = { id: SEARCH_EGRESS_ALLOW_ID, searchEgress: "allow" };
@@ -362,6 +364,99 @@ describe("resolveWatchActions", () => {
       });
       expect(resolution).toHaveProperty("configError");
     }
+  });
+});
+
+/**
+ * The mapping from a validated mode to a live surface.
+ *
+ * Every `resolveWatchActions` test above asserts a config *error*, because a
+ * successful resolution opens an MCP transport and these tests deliberately pass
+ * unreachable dependencies. That left the mapping itself unexercised: a swapped
+ * branch would have produced a terminal prompt for `graphical` and no test would
+ * have noticed. `createConfirmation` is where the mapping lives, so it is tested
+ * where it can be observed — including through a real spawned process.
+ */
+describe("createConfirmation", () => {
+  const plan: CapabilityActionPlan = {
+    kind: "run_tests",
+    tool: "run_command",
+    arguments: { command: "cd /workspace && bun test" },
+    summary: "cd /workspace && bun test",
+    confirmation: "required",
+  };
+  const request = { candidateId: "req:candidate:0", plan, expiresAt: "2030-01-01T00:01:00.000Z" };
+  const stub = `${import.meta.dir}/fixtures/graphical-ui/stub.mjs`;
+
+  it("builds the terminal surface for terminal mode", () => {
+    const policy = createConfirmation({ mode: "terminal" });
+    expect(policy.surfaceId).toBe("terminal");
+  });
+
+  it("builds the graphical surface for graphical mode", () => {
+    const policy = createConfirmation({ mode: "graphical", command: "squid-ui", args: [] });
+    expect(policy.surfaceId).toBe("graphical");
+  });
+
+  // The end-to-end path a `SQUID_ACTION_CONFIRM=graphical` run takes: mode to
+  // surface to transport to a spawned process, one prompt over the wire, one
+  // correlated answer back, one decision. Each layer has its own tests; this is
+  // the one that fails if they are correct individually and misconnected.
+  it("carries a real prompt to a spawned process and back", async () => {
+    const policy = createConfirmation({
+      mode: "graphical",
+      command: process.execPath,
+      args: [stub, "approve"],
+    });
+    expect(await policy.confirm(request)).toEqual({
+      outcome: "accepted",
+      reason: "user_accepted",
+    });
+    await policy.close?.();
+  });
+
+  it("refuses when the spawned UI declines", async () => {
+    const policy = createConfirmation({
+      mode: "graphical",
+      command: process.execPath,
+      args: [stub, "decline"],
+    });
+    expect(await policy.confirm(request)).toEqual({
+      outcome: "rejected",
+      reason: "user_rejected",
+    });
+    await policy.close?.();
+  });
+
+  // A missing binary is the likeliest production failure — the Rust crate is not
+  // built, or the path is wrong. It must read as a closed surface, never as
+  // consent, and the timeout must not be what discovers it.
+  it("fails closed when the UI binary does not exist", async () => {
+    const policy = createConfirmation({
+      mode: "graphical",
+      command: `${import.meta.dir}/fixtures/graphical-ui/no-such-binary`,
+      args: [],
+    });
+    expect(await policy.confirm(request)).toEqual({
+      outcome: "rejected",
+      reason: "input_closed",
+    });
+    await policy.close?.();
+  });
+
+  // The engine's own deadline, reached through the graphical surface rather than
+  // a stub transport: a UI that reads the prompt and never answers is a timeout,
+  // and `close()` has to reach the still-running child through two layers.
+  it("times out a UI that never answers, and closes it", async () => {
+    const policy = createConfirmation(
+      { mode: "graphical", command: process.execPath, args: [stub, "silent"] },
+      { timeoutMs: 40 },
+    );
+    expect(await policy.confirm(request)).toEqual({
+      outcome: "rejected",
+      reason: "timed_out",
+    });
+    await policy.close?.();
   });
 });
 

@@ -6,7 +6,7 @@ import {
   CapabilityDispatcher,
   type DispatchOutcome,
 } from "./capability-gateway.js";
-import type { ActionConfirmationPolicy } from "./action-confirmation.js";
+import type { ActionConfirmationPolicy, SerialConfirmationPolicy } from "./action-confirmation.js";
 import { createTerminalActionConfirmation } from "./confirmation-surface-terminal.js";
 import { createGraphicalActionConfirmation } from "./confirmation-surface-graphical.js";
 import { createStdioGraphicalTransport } from "./graphical-transport-stdio.js";
@@ -38,6 +38,58 @@ export interface WatchActionsResolution {
 export type LiteralCommandParseResult =
   | { readonly command: string; readonly args: readonly string[] }
   | { readonly configError: string };
+
+/**
+ * Which surface will ask the question, and everything that surface needs.
+ *
+ * A union rather than a mode string beside an optional command, because those
+ * two fields have an invariant between them — a graphical mode with nothing to
+ * spawn is not a configuration, it is a bug — and an invariant a comment asserts
+ * is one a later edit can break. Here it is unrepresentable.
+ */
+export type ConfirmationSurfaceChoice =
+  | { readonly mode: "terminal" }
+  | { readonly mode: "graphical"; readonly command: string; readonly args: readonly string[] };
+
+/**
+ * Builds the confirmation engine for one surface choice.
+ *
+ * Exported separately from `resolveWatchActions` so the mode→surface mapping is
+ * observable on its own: that function opens an MCP transport several steps
+ * before it reaches this decision, so a test of *this* would otherwise have to
+ * spawn a server to watch it happen.
+ *
+ * Both modes compose the same engine — `SerialConfirmationPolicy` — over a
+ * different surface. Serialization, the double expiry check, and every
+ * fail-closed reason therefore stay in one place instead of forking per surface,
+ * and a new surface cannot arrive with its own idea of what a timeout means.
+ *
+ * The graphical process is spawned lazily by the transport, on the first prompt.
+ * Constructing a policy must not open a window: configuration resolution runs at
+ * startup, long before anything is worth confirming.
+ *
+ * Returns the concrete engine rather than the `ActionConfirmationPolicy` port,
+ * because both branches do and `surfaceId` is the only way to see from outside
+ * which surface a mode actually produced.
+ */
+export function createConfirmation(
+  choice: ConfirmationSurfaceChoice,
+  options: { readonly timeoutMs?: number } = {},
+): SerialConfirmationPolicy {
+  const timeout = options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs };
+  switch (choice.mode) {
+    case "terminal":
+      return createTerminalActionConfirmation(timeout);
+    case "graphical":
+      return createGraphicalActionConfirmation({
+        transport: createStdioGraphicalTransport({
+          command: choice.command,
+          args: [...choice.args],
+        }),
+        ...timeout,
+      });
+  }
+}
 
 /**
  * Parses a command line without invoking a shell or expanding variables.
@@ -145,7 +197,8 @@ export async function resolveWatchActions(
   if (graphicalCommand !== undefined && confirmationMode !== "graphical") {
     return { configError: "SQUID_GRAPHICAL_UI_COMMAND requires SQUID_ACTION_CONFIRM=graphical." };
   }
-  let parsedGraphicalCommand: { readonly command: string; readonly args: readonly string[] } | undefined;
+  let surfaceChoice: ConfirmationSurfaceChoice | undefined =
+    confirmationMode === "terminal" ? { mode: "terminal" } : undefined;
   if (confirmationMode === "graphical") {
     if (graphicalCommand === undefined || graphicalCommand.length === 0) {
       return { configError: "SQUID_ACTION_CONFIRM=graphical requires SQUID_GRAPHICAL_UI_COMMAND." };
@@ -154,7 +207,7 @@ export async function resolveWatchActions(
     if ("configError" in parsed) {
       return parsed;
     }
-    parsedGraphicalCommand = parsed;
+    surfaceChoice = { mode: "graphical", command: parsed.command, args: parsed.args };
   }
   const workingDirectory = env.SQUID_ACTION_WORKDIR ?? options.workingDirectory;
   if (workingDirectory !== undefined && !isAbsolute(workingDirectory)) {
@@ -187,23 +240,10 @@ export async function resolveWatchActions(
     client,
     ...(workingDirectory === undefined ? {} : { workingDirectory }),
   });
-  // Both modes compose the same engine — `SerialConfirmationPolicy` — over a
-  // different surface, so serialization, the double expiry check, and every
-  // fail-closed reason stay in one place instead of forking per surface.
-  // `parsedGraphicalCommand` is defined exactly when the mode is graphical:
-  // the validation above already refused every other combination.
   const confirmation: ActionConfirmationPolicy | undefined =
-    confirmationMode === "terminal"
-      ? createTerminalActionConfirmation(timeoutMs === undefined ? {} : { timeoutMs })
-      : parsedGraphicalCommand === undefined
-        ? undefined
-        : createGraphicalActionConfirmation({
-            transport: createStdioGraphicalTransport({
-              command: parsedGraphicalCommand.command,
-              args: [...parsedGraphicalCommand.args],
-            }),
-            ...(timeoutMs === undefined ? {} : { timeoutMs }),
-          });
+    surfaceChoice === undefined
+      ? undefined
+      : createConfirmation(surfaceChoice, timeoutMs === undefined ? {} : { timeoutMs });
   const dispatcher = new CapabilityDispatcher({
     runtime,
     gateway,
