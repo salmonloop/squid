@@ -18,14 +18,57 @@ describe("resolveBrowserReader", () => {
   it("enables the synthetic backend on the exact value", async () => {
     const resolved = await resolveBrowserReader({ env: { SQUID_BROWSER: "synthetic" } });
     if ("configError" in resolved) throw new Error(resolved.configError);
-    expect(resolved.enabled).toBe(true);
+    expect(resolved.readerKind).toBe("synthetic");
+  });
+
+  it("refuses the darwin backend off macOS", async () => {
+    // The screen reader's rule applies here too: asking for real observation on
+    // a host that cannot provide it must fail startup, because a run that got
+    // quiet nothing would look identical to one that works.
+    for (const platform of ["linux", "win32"] as const) {
+      const resolved = await resolveBrowserReader({
+        env: { SQUID_BROWSER: "darwin" },
+        platform,
+      });
+      expect("configError" in resolved && resolved.configError).toContain("requires macOS");
+    }
+  });
+
+  /**
+   * Only the refusal path is exercised off macOS. `createMacosBrowserPageReader`
+   * carries its own `process.platform` assertion and throws when constructed on
+   * another host, so the accept path cannot be faked by injecting `platform` —
+   * and mocking the module would test a factory this machine can never run.
+   * The darwin backend is verified by hand with `SQUID_BROWSER=darwin`, the
+   * same posture the README states for the accessibility screen reader.
+   */
+  it.skipIf(process.platform !== "darwin")("accepts the darwin backend on macOS", async () => {
+    const resolved = await resolveBrowserReader({
+      env: { SQUID_BROWSER: "darwin" },
+      platform: "darwin",
+    });
+    if ("configError" in resolved) throw new Error(resolved.configError);
+    expect(resolved.readerKind).toBe("darwin");
+  });
+
+  it("rejects a bad poll interval before choosing a backend", async () => {
+    // Ordering matters: an invalid interval must be reported as itself, not
+    // masked by a platform refusal that happens to come from the same call.
+    const resolved = await resolveBrowserReader({
+      env: { SQUID_BROWSER: "darwin", SQUID_BROWSER_POLL_MS: "0" },
+      platform: "darwin",
+    });
+    expect("configError" in resolved && resolved.configError).toContain("SQUID_BROWSER_POLL_MS");
   });
 
   it("rejects near-miss values as config errors rather than defaulting", async () => {
     // Same three-outcome rule as SQUID_SEARCH_EGRESS: a typo must fail startup,
     // not silently leave browser observation off and look like a working setup.
-    for (const value of ["Synthetic", "SYNTHETIC", "on", "true", "", "synthetic "]) {
-      const resolved = await resolveBrowserReader({ env: { SQUID_BROWSER: value } });
+    for (const value of ["Synthetic", "SYNTHETIC", "Darwin", "on", "true", "", "synthetic ", "chrome"]) {
+      const resolved = await resolveBrowserReader({
+        env: { SQUID_BROWSER: value },
+        ...(value === "Darwin" ? { platform: "darwin" as const } : {}),
+      });
       expect("configError" in resolved).toBe(true);
     }
   });

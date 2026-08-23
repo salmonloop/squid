@@ -51,6 +51,7 @@ bun run watch:screen
 - `src/terminal-command-reader-fifo.ts` — reads one JSON completion per line from a path a shell hook appends to. A file rather than a wrapper process, so a crashed integration cannot take the user's terminal with it; the hook writes and moves on. Handles partial writes, truncation, and a not-yet-created file. The module doc carries a working zsh hook.
 - `src/resolve-terminal-reader.ts` — resolves `SQUID_TERMINAL` / `SQUID_TERMINAL_FIFO` / `SQUID_TERMINAL_POLL_MS`. Off by default: observing a shell is a capability a run asks for.
 - `src/browser-page-source.ts` — the `BrowserPageReader` backend seam, the neutral `BrowserPageFrame` shape, and the adapter that projects frames onto `browser_navigated` events. This is the source `search_selection` was blocked on: `admitSearch` needs a current browser page, and nothing could produce one. A frame whose URL yields no host is refused rather than given an invented host, and a backend that cannot tell which window owns a tab omits the owner instead of guessing — the reducer then drops a non-matching owner and the next focus change discards the page, so a wrong owner cannot defeat admission.
+- `src/browser-page-reader-macos.ts` — macOS accessibility backend over `osascript`: owning pid, window title, active-tab URL in one poll. Real, darwin-only, not exercised by the offline suite; the parser is.
 - `src/browser-page-reader-synthetic.ts` — scripted page replay backend plus a demo script whose owner matches the screen demo's final window. Zero browser calls, so the search path is demonstrable anywhere.
 - `src/resolve-browser-reader.ts` — resolves `SQUID_BROWSER` / `SQUID_BROWSER_POLL_MS`. Defaults to **off**, unlike the screen reader: browser observation is what makes search reachable, so a run opts in.
 - `src/watch-desktop.ts` — the only entry point that observes more than one part of the desktop: filesystem saves, foreground window text, and (opt-in) browser pages into one core.
@@ -268,7 +269,13 @@ bun run watch:desktop -- /absolute/project/root
 SQUID_BROWSER=synthetic bun run watch:desktop -- /absolute/project/root frames.json pages.json
 ```
 
-`SQUID_BROWSER` has the same three outcomes as `SQUID_SEARCH_EGRESS`: unset means no browser source, exactly `synthetic` replays scripted pages, anything else is a startup configuration error. `SQUID_BROWSER_POLL_MS` sets the sampling cadence.
+`SQUID_BROWSER` has the same three outcomes as `SQUID_SEARCH_EGRESS`: unset means no browser source, exactly `synthetic` or exactly `darwin` selects a backend, and anything else is a startup configuration error. `synthetic` replays scripted pages; `darwin` reads the foreground browser's active-tab URL through the macOS accessibility channel — no extension, no restart, no debug port — covering Chromium browsers and Safari (Firefox exposes neither an AppleScript nor an accessibility URL and stays quiet). `darwin` is refused at startup off macOS, like the screen reader's equivalent. `SQUID_BROWSER_POLL_MS` sets the sampling cadence for both backends.
+
+The darwin backend is not testable in CI — it needs a Mac with automation grants, which macOS prompts for once per browser. Its parser is unit-tested; verify the subprocess half by hand:
+
+```bash
+SQUID_BROWSER=darwin bun run watch:desktop -- /absolute/project/root
+```
 
 One gap remains, and it is an honest refusal rather than a bug in the check:
 
@@ -341,7 +348,7 @@ Tests use `bun:test`. The test suite covers:
 - `createFifoTerminalCommandReader`: relative paths refused at construction, one completion per line, a partial write held rather than parsed, a malformed line skipped without reporting its content, a missing exit code passed through as unknown, a not-yet-created file staying quiet, truncation restarting from the beginning, content written before start still read, and no delivery after close — including a read already in flight when close lands.
 - `inspect_error` planning and admission: the project script for each re-runnable class, classes deliberately excluded (`install`, `vcs`, `container`, `other`, `build`) refused, unknown or non-string classes refused, an absolute resolvable workdir required, the canonical root quoted, digest stability, and admission refusing on a missing outcome, a succeeded command, a different failing class, and every general identity check.
 
-Source tests inject a fake watcher, file probe, and screen-text reader, so they never depend on kernel watch timing, an accessibility API, or a subprocess. Session tests use scripted sources for the same reason: what is under test is the wiring, not any backend. Real-watcher behavior is verified by the `bun run watch:files` smoke run in the release gate, and multi-source ingestion by a `bun run watch:desktop` run against a temporary root; the macOS accessibility backend is verified by hand with `SQUID_SCREEN_READER=darwin bun run watch:screen`.
+Source tests inject a fake watcher, file probe, and screen-text reader, so they never depend on kernel watch timing, an accessibility API, or a subprocess. Session tests use scripted sources for the same reason: what is under test is the wiring, not any backend. Real-watcher behavior is verified by the `bun run watch:files` smoke run in the release gate, and multi-source ingestion by a `bun run watch:desktop` run against a temporary root; the macOS accessibility backends are verified by hand with `SQUID_SCREEN_READER=darwin bun run watch:screen` and `SQUID_BROWSER=darwin bun run watch:desktop`.
 
 ## What is not yet implemented
 

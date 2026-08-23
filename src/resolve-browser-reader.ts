@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describeErrorForAudit } from "./action-egress.js";
 import type { BrowserPageFrame, BrowserPageReaderFactory } from "./browser-page-source.js";
+import { createMacosBrowserPageReader } from "./browser-page-reader-macos.js";
 import {
   createSyntheticBrowserPageReader,
   demoBrowserPageFrames,
@@ -17,8 +18,11 @@ import {
  * it, not because it started a watch.
  *
  * `SQUID_BROWSER` has exactly three outcomes, matching `SQUID_SEARCH_EGRESS`:
- * unset means no browser source, the exact string `synthetic` replays scripted
- * frames, and anything else is a startup configuration error. Note that observing
+ * unset means no browser source, the exact string `synthetic` or `darwin`
+ * selects a backend, and anything else is a startup configuration error.
+ * `darwin` is additionally refused off macOS at startup — the same rule the
+ * screen reader enforces — because a run that asked for real observation and
+ * quietly got nothing would look identical to one that works. Note that observing
  * a page still does not permit egress — `SQUID_SEARCH_EGRESS=allow` is a separate
  * decision, and both are required before a search can run.
  */
@@ -26,7 +30,7 @@ export type BrowserReaderResolution =
   | { readonly enabled: false }
   | {
       readonly enabled: true;
-      readonly readerKind: "synthetic";
+      readonly readerKind: "darwin" | "synthetic";
       readonly readerFactory: BrowserPageReaderFactory;
     }
   | { readonly configError: string };
@@ -35,25 +39,43 @@ export interface ResolveBrowserReaderOptions {
   /** Path to a scripted frame file; the built-in demo is used when absent. */
   readonly framesPath?: string;
   readonly env?: Record<string, string | undefined>;
+  readonly platform?: NodeJS.Platform;
 }
 
 export async function resolveBrowserReader(
   options: ResolveBrowserReaderOptions = {},
 ): Promise<BrowserReaderResolution> {
   const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+
   const kind = env.SQUID_BROWSER;
   if (kind === undefined) return { enabled: false };
-  if (kind !== "synthetic") {
+  if (kind !== "darwin" && kind !== "synthetic") {
     return {
-      configError: 'SQUID_BROWSER must be unset (off) or exactly "synthetic".',
+      configError: 'SQUID_BROWSER must be unset (off), exactly "synthetic", or exactly "darwin".',
+    };
+  }
+  if (kind === "darwin" && platform !== "darwin") {
+    return {
+      configError:
+        `SQUID_BROWSER=darwin requires macOS; this host reports ${platform}.`,
     };
   }
 
+  // One knob for both backends: how often the reader polls.
   const rawPollMs = env.SQUID_BROWSER_POLL_MS;
   const pollMs = rawPollMs === undefined ? undefined : Number(rawPollMs);
   if (pollMs !== undefined && (!Number.isSafeInteger(pollMs) || pollMs <= 0)) {
     return {
       configError: "SQUID_BROWSER_POLL_MS must be a positive integer number of milliseconds.",
+    };
+  }
+
+  if (kind === "darwin") {
+    return {
+      enabled: true,
+      readerKind: kind,
+      readerFactory: createMacosBrowserPageReader(pollMs === undefined ? {} : { pollMs }),
     };
   }
 
