@@ -15,13 +15,23 @@ const FIELD_COUNT = 3;
  * identity and an owner, and every extra field is one more way for a browser
  * to disagree about what a poll returned.
  *
- * The script has to cover two families because neither alone observes every
- * browser. Chromium browsers expose the active tab through their AppleScript
- * dictionaries (`URL of active tab of front window`); Safari exposes a document
- * URL instead. Firefox exposes neither — its window title is all an
- * accessibility reader can see, so this backend reports nothing for it and the
- * source stays quiet rather than emitting a frame with a title masquerading as
- * a page identity.
+ * Two queries, because the two browsers named below disagree about where the
+ * current page lives: Chrome exposes it as the active tab of the front window,
+ * Safari as the front document.
+ *
+ * Coverage is exactly those two, and the narrowness is worth naming rather than
+ * glossing as "Chromium and Safari". `tell application "Google Chrome"`
+ * addresses one literal application; Edge, Brave, Arc, and Vivaldi are separate
+ * applications this script never names, even though they answer the same
+ * vocabulary. (`using terms from` borrows Chrome's dictionary so the script
+ * compiles without Chrome installed — it does not widen what is addressed.)
+ * Firefox exposes no URL at all through either channel.
+ *
+ * For every browser outside those two the URL field stays empty and the source
+ * emits nothing, rather than a frame with a window title masquerading as a page
+ * identity. Adding a browser means adding a `tell` block; that is a deliberate
+ * per-application decision, because each one has to be verified against a real
+ * install before its answer can be trusted as a page identity.
  *
  * The browser-specific queries sit in their own try blocks so an unsupported
  * browser still yields the foreground facts; the owner fields matter on their

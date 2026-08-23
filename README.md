@@ -56,7 +56,7 @@ bun run watch:screen
 - `src/browser-page-reader-synthetic.ts` — scripted page replay backend plus a demo script whose owner matches the screen demo's final window. Zero browser calls, so the search path is demonstrable anywhere.
 - `src/resolve-browser-reader.ts` — resolves `SQUID_BROWSER` / `SQUID_BROWSER_POLL_MS`. Defaults to **off**, unlike the screen reader: browser observation is what makes search reachable, so a run opts in.
 - `src/editor-save-source.ts` — the `EditorSaveReader` seam and the adapter that projects an editor's own save reports onto `file_saved` events with `source.kind: "ide"`. This is the source issue #7 asked for and the only one that reports *ownership* rather than observation: the editor names itself as writer, so its saves carry a real `applicationId` and satisfy `admitRunTests`'s unchanged equality check. Frames are refused, never repaired — no pid, no event.
-- `src/editor-save-reader-fifo.ts` — reads one save report per line from a path an editor extension appends to, mirroring the terminal FIFO: append-only, so a crashed plugin costs one lost report rather than a broken editor. The module doc carries a working VS Code extension snippet.
+- `src/editor-save-reader-fifo.ts` — reads one save report per line from a path an editor extension appends to, mirroring the terminal FIFO: append-only, so a crashed plugin costs one lost report rather than a broken editor. The module doc carries a VS Code snippet to build an extension from; no packaged extension ships here.
 - `src/resolve-editor-save-reader.ts` — resolves `SQUID_EDITOR_SAVES` / `SQUID_EDITOR_FIFO` / `SQUID_EDITOR_POLL_MS`. Off by default like every capability variable: an editor speaking for itself is the strongest ownership claim in the system, so a run gets it by asking.
 - `src/capture-exclusion.ts` — `ExcludingCapturePolicy`, per-application exclusion at the ingress boundary wrapping `RedactingCapturePolicy`. A matched event is dropped outright and diagnostics carry counts only — recording "excluded app X" would recreate what the user asked to hide. `resolveCaptureExclusion` fails closed on a malformed list.
 - `src/capture-gate-source.ts` — the `CaptureGateReader` seam and the adapter projecting control commands onto `capture_gate_changed`. The pause event is the trace that makes a deliberate gap distinguishable from an idle machine.
@@ -354,8 +354,10 @@ An admission rule reads the *whole* projection, so what a run can do depends on 
 | --- | --- | --- | --- |
 | `watch:files` | filesystem | no foreground or selection facts | no `activeApplication` |
 | `watch:screen` | screen text | no browser page | no `file_saved` |
-| `watch:desktop` | filesystem + screen text | no browser page | both facts present; owner still unattributed |
-| `watch:desktop` with `SQUID_BROWSER=synthetic` | + browser page | **dispatches**, with `SQUID_SEARCH_EGRESS=allow` | unchanged |
+| `watch:desktop` | filesystem + screen text | no browser page | both facts present, but a watcher cannot name the writer, so the owner stays `null` and admission refuses |
+| `watch:desktop` with `SQUID_BROWSER=synthetic` | + scripted browser pages | **dispatches**, with `SQUID_SEARCH_EGRESS=allow` | unchanged |
+| `watch:desktop` with `SQUID_BROWSER=darwin` | + observed browser pages | **dispatches** for Chrome and Safari; other browsers produce no page, so refused | unchanged |
+| `watch:desktop` with `SQUID_EDITOR_SAVES=fifo` | + editor-reported saves | unchanged | **dispatches**: the editor names itself, so the owner equals the foreground application |
 
 `inspect_error` is a third action, available with `SQUID_TERMINAL=fifo`. It re-runs the failed check so its output is in front of the user, and the mapping is deliberately narrow because the captured fact is: `TerminalCommandCompletedPayload` holds a class, a flag, and an exit code — no command text, no output, no working directory — so "show me the failing output" cannot be served from history. Opening the file at the failing line would need a line number nothing captured, and re-running with more verbosity would need the original command. Only `test`, `lint`, and `typecheck` are re-runnable; `install` touches the network and a lockfile, `vcs` rewrites history, `container` can deploy, and `other` is unknown, so a failed `kubectl apply` can never propose running itself again. Admission additionally refuses once the command has *succeeded*: a user who fixes the problem before confirming should not then have the old failure's re-run executed.
 
@@ -379,7 +381,7 @@ bun run watch:desktop -- /absolute/project/root
 SQUID_BROWSER=synthetic bun run watch:desktop -- /absolute/project/root frames.json pages.json
 ```
 
-`SQUID_BROWSER` has the same three outcomes as `SQUID_SEARCH_EGRESS`: unset means no browser source, exactly `synthetic` or exactly `darwin` selects a backend, and anything else is a startup configuration error. `synthetic` replays scripted pages; `darwin` reads the foreground browser's active-tab URL through the macOS accessibility channel — no extension, no restart, no debug port — covering Chromium browsers and Safari (Firefox exposes neither an AppleScript nor an accessibility URL and stays quiet). `darwin` is refused at startup off macOS, like the screen reader's equivalent. `SQUID_BROWSER_POLL_MS` sets the sampling cadence for both backends.
+`SQUID_BROWSER` has the same three outcomes as `SQUID_SEARCH_EGRESS`: unset means no browser source, exactly `synthetic` or exactly `darwin` selects a backend, and anything else is a startup configuration error. `synthetic` replays scripted pages; `darwin` reads the foreground browser's active-tab URL through the macOS accessibility channel — no extension, no restart, no debug port. Its coverage is narrow and worth stating exactly: the script addresses Google Chrome's active tab and Safari's front document, and nothing else. Firefox exposes neither an AppleScript nor an accessibility URL; the other Chromium builds (Edge, Brave, Arc, Vivaldi) are different applications the script never names. For all of them the reader returns the foreground facts with an empty URL and the source emits nothing, rather than passing a window title off as a page identity — so an unreadable browser is one Squid stays quiet about, not one it guesses at. `darwin` is refused at startup off macOS, like the screen reader's equivalent. `SQUID_BROWSER_POLL_MS` sets the sampling cadence for both backends.
 
 The darwin backend is not testable in CI — it needs a Mac with automation grants, which macOS prompts for once per browser. Its parser is unit-tested; verify the subprocess half by hand:
 
@@ -387,9 +389,7 @@ The darwin backend is not testable in CI — it needs a Mac with automation gran
 SQUID_BROWSER=darwin bun run watch:desktop -- /absolute/project/root
 ```
 
-One gap remains, and it is an honest refusal rather than a bug in the check:
-
-- **A filesystem save has no owner.** `FilesystemActivitySource` reports `applicationId: null` because a path-only watcher cannot know which process performed a write, and `admitRunTests` requires the save's owner to *equal* the foreground application. Treating an unattributed save as the foreground application's work would authorize running tests on a file written by a background formatter — the `filesystem-save-run-tests` fixture asserts `none` for exactly this case. Closing it needs a source that knows what it saved.
+A filesystem save still has no owner, and that is an honest refusal rather than a bug in the check. `FilesystemActivitySource` reports `applicationId: null` because a path-only watcher cannot know which process performed a write, and `admitRunTests` requires the save's owner to *equal* the foreground application. Treating an unattributed save as the foreground application's work would authorize running tests on a file written by a background formatter — the `filesystem-save-run-tests` fixture asserts `none` for exactly this case, and still does. What closes it is a source that knows what it saved, which is the next section.
 
 A note on the synthetic demos: the screen and browser readers run on independent timers, so their interleaving is not fixed. The search rule requires the selection to be observed *after* the page, and whether that ordering falls out of a given demo run is a race. The demos show that a page becomes observable and is correctly attributed to a window; the end-to-end guarantee is pinned deterministically by `tests/browser-search-admission.test.ts`, which drives the real source in the order a live desktop produces.
 
@@ -408,7 +408,7 @@ SQUID_EDITOR_SAVES=fifo SQUID_EDITOR_FIFO=/absolute/path/saves.fifo \
   bun run watch:desktop -- /absolute/project/root
 ```
 
-A VS Code extension that feeds it (from `extension.js`):
+A starting point for a VS Code extension that feeds it (from `extension.js`):
 
 ```js
 const fifo = process.env.SQUID_EDITOR_FIFO;
@@ -419,6 +419,8 @@ if (fifo) workspace.onDidSaveTextDocument((document) => {
   }) + "\n", () => undefined);
 });
 ```
+
+That is a fragment, not a plugin: no packaged extension ships here, so a user scaffolds one around it, creates the append-only file, and sets `SQUID_EDITOR_FIFO` in the editor's own environment. One assumption in it is also unverified against a real install, and it is the one the pairing rests on — a VS Code extension runs in a separate extension-host process, so its `process.pid` may not be the frontmost application pid the screen reader reports. If they differ the equality refuses, which is the safe direction, but the snippet would then need the window's pid rather than the host's.
 
 One admission heuristic moved from ids to names to make real runs possible at all: "is this a coding application" is now decided on the application's *name*, never its id. On macOS the id is a bare unix pid ("4242"), which cannot carry the signal — matching on it made every live run fail regardless of what was in front. Ownership equality still compares ids exactly as before; only the kind-of-application question changed, and it changed toward the field that actually describes what an application is.
 
@@ -520,8 +522,9 @@ Source tests inject a fake watcher, file probe, and screen-text reader, so they 
 Tracked as issues; the entry-point table under [Dispatching actions](#which-entry-point-can-admit-which-action) shows which of these currently block an action.
 
 - Screen keyframes, OCR, and full caret context. Foreground window text is implemented; pixels are not.
-- A real browser backend. `BrowserPageActivitySource` and its contract exist and `search_selection` dispatches through them, but the only backend is the synthetic replay reader. A browser extension or CDP attachment is what turns that into observation of the user's actual browsing.
-- IDE / LSP integration, so no source can attribute a file save to the editor that wrote it. `run_tests` has both required facts available in `watch:desktop` but the save's owner stays `null`, which admission correctly refuses.
+- Browser observation outside Chrome on macOS. `SQUID_BROWSER=darwin` is real observation, but its AppleScript addresses one literal application — `"Google Chrome"` — plus Safari's front document. Every other browser, including the other Chromium builds (Edge, Brave, Arc, Vivaldi) and Firefox, exposes no URL the script asks for, so no `browser_navigated` event is produced and `search_selection` stays refused with `browser_page_missing`. There is also no backend at all for Linux or Windows. The failure direction is safe — a browser Squid cannot read is a browser it says nothing about, rather than one whose window title gets passed off as a page identity — but the coverage is one browser and one OS.
+- An installable editor extension. `SQUID_EDITOR_SAVES=fifo` and the whole ownership path exist (see [Editor-attributed saves](#editor-attributed-saves)), but nothing in this repo installs into an editor: there is no packaged extension, and the VS Code fragment in `src/editor-save-reader-fifo.ts` is a snippet to build from, not a plugin to install. A user must scaffold the extension themselves, create the append-only file, and set `SQUID_EDITOR_FIFO` inside the editor's own environment. One assumption in that snippet is also unverified against a real editor: it reports `process.pid`, and a VS Code extension runs in a separate extension-host process whose pid may differ from the frontmost application pid the macOS screen reader reports — if they differ, the strict equality correctly refuses, so the contract holds but the snippet may need to report the window's pid rather than its own.
+- Automated coverage of either macOS backend's subprocess half. The screen-text and browser `darwin` readers shell out to `osascript`; only their parsers run in CI, and the resolution test for `SQUID_BROWSER=darwin` is skipped off macOS. Both are verified by hand.
 - A surface for suggestions that never reach confirmation. The graphical window (`ui/`) shows a suggestion and takes its answer, but it only opens for a candidate that got as far as being confirmed. One refused at admission, or ranked below the top, leaves no trace on screen — only in the ledger. Whether it should is [issue #5's remaining open question](https://github.com/YoungSx/squid-desktop-assistant/issues/5).
 - A capability mapping for `draft_completion`. It is the one predicted kind with no action: writing text into someone's editor needs an IDE integration that can place it, and a confirmation surface that can show it in place.
 - A *model-backed* belief producer. The belief seam, a deterministic producer, a re-ranking cognition provider, the semantic gate, and shadow mode all exist and are wired (see [Beliefs and cognition](#beliefs-and-cognition)) — but `HeuristicBeliefProvider` infers from rules over the projection, not from a model, so what the belief layer currently adds over the heuristic is structure and measurability rather than new understanding. A model-backed producer is a drop-in at that seam and must clear the same semantic gate, which no model has yet done: `PiRuntime` fails it on determinism.

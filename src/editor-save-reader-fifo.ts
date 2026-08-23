@@ -25,7 +25,10 @@ import type {
  * whose pid is missing or malformed is refused by `projectEditorSaveFrame`
  * rather than repaired.
  *
- * A VS Code extension that feeds it, from `extension.js`:
+ * A starting point for a VS Code extension that feeds it, from `extension.js`.
+ * This is a fragment to build from, not a plugin: no packaged extension ships in
+ * this repository, and `SQUID_EDITOR_FIFO` has to be set in the *editor's* own
+ * environment for the first line to resolve.
  *
  * ```js
  * const fifo = process.env.SQUID_EDITOR_FIFO;
@@ -36,6 +39,16 @@ import type {
  *   }) + "\n", () => undefined);
  * });
  * ```
+ *
+ * One assumption in that snippet is unverified against a real editor, and it is
+ * the assumption the whole pairing rests on. `admitRunTests` compares the
+ * reported pid against the foreground application's id by strict equality, and
+ * on macOS that id is the *frontmost application process* pid. A VS Code
+ * extension runs in a separate extension-host process, so its `process.pid` may
+ * not be that pid. If the two differ the equality refuses — the failure is safe
+ * and the contract holds — but the snippet would then need to report the pid of
+ * the window rather than of the host it runs in. Verify against a real install
+ * before trusting it; nothing offline can establish this.
  */
 export interface FifoEditorSaveReaderOptions {
   /** Absolute path to the FIFO or append-only file editor extensions write. */
