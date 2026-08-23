@@ -334,6 +334,16 @@ Absent variables mean actions stay off — identical to the pre-dispatch behavio
 
 `SQUID_ACTION_CONFIRM_TIMEOUT_MS` belongs to the engine rather than to either surface and requires `SQUID_ACTION_CONFIRM`. `SQUID_GRAPHICAL_UI_COMMAND` is required by — and only accepted with — `SQUID_ACTION_CONFIRM=graphical`; it is parsed into an executable plus literal arguments under the same no-shell rule as the MCP command. Build the binary it names with `cargo build --release` in `ui/`.
 
+The window needs a display at run time, and its X11 dependencies are dynamically loaded rather than linked — so a build that succeeds proves nothing about whether a window can open. On a bare Linux host, `libxkbcommon-x11` in particular is absent often enough to be worth naming: without it the process aborts on the first prompt. It runs under a virtual display (`xvfb-run -a squid-ui`), which is how the smoke run below drives it headlessly; a real session needs no wrapper.
+
+```bash
+# End-to-end smoke run: opens a real window under a virtual display, clicks
+# Approve, and prints the answer line the daemon would have received.
+bun run ui:smoke
+```
+
+That run is not a substitute for `cargo test` — it is the only check that covers what unit tests structurally cannot: that a window actually maps, that a click reaches the answer channel, and that a refusal stays a refusal on screen.
+
 `watch:desktop` and `watch:files` execute tests from the canonical watched root; `watch:screen` uses its launch directory. `SQUID_ACTION_WORKDIR=/absolute/path` overrides either. The predicted path must remain inside that root. The MCP server command is parsed into an executable plus literal arguments and launched directly, never through a shell: quoted spaces are supported, while variables, substitutions, pipes, redirects, comments, and globs are rejected. This protects server startup configuration separately from the deliberately shell-shaped `run_command` string sent to the MCP server.
 
 ### Which entry point can admit which action
