@@ -1,0 +1,86 @@
+import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
+
+// One window, one pending question. The window is hidden whenever nothing is
+// pending, so its mere presence is the "a suggestion exists" signal issue #5
+// asks for — there is no tray icon or feed to keep in sync with it.
+//
+// Non-modal by construction: Slint windows do not grab input, so the user keeps
+// working while this sits on screen. That matters because the confirmation has a
+// deadline; a modal dialog would make the deadline a hostage-taking.
+export component PromptWindow inherits Window {
+    // Everything the surface is allowed to know. Deliberately four scalars, the
+    // same four `ConfirmationPrompt` carries: there is no `arguments` property
+    // here, so no future edit to this file can render one by accident.
+    in property <string> action-kind;
+    in property <string> summary;
+    in property <string> expires-at;
+
+    callback approve();
+    callback decline();
+
+    title: "Squid";
+    // A confirmation buried behind other windows is one the engine will time
+    // out. Staying on top is what makes the deadline answerable.
+    always-on-top: true;
+    preferred-width: 460px;
+
+    VerticalBox {
+        padding: 18px;
+        spacing: 10px;
+
+        Text {
+            text: "Squid wants to run: " + root.action-kind;
+            font-size: 15px;
+            font-weight: 700;
+            wrap: word-wrap;
+        }
+
+        // The plan's `summary`, verbatim and alone.
+        //
+        // `action-planner.ts` builds `summary` to be selection-free — for a
+        // search it carries the selection's *length*, never its text — and
+        // `ConfirmationPrompt` has no `arguments` field at all. So this line
+        // cannot leak the selection even if someone wanted it to. Rendering the
+        // selection would be an egress decision, not a display detail.
+        //
+        // Monospace because this is a command line: a proportional font makes
+        // whitespace and lookalike characters harder to inspect, and inspecting
+        // it is the entire point of asking.
+        Text {
+            text: root.summary;
+            font-family: "monospace";
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+
+        Text {
+            text: "Expires at " + root.expires-at;
+            font-size: 11px;
+            color: #999999;
+            wrap: no-wrap;
+        }
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            alignment: end;
+
+            // Decline first in reading order, and not the primary button: the
+            // safe answer should never be the one a reflex click lands on.
+            Button {
+                text: "Decline";
+                clicked => {
+                    root.decline();
+                }
+            }
+
+            Button {
+                text: "Approve";
+                primary: true;
+                clicked => {
+                    root.approve();
+                }
+            }
+        }
+    }
+}

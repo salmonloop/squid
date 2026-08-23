@@ -1,0 +1,39 @@
+[package]
+name = "squid-ui"
+version = "0.1.0"
+edition = "2021"
+description = "Squid's graphical confirmation surface: one native window, one answer per prompt."
+publish = false
+
+[[bin]]
+name = "squid-ui"
+path = "src/main.rs"
+
+[dependencies]
+# Native rendering only. `default-features = false` drops the interpreter and
+# every other backend so this binary cannot silently fall back to a webview or
+# a software path that looks like a window but is not one — the decision on
+# issue #5 was fully native rendering, and the feature list is where that is
+# actually enforced.
+slint = { version = "1.17.1", default-features = false, features = [
+    "compat-1-2",
+    "std",
+    "backend-winit",
+    "renderer-femtovg",
+] }
+# No other dependencies, on purpose. The wire format is one flat object of five
+# scalar fields, and `src/protocol.rs` reads it with a hand-written structural
+# parser — see the reasoning and the escape/surrogate/control-character tests
+# there. A process whose whole job is to turn a click into permission to run a
+# command has its own supply chain as part of its threat model.
+
+[build-dependencies]
+slint-build = "1.17.1"
+
+[profile.release]
+# A confirmation window is not a hot loop; size and startup latency matter more
+# than throughput, and a smaller binary is faster to ship next to the daemon.
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
