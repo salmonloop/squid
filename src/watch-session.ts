@@ -1,6 +1,8 @@
 import { realpath } from "node:fs/promises";
 import { createWatchRuntime, type WatchRuntime } from "./create-watch-runtime.js";
 import { describeErrorForAudit, resolveSearchEgress } from "./action-egress.js";
+import { CaptureGateActivitySource } from "./capture-gate-source.js";
+import { resolveCaptureGate } from "./resolve-capture-gate.js";
 import type { ActivitySource, ActivitySourceDiagnostic } from "./activity-source.js";
 import type { ActivityEvent } from "./protocol.js";
 import type { PredictionRuntimeIngestResult } from "./prediction-runtime.js";
@@ -106,6 +108,12 @@ export async function startWatchSession(
   const egress = resolveSearchEgress(env.SQUID_SEARCH_EGRESS);
   if ("configError" in egress) return { configError: egress.configError };
 
+  // The capture gate resolves with the other capabilities, before any sink
+  // opens: a typo in SQUID_CONTROL must fail startup rather than silently
+  // leave a run that cannot be paused.
+  const gate = resolveCaptureGate(env);
+  if ("configError" in gate) return { configError: gate.configError };
+
   const watch = createWatchRuntime({
     ...(options.databasePath === undefined ? {} : { databasePath: options.databasePath }),
     provider: resolved.selection.provider,
@@ -134,13 +142,24 @@ export async function startWatchSession(
     return { configError: actions.configError };
   }
 
-  const sources = await options.createSources({
+  const sources = [...await options.createSources({
     databasePath: watch.databasePath,
     ledgerPath: watch.ledgerPath,
     onDiagnostic: (diagnostic) => {
       logError(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
     },
-  });
+  })];
+  if (gate.enabled) {
+    // Last, after every observer: a pause command must land in the timeline
+    // with the foreground already projected, and resume must arrive before any
+    // event the resumed capture produces.
+    sources.push(new CaptureGateActivitySource({
+      readerFactory: gate.readerFactory,
+      onDiagnostic: (diagnostic) => {
+        logError(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
+      },
+    }));
+  }
   if (sources.length === 0) {
     await watch.dispose();
     return { configError: "A watch session needs at least one activity source." };
@@ -205,6 +224,7 @@ export async function startWatchSession(
       ...(actions === undefined ? {} : { actions: actions.gatewayId }),
       store: watch.databasePath ?? "memory",
       ledger: watch.ledgerPath ?? "memory",
+      control: gate.enabled ? gate.readerKind : "off",
       restoredActions: restored.recentActions.length,
     },
     runtime: watch,

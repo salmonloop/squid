@@ -158,6 +158,9 @@ export class RedactingCapturePolicy implements CapturePolicy {
       case "terminal_command_completed":
       case "screen_keyframe_created":
       case "idle_state_changed":
+      // The gate's payload is one boolean — the fact that capture was gated is
+      // itself the event, and hiding it would defeat the pause feature.
+      case "capture_gate_changed":
         return undefined;
       default:
         return assertKindHandled(event.kind);

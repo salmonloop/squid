@@ -16,6 +16,7 @@ export const activityKinds = [
   "terminal_command_completed",
   "screen_keyframe_created",
   "idle_state_changed",
+  "capture_gate_changed",
 ] as const;
 
 export type ActivityKind = (typeof activityKinds)[number];
@@ -88,6 +89,16 @@ export interface BrowserNavigatedPayload {
   owner: ForegroundOwner | null;
 }
 
+/**
+ * The capture gate moved. This event is what makes a paused interval
+ * distinguishable from an idle one: without it, a silent stretch in the
+ * timeline is ambiguous between "the user stepped away" and "the user asked
+ * not to be observed", and any later analysis reads the wrong one.
+ */
+export interface CaptureGateChangedPayload {
+  paused: boolean;
+}
+
 export interface SemanticAction {
   kind: string;
   occurredAt: string;
@@ -126,6 +137,12 @@ export interface BrowserPageState extends BrowserNavigatedPayload {
   observationOrdinal: number;
 }
 
+export interface CaptureGateState {
+  paused: boolean;
+  sourceEventId: string;
+  occurredAt: string;
+}
+
 export interface EpisodeState {
   id: string;
   startedAt: string;
@@ -144,6 +161,8 @@ export interface WorldState {
   recentFiles: string[];
   recentActions: SemanticAction[];
   lastCommandOutcome: TerminalCommandCompletedPayload | null;
+  /** Last observed gate position; null until a gate event is seen. */
+  captureGate: CaptureGateState | null;
 }
 
 export type PredictionKind =
@@ -258,6 +277,10 @@ export const ActivityEventSchema = Type.Union([
   activityEventSchema("terminal_command_completed", terminalCommandCompletedPayloadSchema),
   activityEventSchema("screen_keyframe_created", emptyPayloadSchema),
   activityEventSchema("idle_state_changed", emptyPayloadSchema),
+  activityEventSchema(
+    "capture_gate_changed",
+    Type.Object({ paused: Type.Boolean() }, { additionalProperties: false }),
+  ),
 ]);
 
 const activityEventValidator = Compile(ActivityEventSchema);
@@ -374,6 +397,7 @@ export function emptyWorldState(): WorldState {
     recentFiles: [],
     recentActions: [],
     lastCommandOutcome: null,
+    captureGate: null,
   };
 }
 

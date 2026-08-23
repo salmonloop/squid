@@ -11,6 +11,7 @@ import {
   type ActivityEvent,
   type ApplicationActivatedPayload,
   type BrowserNavigatedPayload,
+  type CaptureGateChangedPayload,
   type FocusChangedPayload,
   type SemanticAction,
   type TerminalCommandCompletedPayload,
@@ -174,6 +175,18 @@ export function reduceWorldState(
         sourceEventId: event.eventId,
         observedAt: event.occurredAt,
         observationOrdinal: next.episode?.eventCount ?? 0,
+      };
+      break;
+    }
+    case "capture_gate_changed": {
+      // The gate is global, not episode-scoped: a pause that outlives the
+      // episode gap must still read as paused after the boundary, so it is set
+      // on `next` rather than cleared by the episode reset above.
+      const payload = event.payload as CaptureGateChangedPayload;
+      next.captureGate = {
+        paused: payload.paused,
+        sourceEventId: event.eventId,
+        occurredAt: event.occurredAt,
       };
       break;
     }
