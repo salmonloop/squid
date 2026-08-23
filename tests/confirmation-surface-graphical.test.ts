@@ -127,6 +127,24 @@ describe("GraphicalConfirmationSurface", () => {
       .toEqual({ outcome: "rejected", reason: "input_closed" });
     await policy.close();
   });
+
+  it("closes the transport when the engine closes the surface", async () => {
+    // The engine's close() calls surface.close?.(); without forwarding, the
+    // spawned UI process would outlive the watcher. This is the one property
+    // the conformance matrix cannot check — its harness dispose is a no-op —
+    // so it lives here as a surface-specific test.
+    let closed = false;
+    const transport: GraphicalTransport = {
+      available: () => !closed,
+      ask: async () => "approved",
+      close: async () => {
+        closed = true;
+      },
+    };
+    const policy = new SerialConfirmationPolicy({ surface: new GraphicalConfirmationSurface({ transport }) });
+    await policy.close();
+    expect(closed).toBe(true);
+  });
 });
 
 describe("createGraphicalActionConfirmation", () => {

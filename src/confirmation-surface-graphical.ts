@@ -99,6 +99,13 @@ export class GraphicalConfirmationSurface implements ConfirmationSurface {
     // and the wire schema is named once, here, for the Rust binary to mirror.
     return this.transport.ask(toGraphicalPayload(prompt), signal);
   }
+
+  public async close(): Promise<void> {
+    // The engine's close() calls surface.close?.() — without this, the spawned
+    // UI process would outlive the watcher. Delegated to the transport because
+    // the surface does not own the child; it only owns the type boundary.
+    await this.transport.close?.();
+  }
 }
 
 export interface GraphicalActionConfirmationOptions {
