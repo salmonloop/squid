@@ -9,7 +9,15 @@ import { orderActivityEvents } from "../src/chronicle-ordering.js";
 
 export interface StoreHarness {
   readonly store: EventStore;
+  /** Removes the backing storage. Only the harness that created it calls this. */
   dispose(): Promise<void>;
+  /**
+   * Reopens the same backing storage in a fresh instance, for the
+   * deletion-durability test. Its `dispose` releases only that instance's
+   * handle — never the files, which stay owned by this harness.
+   * `undefined` for the in-memory store, whose storage has no second handle.
+   */
+  reopen(): Promise<{ readonly store: EventStore; dispose(): Promise<void> } | undefined>;
 }
 
 export function describeEventStoreConformance(
@@ -176,6 +184,120 @@ export function describeEventStoreConformance(
         await harness.dispose();
       }
     });
+
+    // Retention deletion is the one operation that removes, and "removes" must
+    // mean the same thing in every backend: the bytes actually go, survivors
+    // rehydrate unchanged, and a misread range refuses rather than deleting
+    // something the user did not ask about.
+    it("deletes exactly the ranged events and keeps the rest", async () => {
+      const harness = await createStore();
+      try {
+        const events = await seedEvents(harness.store);
+        const removed = await harness.store.deleteRange({
+          from: events[1]!.occurredAt,
+          until: events[2]!.occurredAt,
+        });
+
+        expect(removed).toBe(2);
+        const remaining = (await harness.store.all()).map((e) => e.eventId);
+        expect(remaining).toEqual([events[0]!.eventId]);
+      } finally {
+        await harness.dispose();
+      }
+    });
+
+    it("treats range bounds inclusively", async () => {
+      const harness = await createStore();
+      try {
+        const events = await seedEvents(harness.store);
+        // Both endpoints name existing events; both must go.
+        const removed = await harness.store.deleteRange({
+          from: "2026-08-16T23:00:00.000-01:00",
+          until: "2026-08-17T01:00:02.000+01:00",
+        });
+
+        expect(removed).toBe(3);
+        expect(await harness.store.all()).toEqual([]);
+      } finally {
+        await harness.dispose();
+      }
+    });
+
+    it("returns zero and changes nothing for an empty range", async () => {
+      const harness = await createStore();
+      try {
+        const events = await seedEvents(harness.store);
+
+        expect(await harness.store.deleteRange({ from: "2020-01-01T00:00:00.000Z", until: "2020-12-31T23:59:59.999Z" })).toBe(0);
+        expect((await harness.store.all()).length).toBe(events.length);
+      } finally {
+        await harness.dispose();
+      }
+    });
+
+    it("rejects an inverted or unparseable range without deleting", async () => {
+      const harness = await createStore();
+      try {
+        const events = await seedEvents(harness.store);
+
+        for (const range of [
+          { from: "2026-08-17T00:00:02.000Z", until: "2026-08-17T00:00:00.000Z" },
+          { from: "not-a-date", until: "2026-08-17T00:00:02.000Z" },
+          { from: "2026-08-17T00:00:00.000Z", until: "" },
+        ]) {
+          await expect(harness.store.deleteRange(range)).rejects.toThrow();
+        }
+        expect((await harness.store.all()).length).toBe(events.length);
+      } finally {
+        await harness.dispose();
+      }
+    });
+
+    it("keeps accepting appends after a deletion", async () => {
+      // The store must stay writable once history has been cut: retention runs
+      // mid-life, not at teardown, and the next append lands after the gap.
+      const harness = await createStore();
+      try {
+        const events = await seedEvents(harness.store);
+        await harness.store.deleteRange({ from: events[1]!.occurredAt, until: events[2]!.occurredAt });
+
+        const later = createActivityEvent({
+          kind: "file_saved",
+          occurredAt: "2026-08-18T00:00:00.000Z",
+          payload: { path: "b.ts", applicationId: "editor" },
+        });
+        await harness.store.append(later);
+
+        const all = await harness.store.all();
+        expect(all.map((e) => e.eventId).sort()).toEqual([events[0]!.eventId, later.eventId].sort());
+        expect((await harness.store.all())[0]).toEqual(
+          expect.not.objectContaining({ eventId: events[1]!.eventId }),
+        );
+      } finally {
+        await harness.dispose();
+      }
+    });
+
+    it("survives a reopen with the deletion applied", async () => {
+      // Durability of deletion matters as much as durability of capture: a
+      // backend that resurrects deleted rows on restart has not deleted them.
+      // The reopened instance is read *before* the original harness disposes,
+      // because dispose removes the backing files; a reopen handle owns only
+      // its connection, never the storage.
+      const first = await createStore();
+      let reopened: { readonly store: EventStore; dispose(): Promise<void> } | undefined;
+      try {
+        const events = await seedEvents(first.store);
+        await first.store.deleteRange({ from: events[1]!.occurredAt, until: events[2]!.occurredAt });
+        reopened = await first.reopen();
+        if (reopened !== undefined) {
+          expect((await reopened.store.all()).length).toBe(1);
+        }
+      } finally {
+        await reopened?.dispose();
+        await first.dispose();
+      }
+    });
   });
 }
 
@@ -197,23 +319,42 @@ export function inMemoryHarness(): Promise<StoreHarness> {
   return Promise.resolve({
     store: new InMemoryEventStore(),
     dispose: () => Promise.resolve(),
+    reopen: () => Promise.resolve(undefined),
   });
 }
 
 export async function jsonlHarness(): Promise<StoreHarness> {
   const dir = await createTempDir();
-  const store = new JsonlEventStore(join(dir, "events.jsonl"));
-  return { store, dispose: () => rm(dir, { recursive: true, force: true }) };
+  const filePath = join(dir, "events.jsonl");
+  return {
+    store: new JsonlEventStore(filePath),
+    dispose: () => rm(dir, { recursive: true, force: true }),
+    reopen: () =>
+      // A reopened JSONL handle owns no files; releasing it is a no-op because
+      // the store holds nothing but the path.
+      Promise.resolve({ store: new JsonlEventStore(filePath), dispose: () => Promise.resolve() }),
+  };
 }
 
 export async function sqliteHarness(): Promise<StoreHarness> {
   const dir = await createTempDir();
-  const store = new SqliteEventStore(join(dir, "events.db"));
+  const filePath = join(dir, "events.db");
+  const store = new SqliteEventStore(filePath);
   return {
     store,
     dispose: async () => {
       store.close();
       await rm(dir, { recursive: true, force: true });
+    },
+    reopen: () => {
+      const instance = new SqliteEventStore(filePath);
+      return Promise.resolve({
+        store: instance,
+        dispose: async () => {
+          instance.close();
+          await rm(`${filePath}-wal`, `${filePath}-shm`, { force: true }).catch(() => {});
+        },
+      });
     },
   };
 }

@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname, relative, sep } from "node:path";
-import { parseTimestamp, type EventStore } from "./event-store.js";
+import { parseDeletionRange, parseTimestamp, type EventStore } from "./event-store.js";
 import { parseActivityEvent, type ActivityEvent } from "./protocol.js";
 
 /**
@@ -132,6 +132,25 @@ export class SqliteEventStore implements EventStore {
         .query("SELECT event_json FROM chronicle_events WHERE occurred_at_ms >= ?")
         .all(threshold),
     );
+  }
+
+  /**
+   * Deletes ranged rows in one statement. The `occurred_at_ms` index makes the
+   * range a scan of exactly the rows removed; `changes` is the authoritative
+   * count, so no read-back is needed.
+   *
+   * The scalar column truncates sub-millisecond precision, and that lossiness
+   * is the *deletion* boundary too: an event whose sub-millisecond spelling
+   * rounds outside the requested range keeps or loses its row by its stored
+   * millisecond, the same value `since()` filters on. Range edges are compared
+   * in milliseconds everywhere, so deletion and query agree.
+   */
+  async deleteRange(range: { readonly from: string; readonly until: string }): Promise<number> {
+    this.assertOpen();
+    const { fromMs, untilMs } = parseDeletionRange(range.from, range.until);
+    return this.database
+      .query("DELETE FROM chronicle_events WHERE occurred_at_ms >= ? AND occurred_at_ms <= ?")
+      .run(fromMs, untilMs).changes;
   }
 
   /**

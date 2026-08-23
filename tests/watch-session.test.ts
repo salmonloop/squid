@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "bun:test";
 import type {
   ActivityEventEmitter,
@@ -6,6 +9,8 @@ import type {
 } from "../src/activity-source.js";
 import { createActivityEvent, type ActivityEvent } from "../src/protocol.js";
 import { startWatchSession, type WatchSourceContext } from "../src/watch-session.js";
+import { SqliteEventStore } from "../src/sqlite-event-store.js";
+import { SqlitePredictionLedger } from "../src/sqlite-prediction-ledger.js";
 
 /**
  * A source that emits exactly what a test hands it, recording lifecycle so the
@@ -46,6 +51,19 @@ function fileSaved(eventId: string, path: string): ActivityEvent {
     sessionId: "fs-session",
     sequence: Number(eventId.split("-").at(-1) ?? 0),
     payload: { path, applicationId: null },
+  });
+}
+
+/** The same save shape, with an explicit occurredAt for retention windows. */
+function fileSavedAt(eventId: string, occurredAt: string): ActivityEvent {
+  return createActivityEvent({
+    kind: "file_saved",
+    eventId,
+    source: { kind: "filesystem", instanceId: "fs-1" },
+    sessionId: "fs-session",
+    sequence: 0,
+    occurredAt,
+    payload: { path: "src/ancient.test.ts", applicationId: null },
   });
 }
 
@@ -255,5 +273,82 @@ describe("startWatchSession", () => {
     const described = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
     expect(described.some((line) => line.kind === "file_saved")).toBe(true);
     await result.session.stop();
+  });
+
+  it("reports a config error rather than starting when retention is malformed", async () => {
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const result = await startWatchSession({
+      workingDirectory: "/tmp",
+      env: { SQUID_RETENTION_HOURS: "soon" },
+      log: () => {},
+      logError: () => {},
+      createSources: async () => [source],
+      describeEvent: () => ({}),
+    });
+
+    expect("configError" in result).toBe(true);
+    if ("configError" in result) {
+      expect(result.configError).toContain("SQUID_RETENTION_HOURS");
+    }
+    // Same refusal posture as egress: nothing starts on a policy that cannot
+    // be honored, and the error names the variable the user must fix.
+    expect(lifecycle).toEqual([]);
+    expect(source.started).toBe(false);
+  });
+
+  /**
+   * Retention prunes before restore, and both halves are observable without a
+   * test hook: the prune through the durable database it empties (the seeded
+   * ancient event is gone), the ordering through the dedupe index — an event
+   * restored from history replays as "duplicate", while one deleted before
+   * restore is accepted as new. The session needs a real SQLite pairing here
+   * because the in-memory stores have nothing to persist between seeding and
+   * startup.
+   */
+  it("states the retention bound in the banner and prunes old history before restore", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "squid-watch-retention-"));
+    try {
+      const databasePath = join(dir, "events.db");
+      const seedStore = new SqliteEventStore(databasePath);
+      await seedStore.append(fileSavedAt("evt-ancient", "2020-01-01T00:00:00.000Z"));
+      seedStore.close();
+
+      const lifecycle: string[] = [];
+      const source = new ScriptedSource("alpha", lifecycle);
+      // One hour of retention: the seeded event predates any real cutoff.
+      const result = await startWatchSession({
+        workingDirectory: "/tmp",
+        env: { ...OFFLINE_ENV, SQUID_RETENTION_HOURS: "1" },
+        databasePath,
+        log: () => {},
+        logError: () => {},
+        createSources: async () => [source],
+        describeEvent: () => ({}),
+      });
+      if ("configError" in result) throw new Error(result.configError);
+      const { session } = result;
+
+      expect(session.banner.retention).toBe(1);
+      expect(session.banner.prunedEvents).toBe(1);
+
+      // Prune-before-restore, observed through behavior: replaying the deleted
+      // id must be accepted fresh — had restore seen it first, this would be
+      // disposition "duplicate".
+      const replay = await session.runtime.core.ingest(
+        fileSavedAt("evt-ancient", "2026-08-22T12:00:00.000Z"),
+      );
+      expect(replay.disposition).toBe("accepted");
+
+      const reopened = new SqliteEventStore(databasePath);
+      try {
+        expect((await reopened.all()).map((e) => e.eventId)).toEqual(["evt-ancient"]);
+      } finally {
+        reopened.close();
+      }
+      await session.stop();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

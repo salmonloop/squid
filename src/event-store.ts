@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { parseActivityEvent, type ActivityEvent } from "./protocol.js";
 
@@ -19,11 +19,40 @@ import { parseActivityEvent, type ActivityEvent } from "./protocol.js";
  * `since` keeps events whose `occurredAt` is at or after the threshold, after
  * decoding both sides to epoch milliseconds so timezone spellings compare
  * equal. Return order is likewise uncontracted.
+ *
+ * `deleteRange` is the one operation that removes. Retention deletion must
+ * actually free the record — a tombstone would keep every byte it claims to
+ * have deleted — so this rewrites or truncates storage in place. The range is
+ * inclusive on both ends, decoded to epoch milliseconds like `since`, and the
+ * returned count is what was removed. Events outside the range are untouched,
+ * and a subsequent read rehydrates them through `parseActivityEvent` exactly as
+ * before.
  */
 export interface EventStore {
   append(event: ActivityEvent): Promise<void>;
   all(): Promise<readonly ActivityEvent[]>;
   since(occurredAt: string): Promise<readonly ActivityEvent[]>;
+  deleteRange(range: { readonly from: string; readonly until: string }): Promise<number>;
+}
+
+/**
+ * Validates a deletion range into epoch-millisecond bounds.
+ *
+ * Both endpoints must be finite date-times and `from` may not exceed `until`.
+ * An inverted or unparseable range refuses rather than deleting nothing (or
+ * everything): retention is the user's "delete my history" request, and acting
+ * on a misread range is not recoverable.
+ */
+export function parseDeletionRange(
+  from: string,
+  until: string,
+): { readonly fromMs: number; readonly untilMs: number } {
+  const fromMs = parseTimestamp(from);
+  const untilMs = parseTimestamp(until);
+  if (fromMs > untilMs) {
+    throw new TypeError("Deletion range start must not be after its end.");
+  }
+  return { fromMs, untilMs };
 }
 
 export interface EventStoreDiagnostic {
@@ -46,10 +75,28 @@ export class InMemoryEventStore implements EventStore {
     const threshold = parseTimestamp(occurredAt);
     return (await this.all()).filter((event) => new Date(event.occurredAt).getTime() >= threshold);
   }
+
+  async deleteRange(range: { readonly from: string; readonly until: string }): Promise<number> {
+    const { fromMs, untilMs } = parseDeletionRange(range.from, range.until);
+    let removed = 0;
+    for (let index = this.events.length - 1; index >= 0; index -= 1) {
+      if (inRange(this.events[index]!, fromMs, untilMs)) {
+        this.events.splice(index, 1);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
+}
+
+/** Shared range test: inclusive on both ends, decoded to epoch milliseconds. */
+function inRange(event: ActivityEvent, fromMs: number, untilMs: number): boolean {
+  const at = new Date(event.occurredAt).getTime();
+  return at >= fromMs && at <= untilMs;
 }
 
 export class JsonlEventStore implements EventStore {
-  private writeTail: Promise<void> = Promise.resolve();
+  private writeTail: Promise<unknown> = Promise.resolve();
   private readDiagnostics: EventStoreDiagnostic[] = [];
 
   public constructor(private readonly filePath: string) {}
@@ -71,21 +118,45 @@ export class JsonlEventStore implements EventStore {
   async all(): Promise<readonly ActivityEvent[]> {
     await this.writeTail;
     this.readDiagnostics = [];
-
-    let content: string;
-    try {
-      content = await readFile(this.filePath, "utf8");
-    } catch (error) {
-      if (isMissingFile(error)) return [];
-      throw error;
-    }
-
-    return readJsonlEvents(content, this.readDiagnostics);
+    return readJsonlEvents(await readFileOrNothing(this.filePath), this.readDiagnostics);
   }
 
   async since(occurredAt: string): Promise<readonly ActivityEvent[]> {
     const threshold = parseTimestamp(occurredAt);
     return (await this.all()).filter((event) => new Date(event.occurredAt).getTime() >= threshold);
+  }
+
+  /**
+   * Rewrites the file without the ranged events, then replays the remainder.
+   *
+   * A JSONL line is the only copy of its event, so deletion means writing a new
+   * file and renaming it over the old one — an interrupted rewrite must leave
+   * either the old history or the new one, never a half-file. `rename` is
+   * atomic on the same directory, which the temp file shares. The write-tail
+   * serializes this against concurrent appends so a delete can never interleave
+   * with a partially written append.
+   */
+  async deleteRange(range: { readonly from: string; readonly until: string }): Promise<number> {
+    const { fromMs, untilMs } = parseDeletionRange(range.from, range.until);
+    const write = this.writeTail.then(async () => {
+      // Reads the file directly rather than through `all()`: that method awaits
+      // the write tail, which this callback *is* — calling it here would await
+      // our own completion and deadlock.
+      const events = readJsonlEvents(await readFileOrNothing(this.filePath), []);
+      const kept = events.filter((event) => !inRange(event, fromMs, untilMs));
+      const removed = events.length - kept.length;
+      if (removed === 0) return 0;
+
+      const tempPath = `${this.filePath}.delete-${crypto.randomUUID()}`;
+      await mkdir(dirname(this.filePath), { recursive: true });
+      // Kept lines are already parsed; re-serializing them preserves every
+      // field exactly as a read would return it.
+      await writeFile(tempPath, kept.map((event) => `${JSON.stringify(event)}\n`).join(""), "utf8");
+      await rename(tempPath, this.filePath);
+      return removed;
+    });
+    this.writeTail = write.catch(() => undefined);
+    return write;
   }
 }
 
@@ -145,4 +216,14 @@ export function parseTimestamp(value: string): number {
 
 function isMissingFile(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+/** Reads the whole store file, treating a missing file as empty history. */
+async function readFileOrNothing(filePath: string): Promise<string> {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch (error) {
+    if (isMissingFile(error)) return "";
+    throw error;
+  }
 }

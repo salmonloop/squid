@@ -25,6 +25,7 @@ bun run build
 bun run dev
 bun run evaluate
 bun run gate:pi
+bun run history:delete -- /absolute/path/events.db <from> <until>
 bun run ledger:report -- /absolute/path.db.ledger.db
 bun run watch:desktop -- /absolute/project/root
 bun run watch:files -- /absolute/project/root
@@ -319,7 +320,7 @@ if (fifo) workspace.onDidSaveTextDocument((document) => {
 
 One admission heuristic moved from ids to names to make real runs possible at all: "is this a coding application" is now decided on the application's *name*, never its id. On macOS the id is a bare unix pid ("4242"), which cannot carry the signal — matching on it made every live run fail regardless of what was in front. Ownership equality still compares ids exactly as before; only the kind-of-application question changed, and it changed toward the field that actually describes what an application is.
 
-### Capture policy: exclusion and pause
+### Capture policy: exclusion, pause, and retention
 
 Capture is irreversible by design — once an event is ingested it is history — so both user-facing controls act at the ingress boundary, before the store.
 
@@ -333,6 +334,10 @@ squid-resume() { echo '{"op":"resume"}' >> "$SQUID_CONTROL_FIFO"; }
 ```
 
 Each command becomes a durable `capture_gate_changed` event in the timeline, and the projection keeps the last gate position in `WorldState.captureGate` — global across episodes, so a pause that outlives the episode gap still reads as paused after it. That event is what makes a deliberate gap distinguishable from an idle machine; without it, silence between two stretches of activity is ambiguous and any later analysis reads it wrong. An unknown or malformed command is refused with a diagnostic that names nothing but the failure itself.
+
+**Retention and range deletion.** `SQUID_RETENTION_HOURS=72` bounds how long history stays: at every watch-session startup everything at or before *now − 72h* is deleted — events first, then every ledger record whose trigger event was lost (attempts, feedback, plans, decisions), so no record survives without its anchor. The startup banner reports the bound (`retention`) and what that pass removed (`prunedEvents`, `prunedRecords`). The prune runs once per process start, not on a timer: a long-running session must not delete under the user's feet mid-episode; the next restart catches up. For a deliberate one-off ("delete everything between lunch and dinner"), `bun run history:delete -- /absolute/events.db <from> <until>` removes the same range through the same closure logic, refusing an inverted or unparseable range before it opens any file.
+
+Deletion is truncation, not tombstones: removed events leave no marker behind, because a tombstone keeps every byte it claims to delete. The ledger closure is computed *after* the event deletion commits, by diffing attempts' trigger ids against surviving events — no second copy of "which events existed" exists anywhere. Failure direction matters: if the ledger half fails, fewer events remain but the ledger stays self-contained until the next pass; over-retention waits, under-retention cannot be undone. All three controls share one posture: unset means off, a valid value means exactly what it says, and anything malformed (`0`, `-3`, `2.5`, `"soon"`, whitespace) fails startup naming the variable — never a silent fallback on the boundary that cannot undo.
 
 ## Replay evaluation
 
@@ -398,6 +403,7 @@ Tests use `bun:test`. The test suite covers:
 - `classifyCommand` and `TerminalCommandActivitySource`: every recognized class, unrecognized commands collapsing to `other`, the returned value always a member of the closed list whatever goes in, env-assignment prefixes seen past without their values being inspected, a class name later in the line not matching (`git commit -m "fix test"` is `vcs`), word boundaries so `gitk` is not `vcs`, the raw line absent from every emitted event including a `psql` URL with credentials, `succeeded` derived from the exit code, an unreadable exit code treated as failure, two identical failures emitted as two facts rather than deduped, sequence advancing only for emitted events, reader and delivery diagnostics, a non-object frame leaving the delivery tail usable, restartable failed start, and end-to-end ingestion producing exactly the two fields the `inspect_error` rule reads.
 - `createFifoTerminalCommandReader`: relative paths refused at construction, one completion per line, a partial write held rather than parsed, a malformed line skipped without reporting its content, a missing exit code passed through as unknown, a not-yet-created file staying quiet, truncation restarting from the beginning, content written before start still read, and no delivery after close — including a read already in flight when close lands.
 - `inspect_error` planning and admission: the project script for each re-runnable class, classes deliberately excluded (`install`, `vcs`, `container`, `other`, `build`) refused, unknown or non-string classes refused, an absolute resolvable workdir required, the canonical root quoted, digest stability, and admission refusing on a missing outcome, a succeeded command, a different failing class, and every general identity check.
+- Retention: `resolveRetention` accepting only strict positive-integer spellings; cross-backend end-to-end prune (sqlite, jsonl+memory, in-memory) removing old events with their full dependent ledger closure while keeping fresh chains byte-intact and no-oping below the cutoff; and session wiring — a malformed `SQUID_RETENTION_HOURS` refused before any source starts, the bound and per-pass removals in the banner, and prune-before-restore observed through a replayed deleted id being accepted rather than deduped.
 
 Source tests inject a fake watcher, file probe, and screen-text reader, so they never depend on kernel watch timing, an accessibility API, or a subprocess. Session tests use scripted sources for the same reason: what is under test is the wiring, not any backend. Real-watcher behavior is verified by the `bun run watch:files` smoke run in the release gate, and multi-source ingestion by a `bun run watch:desktop` run against a temporary root; the macOS accessibility backends are verified by hand with `SQUID_SCREEN_READER=darwin bun run watch:screen` and `SQUID_BROWSER=darwin bun run watch:desktop`.
 
@@ -411,7 +417,7 @@ Tracked as issues; the entry-point table under [Dispatching actions](#which-entr
 - Overlay / suggestion UI. The only way to see or answer a suggestion is a terminal prompt.
 - A capability mapping for `draft_completion`. It is the one predicted kind with no action: writing text into someone's editor needs an IDE integration that can place it, and a confirmation surface that can show it in place.
 - `BeliefState` beyond its validated contract. `src/belief-state.ts` defines and fail-closed-validates a belief batch (`task_intent`, evidence, TTL, episode/digest/generation agreement), but nothing produces or consumes one yet: there is no belief provider, no store, and no runtime wiring. The next phase must land `BeliefProvider`, `CognitionProvider`, a semantic gate, and shadow/suggestion mode together — a prompt change alone would not be it.
-- Capture-time privacy policy beyond credential redaction and exclusion/pause. `RedactingCapturePolicy` filters credential content, `SQUID_EXCLUDE` drops named applications outright, and the `SQUID_CONTROL` gate records pauses into the timeline; what remains is **retention** — bounded history with a stated policy, and range deletion that also reaches the ledger so no attempt survives without its trigger event.
+- Capture-time privacy beyond redaction, exclusion, pause, and retention. Those four exist (`RedactingCapturePolicy`, `SQUID_EXCLUDE`, the `SQUID_CONTROL` gate, `SQUID_RETENTION_HOURS` + `history:delete`); what remains is a retention pass *during* a long-running session — startup-only today — and any interactive surface for choosing ranges by hand.
 
 ## Archived documents
 

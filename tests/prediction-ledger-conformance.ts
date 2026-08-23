@@ -1,11 +1,16 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "bun:test";
 import {
   candidateEnvelopes,
+  createActionPlanRecord,
   createAttemptRecord,
   createFeedbackRecord,
+  createPlanDecisionRecord,
   parsePredictionLedgerRecord,
   PredictionLedgerConflictError,
   PredictionLedgerReferenceError,
+  type ActionPlanRecord,
+  type PlanDecisionRecord,
   type PredictionAttemptRecord,
   type PredictionLedger,
 } from "../src/prediction-ledger.js";
@@ -385,6 +390,209 @@ export function describePredictionLedgerConformance(
       } finally {
         await harness.dispose();
       }
+    });
+
+    // Retention deletion is the one operation that removes from the ledger,
+    // and its whole point is the Done-when of issue #6: after deleting events,
+    // no surviving ledger record may reference what was removed. The closure —
+    // attempt → candidates → feedback/plan → decision/dispatch — is contract,
+    // so every backend must walk it identically.
+    describe("deleteRecordsRemovedWithEvents", () => {
+      // Distinct valid digests for the doomed and surviving chains.
+      const DOOMED_DIGEST = `sha256:${"b".repeat(64)}`;
+      const KEPT_DIGEST = `sha256:${"c".repeat(64)}`;
+
+      async function seedFullChain(harness: { readonly ledger: PredictionLedger }): Promise<void> {
+        // `attempt()` hardcodes `triggerEventId: "evt-1"` — that is the doomed
+        // chain's trigger. The surviving attempt gets its own event id.
+        const survivor = attemptWithTrigger("kept-req", "evt-survives");
+        await harness.ledger.appendAttempt(attempt("doomed-req"));
+        await harness.ledger.appendAttempt(survivor);
+
+        await harness.ledger.appendFeedback(createFeedbackRecord({
+          feedbackId: "fb-doomed",
+          requestId: "doomed-req",
+          candidateId: "doomed-req:candidate:0",
+          feedback: "accepted",
+        }));
+        await harness.ledger.appendFeedback(createFeedbackRecord({
+          feedbackId: "fb-kept",
+          requestId: "kept-req",
+          candidateId: "kept-req:candidate:0",
+          feedback: "accepted",
+        }));
+
+        const doomedPlan = planFor("doomed-req", "doomed-req:candidate:0", DOOMED_DIGEST);
+        const keptPlan = planFor("kept-req", "kept-req:candidate:0", KEPT_DIGEST);
+        await harness.ledger.recordPlan(doomedPlan);
+        await harness.ledger.recordPlan(keptPlan);
+        await harness.ledger.recordDecision(decisionFor(DOOMED_DIGEST, "accepted"));
+        await harness.ledger.recordDecision(decisionFor(KEPT_DIGEST, "rejected"));
+      }
+
+      function attemptWithTrigger(requestId: string, triggerEventId: string): PredictionAttemptRecord {
+        return { ...attempt(requestId), triggerEventId };
+      }
+
+      function planFor(
+        requestId: string,
+        candidateId: string,
+        digest: string,
+      ): ActionPlanRecord {
+        return createActionPlanRecord({
+          attemptId: requestId,
+          requestId,
+          candidateId,
+          planDigest: digest,
+          candidateParametersDigest: `sha256:${"c".repeat(64)}`,
+          confirmation: "required",
+          egressPolicyId: "search-egress-deny-v1",
+        });
+      }
+
+      function decisionFor(digest: string, decision: "accepted" | "rejected"): PlanDecisionRecord {
+        return createPlanDecisionRecord({
+          planDigest: digest,
+          decision,
+          detailsDigest: `sha256:${createHash("sha256").update(decision).digest("hex")}`,
+        });
+      }
+
+      it("removes only the closure of the named trigger events", async () => {
+        const harness = await createLedger();
+        try {
+          await seedFullChain(harness);
+
+          const removed = await harness.ledger.deleteRecordsRemovedWithEvents(new Set(["evt-1"]));
+
+          // The doomed chain: its attempt, its feedback, its plan, its decision.
+          expect(removed).toBe(4);
+          const remaining = (await harness.ledger.all()).map((r) => r.recordId).sort();
+          expect(remaining).toEqual([
+            "attempt:kept-req",
+            "feedback:fb-kept",
+            `plan:kept-req:candidate:0:${KEPT_DIGEST}`,
+            `plan_decision:${KEPT_DIGEST}:rejected`,
+          ].sort());
+        } finally {
+          await harness.dispose();
+        }
+      });
+
+      it("leaves nothing dangling after deletion", async () => {
+        // The Done-when stated as an assertion: every surviving reference
+        // resolves. Feedback → candidate must exist inside a surviving attempt;
+        // a plan's attemptId must be a surviving attempt.
+        const harness = await createLedger();
+        try {
+          await seedFullChain(harness);
+          await harness.ledger.deleteRecordsRemovedWithEvents(new Set(["evt-1"]));
+
+          const records = await harness.ledger.all();
+          const survivingCandidates = new Set(
+            records.flatMap((r) =>
+              r.recordType === "attempt" ? r.candidates.map((c) => c.candidateId) : []),
+            );
+          // Plans reference attempts by requestId, so the surviving set is
+          // keyed by requestId, not recordId.
+          const survivingAttempts = new Set(
+            records.filter((r) => r.recordType === "attempt").map((r) => r.requestId),
+          );
+          for (const record of records) {
+            if (record.recordType === "feedback") {
+              expect(survivingCandidates.has(record.candidateId)).toBe(true);
+            }
+            if (record.recordType === "plan") {
+              expect(survivingAttempts.has(record.attemptId)).toBe(true);
+              expect(survivingCandidates.has(record.candidateId)).toBe(true);
+            }
+          }
+        } finally {
+          await harness.dispose();
+        }
+      });
+
+      it("keeps unrelated history byte-identical", async () => {
+        const harness = await createLedger();
+        try {
+          await seedFullChain(harness);
+          // Snapshot the four known survivors by recordId: a doomed chain
+          // decision carries only its digest in its id, so substring matching
+          // on "doomed" would wrongly include it.
+          const survivingRecordIds = new Set([
+            "attempt:kept-req",
+            "feedback:fb-kept",
+            `plan:kept-req:candidate:0:${KEPT_DIGEST}`,
+            `plan_decision:${KEPT_DIGEST}:rejected`,
+          ]);
+          const before = (await harness.ledger.all())
+            .filter((r) => survivingRecordIds.has(r.recordId))
+            .map((r) => structuredClone(r));
+          expect(before).toHaveLength(4);
+
+          await harness.ledger.deleteRecordsRemovedWithEvents(new Set(["evt-1"]));
+
+          const after = await harness.ledger.all();
+          for (const record of before) {
+            expect(after).toContainEqual(record);
+          }
+        } finally {
+          await harness.dispose();
+        }
+      });
+
+      it("returns zero and changes nothing when no record references the events", async () => {
+        const harness = await createLedger();
+        try {
+          await seedFullChain(harness);
+
+          const removed = await harness.ledger.deleteRecordsRemovedWithEvents(
+            new Set(["evt-never-triggered"]),
+          );
+          expect(removed).toBe(0);
+          expect(await harness.ledger.all()).toHaveLength(8);
+        } finally {
+          await harness.dispose();
+        }
+      });
+
+      it("accepts appends normally after a deletion", async () => {
+        // Deletion is mid-life maintenance, not teardown: the ledger stays
+        // writable, and uniqueness constraints keep holding against new ids.
+        const harness = await createLedger();
+        try {
+          await seedFullChain(harness);
+          await harness.ledger.deleteRecordsRemovedWithEvents(new Set(["evt-1"]));
+
+          await expect(
+            harness.ledger.appendAttempt(attempt("post-delete")),
+          ).resolves.toBeUndefined();
+          expect((await harness.ledger.all()).at(-1)?.recordId).toBe("attempt:post-delete");
+        } finally {
+          await harness.dispose();
+        }
+      });
+
+      it("reuses freed identity without conflict", async () => {
+        // After the doomed chain is gone, re-appending an attempt with the same
+        // request id must succeed: deletion means deleted, not reserved. This
+        // is exactly where a tombstone design would fail — the id would still
+        // be held by the tombstone.
+        const harness = await createLedger();
+        try {
+          const doomed = attempt("doomed-req");
+          await harness.ledger.appendAttempt(doomed);
+          await harness.ledger.deleteRecordsRemovedWithEvents(new Set(["evt-1"]));
+          expect(await harness.ledger.all()).toHaveLength(0);
+
+          await expect(
+            harness.ledger.appendAttempt(attempt("doomed-req")),
+          ).resolves.toBeUndefined();
+          expect(await harness.ledger.all()).toHaveLength(1);
+        } finally {
+          await harness.dispose();
+        }
+      });
     });
   });
 }

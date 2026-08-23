@@ -9,6 +9,7 @@
     "dev": "bun run src/main.ts",
     "evaluate": "bun run src/evaluate.ts",
     "gate:pi": "bun run src/gate-pi.ts",
+    "history:delete": "bun run src/history-delete.ts",
     "ledger:report": "bun run src/ledger-report.ts",
     "test": "bun test",
     "watch:desktop": "bun run src/watch-desktop.ts",

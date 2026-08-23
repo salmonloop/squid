@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, readFile, truncate } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, truncate, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { Compile } from "typebox/compile";
 import { Type } from "typebox";
@@ -256,6 +256,25 @@ export interface PredictionLedger {
   all(): Promise<readonly PredictionLedgerRecord[]>;
 
   /**
+   * Deletes every record whose provenance names a removed trigger event, so
+   * retention deletion cannot leave an attempt pointing at history that no
+   * longer exists.
+   *
+   * The input is the set of removed event ids — what the event store just
+   * deleted, not record ids the caller would have to resolve. The ledger walks
+   * the reference graph itself and removes the whole dependent closure: an
+   * attempt triggered by a removed event takes its candidates with it, and any
+   * feedback or plan naming one of those candidates goes too. A plan whose only
+   * link was through its attempt is likewise removed; dispatches, decisions,
+   * and invalidations follow their plan digest.
+   *
+   * What remains after the call is provably self-contained: no surviving record
+   * references anything that no longer exists. Returns the number of records
+   * removed.
+   */
+  deleteRecordsRemovedWithEvents(removedEventIds: ReadonlySet<string>): Promise<number>;
+
+  /**
    * Persists a plan before confirmation. Identical records are idempotent;
    * a different digest for the same candidate conflicts.
    */
@@ -293,6 +312,88 @@ export interface PredictionLedger {
     detailsDigest: string,
     now: string,
   ): Promise<CompleteDispatchResult>;
+}
+
+/**
+ * Resolves the records a retention deletion must take with it.
+ *
+ * Shared by all three backends on purpose: "which records reference a removed
+ * event" is contract, not implementation, and three independent traversals
+ * would eventually disagree — the same drift the claim state machine exists to
+ * prevent.
+ *
+ * The walk runs to a fixed point because references chain: removing an attempt
+ * orphans its candidate ids, orphaned candidate ids orphan their feedback and
+ * plans (a plan names both `attemptId` and `candidateId`), and an orphaned
+ * plan orphans its decisions, dispatches, and invalidations by digest. A single
+ * pass would leave the tail of that chain dangling.
+ *
+ * Attempts are matched on `triggerEventId`, which legacy v1 records carry too —
+ * so pre-audit history deletes by the same rule as current records.
+ */
+export function resolveRecordsRemovedWithEvents(
+  records: readonly PredictionLedgerRecord[],
+  removedEventIds: ReadonlySet<string>,
+): ReadonlySet<string> {
+  const removed = new Set<string>();
+
+  let grew = true;
+  while (grew) {
+    grew = false;
+
+    // Candidate ids that will survive: every attempt not itself being removed
+    // still declares its candidates, and feedback/plans may only be deleted
+    // when no survivor owns their id.
+    const survivingCandidates = new Set<string>();
+    for (const record of records) {
+      if (
+        record.recordType === "attempt" && !removed.has(record.recordId)
+        && !removedEventIds.has(record.triggerEventId)
+      ) {
+        for (const envelope of record.candidates) survivingCandidates.add(envelope.candidateId);
+      }
+    }
+
+    for (const record of records) {
+      if (removed.has(record.recordId)) continue;
+      if (!isRemovedWithEvents(record, records, removedEventIds, removed, survivingCandidates)) continue;
+      removed.add(record.recordId);
+      grew = true;
+    }
+  }
+  return removed;
+}
+
+function isRemovedWithEvents(
+  record: PredictionLedgerRecord,
+  records: readonly PredictionLedgerRecord[],
+  removedEventIds: ReadonlySet<string>,
+  removed: ReadonlySet<string>,
+  survivingCandidates: ReadonlySet<string>,
+): boolean {
+  switch (record.recordType) {
+    case "attempt":
+      return removedEventIds.has(record.triggerEventId);
+    case "feedback":
+      // The candidate's owner attempt was removed; the feedback has nothing
+      // left to describe and stays only as a dangling id.
+      return !survivingCandidates.has(record.candidateId);
+    case "plan":
+      return removed.has(record.attemptId) || !survivingCandidates.has(record.candidateId);
+    case "plan_decision":
+    case "plan_dispatch":
+    case "plan_invalidation": {
+      // These follow their plan: once every plan carrying this digest is being
+      // removed, the digest has no living subject.
+      const planSurvives = records.some((other) =>
+        other.recordType === "plan"
+        && other.planDigest === record.planDigest
+        && !removed.has(other.recordId));
+      return !planSurvives;
+    }
+    default:
+      return false;
+  }
 }
 
 export interface PredictionFeedbackInput {
@@ -783,6 +884,14 @@ export function createPlanInvalidationRecord(input: {
 export class InMemoryPredictionLedger implements PredictionLedger {
   private readonly index = new LedgerIndex();
 
+  public async deleteRecordsRemovedWithEvents(
+    removedEventIds: ReadonlySet<string>,
+  ): Promise<number> {
+    const recordIds = resolveRecordsRemovedWithEvents(this.index.all(), removedEventIds);
+    this.index.remove(recordIds);
+    return recordIds.size;
+  }
+
   public async appendAttempt(record: PredictionAttemptRecord): Promise<void> {
     this.append(parsePredictionLedgerRecord(record));
   }
@@ -850,13 +959,41 @@ export class InMemoryPredictionLedger implements PredictionLedger {
 
 export class JsonlPredictionLedger implements PredictionLedger {
   private readonly index = new LedgerIndex();
-  private writeTail: Promise<void> = Promise.resolve();
+  private writeTail: Promise<unknown> = Promise.resolve();
   private loadPromise: Promise<void> | null = null;
   private loaded = false;
   private repairAtBytes: number | null = null;
   private readDiagnostics: PredictionLedgerDiagnostic[] = [];
 
   public constructor(private readonly filePath: string) {}
+
+  public async deleteRecordsRemovedWithEvents(
+    removedEventIds: ReadonlySet<string>,
+  ): Promise<number> {
+    const write = this.writeTail.then(async () => {
+      await this.ensureLoaded();
+      const recordIds = resolveRecordsRemovedWithEvents(this.index.all(), removedEventIds);
+      if (recordIds.size === 0) return 0;
+
+      // Same atomic rewrite the event store uses: temp file, rename over. An
+      // interrupted delete leaves either old history or new — never a half
+      // ledger whose audit trail no longer parses.
+      const kept = this.index.all().filter((record) => !recordIds.has(record.recordId));
+      const tempPath = `${this.filePath}.delete-${crypto.randomUUID()}`;
+      await mkdir(dirname(this.filePath), { recursive: true });
+      if (this.repairAtBytes !== null) {
+        // A pending truncated-tail repair is subsumed by this rewrite: the new
+        // file contains only parsed records.
+        this.repairAtBytes = null;
+      }
+      await writeFile(tempPath, kept.map((record) => `${JSON.stringify(record)}\n`).join(""), "utf8");
+      await rename(tempPath, this.filePath);
+      this.index.remove(recordIds);
+      return recordIds.size;
+    });
+    this.writeTail = write.catch(() => undefined);
+    return (await write) as number;
+  }
 
   public get diagnostics(): readonly PredictionLedgerDiagnostic[] {
     return this.readDiagnostics.map((diagnostic) => ({ ...diagnostic }));
@@ -1153,6 +1290,32 @@ class LedgerIndex {
 
   public all(): readonly PredictionLedgerRecord[] {
     return structuredClone(this.records);
+  }
+
+  /**
+   * Removes the named records and every index entry they owned.
+   *
+   * The closure resolver guarantees the set is self-consistent — an attempt's
+   * candidates go with it, so dropping their index entries cannot leave a
+   * feedback record pointing at a candidate that still exists. Records not in
+   * the set are untouched; removing an unknown id is a no-op.
+   */
+  public remove(recordIds: ReadonlySet<string>): void {
+    if (recordIds.size === 0) return;
+    // Backwards, so splicing never skips the next record.
+    for (let index = this.records.length - 1; index >= 0; index -= 1) {
+      const record = this.records[index]!;
+      if (!recordIds.has(record.recordId)) continue;
+      if (record.recordType === "attempt") {
+        this.byRequestId.delete(record.requestId);
+        for (const envelope of record.candidates) {
+          this.candidateIds.delete(envelope.candidateId);
+          this.requestByCandidateId.delete(envelope.candidateId);
+        }
+      }
+      this.byRecordId.delete(record.recordId);
+      this.records.splice(index, 1);
+    }
   }
 }
 

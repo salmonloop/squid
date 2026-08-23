@@ -3,9 +3,11 @@ import { createWatchRuntime, type WatchRuntime } from "./create-watch-runtime.js
 import { describeErrorForAudit, resolveSearchEgress } from "./action-egress.js";
 import { CaptureGateActivitySource } from "./capture-gate-source.js";
 import { resolveCaptureGate } from "./resolve-capture-gate.js";
+import { HOUR_MS, resolveRetention } from "./resolve-retention.js";
 import type { ActivitySource, ActivitySourceDiagnostic } from "./activity-source.js";
 import type { ActivityEvent } from "./protocol.js";
 import type { PredictionRuntimeIngestResult } from "./prediction-runtime.js";
+import { runRetentionPrune, type RetentionPruneResult } from "./retention-prune.js";
 import { sqliteWatchExclusions } from "./sqlite-event-store.js";
 import { resolveWatchActions, type WatchActionsResolution } from "./watch-actions.js";
 import { resolveWatchProvider } from "./watch-provider.js";
@@ -115,6 +117,12 @@ export async function startWatchSession(
   const gate = resolveCaptureGate(env);
   if ("configError" in gate) return { configError: gate.configError };
 
+  // Retention resolves with the other capability variables, before any sink
+  // opens: a typo in SQUID_RETENTION_HOURS must fail startup rather than run a
+  // capture session whose deletion policy was silently not applied.
+  const retention = resolveRetention({ env });
+  if ("configError" in retention) return { configError: retention.configError };
+
   const watch = createWatchRuntime({
     ...(options.databasePath === undefined ? {} : { databasePath: options.databasePath }),
     provider: resolved.selection.provider,
@@ -128,6 +136,23 @@ export async function startWatchSession(
       logError(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
     },
   });
+
+  // Retention prunes before restore, so the projection is rebuilt from the
+  // history that actually remains — an event the policy deleted must not be
+  // re-ingested into world state. The prune runs once per process start;
+  // there is no in-run timer, because a long-running session would otherwise
+  // delete under the user's feet mid-episode.
+  let pruneSummary: RetentionPruneResult | undefined;
+  if (retention.enabled) {
+    try {
+      pruneSummary = await runRetentionPrune(watch.store, watch.ledger, {
+        cutoffMs: Date.now() - retention.hours * HOUR_MS,
+      });
+    } catch (error) {
+      await watch.dispose();
+      return { configError: `Retention prune failed: ${describeErrorForAudit(error)}` };
+    }
+  }
 
   // Rebuild the dedupe index and projection from history before observing, so a
   // restart cannot re-ingest an event the store already holds.
@@ -240,6 +265,11 @@ export async function startWatchSession(
       store: watch.databasePath ?? "memory",
       ledger: watch.ledgerPath ?? "memory",
       control: gate.enabled ? gate.readerKind : "off",
+      retention: retention.enabled ? retention.hours : "off",
+      ...(pruneSummary === undefined ? {} : {
+        prunedEvents: pruneSummary.removedEvents,
+        prunedRecords: pruneSummary.removedRecords,
+      }),
       restoredActions: restored.recentActions.length,
     },
     runtime: watch,

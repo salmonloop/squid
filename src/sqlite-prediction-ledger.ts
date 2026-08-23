@@ -8,6 +8,7 @@ import {
   PredictionLedgerConflictError,
   PredictionLedgerReferenceError,
   recordIdentity,
+  resolveRecordsRemovedWithEvents,
   type ActionPlanRecord,
   type ClaimDispatchInputs,
   type CompleteDispatchResult,
@@ -55,6 +56,46 @@ export class SqlitePredictionLedger implements PredictionLedger {
       this.database.close();
       throw error;
     }
+  }
+
+  public async deleteRecordsRemovedWithEvents(
+    removedEventIds: ReadonlySet<string>,
+  ): Promise<number> {
+    this.assertOpen();
+    // One transaction: the closure is computed and applied atomically, so no
+    // concurrent append can interleave between resolving what must go and
+    // removing it — a feedback record appended mid-delete would otherwise
+    // reference a candidate deleted microseconds later.
+    const transaction = this.database.transaction((): number => {
+      const recordIds = resolveRecordsRemovedWithEvents(this.allSync(), removedEventIds);
+      if (recordIds.size === 0) return 0;
+      const placeholders = [...recordIds].map(() => "?").join(", ");
+      this.database
+        .query(`DELETE FROM ledger_records WHERE record_id IN (${placeholders})`)
+        .run(...recordIds);
+
+      // Candidate rows go after records: `ledger_records.candidate_id`
+      // references this table, so deleting a candidate first could fire the FK
+      // against a record row that the same transaction is about to remove.
+      const orphaned = this.database
+        .query(
+          `SELECT c.candidate_id FROM ledger_candidates c
+           LEFT JOIN ledger_records r ON r.record_type = 'attempt' AND r.request_id = c.request_id
+           GROUP BY c.candidate_id
+           HAVING COUNT(r.record_id) = 0`,
+        )
+        .all() as readonly { candidate_id: string }[];
+      if (orphaned.length > 0) {
+        const orphanPlaceholders = orphaned.map(() => "?").join(", ");
+        this.database
+          .query(
+            `DELETE FROM ledger_candidates WHERE candidate_id IN (${orphanPlaceholders})`,
+          )
+          .run(...orphaned.map((row) => row.candidate_id));
+      }
+      return recordIds.size;
+    });
+    return transaction();
   }
 
   public async appendAttempt(record: PredictionAttemptRecord): Promise<void> {
