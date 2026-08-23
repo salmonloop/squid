@@ -91,4 +91,45 @@ describe("createStdioGraphicalTransport", () => {
     expect(await ask(transport)).toBe("approved");
     await transport.close?.();
   });
+
+  it("settles a pending ask when the signal aborts", async () => {
+    const transport = createStdioGraphicalTransport({
+      command: node,
+      args: [stub, "silent"],
+    });
+    const controller = new AbortController();
+    const pending = transport.ask(payload, controller.signal);
+    // The engine aborts on timeout, on expiry, and on shutdown. A surface that
+    // ignored the signal would leave this promise unsettled and the window on
+    // screen for a question nobody is waiting for.
+    controller.abort();
+    await expect(pending).rejects.toThrow(/surface closed/);
+    await transport.close?.();
+  });
+
+  it("refuses an ask whose signal is already aborted", async () => {
+    const transport = createStdioGraphicalTransport({
+      command: node,
+      args: [stub, "approve"],
+    });
+    const controller = new AbortController();
+    controller.abort();
+    await expect(transport.ask(payload, controller.signal)).rejects.toThrow(/surface closed/);
+    await transport.close?.();
+  });
+
+  it("drops an answer whose prompt id does not match the pending ask", async () => {
+    const transport = createStdioGraphicalTransport({
+      command: node,
+      args: [stub, "stale"],
+    });
+    const controller = new AbortController();
+    const pending = transport.ask(payload, controller.signal);
+    // The stub answers with a wrong id, modelling a reply to a prompt this side
+    // already abandoned. Applying it would mean approving a plan the user never
+    // saw, so the transport must ignore it and stay pending until aborted.
+    controller.abort();
+    await expect(pending).rejects.toThrow(/surface closed/);
+    await transport.close?.();
+  });
 });
