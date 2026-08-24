@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { HeuristicPredictor } from "../src/baseline-predictor.js";
 import type { PredictionCandidate } from "../src/protocol.js";
 import type { PredictionProvider } from "../src/prediction-provider.js";
+import { RedactingContextPolicy } from "../src/context-policy.js";
 import type { ProviderGateResult } from "../src/provider-gate.js";
 import type { SemanticGateResult } from "../src/semantic-gate.js";
 import {
@@ -207,8 +208,14 @@ describe("selectPredictionProvider in cognition mode", () => {
 
   function cognitionHarness(result: () => Promise<SemanticGateResult>) {
     const calls = { createCognition: 0, runSemanticGate: 0 };
+    // The caller supplies the policy so one instance can be shared by the gate,
+    // the belief resolver's claimed id, and the returned selection. Asserting
+    // identity below — not just a matching id — is what would catch a future edit
+    // that reverted to constructing a second one here.
+    const contextPolicy = new RedactingContextPolicy();
     const seams: Omit<CognitionProviderOptions, "mode" | "gate"> = {
       heuristic: new HeuristicPredictor(),
+      contextPolicy,
       createCognition: () => {
         calls.createCognition += 1;
         return stubCognition;
@@ -218,7 +225,7 @@ describe("selectPredictionProvider in cognition mode", () => {
         return result();
       },
     };
-    return { calls, seams };
+    return { calls, seams, contextPolicy };
   }
 
   function semanticResult(
@@ -229,13 +236,16 @@ describe("selectPredictionProvider in cognition mode", () => {
   }
 
   it("admits the cognition path when the semantic gate passes", async () => {
-    const { calls, seams } = cognitionHarness(async () => semanticResult("passed"));
+    const { calls, seams, contextPolicy } = cognitionHarness(async () => semanticResult("passed"));
     const selection = await selectPredictionProvider({ ...seams, mode: "cognition", gate: "replay" });
 
     expect(selection.provider.name).toBe("belief-rerank");
     expect(selection.declineReason).toBeNull();
     expect(selection.actionTrust).toBe("trusted");
-    expect(selection.contextPolicy.id).toBe("redacting");
+    // The caller's own instance, not a second one that happens to share the id.
+    // A matching id would pass while the gate scored a different projection than
+    // the live coordinator applies — the defect this threading exists to close.
+    expect(selection.contextPolicy).toBe(contextPolicy);
     expect(calls).toEqual({ createCognition: 1, runSemanticGate: 1 });
   });
 

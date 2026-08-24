@@ -10,7 +10,12 @@ import {
   type BeliefStateBatch,
 } from "../src/belief-state.js";
 import { BeliefBackedPredictionProvider } from "../src/cognition-provider.js";
-import { PassthroughContextPolicy, RedactingContextPolicy } from "../src/context-policy.js";
+import {
+  PassthroughContextPolicy,
+  RedactingContextPolicy,
+  type ContextPolicy,
+} from "../src/context-policy.js";
+import type { PredictionProviderFactory } from "../src/evaluation.js";
 import { heuristicEvaluationScenarios } from "../src/evaluation-fixtures.js";
 import { HeuristicBeliefProvider } from "../src/heuristic-belief-provider.js";
 import { InMemoryEventStore } from "../src/event-store.js";
@@ -491,16 +496,67 @@ describe("the live path from coordinator to belief", () => {
  * nondeterminism that already sinks `PiRuntime` through unremarked.
  */
 describe("runSemanticGate over the belief-backed cognition path", () => {
-  const cognitionProvider = () => new BeliefBackedPredictionProvider(
-    new BeliefRerankCognition(),
-    createBeliefResolver({
-      beliefProvider: new HeuristicBeliefProvider(),
-      // Matches the policy `evaluateWithProvider`'s coordinator applies. A
-      // mismatch here would refuse every batch and quietly turn the gate into a
-      // measurement of the heuristic.
-      contextPolicyId: new PassthroughContextPolicy().id,
-    }),
-  );
+  /** Built exactly as `resolveCognitionProvider` builds it: one shared policy. */
+  function cognitionProviderUnder(policy: ContextPolicy): PredictionProviderFactory {
+    return () => new BeliefBackedPredictionProvider(
+      new BeliefRerankCognition(),
+      createBeliefResolver({
+        beliefProvider: new HeuristicBeliefProvider(),
+        contextPolicyId: policy.id,
+      }),
+    );
+  }
+
+  const cognitionProvider = cognitionProviderUnder(new PassthroughContextPolicy());
+
+  /**
+   * The gate exists to decide whether a provider may reach a real dispatch, so it
+   * has to score the provider *as the live run configures it*. The live cognition
+   * path applies `RedactingContextPolicy`; if the gate applies passthrough, a
+   * belief producer is measured on window titles, full paths, and URL query
+   * strings it can never have in production — and then earns `trusted` on that
+   * evidence.
+   *
+   * The `contextPolicyId` agreement check cannot catch this: a cooperative
+   * producer echoes the request's id back, so request and batch agree whatever
+   * the resolver was told. Only observing the state the provider actually receives
+   * settles it, which is what this asserts.
+   */
+  it("hands the belief provider the state the live run would project", async () => {
+    const policy = new RedactingContextPolicy();
+    const seen: WorldState[] = [];
+    const spy: BeliefProvider = {
+      name: "state-spy",
+      infer: async (request, signal) => {
+        seen.push(request.worldState);
+        return new HeuristicBeliefProvider().infer(request, signal);
+      },
+    };
+
+    const result = await runSemanticGate({
+      scenarios: heuristicEvaluationScenarios,
+      contextPolicy: policy,
+      createProvider: () => new BeliefBackedPredictionProvider(
+        new BeliefRerankCognition(),
+        createBeliefResolver({ beliefProvider: spy, contextPolicyId: policy.id }),
+      ),
+    });
+
+    expect(result.status).toBe("passed");
+    expect(seen.length).toBeGreaterThan(0);
+
+    // Redaction is observable in the projection, so these assert the policy really
+    // ran rather than that the id was merely claimed.
+    const titles = seen.map((state) => state.focus?.windowTitle).filter((t) => t !== undefined);
+    expect(titles.length).toBeGreaterThan(0);
+    expect(titles.every((title) => title === "[redacted]")).toBe(true);
+
+    const targets = seen.flatMap((state) => state.recentActions.map((action) => action.target));
+    const paths = targets.filter((target): target is string => target !== null && target.includes("."));
+    expect(paths.length).toBeGreaterThan(0);
+    // Basenamed, so no directory structure reaches a provider under this policy.
+    expect(paths.every((path) => !path.includes("/"))).toBe(true);
+  });
 
   it("admits the belief-backed path on both quality and determinism", async () => {
     const result = await runSemanticGate({

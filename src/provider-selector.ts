@@ -63,6 +63,18 @@ export interface CognitionProviderOptions {
   readonly heuristic: Predictor;
   readonly createCognition: () => PredictionProvider;
   readonly runSemanticGate: () => Promise<SemanticGateResult>;
+  /**
+   * The policy this provider's state is projected through, supplied by the caller
+   * rather than constructed here.
+   *
+   * Required, and required for a specific reason: the belief layer behind a
+   * cognition provider must be told the id of the policy that actually ran, and
+   * the gate must apply that same policy. Three separate `new
+   * RedactingContextPolicy()` calls — one for the resolver's claimed id, one for
+   * the gate, one for the returned selection — agree only by the coincidence of a
+   * shared literal. Threading one instance makes the agreement structural.
+   */
+  readonly contextPolicy: ContextPolicy;
 }
 
 /**
@@ -124,13 +136,21 @@ export async function selectPredictionProvider(
     };
   }
   return {
-    // Both admitted paths get the redacting policy, and for the same reason: a
+    // Both admitted paths get a redacting policy, and for the same reason: a
     // provider that reasons about the projection is an egress boundary whether it
     // runs out of process or not. Cognition is in-process today, but the belief
     // producer behind it is a seam a model is meant to fill — and a policy chosen
     // by where the code happens to run would silently widen the moment it does.
+    //
+    // Cognition brings its own instance because its belief layer names the policy
+    // and its gate has to apply it; the two must be the same object, not two
+    // constructions that share a literal id. Pi constructs one here because
+    // nothing downstream of it reads a policy id — see the note on
+    // `CognitionProviderOptions.contextPolicy`.
     provider: options.mode === "pi" ? options.createPi() : options.createCognition(),
-    contextPolicy: new RedactingContextPolicy(),
+    contextPolicy: options.mode === "pi"
+      ? new RedactingContextPolicy()
+      : options.contextPolicy,
     // The same rule the model path uses, and it is the constraint issue #4 names:
     // an un-gated provider stays `suggestion_only`, so nothing it proposes can be
     // dispatched. A probe says only "it answers"; a replay says "it answers as

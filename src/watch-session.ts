@@ -102,7 +102,20 @@ export async function startWatchSession(
   // Choose the primary predictor before opening any sink: a config error or a
   // declined model must not leave a half-created database behind. The default
   // `SQUID_PROVIDER=heuristic` never touches a model.
-  const resolved = await resolveWatchProvider(env);
+  const resolved = await resolveWatchProvider(env, {
+    // Belief outcomes go to the same stderr channel every other diagnostic uses.
+    // Without this a cognition run cannot be told apart from one whose belief
+    // layer has been silently refusing every batch — the ranking would differ,
+    // which reads as a bad model rather than a starved one.
+    onDiagnostic: (diagnostic) => {
+      logError(JSON.stringify({
+        diagnostic: diagnostic.kind,
+        provider: diagnostic.provider,
+        status: diagnostic.status,
+        ...(diagnostic.reasonCode === undefined ? {} : { reasonCode: diagnostic.reasonCode }),
+      }));
+    },
+  });
   if (!resolved.ok) return { configError: resolved.configError };
   if (resolved.selection.declineReason !== null) {
     logError(JSON.stringify({
@@ -172,6 +185,14 @@ export async function startWatchSession(
   // restart cannot re-ingest an event the store already holds.
   const restored = await watch.runtime.restore();
 
+  /**
+   * Everything a resolved prediction goes on to do: the log line, the shadow run,
+   * the dispatch. The runtime drains the prediction itself but knows nothing about
+   * what a caller chained onto it, so shutdown has to await these first — see the
+   * ordering comment in `stop`.
+   */
+  const outcomeContinuations = new Set<Promise<void>>();
+
   // The shadow path is built after the ledger exists and before any source starts.
   // Its ledger writes are tracked here rather than by the runtime: the runtime
   // drains what *it* wrote, and a shadow record appended after the sinks closed
@@ -214,6 +235,31 @@ export async function startWatchSession(
       })
     : undefined;
 
+  /**
+   * Settles the shadow path, in the one order that loses nothing.
+   *
+   * Three steps, each needed for a different reason. First the outcome
+   * continuations: a shadow run only *starts* inside one, so disposing the runner
+   * before they settle makes `observe` hit its disposed guard and return —
+   * producing no run, no record, and no diagnostic. Then the runner, so every
+   * observation has fired. Then the appends those observations began, because
+   * closing the ledger under a write still in flight would drop the record.
+   *
+   * Awaiting a continuation implicitly awaits the prediction behind it, so this
+   * needs no new runtime hook. Every path that disposes calls this, including the
+   * early returns, so the ordering lives in one place rather than three.
+   */
+  const drainShadow = async (): Promise<void> => {
+    while (outcomeContinuations.size > 0) {
+      await Promise.allSettled([...outcomeContinuations]);
+    }
+    if (shadowRunner === undefined) return;
+    await shadowRunner.dispose();
+    while (shadowWrites.size > 0) {
+      await Promise.allSettled([...shadowWrites]);
+    }
+  };
+
   // The action half of the closed loop, off unless SQUID_ACTIONS opts in. Like
   // the provider above it resolves before any source starts: a typo must fail
   // loudly here, not silently disable execution.
@@ -223,6 +269,10 @@ export async function startWatchSession(
     egressPolicy: egress,
   });
   if (actions !== undefined && "configError" in actions) {
+    // Vacuous today — no source has started, so nothing can be in flight — but the
+    // runner exists by now, and a path that disposes without draining is the
+    // asymmetry a later edit turns into a lost record.
+    await drainShadow();
     await watch.dispose();
     return { configError: actions.configError };
   }
@@ -246,7 +296,7 @@ export async function startWatchSession(
     }));
   }
   if (sources.length === 0) {
-    await shadowRunner?.dispose();
+    await drainShadow();
     await watch.dispose();
     return { configError: "A watch session needs at least one activity source." };
   }
@@ -310,7 +360,7 @@ export async function startWatchSession(
     };
     log(JSON.stringify(options.describeEvent(event, ingested)));
     if (result.prediction === null) return;
-    void result.prediction.then(async (outcome) => {
+    const settled = result.prediction.then(async (outcome) => {
       log(JSON.stringify({
         requestId: outcome.requestId,
         status: outcome.status,
@@ -342,6 +392,17 @@ export async function startWatchSession(
       // cannot take down the ingest loop.
       logError(JSON.stringify({ dispatchError: describeErrorForAudit(error) }));
     });
+    // Tracked rather than `void`ed. Everything downstream of an outcome — the
+    // shadow run and its ledger append — happens in this continuation, and the
+    // runtime does not know it exists: `runtime.dispose()` drains the prediction,
+    // not what a caller chained onto it. Untracked, a shutdown drains the runtime
+    // *after* the shadow runner is already disposed, so the observation is dropped
+    // with no record and no diagnostic.
+    outcomeContinuations.add(settled);
+    void settled.then(
+      () => outcomeContinuations.delete(settled),
+      () => outcomeContinuations.delete(settled),
+    );
   };
 
   // Started one at a time rather than with Promise.all: a source that rejects
@@ -356,14 +417,10 @@ export async function startWatchSession(
     for (const source of started.reverse()) {
       await source.stop().catch(() => {});
     }
-    // A source that failed mid-start may already have emitted, so the shadow runs
-    // it triggered are drained before the ledger closes under them.
-    if (shadowRunner !== undefined) {
-      await shadowRunner.dispose();
-      while (shadowWrites.size > 0) {
-        await Promise.allSettled([...shadowWrites]);
-      }
-    }
+    // A source that failed mid-start may already have emitted, so this path is the
+    // one where a drop is reachable rather than theoretical: `source.start(ingest)`
+    // ran, predictions may be in flight, and their shadow runs have not begun.
+    await drainShadow();
     await watch.dispose();
     return { configError: `A source failed to start: ${describeErrorForAudit(error)}` };
   }
@@ -402,17 +459,7 @@ export async function startWatchSession(
       // Settle confirmation and dispatch while the runtime is still open:
       // rejection and terminal action feedback must reach the ledger.
       if (actions !== undefined) await actions.close();
-      // Then the shadow path, in two steps and in this order: drain the runs so
-      // every observation has fired, then drain the appends those observations
-      // started. Disposing the runtime first would close the ledger under a write
-      // still in flight, and awaiting only the runs would leave the last append
-      // racing the close.
-      if (shadowRunner !== undefined) {
-        await shadowRunner.dispose();
-        while (shadowWrites.size > 0) {
-          await Promise.allSettled([...shadowWrites]);
-        }
-      }
+      await drainShadow();
       await watch.dispose();
     },
   };

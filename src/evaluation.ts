@@ -1,6 +1,7 @@
 import { orderActivityEvents } from "./chronicle-ordering.js";
 import { InMemoryEventStore } from "./event-store.js";
 import type { Predictor } from "./baseline-predictor.js";
+import type { ContextPolicy } from "./context-policy.js";
 import type { ActivityEvent, PredictionCandidate, PredictionKind } from "./protocol.js";
 import { SquidCore } from "./squid-core.js";
 import {
@@ -60,6 +61,18 @@ export type PredictionProviderFactory = () => PredictionProvider;
 export interface ProviderEvaluationOptions {
   /** Hard timeout per prediction request. Defaults to the coordinator timeout. */
   readonly timeoutMs?: number;
+  /**
+   * The policy to project state through before it reaches the provider. Omitted
+   * keeps the coordinator's passthrough default.
+   *
+   * This has to be settable, because a gate that applies a different policy than
+   * the live run is not scoring the provider it authorizes. A belief producer
+   * reading window titles or full paths would be measured on signal it can never
+   * have in production — and the belief contract's own `contextPolicyId` check
+   * cannot catch that, since a cooperative producer echoes back whatever id it
+   * was given.
+   */
+  readonly contextPolicy?: ContextPolicy;
 }
 
 export async function evaluateScenarios(
@@ -94,6 +107,7 @@ export async function evaluateWithProvider(
     const coordinator = new PredictionCoordinator({
       provider,
       ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      ...(options.contextPolicy !== undefined ? { contextPolicy: options.contextPolicy } : {}),
       random: () => {
         if (nextRequestId === null) {
           throw new Error("Evaluation coordinator requested an ID outside a cut point.");
