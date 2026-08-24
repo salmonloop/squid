@@ -96,6 +96,8 @@ function eventAt(eventId: string, occurredAt: string): ReturnType<typeof createA
 function attemptFor(
   requestId: string,
   triggerEventId: string,
+  /** Defaults to the trigger alone; tests citing extra evidence pass more. */
+  sourceEventIds: readonly string[] = [triggerEventId],
 ): ReturnType<typeof createAttemptRecord> {
   return createAttemptRecord({
     triggerEventId,
@@ -119,7 +121,7 @@ function attemptFor(
         rationale: "saved",
         confidence: 0.9,
         expiresAt: NEW_AT,
-        sourceEventIds: [triggerEventId],
+        sourceEventIds,
         parameters: {},
       }],
     },
@@ -128,7 +130,7 @@ function attemptFor(
       rationale: "saved",
       confidence: 0.9,
       expiresAt: NEW_AT,
-      sourceEventIds: [triggerEventId],
+      sourceEventIds,
       parameters: {},
     }]),
   });
@@ -229,6 +231,46 @@ for (const [name, create] of [
         expect(result).toEqual({ removedEvents: 0, removedRecords: 0 });
         expect(await harness.store.all()).toHaveLength(2);
         expect(await harness.ledger.all()).toHaveLength(5);
+      } finally {
+        await harness.dispose();
+      }
+    });
+
+    it("removes an attempt whose trigger survives but whose cited evidence does not", async () => {
+      // The hole the closure existed for and did not cover: `sourceEventIds`
+      // are events a prediction *read*, not the one that fired it. A trigger
+      // inside the retention window can cite evidence outside it — or evidence
+      // deleted by an earlier partial pass — so "the trigger survived" is not
+      // proof the attempt's references all resolve. Before
+      // `recordEventReferences`, both halves of deletion matched on
+      // `triggerEventId` alone and this scenario left the attempt in place,
+      // pointing at an event that no longer existed.
+      const harness = await create();
+      try {
+        await harness.store.append(eventAt("evt-trigger", NEW_AT));
+        await harness.store.append(eventAt("evt-evidence", OLD_AT));
+
+        await harness.ledger.appendAttempt(
+          attemptFor("evidence-req", "evt-trigger", ["evt-trigger", "evt-evidence"]),
+        );
+
+        const result = await runRetentionPrune(harness.store, harness.ledger, {
+          cutoffMs: CUTOFF_MS,
+        });
+
+        // The trigger survived, so event deletion removed one event but the
+        // attempt must go with its evidence anyway.
+        expect(result.removedEvents).toBe(1);
+        expect(result.removedRecords).toBe(1);
+
+        const records = await harness.ledger.all();
+        expect(records).toHaveLength(0);
+
+        // And a repeat pass finds nothing left over: the closure is stable.
+        const second = await runRetentionPrune(harness.store, harness.ledger, {
+          cutoffMs: CUTOFF_MS,
+        });
+        expect(second).toEqual({ removedEvents: 0, removedRecords: 0 });
       } finally {
         await harness.dispose();
       }

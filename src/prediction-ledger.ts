@@ -315,6 +315,53 @@ export interface PredictionLedger {
 }
 
 /**
+ * Every event id a record depends on for its meaning.
+ *
+ * The one place that answers "which events does this record cite". Both halves of
+ * retention deletion read it — the resolver that derives which events history lost,
+ * and the closure below that decides which records go with them — so a new
+ * event-referencing field becomes covered by adding it here once, rather than in
+ * two traversals that must be kept in agreement by hand.
+ *
+ * They were not in agreement. Both halves matched attempts on `triggerEventId`
+ * alone, while a candidate envelope also carries `sourceEventIds` — the events the
+ * prediction actually read. Deleting one of those while its trigger survived left
+ * the attempt in place citing an event that no longer existed, which is exactly the
+ * dangling reference this closure exists to make impossible.
+ *
+ * Only records that name events appear here. A plan, decision, dispatch, or
+ * invalidation reaches history through its attempt and candidate, never directly.
+ */
+export function recordEventReferences(record: PredictionLedgerRecord): ReadonlySet<string> {
+  if (record.recordType !== "attempt") return EMPTY_EVENT_REFERENCES;
+
+  const references = new Set<string>([record.triggerEventId]);
+  for (const envelope of record.candidates) {
+    // v2 envelopes carry `sourceEventIds` directly; a legacy v1 envelope carries
+    // the whole candidate, which holds the same field. Both spellings are covered
+    // so pre-audit history deletes by the same rule as current records.
+    const sourceEventIds = "candidate" in envelope
+      ? envelope.candidate.sourceEventIds
+      : envelope.sourceEventIds;
+    for (const eventId of sourceEventIds) references.add(eventId);
+  }
+  return references;
+}
+
+const EMPTY_EVENT_REFERENCES: ReadonlySet<string> = new Set<string>();
+
+/** True when any event this record cites is among those removed. */
+function citesRemovedEvent(
+  record: PredictionLedgerRecord,
+  removedEventIds: ReadonlySet<string>,
+): boolean {
+  for (const eventId of recordEventReferences(record)) {
+    if (removedEventIds.has(eventId)) return true;
+  }
+  return false;
+}
+
+/**
  * Resolves the records a retention deletion must take with it.
  *
  * Shared by all three backends on purpose: "which records reference a removed
@@ -328,8 +375,11 @@ export interface PredictionLedger {
  * plan orphans its decisions, dispatches, and invalidations by digest. A single
  * pass would leave the tail of that chain dangling.
  *
- * Attempts are matched on `triggerEventId`, which legacy v1 records carry too —
- * so pre-audit history deletes by the same rule as current records.
+ * Which events a record cites is answered by `recordEventReferences` rather than
+ * spelled out inline, so this traversal and the caller that derives *which events
+ * were removed* read one field list. Two independent spellings of "the events a
+ * record depends on" is how the `sourceEventIds` half of this closure stayed
+ * missing.
  */
 export function resolveRecordsRemovedWithEvents(
   records: readonly PredictionLedgerRecord[],
@@ -348,7 +398,7 @@ export function resolveRecordsRemovedWithEvents(
     for (const record of records) {
       if (
         record.recordType === "attempt" && !removed.has(record.recordId)
-        && !removedEventIds.has(record.triggerEventId)
+        && !citesRemovedEvent(record, removedEventIds)
       ) {
         for (const envelope of record.candidates) survivingCandidates.add(envelope.candidateId);
       }
@@ -373,7 +423,7 @@ function isRemovedWithEvents(
 ): boolean {
   switch (record.recordType) {
     case "attempt":
-      return removedEventIds.has(record.triggerEventId);
+      return citesRemovedEvent(record, removedEventIds);
     case "feedback":
       // The candidate's owner attempt was removed; the feedback has nothing
       // left to describe and stays only as a dangling id.

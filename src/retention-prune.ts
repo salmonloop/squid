@@ -1,4 +1,5 @@
 import type { EventStore } from "./event-store.js";
+import { recordEventReferences } from "./prediction-ledger.js";
 import type { PredictionLedger, PredictionLedgerRecord } from "./prediction-ledger.js";
 
 /**
@@ -72,12 +73,20 @@ export async function runRetentionPrune(
 const EPOCH_START = "1970-01-01T00:00:00.000Z";
 
 /**
- * The event ids whose loss explains dangling references: every trigger id an
- * attempt names that no surviving event carries.
+ * The event ids whose loss explains dangling references: every event a surviving
+ * record cites that no surviving event carries.
  *
  * Computed from the ledger's own view rather than a pre-delete snapshot of the
  * store — exact without an extra read, and correct across repeated passes
  * where an earlier run deleted events but died before pruning their records.
+ *
+ * Which events a record cites comes from `recordEventReferences`, the same
+ * function the ledger's closure traversal uses. That sharing is the point: this
+ * half decides *which events were lost* and that half decides *which records go
+ * with them*, so a field one of them missed would silently narrow the deletion.
+ * Both used to read `triggerEventId` alone and neither read a candidate's
+ * `sourceEventIds`, which left an attempt whose trigger survived citing evidence
+ * that had been deleted.
  */
 function resolveRemovedEventIds(
   records: readonly PredictionLedgerRecord[],
@@ -85,8 +94,8 @@ function resolveRemovedEventIds(
 ): ReadonlySet<string> {
   const removed = new Set<string>();
   for (const record of records) {
-    if (record.recordType === "attempt" && !survivorIds.has(record.triggerEventId)) {
-      removed.add(record.triggerEventId);
+    for (const eventId of recordEventReferences(record)) {
+      if (!survivorIds.has(eventId)) removed.add(eventId);
     }
   }
   return removed;
