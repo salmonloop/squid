@@ -1,3 +1,4 @@
+import type { ContextPolicy } from "./context-policy.js";
 import { evaluateWithProvider } from "./evaluation.js";
 import { runProviderGate, type ProviderGateResult, type ProviderGateThresholds } from "./provider-gate.js";
 import type { PredictionProviderFactory, ReplayScenario } from "./evaluation.js";
@@ -69,6 +70,19 @@ export interface SemanticGateOptions {
   readonly probeAvailability?: () => Promise<string | null>;
   readonly thresholds?: Partial<SemanticGateThresholds>;
   readonly timeoutMs?: number;
+  /**
+   * The policy the live run projects state through, so this gate scores the
+   * provider *as configured*. Pass the same instance the caller hands to
+   * `selectPredictionProvider`.
+   *
+   * This matters most for the layer this gate was built to admit. A belief
+   * producer reasoning over window titles, full paths, or URL query strings would,
+   * under a passthrough gate, be measured on signal a redacting live run never
+   * gives it — pass, earn `trusted`, and then degrade. The belief contract's own
+   * `contextPolicyId` check cannot catch that: a cooperative producer echoes back
+   * whatever id it was handed, so request and batch agree either way.
+   */
+  readonly contextPolicy?: ContextPolicy;
 }
 
 const MAX_REPORTED_UNSTABLE = 8;
@@ -89,6 +103,7 @@ export async function runSemanticGate(
       : { probeAvailability: options.probeAvailability }),
     thresholds,
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    ...(options.contextPolicy === undefined ? {} : { contextPolicy: options.contextPolicy }),
   });
 
   // A skip is not a pass and not a failure: an unreachable provider is not
@@ -142,6 +157,10 @@ async function measureStability(
   for (let run = 0; run < Math.max(1, runs); run += 1) {
     const report = await evaluateWithProvider(options.scenarios, options.createProvider, {
       ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+      // The same policy the ranking half used. Measuring stability under a
+      // different projection than ranking would let a provider pass two halves of
+      // a gate that never agreed on what it was scoring.
+      ...(options.contextPolicy === undefined ? {} : { contextPolicy: options.contextPolicy }),
     });
     const topByCutPoint = new Map<string, string>();
     for (const result of report.results) {

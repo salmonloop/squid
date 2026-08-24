@@ -1,4 +1,5 @@
 import { HeuristicPredictor } from "./baseline-predictor.js";
+import type { BeliefOutcome } from "./belief-provider.js";
 import { RedactingContextPolicy } from "./context-policy.js";
 import {
   parseProviderGateMode,
@@ -29,8 +30,33 @@ export type WatchProviderResolution =
   /** A recognized variable held an unrecognized value. The caller reports and exits. */
   | { readonly ok: false; readonly configError: string };
 
+/** What a resolved provider reports about its own belief layer, per request. */
+export interface WatchProviderDiagnostic {
+  readonly kind: "belief_outcome";
+  readonly requestId: string;
+  readonly provider: string;
+  readonly status: BeliefOutcome["status"];
+  readonly latencyMs: number;
+  /** Absent on success. Already sanitized where it carries provider text. */
+  readonly reasonCode?: string;
+}
+
+export interface ResolveWatchProviderOptions {
+  /**
+   * Reports belief outcomes for a cognition run.
+   *
+   * Without it, a cognition provider silently predicting belief-free forever is
+   * indistinguishable from one the belief layer is feeding — the two differ only
+   * in the ranking, and a wrong ranking looks like a bad model rather than a
+   * starved one. Optional so existing callers and tests are unchanged, but the
+   * watch session supplies it.
+   */
+  readonly onDiagnostic?: (diagnostic: WatchProviderDiagnostic) => void;
+}
+
 export async function resolveWatchProvider(
   env: Record<string, string | undefined> = process.env,
+  options: ResolveWatchProviderOptions = {},
 ): Promise<WatchProviderResolution> {
   const mode = parseProviderMode(env.SQUID_PROVIDER);
   if (mode === null) {
@@ -56,7 +82,10 @@ export async function resolveWatchProvider(
   }
 
   if (mode === "cognition") {
-    return { ok: true, selection: await resolveCognitionProvider(gate) };
+    return {
+      ok: true,
+      selection: await resolveCognitionProvider(gate, options.onDiagnostic),
+    };
   }
 
   const [{ PiRuntime }, { runProviderGate }, { heuristicEvaluationScenarios }] = await Promise.all([
@@ -89,19 +118,24 @@ export async function resolveWatchProvider(
 /**
  * Assembles the belief-backed cognition provider and the gate that admits it.
  *
- * The subtle requirement is that the gate must score *the provider the live run
- * would use*, which means the belief resolver inside it has to be told the same
- * `contextPolicyId` the coordinator will apply. Get that wrong and every belief
- * batch fails `context_policy_mismatch` during the replay: the gate would then
- * measure a cognition layer that never once saw a belief, pass it for being
- * indistinguishable from the heuristic, and admit it — after which the live run,
- * with beliefs flowing, behaves like something the gate never tested.
+ * One `ContextPolicy` instance is built here and used three times: the gate
+ * projects state through it, the belief resolver names it, and the selection
+ * returns it so the live coordinator applies it. All three have to be the same
+ * policy or the gate is not scoring the run it authorizes — and the failure is
+ * quiet in both directions.
  *
- * `selectPredictionProvider` decides the policy, so its id is read from the class
- * rather than repeated as a literal here.
+ * Get the *id* wrong and every belief batch fails `context_policy_mismatch`
+ * during the replay, so the gate measures a cognition layer that never saw a
+ * belief and passes it for being indistinguishable from the heuristic. Get the
+ * *policy* wrong — the original defect here — and the gate feeds the belief
+ * producer full window titles and paths while the live run feeds it redacted
+ * ones, so a producer earns `trusted` on evidence it can never reproduce. The
+ * belief contract cannot catch the second case: a cooperative producer echoes
+ * back whatever id it was handed, so request and batch agree either way.
  */
 async function resolveCognitionProvider(
   gate: ProviderGateMode,
+  onDiagnostic: ((diagnostic: WatchProviderDiagnostic) => void) | undefined,
 ): Promise<ProviderSelection> {
   const [
     { BeliefRerankCognition },
@@ -119,26 +153,52 @@ async function resolveCognitionProvider(
     import("./evaluation-fixtures.js"),
   ]);
 
-  const contextPolicyId = new RedactingContextPolicy().id;
-  const createProvider = () => new BeliefBackedPredictionProvider(
+  const contextPolicy = new RedactingContextPolicy();
+  const buildResolver = (observe: boolean) => createBeliefResolver({
+    beliefProvider: new HeuristicBeliefProvider(),
+    contextPolicyId: contextPolicy.id,
+    // Only the live provider reports. The gate runs the corpus four times, so
+    // wiring it there would emit sixty lines of startup noise describing a replay
+    // rather than the user's session — and the gate already reports its own
+    // verdict.
+    ...(observe && onDiagnostic !== undefined
+      ? {
+        onOutcome: (outcome) => onDiagnostic({
+          kind: "belief_outcome",
+          requestId: outcome.requestId,
+          provider: outcome.provider,
+          status: outcome.status,
+          latencyMs: outcome.latencyMs,
+          // Never the batch. `status` and `reasonCode` are a closed vocabulary
+          // plus already-sanitized provider text; the beliefs themselves stay
+          // inside the prediction path.
+          ...(outcome.reasonCode === undefined ? {} : { reasonCode: outcome.reasonCode }),
+        }),
+      }
+      : {}),
+  });
+
+  const createGateProvider = () => new BeliefBackedPredictionProvider(
     new BeliefRerankCognition(),
-    createBeliefResolver({
-      beliefProvider: new HeuristicBeliefProvider(),
-      contextPolicyId,
-    }),
+    buildResolver(false),
   );
 
   return selectPredictionProvider({
     mode: "cognition",
     gate,
     heuristic: new HeuristicPredictor(),
-    createCognition: createProvider,
+    createCognition: () => new BeliefBackedPredictionProvider(
+      new BeliefRerankCognition(),
+      buildResolver(true),
+    ),
+    contextPolicy,
     // No `probeAvailability`: an in-process provider cannot be unavailable, and
     // supplying a probe that always succeeds would only add a way for the gate to
     // skip — which reads as "not evaluated", the one verdict that must not admit.
     runSemanticGate: () => runSemanticGate({
       scenarios: heuristicEvaluationScenarios,
-      createProvider,
+      createProvider: createGateProvider,
+      contextPolicy,
     }),
   });
 }

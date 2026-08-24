@@ -59,7 +59,17 @@ export interface ShadowObservation {
   readonly beliefValues: readonly string[];
   readonly shadowStatus: "succeeded" | "failed";
   readonly latencyMs: number;
-  /** Stable identifier. Never carries model text. */
+  /**
+   * Why the run produced what it did. A validation reason is a fixed identifier
+   * (`state_digest_mismatch` and friends), but a provider failure carries
+   * `describeErrorForAudit` output — sanitized, and still provider-derived text,
+   * because an error message routinely quotes the thing that failed.
+   *
+   * So a consumer must treat this as audit text rather than as an enum: it reaches
+   * the ledger through `createShadowAttemptRecord`, which sanitizes it again before
+   * the write. Calling it "never model text" would be the kind of reassurance that
+   * gets a sanitizer removed as redundant.
+   */
   readonly reasonCode?: string;
   /** True when live and shadow agree on the top-1 kind. */
   readonly top1Agrees: boolean;

@@ -465,6 +465,75 @@ describe("startWatchSession", () => {
     expect(shadow.candidates.map((candidate) => candidate.kind)).toEqual(["inspect_error"]);
   });
 
+  /**
+   * A cognition run must be distinguishable from one whose belief layer is
+   * refusing every batch. Both predict; they differ only in the ranking, and a
+   * wrong ranking reads as a bad model rather than a starved one — so the belief
+   * status has to be observable, or the fidelity of the gate is unverifiable in
+   * production.
+   */
+  it("reports belief outcomes in a cognition run", async () => {
+    const errors: string[] = [];
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result } = await startSession({
+      sources: [source],
+      // `probe` keeps the run at suggestion_only, which is enough to observe the
+      // belief layer without also admitting dispatch.
+      env: { ...OFFLINE_ENV, SQUID_PROVIDER: "cognition", SQUID_PROVIDER_GATE: "probe" },
+      logError: (line) => errors.push(line),
+    });
+    if ("configError" in result) throw new Error(result.configError);
+
+    expect(result.session.banner.provider).toBe("belief-rerank");
+
+    await source.emit!(terminalCommandFailed("term-1"));
+    await result.session.runtime.runtime.awaitIdle();
+    await result.session.stop();
+
+    const outcomes = errors
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((line) => line.diagnostic === "belief_outcome");
+    expect(outcomes.length).toBeGreaterThan(0);
+    expect(outcomes[0]!.provider).toBe("heuristic-belief");
+    // A failed command is a world the `debug_failure` rule fires on, so this run
+    // genuinely had beliefs rather than merely reporting a status.
+    expect(outcomes[0]!.status).toBe("succeeded");
+    // Status and reason codes only — never the batch, whose beliefs stay inside
+    // the prediction path.
+    expect(outcomes[0]).not.toHaveProperty("batch");
+    expect(outcomes[0]).not.toHaveProperty("beliefs");
+  });
+
+  /**
+   * The drop this covers is invisible by construction, which is why it needs a
+   * test rather than an inspection: a shadow run only starts inside the
+   * continuation chained onto a resolved prediction, and the runtime drains the
+   * prediction but knows nothing about that chain. Stop without awaiting it and
+   * `observe` hits its disposed guard — no run, no record, and no diagnostic
+   * either, so the ledger simply has one fewer shadow attempt than ingests.
+   *
+   * Stopping without `awaitIdle` first is exactly the shutdown a signal handler
+   * performs, so this is the real ordering rather than a contrived one.
+   */
+  it("records a shadow run for a prediction still in flight at stop", async () => {
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result } = await startSession({
+      sources: [source],
+      env: { ...OFFLINE_ENV, SQUID_SHADOW_COGNITION: "on" },
+    });
+    if ("configError" in result) throw new Error(result.configError);
+
+    await source.emit!(terminalCommandFailed("term-1"));
+    // Deliberately no `awaitIdle()`: stop() has to settle the shadow path itself.
+    await result.session.stop();
+
+    const report = buildLedgerReport(await result.session.runtime.ledger.all());
+    expect(report.paths.live.attempts).toBe(1);
+    expect(report.paths.shadow.attempts).toBe(1);
+  });
+
   it("logs the shadow run in counts and kinds, never in content", async () => {
     const lines: string[] = [];
     const lifecycle: string[] = [];

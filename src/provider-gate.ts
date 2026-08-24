@@ -1,5 +1,6 @@
 import { describeErrorForAudit } from "./action-egress.js";
 import { HeuristicPredictor } from "./baseline-predictor.js";
+import type { ContextPolicy } from "./context-policy.js";
 import type { EvaluationReport, PredictionProviderFactory, ReplayScenario } from "./evaluation.js";
 import { evaluateScenarios, evaluateWithProvider } from "./evaluation.js";
 import type { PredictionProvider } from "./prediction-provider.js";
@@ -83,6 +84,18 @@ export interface ProviderGateOptions {
   readonly probeAvailability?: () => Promise<string | null>;
   readonly thresholds?: ProviderGateThresholds;
   readonly timeoutMs?: number;
+  /**
+   * Policy to project state through before it reaches the candidate provider.
+   * Omitted keeps passthrough, which is what an in-process candidate wants.
+   *
+   * Applied to the *candidate* only, deliberately. The baseline is the heuristic
+   * running in-process on unprojected state — the same way it runs as the
+   * coordinator's live fallback — so projecting it too would score a predictor
+   * nothing ever runs. The comparison is therefore "candidate under its real
+   * egress boundary versus the local baseline", which is the question this gate
+   * is asked.
+   */
+  readonly contextPolicy?: ContextPolicy;
 }
 
 /**
@@ -114,6 +127,11 @@ export async function runProviderGate(
     };
   }
 
+  // Deliberately unprojected, even when the candidate is projected. The heuristic
+  // is what the coordinator falls back to in-process, and `runFallback` reads
+  // `request.worldState` — the unprojected snapshot. Passing a policy here would
+  // score a predictor no live run ever executes, and would move the floor the
+  // candidate is measured against for a reason unrelated to the candidate.
   const baseline = await evaluateScenarios(scenarios, () => new HeuristicPredictor());
 
   // Count what the provider actually answered. The ranking report cannot show
@@ -124,6 +142,7 @@ export async function runProviderGate(
   try {
     candidate = await evaluateWithProvider(scenarios, () => observer.wrap(createProvider()), {
       ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      ...(options.contextPolicy !== undefined ? { contextPolicy: options.contextPolicy } : {}),
     });
   } catch (error) {
     return {

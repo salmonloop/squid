@@ -17,16 +17,26 @@ import type { ShadowObservation } from "./shadow-cognition.js";
  *
  * Three separate namespaces are shifted, not one:
  *
- *   - `requestId` gains a `:shadow` suffix. `claimDispatch` finds an attempt by
- *     `record.requestId === plan.attemptId`, and a plan's `attemptId` is a live
- *     request id, so a shadow record is unreachable by that lookup. This is the
- *     structural reason shadow mode cannot dispatch: not a flag anyone remembered
- *     to check, but an id no claim will ever ask for.
+ *   - `requestId` gains a `:shadow` suffix. This is what lets the two records
+ *     *coexist*: `assertCanAccept` refuses a second attempt for a request that
+ *     already has one, so an unshifted shadow record would lose that collision
+ *     (the live write lands first, since `PredictionRuntime` awaits its attempt
+ *     write before resolving the outcome the shadow run observes) and never be
+ *     written at all. It also puts the record outside the id `claimDispatch`
+ *     searches — that lookup is `record.requestId === plan.attemptId`, and a
+ *     plan's `attemptId` is always a live request id.
  *   - `candidateId`s follow from the shifted request id, so a shadow candidate
  *     cannot collide with the live candidate at the same ordinal — which the
  *     ledger index would otherwise refuse as a conflict.
  *   - `provider` gains a `shadow:` prefix, which is what makes the split legible
  *     in `bun run ledger:report` rather than merely safe.
+ *
+ * What actually makes dispatch impossible is narrower than all of that, and worth
+ * being precise about: `ShadowCognitionRunner` has no dispatcher. Its only output
+ * is an observation, and no caller passes `shadowCandidates` to anything that
+ * dispatches. The id and the trust level below are defence in depth around that
+ * one fact — remove either and shadow mode still cannot act, so neither should be
+ * read as the load-bearing guarantee.
  *
  * `triggerEventId` is deliberately *not* shifted: both records describe the same
  * ingest, and retention deletion removes records by trigger event. Renaming it
@@ -88,9 +98,10 @@ export function createShadowAttemptRecord(input: {
     triggerDisposition: observation.context.triggerDisposition,
     contextPolicyId: observation.context.contextPolicyId,
     // Always suggestion-only, regardless of how the live run is configured. A
-    // shadow path has passed no gate for *this* user's world, and the trust field
-    // is what `action-admission.ts` reads — so this is the second, independent
-    // reason a shadow candidate cannot be dispatched, after the unreachable id.
+    // shadow path has passed no gate for *this* user's world. `admitAction` reads
+    // the attempt's own trust level and not just the runtime's, so this genuinely
+    // refuses on its own — it is the defence-in-depth layer the header describes,
+    // not the reason dispatch is impossible.
     actionTrust: "suggestion_only",
     egressPolicyId: input.egressPolicyId,
   });
