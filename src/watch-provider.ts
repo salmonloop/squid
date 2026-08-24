@@ -2,6 +2,7 @@ import { HeuristicPredictor } from "./baseline-predictor.js";
 import type { BeliefOutcome } from "./belief-provider.js";
 import type { BeliefStateBatch } from "./belief-state.js";
 import { RedactingContextPolicy } from "./context-policy.js";
+import { resolveBeliefProvider } from "./resolve-belief-provider.js";
 import {
   parseProviderGateMode,
   parseProviderMode,
@@ -102,10 +103,7 @@ export async function resolveWatchProvider(
   }
 
   if (mode === "cognition") {
-    return {
-      ok: true,
-      selection: await resolveCognitionProvider(gate, options),
-    };
+    return resolveCognitionProvider(gate, env, options);
   }
 
   const [{ PiRuntime }, { runProviderGate }, { heuristicEvaluationScenarios }] = await Promise.all([
@@ -155,18 +153,25 @@ export async function resolveWatchProvider(
  */
 async function resolveCognitionProvider(
   gate: ProviderGateMode,
+  env: Record<string, string | undefined>,
   options: ResolveWatchProviderOptions,
-): Promise<ProviderSelection> {
+): Promise<WatchProviderResolution> {
+  // Which producer sits behind the seam is a config question, answered before any
+  // model graph loads: a typo must fail startup rather than silently run the
+  // deterministic rules while an operator believes a model is being scored.
+  const beliefProvider = resolveBeliefProvider({ env });
+  if ("configError" in beliefProvider) {
+    return { ok: false, configError: beliefProvider.configError };
+  }
+
   const [
     { BeliefRerankCognition },
-    { HeuristicBeliefProvider },
     { createBeliefResolver },
     { BeliefBackedPredictionProvider },
     { runSemanticGate },
     { heuristicEvaluationScenarios },
   ] = await Promise.all([
     import("./belief-rerank-cognition.js"),
-    import("./heuristic-belief-provider.js"),
     import("./belief-resolver.js"),
     import("./cognition-provider.js"),
     import("./semantic-gate.js"),
@@ -212,8 +217,14 @@ async function resolveCognitionProvider(
     }
   };
   const observed = options.onDiagnostic !== undefined || options.onBeliefBatch !== undefined;
+
+  // One producer instance, shared. A `BeliefProvider` holds no per-request state, and
+  // the model-backed one opens a model runtime in its constructor — the gate builds a
+  // provider per scenario per replay, so constructing a producer alongside each would
+  // open that runtime 57 times to answer 57 questions.
+  const producer = await beliefProvider.createProvider();
   const buildResolver = (observe: boolean) => createBeliefResolver({
-    beliefProvider: new HeuristicBeliefProvider(),
+    beliefProvider: producer,
     contextPolicyId: contextPolicy.id,
     ...(observe && observed ? { onOutcome: observeOutcome } : {}),
   });
@@ -223,22 +234,44 @@ async function resolveCognitionProvider(
     buildResolver(false),
   );
 
-  return selectPredictionProvider({
-    mode: "cognition",
-    gate,
-    heuristic: new HeuristicPredictor(),
-    createCognition: () => new BeliefBackedPredictionProvider(
-      new BeliefRerankCognition(),
-      buildResolver(true),
-    ),
-    contextPolicy,
-    // No `probeAvailability`: an in-process provider cannot be unavailable, and
-    // supplying a probe that always succeeds would only add a way for the gate to
-    // skip — which reads as "not evaluated", the one verdict that must not admit.
-    runSemanticGate: () => runSemanticGate({
-      scenarios: heuristicEvaluationScenarios,
-      createProvider: createGateProvider,
+  return {
+    ok: true,
+    selection: await selectPredictionProvider({
+      mode: "cognition",
+      gate,
+      heuristic: new HeuristicPredictor(),
+      createCognition: () => new BeliefBackedPredictionProvider(
+        new BeliefRerankCognition(),
+        buildResolver(true),
+      ),
       contextPolicy,
+      runSemanticGate: () => runSemanticGate({
+        scenarios: heuristicEvaluationScenarios,
+        createProvider: createGateProvider,
+        contextPolicy,
+        // Present only for a model-backed producer. The heuristic is in-process and
+        // cannot be unavailable, and a probe that always succeeds would only add a way
+        // for the gate to skip — which reads as "not evaluated", the one verdict that
+        // must not admit. A model that is merely unreachable must skip rather than fail,
+        // since an outage is not evidence about the producer.
+        ...(beliefProvider.probeAvailability === null
+          ? {}
+          : { probeAvailability: beliefProvider.probeAvailability }),
+        // A model call runs 7–15s against the configured endpoint, and the gate makes
+        // one per cut point. The default coordinator timeout would score a reachable
+        // producer as a failure for being slow.
+        ...(beliefProvider.kind === "heuristic" ? {} : { timeoutMs: BELIEF_GATE_TIMEOUT_MS }),
+      }),
     }),
-  });
+  };
 }
+
+/**
+ * Ceiling for one belief-backed prediction inside the gate.
+ *
+ * Well above the observed 7–15s time-to-first-byte of the configured endpoint, below
+ * the point where a hung producer stalls startup indefinitely. Matches the reasoning
+ * behind `DEFAULT_PROVIDER_GATE_TIMEOUT_MS`; kept separate because this path pays for
+ * two model calls in sequence when a cognition layer is also model-backed.
+ */
+const BELIEF_GATE_TIMEOUT_MS = 90_000;
