@@ -256,6 +256,33 @@ What remains under the model's control is the one thing a rule cannot supply: wh
 
 The residual instability does not become flicker, it becomes **coverage loss**. When nothing survives admission the producer throws `NoBeliefsError`, the resolver reports `none`, and the ranking is the heuristic's — which is deterministic by construction. So a model that cannot repeat itself costs suggestions it might have made, never suggestions that appear on one screen and not the next. That is selective prediction with a deterministic fallback, and the fallback already existed.
 
+#### Measuring it: `bun run gate:belief`
+
+```bash
+bun run gate:belief   # needs a reachable model; ~40 minutes of endpoint time
+```
+
+Separate from `bun test` for the same reason as `gate:pi`: one run is roughly sixty model calls for the ranking half and three times that again for stability. Exit 1 is a measured refusal; a skip exits 0, because an unreachable model is not evidence about the model.
+
+It reports **two** verdicts, and the second is the reason the script exists. `runSemanticGate` observes a `PredictionProvider`, and a belief may move a candidate's confidence by at most 0.25 — so wherever a belief cannot overturn the heuristic's ranking, belief instability is *invisible to the gate*. A top-1-stable verdict over an internally unstable belief layer would read as success. The `beliefs` half therefore replays the corpus asking only the belief question and compares the admitted batch directly, reporting stability and coverage. Measured in the script rather than by extending `SemanticGateThresholds`, so the gate's own contract stays untouched.
+
+**The measured verdict, on the fifteen-point corpus.** The gate passes: top-1 at 15/15, level with the baseline, `fallbackRate` 0, and `top1Stability` exactly 1 across three replays. The belief layer underneath it does *not*: 10/15 cut points stable, coverage 33%.
+
+| | Value |
+| --- | --- |
+| `gate.status` | `passed` |
+| `top1Stability` | 1 (15/15 cut points, 3 runs) |
+| top-1 vs baseline | 15/15 vs 15/15 |
+| `fallbackRate` | 0 |
+| Belief-layer stability | 10/15 (0.67) |
+| Belief coverage | 33% |
+
+Read those two rows together, because separately each is misleading. The ranking is reproducible **because** the 0.25 weight cap absorbed a belief layer that changed its mind on five of fifteen cut points — not because the model repeated itself. A corpus where beliefs decide more would not absorb it, and the script says so out loud rather than reporting a bare pass. Coverage 33% is the abstention design working as intended: the model declined on two thirds of the corpus, and every decline cost a suggestion rather than producing an unstable one.
+
+That is the honest state of a model-backed belief producer here. It clears the admission boundary, and the number the boundary cannot see is the one to watch.
+
+Both halves run under `RedactingContextPolicy` — the policy the live cognition run applies. A passthrough policy here would score the producer on window titles and full paths it can never have in production, and the belief contract's `contextPolicyId` echo cannot catch that: a cooperative producer repeats back whatever id it was handed.
+
 ### What a stored belief is, and is not
 
 A validated batch is persisted to the prediction ledger as a `belief_batch` record. It is **history**: auditable, never re-validated as current, and never read back as ranking input.

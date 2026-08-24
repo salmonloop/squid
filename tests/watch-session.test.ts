@@ -389,6 +389,48 @@ describe("startWatchSession", () => {
     expect(source.started).toBe(false);
   });
 
+  it("refuses a malformed belief producer before starting a source", async () => {
+    // Checked in every configuration, not only when shadow mode observes it: a typo that
+    // silently selected the heuristic would leave an operator reading a report of
+    // deterministic rules and concluding a model agrees with them everywhere.
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const result = await startWatchSession({
+      workingDirectory: "/tmp",
+      env: { ...OFFLINE_ENV, SQUID_BELIEF_PROVIDER: "gpt" },
+      log: () => {},
+      logError: () => {},
+      createSources: async () => [source],
+      describeEvent: () => ({}),
+    });
+
+    expect("configError" in result).toBe(true);
+    if ("configError" in result) {
+      expect(result.configError).toContain("SQUID_BELIEF_PROVIDER");
+    }
+    expect(source.started).toBe(false);
+  });
+
+  it("refuses a malformed belief producer on the cognition path too", async () => {
+    // The live path resolves the same variable, and it resolves it before any sink opens.
+    // Two readers of one variable is the point: a run must not be able to score a model
+    // live while shadowing the heuristic, since `top1Agrees` would then be comparing two
+    // different questions.
+    const result = await startWatchSession({
+      workingDirectory: "/tmp",
+      env: { ...OFFLINE_ENV, SQUID_PROVIDER: "cognition", SQUID_BELIEF_PROVIDER: "gpt" },
+      log: () => {},
+      logError: () => {},
+      createSources: async () => [new ScriptedSource("alpha", [])],
+      describeEvent: () => ({}),
+    });
+
+    expect("configError" in result).toBe(true);
+    if ("configError" in result) {
+      expect(result.configError).toContain("SQUID_BELIEF_PROVIDER");
+    }
+  });
+
   it("says shadow mode is off by default, changing nothing about the ledger", async () => {
     const lifecycle: string[] = [];
     const source = new ScriptedSource("alpha", lifecycle);

@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "bun run src/main.ts",
     "evaluate": "bun run src/evaluate.ts",
+    "gate:belief": "bun run src/gate-belief.ts",
     "gate:pi": "bun run src/gate-pi.ts",
     "history:delete": "bun run src/history-delete.ts",
     "ledger:report": "bun run src/ledger-report.ts",
