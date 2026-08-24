@@ -1,5 +1,6 @@
 import { HeuristicPredictor } from "./baseline-predictor.js";
 import type { BeliefOutcome } from "./belief-provider.js";
+import type { BeliefStateBatch } from "./belief-state.js";
 import { RedactingContextPolicy } from "./context-policy.js";
 import {
   parseProviderGateMode,
@@ -41,6 +42,13 @@ export interface WatchProviderDiagnostic {
   readonly reasonCode?: string;
 }
 
+/** A belief batch that survived validation, with the request it answered. */
+export interface WatchProviderBeliefBatch {
+  readonly requestId: string;
+  readonly provider: string;
+  readonly batch: BeliefStateBatch;
+}
+
 export interface ResolveWatchProviderOptions {
   /**
    * Reports belief outcomes for a cognition run.
@@ -52,6 +60,18 @@ export interface ResolveWatchProviderOptions {
    * watch session supplies it.
    */
   readonly onDiagnostic?: (diagnostic: WatchProviderDiagnostic) => void;
+  /**
+   * Receives every batch that survived validation, for persistence as history.
+   *
+   * Deliberately a second seam rather than a field on the diagnostic above. The
+   * two carry different things to different places under different rules: a
+   * diagnostic is a sanitized line for an operator's terminal, and this is an
+   * audit record for the ledger. Folding them would force one of the two — either
+   * the log line starts carrying beliefs, or the ledger stops being able to. A
+   * widened diagnostic would also be a trap: every consumer would receive the
+   * batch and have to remember not to print it.
+   */
+  readonly onBeliefBatch?: (observed: WatchProviderBeliefBatch) => void;
 }
 
 export async function resolveWatchProvider(
@@ -84,7 +104,7 @@ export async function resolveWatchProvider(
   if (mode === "cognition") {
     return {
       ok: true,
-      selection: await resolveCognitionProvider(gate, options.onDiagnostic),
+      selection: await resolveCognitionProvider(gate, options),
     };
   }
 
@@ -135,7 +155,7 @@ export async function resolveWatchProvider(
  */
 async function resolveCognitionProvider(
   gate: ProviderGateMode,
-  onDiagnostic: ((diagnostic: WatchProviderDiagnostic) => void) | undefined,
+  options: ResolveWatchProviderOptions,
 ): Promise<ProviderSelection> {
   const [
     { BeliefRerankCognition },
@@ -154,28 +174,48 @@ async function resolveCognitionProvider(
   ]);
 
   const contextPolicy = new RedactingContextPolicy();
+  /**
+   * One observation point feeding two consumers, because there is only one fact:
+   * a belief attempt settled. The terminal line describes it without the beliefs;
+   * the ledger record is the beliefs. Deriving both here rather than letting the
+   * session re-derive either keeps `BeliefOutcome` the single source of what
+   * happened — a batch that reached the ledger without a matching diagnostic, or
+   * the reverse, would be a report and an audit trail disagreeing about the same
+   * request.
+   *
+   * Only the live provider observes. The gate replays the corpus four times, so
+   * wiring it there would emit sixty lines of startup noise describing a replay
+   * rather than the user's session, and would write ledger records for
+   * predictions that never happened.
+   */
+  const observeOutcome = (outcome: BeliefOutcome): void => {
+    options.onDiagnostic?.({
+      kind: "belief_outcome",
+      requestId: outcome.requestId,
+      provider: outcome.provider,
+      status: outcome.status,
+      latencyMs: outcome.latencyMs,
+      // Never the batch. `status` and `reasonCode` are a closed vocabulary plus
+      // already-sanitized provider text; the beliefs themselves go to the ledger.
+      ...(outcome.reasonCode === undefined ? {} : { reasonCode: outcome.reasonCode }),
+    });
+    // Only a batch that survived validation is history worth keeping. A rejected
+    // or absent one is already fully described by the diagnostic's reason code,
+    // and persisting it would put a batch the contract refused into the audit
+    // trail as though it had been believed.
+    if (outcome.batch !== null) {
+      options.onBeliefBatch?.({
+        requestId: outcome.requestId,
+        provider: outcome.provider,
+        batch: outcome.batch,
+      });
+    }
+  };
+  const observed = options.onDiagnostic !== undefined || options.onBeliefBatch !== undefined;
   const buildResolver = (observe: boolean) => createBeliefResolver({
     beliefProvider: new HeuristicBeliefProvider(),
     contextPolicyId: contextPolicy.id,
-    // Only the live provider reports. The gate runs the corpus four times, so
-    // wiring it there would emit sixty lines of startup noise describing a replay
-    // rather than the user's session — and the gate already reports its own
-    // verdict.
-    ...(observe && onDiagnostic !== undefined
-      ? {
-        onOutcome: (outcome) => onDiagnostic({
-          kind: "belief_outcome",
-          requestId: outcome.requestId,
-          provider: outcome.provider,
-          status: outcome.status,
-          latencyMs: outcome.latencyMs,
-          // Never the batch. `status` and `reasonCode` are a closed vocabulary
-          // plus already-sanitized provider text; the beliefs themselves stay
-          // inside the prediction path.
-          ...(outcome.reasonCode === undefined ? {} : { reasonCode: outcome.reasonCode }),
-        }),
-      }
-      : {}),
+    ...(observe && observed ? { onOutcome: observeOutcome } : {}),
   });
 
   const createGateProvider = () => new BeliefBackedPredictionProvider(

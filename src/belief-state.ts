@@ -16,7 +16,37 @@ export const beliefValues = [
 
 export type BeliefValue = (typeof beliefValues)[number];
 
-/** Bounds keep an untrusted producer from turning a batch into a data sink. */
+/**
+ * Bounds keep an untrusted producer from turning a batch into a data sink.
+ *
+ * `maxTtlMs` needs a word, because read alongside `validateBatchAgainstRequest` it
+ * looks self-contradictory: that function demands exact agreement on the state
+ * digest and projection generation, and `SquidCore` bumps the generation on every
+ * ingest, so a batch is refused the moment the next event lands. A 24-hour ceiling
+ * over a validity window of one projection would be incoherent — if they answered
+ * the same question.
+ *
+ * They answer two. `expiresAt` is the *producer's* claim about how long its own
+ * inference deserves to be believed, and the ceiling exists to bound that claim: a
+ * producer asserting a week-long intent is overreaching whatever else is true. The
+ * digest equality decides something else entirely — whether this batch may inform
+ * *this* prediction — and the answer has to be no for any world that has moved,
+ * because a consumer cannot tell a stale belief from a fresh one by looking at it.
+ *
+ * So the ceiling is not a promise about reuse. A validated batch is persisted as
+ * history (`BeliefBatchRecord` in `prediction-ledger.ts`) and nothing ever reads one
+ * back as ranking input, which is why the digest question is never asked of a stored
+ * record. That restriction is load-bearing rather than cautious: `runSemanticGate`
+ * admits a cognition provider by replaying a corpus and requiring an identical top-1
+ * answer every time, which holds only while a prediction is a pure function of the
+ * state it was given. A belief read back from the ledger would make the answer
+ * depend on what earlier runs happened to write.
+ *
+ * What accumulates across a session is therefore the record — auditable through
+ * `bun run ledger:report` — rather than the ranking. Raising this ceiling would not
+ * change that; the equality checks are what bound a belief's reach, and they are
+ * deliberate.
+ */
 export const BELIEF_LIMITS = {
   maxBeliefs: 32,
   maxEvidenceEventIds: 32,

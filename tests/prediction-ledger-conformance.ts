@@ -4,16 +4,23 @@ import {
   candidateEnvelopes,
   createActionPlanRecord,
   createAttemptRecord,
+  createBeliefBatchRecord,
   createFeedbackRecord,
   createPlanDecisionRecord,
   parsePredictionLedgerRecord,
   PredictionLedgerConflictError,
   PredictionLedgerReferenceError,
   type ActionPlanRecord,
+  type BeliefBatchRecord,
   type PlanDecisionRecord,
   type PredictionAttemptRecord,
   type PredictionLedger,
 } from "../src/prediction-ledger.js";
+import {
+  BELIEF_SCHEMA_VERSION,
+  BELIEF_TYPE,
+  type BeliefStateBatch,
+} from "../src/belief-state.js";
 import type { PredictionOutcome } from "../src/prediction-provider.js";
 import type { PredictionCandidate } from "../src/protocol.js";
 
@@ -65,6 +72,53 @@ export function attempt(
     egressPolicyId: "search-egress-deny-v1",
     outcome: resolved,
     candidates: candidateEnvelopes(requestId, resolved.candidates),
+  });
+}
+
+/**
+ * A batch shaped exactly as `validateBatchAgainstRequest` would have accepted it.
+ *
+ * Hand-built rather than produced by `HeuristicBeliefProvider`, because what this
+ * suite pins is the *ledger's* handling of a batch — persistence, identity, and
+ * closure over cited evidence. Deriving it from a real provider would couple every
+ * assertion here to which rules that provider happens to fire, and a rule change
+ * would then read as a ledger regression.
+ */
+export function beliefBatch(overrides: Partial<BeliefStateBatch> = {}): BeliefStateBatch {
+  return {
+    schemaVersion: BELIEF_SCHEMA_VERSION,
+    beliefBatchId: "batch-1",
+    projectionGeneration: 1,
+    episodeId: "ep-1",
+    stateDigest: `sha256:${"a".repeat(64)}`,
+    generatedAt: "2026-08-19T10:00:00.000Z",
+    provider: "heuristic-belief",
+    modelVersion: "v1",
+    promptVersion: "v1",
+    contextPolicyId: "passthrough",
+    beliefs: [{
+      id: "belief-0",
+      type: BELIEF_TYPE,
+      value: "validate_change",
+      confidence: 0.8,
+      // `evt-1` is the same event `attempt()` names as its trigger, so a deletion
+      // that takes the attempt also takes this batch — which is the closure case.
+      evidenceEventIds: ["evt-1"],
+      inferredAt: "2026-08-19T10:00:00.000Z",
+      expiresAt: "2026-08-19T10:02:00.000Z",
+    }],
+    ...overrides,
+  };
+}
+
+export function beliefRecord(
+  requestId = "req-1",
+  overrides: Partial<BeliefStateBatch> = {},
+): BeliefBatchRecord {
+  return createBeliefBatchRecord({
+    requestId,
+    batch: beliefBatch(overrides),
+    observedAt: "2026-08-19T10:00:00.750Z",
   });
 }
 
@@ -392,6 +446,108 @@ export function describePredictionLedgerConformance(
       }
     });
 
+    /**
+     * Beliefs persist as *history*: auditable, never re-validated as current, and
+     * never read back as ranking input. These pin the storage half of that — that a
+     * batch survives a round trip intact, that it does not need an attempt to exist,
+     * and that a replay is idempotent. The closure half is below.
+     */
+    describe("appendBeliefBatch", () => {
+      it("round-trips a validated batch without loss", async () => {
+        const harness = await createLedger();
+        try {
+          const record = beliefRecord();
+          await harness.ledger.appendBeliefBatch(record);
+
+          const records = await harness.ledger.all();
+          expect(records).toHaveLength(1);
+          expect(records[0]).toEqual(record);
+          // The whole batch survives, not a summary of it. A report that could only
+          // see counts would not be able to answer what was believed.
+          const stored = records[0] as BeliefBatchRecord;
+          expect(stored.batch.beliefs[0]?.value).toBe("validate_change");
+          expect(stored.batch.stateDigest).toBe(beliefBatch().stateDigest);
+        } finally {
+          await harness.dispose();
+        }
+      });
+
+      it("accepts a batch with no attempt record for its request", async () => {
+        // A batch is produced before the prediction it informs has an outcome, and
+        // that prediction may fail or be cancelled. Requiring an attempt first would
+        // discard exactly the batches a failed run most needs explained.
+        const harness = await createLedger();
+        try {
+          await expect(
+            harness.ledger.appendBeliefBatch(beliefRecord("req-never-completed")),
+          ).resolves.toBeUndefined();
+          expect(await harness.ledger.all()).toHaveLength(1);
+        } finally {
+          await harness.dispose();
+        }
+      });
+
+      it("treats a byte-identical re-append as a no-op", async () => {
+        const harness = await createLedger();
+        try {
+          const record = beliefRecord();
+          await harness.ledger.appendBeliefBatch(record);
+          await harness.ledger.appendBeliefBatch(record);
+
+          expect(await harness.ledger.all()).toHaveLength(1);
+        } finally {
+          await harness.dispose();
+        }
+      });
+
+      it("rejects a different batch under the same batch ID", async () => {
+        // Identity comes from `beliefBatchId`, so two different inferences claiming
+        // one id is a producer bug. Accepting the second silently would leave the
+        // audit trail asserting whichever landed last.
+        const harness = await createLedger();
+        try {
+          await harness.ledger.appendBeliefBatch(beliefRecord());
+
+          await expect(
+            harness.ledger.appendBeliefBatch(
+              beliefRecord("req-1", { projectionGeneration: 2 }),
+            ),
+          ).rejects.toBeInstanceOf(PredictionLedgerConflictError);
+          expect(await harness.ledger.all()).toHaveLength(1);
+        } finally {
+          await harness.dispose();
+        }
+      });
+
+      it("keeps a batch beside the attempt for the same request", async () => {
+        // Two records about one prediction, and neither constrains the other: the
+        // belief record is not a foreign key onto the attempt.
+        const harness = await createLedger();
+        try {
+          await harness.ledger.appendAttempt(attempt("req-1"));
+          await harness.ledger.appendBeliefBatch(beliefRecord("req-1"));
+
+          expect((await harness.ledger.all()).map((r) => r.recordType))
+            .toEqual(["attempt", "belief_batch"]);
+        } finally {
+          await harness.dispose();
+        }
+      });
+
+      it("re-parses a stored batch without loss", async () => {
+        const harness = await createLedger();
+        try {
+          await harness.ledger.appendBeliefBatch(beliefRecord());
+
+          const record = (await harness.ledger.all())[0]!;
+          expect(parsePredictionLedgerRecord(JSON.parse(JSON.stringify(record))))
+            .toEqual(record);
+        } finally {
+          await harness.dispose();
+        }
+      });
+    });
+
     // Retention deletion is the one operation that removes from the ledger,
     // and its whole point is the Done-when of issue #6: after deleting events,
     // no surviving ledger record may reference what was removed. The closure —
@@ -568,6 +724,94 @@ export function describePredictionLedgerConformance(
             harness.ledger.appendAttempt(attempt("post-delete")),
           ).resolves.toBeUndefined();
           expect((await harness.ledger.all()).at(-1)?.recordId).toBe("attempt:post-delete");
+        } finally {
+          await harness.dispose();
+        }
+      });
+
+      it("removes a belief batch whose evidence was deleted", async () => {
+        // Issue #12's Done-when: whatever is persisted must be covered by retention
+        // closure. A belief cites `evidenceEventIds` directly — that citation is the
+        // entire basis on which a belief can be audited — so a stored batch outliving
+        // its evidence is exactly the orphan this closure forbids.
+        const harness = await createLedger();
+        try {
+          await harness.ledger.appendBeliefBatch(beliefRecord());
+
+          const removed = await harness.ledger.deleteRecordsRemovedWithEvents(
+            new Set(["evt-1"]),
+          );
+
+          expect(removed).toBe(1);
+          expect(await harness.ledger.all()).toEqual([]);
+        } finally {
+          await harness.dispose();
+        }
+      });
+
+      it("keeps a belief batch whose evidence survived", async () => {
+        // The negative half. A closure that removed every batch on any deletion
+        // would also satisfy the assertion above, and would quietly destroy the
+        // history this issue exists to accumulate.
+        const harness = await createLedger();
+        try {
+          await harness.ledger.appendBeliefBatch(
+            beliefRecord("req-1", {
+              beliefBatchId: "batch-survives",
+              beliefs: beliefBatch().beliefs.map((belief) => ({
+                ...belief,
+                evidenceEventIds: ["evt-survives"],
+              })),
+            }),
+          );
+
+          const removed = await harness.ledger.deleteRecordsRemovedWithEvents(
+            new Set(["evt-1"]),
+          );
+
+          expect(removed).toBe(0);
+          expect(await harness.ledger.all()).toHaveLength(1);
+        } finally {
+          await harness.dispose();
+        }
+      });
+
+      it("removes a batch citing several events when any one of them goes", async () => {
+        // A belief is inferred from its evidence as a set. Losing one member makes
+        // the inference unreproducible, so partial evidence is not weaker evidence —
+        // it is an unauditable claim, and the whole record goes.
+        const harness = await createLedger();
+        try {
+          await harness.ledger.appendBeliefBatch(
+            beliefRecord("req-1", {
+              beliefs: beliefBatch().beliefs.map((belief) => ({
+                ...belief,
+                evidenceEventIds: ["evt-1", "evt-survives"],
+              })),
+            }),
+          );
+
+          expect(await harness.ledger.deleteRecordsRemovedWithEvents(new Set(["evt-1"])))
+            .toBe(1);
+          expect(await harness.ledger.all()).toEqual([]);
+        } finally {
+          await harness.dispose();
+        }
+      });
+
+      it("removes a batch independently of the attempt for its request", async () => {
+        // The two are not linked, in either direction: a surviving attempt must not
+        // hold a batch whose evidence is gone, and a deleted attempt must not drag
+        // down a batch whose own evidence survived.
+        const harness = await createLedger();
+        try {
+          await harness.ledger.appendAttempt(attemptWithTrigger("req-1", "evt-survives"));
+          await harness.ledger.appendBeliefBatch(beliefRecord("req-1"));
+
+          expect(await harness.ledger.deleteRecordsRemovedWithEvents(new Set(["evt-1"])))
+            .toBe(1);
+          const remaining = await harness.ledger.all();
+          expect(remaining.map((r) => r.recordType)).toEqual(["attempt"]);
         } finally {
           await harness.dispose();
         }

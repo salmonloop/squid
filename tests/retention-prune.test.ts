@@ -4,9 +4,15 @@ import { join } from "node:path";
 import { describe, expect, it } from "bun:test";
 import { createActivityEvent } from "../src/protocol.js";
 import {
+  BELIEF_SCHEMA_VERSION,
+  BELIEF_TYPE,
+  type BeliefStateBatch,
+} from "../src/belief-state.js";
+import {
   candidateEnvelopes,
   createActionPlanRecord,
   createAttemptRecord,
+  createBeliefBatchRecord,
   createFeedbackRecord,
   createPlanDecisionRecord,
 } from "../src/prediction-ledger.js";
@@ -137,6 +143,39 @@ function attemptFor(
 }
 
 /**
+ * A batch shaped as validation would have accepted it, citing exactly the given
+ * events. Timestamps sit at `NEW_AT` regardless of the evidence's age: a belief's
+ * own lifetime has nothing to do with retention, which is the point — deletion
+ * follows the evidence, not the TTL a producer claimed.
+ */
+function batchCiting(
+  beliefBatchId: string,
+  evidenceEventIds: readonly string[],
+): BeliefStateBatch {
+  return {
+    schemaVersion: BELIEF_SCHEMA_VERSION,
+    beliefBatchId,
+    projectionGeneration: 1,
+    episodeId: "ep-retention",
+    stateDigest: `sha256:${"a".repeat(64)}`,
+    generatedAt: NEW_AT,
+    provider: "heuristic-belief",
+    modelVersion: "v1",
+    promptVersion: "v1",
+    contextPolicyId: "passthrough",
+    beliefs: [{
+      id: `${beliefBatchId}:belief:0`,
+      type: BELIEF_TYPE,
+      value: "validate_change",
+      confidence: 0.8,
+      evidenceEventIds: [...evidenceEventIds],
+      inferredAt: NEW_AT,
+      expiresAt: new Date(Date.parse(NEW_AT) + 120_000).toISOString(),
+    }],
+  };
+}
+
+/**
  * Seeds one doomed chain (old trigger) and one surviving chain (fresh
  * trigger), each: attempt → feedback → plan → decision. The doomed side has
  * four records; deleting its trigger event must remove all four and touch
@@ -231,6 +270,59 @@ for (const [name, create] of [
         expect(result).toEqual({ removedEvents: 0, removedRecords: 0 });
         expect(await harness.store.all()).toHaveLength(2);
         expect(await harness.ledger.all()).toHaveLength(5);
+      } finally {
+        await harness.dispose();
+      }
+    });
+
+    it("removes a persisted belief batch when its evidence ages out", async () => {
+      // Issue #12's Done-when, end to end rather than at the ledger boundary: a
+      // real store deletes real events and the belief history goes with them. The
+      // ledger's own suite proves the closure walks correctly given a removed-event
+      // set; this proves the *composition* derives that set from a belief's
+      // citations at all. A batch citing only aged-out events names no removed event
+      // that `resolveRemovedEventIds` could see unless `recordEventReferences`
+      // reports belief evidence, and a batch outliving its evidence is the orphan
+      // the closure forbids.
+      const harness = await create();
+      try {
+        await harness.store.append(eventAt("evt-old", OLD_AT));
+        await harness.store.append(eventAt("evt-new", NEW_AT));
+        await harness.ledger.appendBeliefBatch(createBeliefBatchRecord({
+          requestId: "belief-req",
+          batch: batchCiting("doomed-batch", ["evt-old"]),
+        }));
+        await harness.ledger.appendBeliefBatch(createBeliefBatchRecord({
+          requestId: "belief-req-2",
+          batch: batchCiting("kept-batch", ["evt-new"]),
+        }));
+
+        const result = await runRetentionPrune(harness.store, harness.ledger, {
+          cutoffMs: CUTOFF_MS,
+        });
+
+        expect(result.removedEvents).toBe(1);
+        expect(result.removedRecords).toBe(1);
+
+        // What survives is self-contained: the remaining batch cites only events the
+        // store still holds. That is the invariant; the count above is its shadow.
+        const survivors = new Set((await harness.store.all()).map((e) => e.eventId));
+        const records = await harness.ledger.all();
+        expect(records).toHaveLength(1);
+        for (const record of records) {
+          if (record.recordType !== "belief_batch") continue;
+          for (const belief of record.batch.beliefs) {
+            for (const eventId of belief.evidenceEventIds) {
+              expect(survivors.has(eventId)).toBe(true);
+            }
+          }
+        }
+
+        // And a repeat pass finds nothing: the closure is stable over belief records
+        // the same way it is over attempts.
+        expect(await runRetentionPrune(harness.store, harness.ledger, {
+          cutoffMs: CUTOFF_MS,
+        })).toEqual({ removedEvents: 0, removedRecords: 0 });
       } finally {
         await harness.dispose();
       }

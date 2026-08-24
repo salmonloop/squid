@@ -1,6 +1,7 @@
 import { describeErrorForAudit } from "./action-egress.js";
 import { SqlitePredictionLedger } from "./sqlite-prediction-ledger.js";
 import type {
+  BeliefBatchRecord,
   PredictionAttemptRecord,
   PredictionLedgerRecord,
 } from "./prediction-ledger.js";
@@ -36,6 +37,29 @@ export interface PathReport {
 }
 
 /**
+ * What the belief layer asserted over the run.
+ *
+ * The answer to "what accumulated across this session". A belief is used to rank
+ * exactly one prediction and is never read back, so the ranking gains nothing from
+ * history — but the record does accumulate, and this is where it becomes legible.
+ * `byValue` is safe to print because the intent vocabulary is closed; a belief
+ * carries no command, no parameters, and no prose, so there is nothing here that
+ * could echo a selection back.
+ *
+ * Not split into live and shadow paths, unlike attempts, because only the live path
+ * writes these. A shadow run builds its own belief request inline and reports what
+ * it found through its attempt's `fallbackReason`, so a `paths.shadow.beliefs` of
+ * zero would read as "shadow saw no beliefs" rather than "shadow records them
+ * elsewhere".
+ */
+export interface BeliefReport {
+  readonly batches: number;
+  readonly byProvider: Readonly<Record<string, number>>;
+  /** Every asserted intent, counting each belief in every batch. */
+  readonly byValue: Readonly<Record<string, number>>;
+}
+
+/**
  * The live path's figures at the top level, with both paths broken out beneath.
  *
  * Shadow attempts are *excluded* from the top-level numbers rather than mixed in,
@@ -54,6 +78,7 @@ export interface LedgerReport extends PathReport {
     readonly live: PathReport;
     readonly shadow: PathReport;
   };
+  readonly beliefs: BeliefReport;
 }
 
 export function buildLedgerReport(records: readonly PredictionLedgerRecord[]): LedgerReport {
@@ -70,7 +95,22 @@ export function buildLedgerReport(records: readonly PredictionLedgerRecord[]): L
   return {
     ...buildPathReport(live),
     paths: { live: buildPathReport(live), shadow: buildPathReport(shadow) },
+    beliefs: buildBeliefReport(records.filter(
+      (record): record is BeliefBatchRecord => record.recordType === "belief_batch",
+    )),
   };
+}
+
+function buildBeliefReport(batches: readonly BeliefBatchRecord[]): BeliefReport {
+  const byProvider: Record<string, number> = {};
+  const byValue: Record<string, number> = {};
+  for (const record of batches) {
+    byProvider[record.provider] = (byProvider[record.provider] ?? 0) + 1;
+    for (const belief of record.batch.beliefs) {
+      byValue[belief.value] = (byValue[belief.value] ?? 0) + 1;
+    }
+  }
+  return { batches: batches.length, byProvider, byValue };
 }
 
 function buildPathReport(attempts: readonly PredictionAttemptRecord[]): PathReport {

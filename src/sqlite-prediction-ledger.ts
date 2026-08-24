@@ -10,6 +10,7 @@ import {
   recordIdentity,
   resolveRecordsRemovedWithEvents,
   type ActionPlanRecord,
+  type BeliefBatchRecord,
   type ClaimDispatchInputs,
   type CompleteDispatchResult,
   type DispatchClaimResult,
@@ -146,6 +147,23 @@ export class SqlitePredictionLedger implements PredictionLedger {
 
     try {
       this.insertRecord(validated, validated.requestId, validated.candidateId);
+    } catch (error) {
+      throw this.translate(error, validated);
+    }
+  }
+
+  public async appendBeliefBatch(record: BeliefBatchRecord): Promise<void> {
+    this.assertOpen();
+    const validated = parsePredictionLedgerRecord(record) as BeliefBatchRecord;
+    if (this.hasEquivalent(validated)) return;
+    // `candidate_id` is null: a batch informed a whole prediction rather than one
+    // candidate, and there is no attempt row to point at either — a batch is written
+    // even when the prediction it served never produced an attempt. The request id
+    // is still stored so an operator can join a batch to its prediction by eye, but
+    // it is not a foreign key, and the one-attempt-per-request partial index does not
+    // apply because that index is scoped to `record_type = 'attempt'`.
+    try {
+      this.insertRecord(validated, validated.requestId, null);
     } catch (error) {
       throw this.translate(error, validated);
     }
