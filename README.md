@@ -77,6 +77,9 @@ bun run watch:screen
 - `src/belief-state.ts` — the belief contract itself: closed intent vocabulary, bounds against an untrusted producer, and semantic validation of TTLs, duplicate IDs, self-reference, and evidence that postdates the belief citing it.
 - `src/heuristic-belief-provider.ts` — deterministic baseline belief producer: four rules over facts the projection already holds, each naming the events it read. A rule that cannot cite evidence contributes nothing rather than poisoning the batch.
 - `src/belief-evidence.ts` — `evidenceTimeline(state)`, the event map a belief's evidence is checked against, derived from the projected state the provider was shown. A provider can only cite what it could see.
+- `src/belief-admission.ts` — the deterministic half of a model-backed producer: raw proposals in, a validated batch or nothing out. Confidence is quantized to three bands because a producer's own number wobbles for an identical world (measured: 0.85 then 0.9, then 0.5); order is the vocabulary's, never the producer's; an intent citing an event outside the shown projection is dropped whole rather than repaired. Also owns the prompt, so the offline suite can assert what a model is told without loading a model.
+- `src/pi-belief-provider.ts` — the model-backed `BeliefProvider`. Asks a narrower question than `PiRuntime`: which intents from the closed vocabulary hold, each citing events from a list the prompt supplies. Deliberately thin — every property a ranking could pivot on is decided by `belief-admission.ts`, and nothing survives admission means `NoBeliefsError`.
+- `src/resolve-belief-provider.ts` — resolves `SQUID_BELIEF_PROVIDER`. Defaults to the heuristic and imports the pi graph inside its own branch only, so the default path pays nothing for a model at startup or at execution.
 - `src/belief-resolver.ts` — live-path adapter from `PredictionRequest` to a validated batch. Every failure resolves to `null`, so an unreachable belief layer degrades to cognition-from-state; `onOutcome` is how a run says *why* beliefs were absent.
 - `src/cognition-provider.ts` — `CognitionProvider` (state plus beliefs to candidates) and `BeliefBackedPredictionProvider`, the adapter that keeps the belief layer off the critical path.
 - `src/belief-rerank-cognition.ts` — the shipped cognition provider: reorders candidates by asserted intent, cannot invent one, and is deterministic by construction so the stability gate can admit it.
@@ -227,6 +230,31 @@ The projection identity is threaded from `PredictionRuntime` through `Prediction
 `BeliefRerankCognition` (`src/belief-rerank-cognition.ts`) is the shipped `CognitionProvider`. It reorders candidates by the intent the beliefs assert, and it cannot invent one — a belief carries no parameters, so there is nothing to build an action out of, and re-ranking is the whole of its authority. Every candidate it emits was already admissible before it ran. A fully-confident belief may add at most 0.25 to a candidate's confidence: enough to overturn a close ranking, not enough to overturn a wide gap the heuristic scored on evidence the belief layer does not have. Beliefs may be absent, in which case it returns exactly the heuristic's ranking — cognition-from-state is a correct answer, not a degraded one.
 
 `sourceEventIds` are passed through untouched. Admission and the ledger read them to decide whether the world has moved since a candidate was formed, so a cognition layer that rewrote them would be editing the audit trail rather than the ranking.
+
+### A model-backed producer, and why it abstains
+
+`SQUID_BELIEF_PROVIDER=pi` puts a model behind the belief seam. Off by default.
+
+```bash
+SQUID_PROVIDER=cognition SQUID_BELIEF_PROVIDER=pi bun run watch:desktop
+```
+
+The reason this is a capability rather than the default is measured, not cautious. Asked the same world three times, the configured endpoint answered `draft_text@0.8`, then nothing, then `draft_text@0.5`; on another state it answered nothing, then `draft_text@0.6`, then `unknown@0.3`. Four of five cut points disagreed with themselves. That is worse than the action question `PiRuntime` asks, and it is not tunable from here: the pi SDK exposes no sampling controls (`thinkingLevel` and nothing else), and the published cause is server-side — nondeterminism at an inference endpoint comes from [batch-invariance violations in the serving kernels](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/), where reduction order shifts with concurrent load, so identical prompts diverge even at temperature zero. A client of a hosted endpoint cannot reach that.
+
+So the design is the one the neurosymbolic literature settles on for a stochastic proposer: **the model proposes, a pure reducer decides.** `src/belief-admission.ts` takes the model's raw output and removes everything a ranking could pivot on from its control:
+
+| Model's output | What admission does | Why |
+| --- | --- | --- |
+| `confidence: 0.85` vs `0.9` | Quantized to three bands | The measured wobble, made invisible to arithmetic |
+| Emission order | Reordered by vocabulary ordinal | Emission order is a fact about sampling, not about the world |
+| A citation outside the projection | Drops that intent whole | Evidence is the whole basis of an audit; a repaired justification is one the producer never gave |
+| `unknown` | Dropped | Maps to no action, so it can only make a batch look non-empty |
+| The same intent twice | Collapsed to the strongest | `BeliefRerankCognition` would keep only that one anyway |
+| Nothing survives | Abstains | See below |
+
+What remains under the model's control is the one thing a rule cannot supply: which intent to name.
+
+The residual instability does not become flicker, it becomes **coverage loss**. When nothing survives admission the producer throws `NoBeliefsError`, the resolver reports `none`, and the ranking is the heuristic's — which is deterministic by construction. So a model that cannot repeat itself costs suggestions it might have made, never suggestions that appear on one screen and not the next. That is selective prediction with a deterministic fallback, and the fallback already existed.
 
 ### What a stored belief is, and is not
 

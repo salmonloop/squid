@@ -4,10 +4,10 @@ import { describeErrorForAudit, resolveSearchEgress } from "./action-egress.js";
 import { CaptureGateActivitySource } from "./capture-gate-source.js";
 import { resolveCaptureGate } from "./resolve-capture-gate.js";
 import { HOUR_MS, resolveRetention } from "./resolve-retention.js";
+import { resolveBeliefProvider } from "./resolve-belief-provider.js";
 import { resolveShadowCognition } from "./resolve-shadow-cognition.js";
 import { evidenceTimeline } from "./belief-evidence.js";
 import { BeliefRerankCognition } from "./belief-rerank-cognition.js";
-import { HeuristicBeliefProvider } from "./heuristic-belief-provider.js";
 import { createBeliefBatchRecord } from "./prediction-ledger.js";
 import { createShadowAttemptRecord } from "./shadow-ledger.js";
 import { ShadowCognitionRunner } from "./shadow-cognition.js";
@@ -93,6 +93,16 @@ export type WatchSessionResult =
   | { readonly configError: string }
   | { readonly session: WatchSession };
 
+/**
+ * Ceiling for one shadow belief attempt when a model produces the beliefs.
+ *
+ * The runner's 15s default was set against an in-process producer; the configured model
+ * endpoint answers in 7–15s, so a reachable producer would time out on roughly half its
+ * observations and the shadow report would read as an outage rather than as a slow
+ * producer. Still bounded — a shadow run that never settles would hold up shutdown.
+ */
+const SHADOW_MODEL_TIMEOUT_MS = 60_000;
+
 export async function startWatchSession(
   options: WatchSessionOptions,
 ): Promise<WatchSessionResult> {
@@ -167,6 +177,24 @@ export async function startWatchSession(
   // everywhere, when in fact it never ran.
   const shadow = resolveShadowCognition({ env });
   if ("configError" in shadow) return { configError: shadow.configError };
+
+  /**
+   * The producer behind the shadow path's belief layer.
+   *
+   * Resolved from the same variable the live path reads, so one run cannot score a model
+   * live while shadowing the heuristic — the two would then disagree about what was
+   * measured, and `top1Agrees` would be comparing two different questions.
+   *
+   * Built even when shadow mode is off, so a typo in the variable fails startup in every
+   * configuration rather than only in the one that happens to observe it. The heuristic
+   * branch loads no model graph, so the default pays nothing for this.
+   */
+  const shadowBelief = resolveBeliefProvider({ env });
+  if ("configError" in shadowBelief) return { configError: shadowBelief.configError };
+  const shadowBeliefKind = shadowBelief.kind;
+  const shadowBeliefProvider = shadow.enabled
+    ? await shadowBelief.createProvider()
+    : undefined;
 
   const watch = createWatchRuntime({
     ...(options.databasePath === undefined ? {} : { databasePath: options.databasePath }),
@@ -250,10 +278,15 @@ export async function startWatchSession(
       () => beliefWrites.delete(write),
     );
   };
-  const shadowRunner = shadow.enabled
+  const shadowRunner = shadowBeliefProvider !== undefined
     ? new ShadowCognitionRunner({
-        beliefProvider: new HeuristicBeliefProvider(),
+        beliefProvider: shadowBeliefProvider,
         cognition: new BeliefRerankCognition(),
+        // A model-backed producer runs 7–15s against the configured endpoint, which sits
+        // inside the runner's 15s default — a reachable producer would time out on most
+        // observations and the shadow report would read as an outage. The heuristic keeps
+        // the default, since raising it there would only delay a shutdown.
+        ...(shadowBeliefKind === "heuristic" ? {} : { timeoutMs: SHADOW_MODEL_TIMEOUT_MS }),
         onObservation: (observation) => {
           // Kinds, statuses, and counts only. `beliefValues` is a closed
           // vocabulary and candidate kinds are an enum, so nothing here can echo
