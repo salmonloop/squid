@@ -506,6 +506,85 @@ describe("startWatchSession", () => {
   });
 
   /**
+   * Issue #12's first half, end to end: a belief is inferred, used to rank one
+   * prediction, and now *kept*. Before this the batch was discarded the moment the
+   * request settled, so a session accumulated nothing — the ledger held attempts
+   * and no record of what the belief layer had asserted.
+   *
+   * Asserted through a real session rather than by calling the ledger directly,
+   * because what was missing was the wiring: the provider is resolved before any
+   * sink exists, so nothing had a ledger to write to at the point beliefs were
+   * produced. A unit test of `appendBeliefBatch` would have passed throughout.
+   */
+  it("persists the belief batch a cognition run inferred", async () => {
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result } = await startSession({
+      sources: [source],
+      env: { ...OFFLINE_ENV, SQUID_PROVIDER: "cognition", SQUID_PROVIDER_GATE: "probe" },
+    });
+    if ("configError" in result) throw new Error(result.configError);
+    const { session } = result;
+
+    await source.emit!(terminalCommandFailed("term-1"));
+    await session.runtime.runtime.awaitIdle();
+    // Belief writes start inside the prediction, so the drain in `stop` is what
+    // makes them observable — closing the ledger under one would lose the record.
+    await session.stop();
+
+    const records = await session.runtime.ledger.all();
+    const batches = records.filter((record) => record.recordType === "belief_batch");
+    expect(batches).toHaveLength(1);
+    const batch = batches[0]!;
+    if (batch.recordType !== "belief_batch") throw new Error("expected a belief batch");
+
+    // The failed command is a world the `debug_failure` rule fires on, so this
+    // asserts a real inference was stored rather than an empty shell.
+    expect(batch.provider).toBe("heuristic-belief");
+    expect(batch.batch.beliefs.map((belief) => belief.value)).toEqual(["debug_failure"]);
+
+    // Stored against the projection it actually described. The digest is what makes
+    // the record auditable — and what makes reusing it as evidence impossible,
+    // since the next ingest moves it.
+    const live = records.find(
+      (record) => record.recordType === "attempt" && !isShadowProvider(record.provider),
+    );
+    if (live?.recordType !== "attempt") throw new Error("expected a live attempt");
+    expect(batch.batch.stateDigest).toBe(live.stateDigest);
+    expect(batch.batch.projectionGeneration).toBe(live.projectionGeneration);
+    expect(batch.requestId).toBe(live.requestId);
+
+    // And the beliefs cite the event that produced them, which is what retention
+    // deletion follows.
+    expect(batch.batch.beliefs.flatMap((belief) => belief.evidenceEventIds))
+      .toContain(live.triggerEventId);
+
+    // Legible to an operator through the same report the rest of the run is.
+    expect(buildLedgerReport(records).beliefs).toEqual({
+      batches: 1,
+      byProvider: { "heuristic-belief": 1 },
+      byValue: { debug_failure: 1 },
+    });
+  });
+
+  it("writes no belief record on the default heuristic path", async () => {
+    // The default provider has no belief layer, so a batch appearing here would
+    // mean something was fabricating one. Kept as a test because the seam is
+    // wired unconditionally — only the cognition branch installs an observer.
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result } = await startSession({ sources: [source] });
+    if ("configError" in result) throw new Error(result.configError);
+
+    await source.emit!(terminalCommandFailed("term-1"));
+    await result.session.runtime.runtime.awaitIdle();
+    await result.session.stop();
+
+    const records = await result.session.runtime.ledger.all();
+    expect(records.filter((record) => record.recordType === "belief_batch")).toEqual([]);
+  });
+
+  /**
    * The drop this covers is invisible by construction, which is why it needs a
    * test rather than an inspection: a shadow run only starts inside the
    * continuation chained onto a resolved prediction, and the runtime drains the

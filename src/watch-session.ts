@@ -8,6 +8,7 @@ import { resolveShadowCognition } from "./resolve-shadow-cognition.js";
 import { evidenceTimeline } from "./belief-evidence.js";
 import { BeliefRerankCognition } from "./belief-rerank-cognition.js";
 import { HeuristicBeliefProvider } from "./heuristic-belief-provider.js";
+import { createBeliefBatchRecord } from "./prediction-ledger.js";
 import { createShadowAttemptRecord } from "./shadow-ledger.js";
 import { ShadowCognitionRunner } from "./shadow-cognition.js";
 import type { ActivitySource, ActivitySourceDiagnostic } from "./activity-source.js";
@@ -17,7 +18,7 @@ import type { PredictionRuntimeIngestResult } from "./prediction-runtime.js";
 import { runRetentionPrune, type RetentionPruneResult } from "./retention-prune.js";
 import { sqliteWatchExclusions } from "./sqlite-event-store.js";
 import { resolveWatchActions, type WatchActionsResolution } from "./watch-actions.js";
-import { resolveWatchProvider } from "./watch-provider.js";
+import { resolveWatchProvider, type WatchProviderBeliefBatch } from "./watch-provider.js";
 
 /**
  * The whole watch pipeline minus the sources: provider admission, egress
@@ -99,6 +100,22 @@ export async function startWatchSession(
   const log = options.log ?? ((line: string) => console.log(line));
   const logError = options.logError ?? ((line: string) => console.error(line));
 
+  /**
+   * Where a validated belief batch goes, once there is a ledger to put it in.
+   *
+   * An indirection because the two ends cannot be wired in one step: the provider
+   * is resolved *before* any sink opens, deliberately — a config error or a
+   * declined model must not leave a half-created database behind — while the
+   * ledger only exists after `createWatchRuntime`. So the provider is handed a
+   * stable closure now and the real destination is installed below.
+   *
+   * Undefined is not a dropped record. Nothing can produce a batch until a source
+   * starts, and sources start last, long after the assignment; the guard exists so
+   * an early-return path that disposes before that point cannot write into a
+   * ledger that is already closing.
+   */
+  let beliefBatchSink: ((observed: WatchProviderBeliefBatch) => void) | undefined;
+
   // Choose the primary predictor before opening any sink: a config error or a
   // declined model must not leave a half-created database behind. The default
   // `SQUID_PROVIDER=heuristic` never touches a model.
@@ -115,6 +132,7 @@ export async function startWatchSession(
         ...(diagnostic.reasonCode === undefined ? {} : { reasonCode: diagnostic.reasonCode }),
       }));
     },
+    onBeliefBatch: (observed) => beliefBatchSink?.(observed),
   });
   if (!resolved.ok) return { configError: resolved.configError };
   if (resolved.selection.declineReason !== null) {
@@ -198,6 +216,40 @@ export async function startWatchSession(
   // drains what *it* wrote, and a shadow record appended after the sinks closed
   // would be lost — so `stop` awaits these explicitly, in order.
   const shadowWrites = new Set<Promise<void>>();
+
+  /**
+   * Persists every validated belief batch as history, and closes the seam the
+   * provider was resolved with.
+   *
+   * The provider is chosen before any sink exists — a config error must not leave
+   * a half-created database behind — so it cannot be handed a ledger at
+   * construction time. The seam is therefore a mutable sink assigned here, which
+   * is also what makes the reverse order safe: a batch produced before this line
+   * runs finds no sink and is dropped rather than written to a ledger that is not
+   * open yet. Nothing can produce one that early in practice, because no source
+   * has started.
+   *
+   * Same posture as the shadow writes beside it: a failed append is a diagnostic,
+   * never a failure of the live prediction, and the write is tracked so shutdown
+   * drains it before closing the ledger.
+   */
+  const beliefWrites = new Set<Promise<void>>();
+  beliefBatchSink = (observed) => {
+    // `provider` is not passed: the record takes it from the batch, which is the
+    // producer's own claim about itself. Accepting it separately here would create
+    // two spellings that could disagree.
+    const write = watch.ledger.appendBeliefBatch(createBeliefBatchRecord({
+      requestId: observed.requestId,
+      batch: observed.batch,
+    })).catch((error: unknown) => {
+      logError(JSON.stringify({ beliefLedgerError: describeErrorForAudit(error) }));
+    });
+    beliefWrites.add(write);
+    void write.then(
+      () => beliefWrites.delete(write),
+      () => beliefWrites.delete(write),
+    );
+  };
   const shadowRunner = shadow.enabled
     ? new ShadowCognitionRunner({
         beliefProvider: new HeuristicBeliefProvider(),
@@ -236,27 +288,39 @@ export async function startWatchSession(
     : undefined;
 
   /**
-   * Settles the shadow path, in the one order that loses nothing.
+   * Settles everything a prediction set in motion that the runtime does not own,
+   * in the one order that loses nothing.
    *
-   * Three steps, each needed for a different reason. First the outcome
-   * continuations: a shadow run only *starts* inside one, so disposing the runner
-   * before they settle makes `observe` hit its disposed guard and return —
-   * producing no run, no record, and no diagnostic. Then the runner, so every
-   * observation has fired. Then the appends those observations began, because
-   * closing the ledger under a write still in flight would drop the record.
+   * Each step is needed for a different reason. First the outcome continuations: a
+   * shadow run only *starts* inside one, so disposing the runner before they settle
+   * makes `observe` hit its disposed guard and return — producing no run, no
+   * record, and no diagnostic. Then the shadow runner, so every observation has
+   * fired, then the appends those observations began, because closing the ledger
+   * under a write still in flight would drop the record. Then the belief writes,
+   * for the same reason.
+   *
+   * The belief drain is unconditional, unlike the shadow half. A belief write is
+   * started from inside the prediction itself rather than from an observation, so
+   * it is in flight on any cognition run whether or not shadow mode is on — an
+   * early return past it would drop the record in exactly the default
+   * configuration.
    *
    * Awaiting a continuation implicitly awaits the prediction behind it, so this
    * needs no new runtime hook. Every path that disposes calls this, including the
    * early returns, so the ordering lives in one place rather than three.
    */
-  const drainShadow = async (): Promise<void> => {
+  const drainDerivedWrites = async (): Promise<void> => {
     while (outcomeContinuations.size > 0) {
       await Promise.allSettled([...outcomeContinuations]);
     }
-    if (shadowRunner === undefined) return;
-    await shadowRunner.dispose();
-    while (shadowWrites.size > 0) {
-      await Promise.allSettled([...shadowWrites]);
+    if (shadowRunner !== undefined) {
+      await shadowRunner.dispose();
+      while (shadowWrites.size > 0) {
+        await Promise.allSettled([...shadowWrites]);
+      }
+    }
+    while (beliefWrites.size > 0) {
+      await Promise.allSettled([...beliefWrites]);
     }
   };
 
@@ -272,7 +336,7 @@ export async function startWatchSession(
     // Vacuous today — no source has started, so nothing can be in flight — but the
     // runner exists by now, and a path that disposes without draining is the
     // asymmetry a later edit turns into a lost record.
-    await drainShadow();
+    await drainDerivedWrites();
     await watch.dispose();
     return { configError: actions.configError };
   }
@@ -296,7 +360,7 @@ export async function startWatchSession(
     }));
   }
   if (sources.length === 0) {
-    await drainShadow();
+    await drainDerivedWrites();
     await watch.dispose();
     return { configError: "A watch session needs at least one activity source." };
   }
@@ -420,7 +484,7 @@ export async function startWatchSession(
     // A source that failed mid-start may already have emitted, so this path is the
     // one where a drop is reachable rather than theoretical: `source.start(ingest)`
     // ran, predictions may be in flight, and their shadow runs have not begun.
-    await drainShadow();
+    await drainDerivedWrites();
     await watch.dispose();
     return { configError: `A source failed to start: ${describeErrorForAudit(error)}` };
   }
@@ -459,7 +523,7 @@ export async function startWatchSession(
       // Settle confirmation and dispatch while the runtime is still open:
       // rejection and terminal action feedback must reach the ledger.
       if (actions !== undefined) await actions.close();
-      await drainShadow();
+      await drainDerivedWrites();
       await watch.dispose();
     },
   };

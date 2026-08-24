@@ -415,6 +415,94 @@ describe("BeliefRerankCognition", () => {
   });
 });
 
+/**
+ * Beliefs persist as history and are never read back as ranking input. Issue #12
+ * asks for the negative to be tested, not merely asserted: a belief from a prior
+ * projection must not silently rank a current prediction.
+ *
+ * This is the load-bearing half of that design. `runSemanticGate` admits a
+ * cognition provider by replaying a corpus and demanding an identical top-1 answer
+ * every time, which holds only while a prediction is a pure function of the state
+ * it was handed. A stored belief reaching the ranking would make the answer depend
+ * on what earlier runs happened to write — so the gate would be measuring a
+ * provider that cannot exist in production, and the reproducibility it certifies
+ * would be an artifact of an empty ledger.
+ */
+describe("a persisted belief never ranks a later prediction", () => {
+  it("asks the belief provider for this projection instead of reusing a prior batch", async () => {
+    const projection = await project(editorSaveEvents);
+    // A batch about an *earlier* projection, exactly as a ledger read would hand
+    // back: valid when it was written, and now a generation stale.
+    const earlier = await project(editorSaveEvents.slice(0, 4));
+    const stale = (await createBeliefResolver({
+      beliefProvider: new HeuristicBeliefProvider(),
+      contextPolicyId: new PassthroughContextPolicy().id,
+    })(predictionRequest(earlier), new AbortController().signal))!;
+
+    const requested: string[] = [];
+    const provider = new BeliefBackedPredictionProvider(
+      new BeliefRerankCognition(),
+      createBeliefResolver({
+        beliefProvider: {
+          name: "counting-belief",
+          infer: async (request, signal) => {
+            requested.push(request.stateDigest);
+            return new HeuristicBeliefProvider().infer(request, signal);
+          },
+        },
+        contextPolicyId: new PassthroughContextPolicy().id,
+      }),
+    );
+
+    const candidates = await provider.predict(
+      predictionRequest(projection),
+      new AbortController().signal,
+    );
+
+    // The provider was asked about *this* digest. Nothing consulted a store, so a
+    // stale batch has no route in: the only belief a prediction can see is one
+    // inferred for the projection it is predicting from.
+    expect(requested).toEqual([projection.stateDigest]);
+    expect(stale.stateDigest).not.toBe(projection.stateDigest);
+    expect(candidates.length).toBeGreaterThan(0);
+  });
+
+  it("refuses the stale batch outright if one is somehow supplied", async () => {
+    // Belt to the structural brace above. If a future reader path ever did hand a
+    // stored batch to the live resolver, validation is what stops it — and this
+    // pins the reason code, so a change that loosened the digest check would fail
+    // here rather than silently admitting history as evidence.
+    const earlier = await project(editorSaveEvents.slice(0, 4));
+    const current = await project(editorSaveEvents);
+    const outcomes: BeliefOutcome[] = [];
+    const resolve = createBeliefResolver({
+      // Answers about the earlier projection whatever it is asked, which is exactly
+      // how a cached or replayed batch would behave.
+      beliefProvider: {
+        name: "replaying-belief",
+        infer: async (_request, signal) =>
+          new HeuristicBeliefProvider().infer(
+            {
+              id: "req-earlier",
+              worldState: earlier.state,
+              episodeId: earlier.state.episode!.id,
+              stateDigest: earlier.stateDigest,
+              projectionGeneration: earlier.projectionGeneration,
+              contextPolicyId: new PassthroughContextPolicy().id,
+              triggeredAt: earlier.state.updatedAt!,
+            },
+            signal,
+          ),
+      },
+      contextPolicyId: new PassthroughContextPolicy().id,
+      onOutcome: (outcome) => outcomes.push(outcome),
+    });
+
+    expect(await resolve(predictionRequest(current), new AbortController().signal)).toBeNull();
+    expect(outcomes[0]?.status).toBe("rejected");
+  });
+});
+
 describe("the live path from coordinator to belief", () => {
   it("delivers a validated batch to cognition through the coordinator", async () => {
     const projection = await project(editorSaveEvents);

@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { Compile } from "typebox/compile";
 import { Type } from "typebox";
 import { digestCandidateParameters } from "./action-plan.js";
+import { beliefStateBatchSchema, type BeliefStateBatch } from "./belief-state.js";
 import type { PredictionOutcome } from "./prediction-provider.js";
 import type { PredictionCandidate, PredictionKind } from "./protocol.js";
 
@@ -226,10 +227,55 @@ export interface PlanInvalidationRecord {
   readonly invalidatedAt: string;
 }
 
+/**
+ * One validated belief batch, kept as history.
+ *
+ * History, not evidence — and that answers the contradiction the belief contract
+ * carried. `BELIEF_LIMITS.maxTtlMs` permits a 24-hour shelf life while
+ * `validateBatchAgainstRequest` demands exact agreement on the state digest and
+ * projection generation, which move on every ingest. Read as one rule the two are
+ * irreconcilable. They are two rules about different questions: `expiresAt` is the
+ * *producer's* claim about how long its inference should be believed, which exists
+ * to bound an untrusted producer, and the digest equality decides whether a batch
+ * may inform *this* prediction. Nothing ever reads a stored batch back as ranking
+ * input, so the second question is never asked of a persisted record and the TTL
+ * ceiling is a bound on a claim rather than a promise about reuse.
+ *
+ * That restriction is not storage timidity. `runSemanticGate` admits a cognition
+ * provider by replaying a corpus and requiring the identical top-1 answer every
+ * time, which holds only while a prediction is a pure function of the state it was
+ * given. A belief read back from the ledger would make the answer depend on what
+ * previous runs happened to write, so the gate would be measuring a provider that
+ * cannot exist in production. What accumulates across a session is therefore the
+ * record — `bun run ledger:report` and the ledger itself — rather than the ranking.
+ *
+ * The batch is embedded whole rather than flattened into columns. It is already an
+ * audit shape by contract: a closed intent vocabulary, bounded strings, a digest,
+ * timestamps, and event ids — no command, no prose, no parameters. Copying fields
+ * out would create a second spelling of the belief contract to keep in agreement,
+ * which is the drift `recordEventReferences` exists to prevent.
+ */
+export interface BeliefBatchRecord {
+  readonly schemaVersion: 1;
+  readonly recordId: string;
+  readonly recordType: "belief_batch";
+  /**
+   * The prediction request the beliefs were produced for. Not a foreign key: a
+   * batch is written whether or not the prediction that asked for it ends up with
+   * an attempt record, so closure follows the cited events instead.
+   */
+  readonly requestId: string;
+  readonly provider: string;
+  readonly observedAt: string;
+  /** The batch exactly as validation accepted it. */
+  readonly batch: BeliefStateBatch;
+}
+
 export type PredictionLedgerRecord =
   | PredictionAttemptRecord
   | LegacyPredictionAttemptRecord
   | PredictionFeedbackRecord
+  | BeliefBatchRecord
   | ActionPlanRecord
   | PlanDecisionRecord
   | PlanDispatchRecord
@@ -253,6 +299,16 @@ export interface ClaimDispatchInputs {
 export interface PredictionLedger {
   appendAttempt(record: PredictionAttemptRecord): Promise<void>;
   appendFeedback(record: PredictionFeedbackRecord): Promise<void>;
+  /**
+   * Persists one validated belief batch as history.
+   *
+   * Deliberately independent of `appendAttempt`: a batch is produced before the
+   * prediction it informs has an outcome, and the prediction may fail or be
+   * cancelled. Requiring an attempt first would mean losing exactly the batches a
+   * failed run most needs explained. Nothing reads these back into a prediction —
+   * see `BeliefBatchRecord` for why that restriction is load-bearing.
+   */
+  appendBeliefBatch(record: BeliefBatchRecord): Promise<void>;
   all(): Promise<readonly PredictionLedgerRecord[]>;
 
   /**
@@ -331,8 +387,18 @@ export interface PredictionLedger {
  *
  * Only records that name events appear here. A plan, decision, dispatch, or
  * invalidation reaches history through its attempt and candidate, never directly.
+ * A belief batch does name events, and directly: it cites `evidenceEventIds`, which
+ * is the whole basis on which a belief can be audited, so a stored batch whose
+ * evidence was deleted is precisely the dangling reference above.
  */
 export function recordEventReferences(record: PredictionLedgerRecord): ReadonlySet<string> {
+  if (record.recordType === "belief_batch") {
+    const references = new Set<string>();
+    for (const belief of record.batch.beliefs) {
+      for (const eventId of belief.evidenceEventIds) references.add(eventId);
+    }
+    return references;
+  }
   if (record.recordType !== "attempt") return EMPTY_EVENT_REFERENCES;
 
   const references = new Set<string>([record.triggerEventId]);
@@ -423,6 +489,12 @@ function isRemovedWithEvents(
 ): boolean {
   switch (record.recordType) {
     case "attempt":
+      return citesRemovedEvent(record, removedEventIds);
+    case "belief_batch":
+      // Same rule as an attempt, and for the same reason: a batch whose evidence
+      // was deleted is a claim about a world nothing can vouch for any more. It
+      // does not follow its request's attempt — a batch is written even when no
+      // attempt record exists — so its own citations are the whole anchor.
       return citesRemovedEvent(record, removedEventIds);
     case "feedback":
       // The candidate's owner attempt was removed; the feedback has nothing
@@ -537,6 +609,19 @@ const feedbackSchema = Type.Object({
   occurredAt: timestamp(),
   details: Type.Record(Type.String(), scalar),
 }, { additionalProperties: false });
+// The belief batch is validated by the belief contract's own schema, reused here
+// rather than restated. A second spelling would drift: a field added to the
+// contract would be silently dropped by this closed union, and the ledger would
+// reject exactly the batches the live path had just accepted.
+const beliefBatchSchema = Type.Object({
+  schemaVersion: Type.Literal(1),
+  recordId: nonEmptyString(),
+  recordType: Type.Literal("belief_batch"),
+  requestId: nonEmptyString(),
+  provider: nonEmptyString(),
+  observedAt: timestamp(),
+  batch: beliefStateBatchSchema,
+}, { additionalProperties: false });
 const sha256Pattern = /^sha256:[0-9a-f]{64}$/u.source;
 const actionPlanSchema = Type.Object({
   schemaVersion: Type.Literal(2),
@@ -590,6 +675,7 @@ const recordValidator = Compile(Type.Union([
   attemptSchema,
   legacyAttemptSchema,
   feedbackSchema,
+  beliefBatchSchema,
   actionPlanSchema,
   planDecisionSchema,
   planDispatchSchema,
@@ -695,6 +781,35 @@ export function createFeedbackRecord(
     occurredAt: input.occurredAt ?? now.toISOString(),
     details: structuredClone(input.details ?? {}),
   }) as PredictionFeedbackRecord;
+}
+
+/**
+ * Wraps a validated batch as a ledger record.
+ *
+ * `beliefBatchId` supplies the identity rather than the request id: a request asks
+ * for beliefs once, but the id a producer stamps on its batch is the thing an
+ * operator correlates against provider-side logs, and reusing it here makes a
+ * replayed write idempotent on the fact rather than on the occasion. The batch must
+ * already have passed `validateBatchAgainstRequest` — this function re-validates its
+ * shape but cannot re-check it against a projection, since the projection it
+ * described is by then two generations gone.
+ */
+export function createBeliefBatchRecord(input: {
+  readonly requestId: string;
+  readonly batch: BeliefStateBatch;
+  readonly observedAt?: string;
+}, now = new Date()): BeliefBatchRecord {
+  return parsePredictionLedgerRecord({
+    schemaVersion: 1,
+    recordId: `belief_batch:${input.batch.beliefBatchId}`,
+    recordType: "belief_batch",
+    requestId: input.requestId,
+    // Denormalized from the batch so a report can group by producer without
+    // reaching inside it, the same way an attempt record surfaces its provider.
+    provider: input.batch.provider,
+    observedAt: input.observedAt ?? now.toISOString(),
+    batch: input.batch,
+  }) as BeliefBatchRecord;
 }
 
 export function parsePredictionLedgerRecord(value: unknown): PredictionLedgerRecord {
@@ -950,6 +1065,10 @@ export class InMemoryPredictionLedger implements PredictionLedger {
     this.append(parsePredictionLedgerRecord(record));
   }
 
+  public async appendBeliefBatch(record: BeliefBatchRecord): Promise<void> {
+    this.append(parsePredictionLedgerRecord(record));
+  }
+
   public async all(): Promise<readonly PredictionLedgerRecord[]> {
     return this.index.all();
   }
@@ -1054,6 +1173,10 @@ export class JsonlPredictionLedger implements PredictionLedger {
   }
 
   public appendFeedback(record: PredictionFeedbackRecord): Promise<void> {
+    return this.append(parsePredictionLedgerRecord(record));
+  }
+
+  public appendBeliefBatch(record: BeliefBatchRecord): Promise<void> {
     return this.append(parsePredictionLedgerRecord(record));
   }
 
