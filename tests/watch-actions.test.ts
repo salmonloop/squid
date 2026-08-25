@@ -262,9 +262,42 @@ async function setup(options: {
 }
 
 describe("resolveWatchActions", () => {
-  it("returns undefined when SQUID_ACTIONS is unset — actions stay off", async () => {
+  it("returns undefined when no command and no explicit spelling are given", async () => {
     const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), {});
     expect(resolution).toBeUndefined();
+  });
+
+  it("enables actions on the MCP command alone, without SQUID_ACTIONS=mcp", async () => {
+    // Open by default: the command is the capability's real opt-in; the
+    // variable was a second key for the same door. A run that sets only the
+    // command gets past every config check and into transport construction —
+    // which fails here because `bun server.ts` is not a server — while a run
+    // that sets neither stays off without touching anything. The assertion is
+    // therefore about *how* it fails: a connection error means validation
+    // passed; a configError would mean the implicit enable did not.
+    let outcome: unknown;
+    try {
+      outcome = await resolveWatchActions(
+        unreachable("runtime"),
+        unreachable("ledger"),
+        { SQUID_ACTIONS_MCP_COMMAND: "bun server.ts" },
+      );
+    } catch (error) {
+      expect((error as Error).message).toContain("Connection closed");
+      return;
+    }
+    expect(outcome).not.toHaveProperty("configError");
+  });
+
+  it("still fails startup when the explicit spelling names no command", async () => {
+    const resolution = await resolveWatchActions(
+      unreachable("runtime"),
+      unreachable("ledger"),
+      { SQUID_ACTIONS: "mcp" },
+    );
+    expect(resolution).toEqual({
+      configError: "SQUID_ACTIONS=mcp requires SQUID_ACTIONS_MCP_COMMAND.",
+    });
   });
 
   it("rejects actions for a provider admitted only in suggestion mode before opening MCP", async () => {
@@ -280,7 +313,9 @@ describe("resolveWatchActions", () => {
   });
 
   it("rejects an invalid SQUID_SEARCH_EGRESS value before opening MCP", async () => {
-    for (const value of ["Allow", "allowed", "deny", "yes"]) {
+    // "deny" is now a valid spelling (the explicit restriction), so only true
+    // near-misses belong in this list.
+    for (const value of ["Allow", "allowed", "DENY", "yes"]) {
       const resolution = await resolveWatchActions(
         unreachable("runtime"),
         unreachable("ledger"),

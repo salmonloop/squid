@@ -1,7 +1,11 @@
 import { HeuristicPredictor } from "./baseline-predictor.js";
 import type { BeliefOutcome } from "./belief-provider.js";
 import type { BeliefStateBatch } from "./belief-state.js";
-import { RedactingContextPolicy } from "./context-policy.js";
+import {
+  PassthroughContextPolicy,
+  RedactingContextPolicy,
+  type ContextPolicy,
+} from "./context-policy.js";
 import { resolveBeliefProvider } from "./resolve-belief-provider.js";
 import {
   parseProviderGateMode,
@@ -106,6 +110,11 @@ export async function resolveWatchProvider(
     return resolveCognitionProvider(gate, env, options);
   }
 
+  const contextPolicy = resolveContextPolicy(env);
+  if ("configError" in contextPolicy) {
+    return { ok: false, configError: contextPolicy.configError };
+  }
+
   const [{ PiRuntime }, { runProviderGate }, { heuristicEvaluationScenarios }] = await Promise.all([
     import("./pi-runtime.js"),
     import("./provider-gate.js"),
@@ -116,6 +125,7 @@ export async function resolveWatchProvider(
     mode,
     gate,
     heuristic: new HeuristicPredictor(),
+    ...(contextPolicy.policy === undefined ? {} : { contextPolicy: contextPolicy.policy }),
     createPi: () => new PiRuntime(),
     // Resolve the model once up front, so an outage declines with a stated
     // reason instead of surfacing as a failed prediction on the first event.
@@ -151,6 +161,32 @@ export async function resolveWatchProvider(
  * belief contract cannot catch the second case: a cooperative producer echoes
  * back whatever id it was handed, so request and batch agree either way.
  */
+/**
+ * Resolves `SQUID_CONTEXT_POLICY` into the projection model-mode providers see.
+ *
+ * Absent means passthrough — the open-by-default posture, where what the model
+ * receives is the same world state the local fallback reads. `redacting` is
+ * the explicit opt-in that narrows window titles, URLs, file paths, focus
+ * text, and action targets before anything leaves the process; anything else
+ * is a startup error rather than a silent choice of posture. The policy is
+ * resolved once here so the selector, the gate, and the belief layer all name
+ * and apply the same one.
+ */
+function resolveContextPolicy(
+  env: Record<string, string | undefined>,
+): { readonly policy: ContextPolicy } | { readonly configError: string } {
+  const raw = env.SQUID_CONTEXT_POLICY;
+  if (raw === undefined || raw === "passthrough") {
+    return { policy: new PassthroughContextPolicy() };
+  }
+  if (raw === "redacting") {
+    return { policy: new RedactingContextPolicy() };
+  }
+  return {
+    configError: 'SQUID_CONTEXT_POLICY must be unset (passthrough), "passthrough", or "redacting".',
+  };
+}
+
 async function resolveCognitionProvider(
   gate: ProviderGateMode,
   env: Record<string, string | undefined>,
@@ -162,6 +198,11 @@ async function resolveCognitionProvider(
   const beliefProvider = resolveBeliefProvider({ env });
   if ("configError" in beliefProvider) {
     return { ok: false, configError: beliefProvider.configError };
+  }
+
+  const contextPolicy = resolveContextPolicy(env);
+  if ("configError" in contextPolicy) {
+    return { ok: false, configError: contextPolicy.configError };
   }
 
   const [
@@ -178,7 +219,6 @@ async function resolveCognitionProvider(
     import("./evaluation-fixtures.js"),
   ]);
 
-  const contextPolicy = new RedactingContextPolicy();
   /**
    * One observation point feeding two consumers, because there is only one fact:
    * a belief attempt settled. The terminal line describes it without the beliefs;
@@ -225,7 +265,7 @@ async function resolveCognitionProvider(
   const producer = await beliefProvider.createProvider();
   const buildResolver = (observe: boolean) => createBeliefResolver({
     beliefProvider: producer,
-    contextPolicyId: contextPolicy.id,
+    contextPolicyId: contextPolicy.policy.id,
     ...(observe && observed ? { onOutcome: observeOutcome } : {}),
   });
 
@@ -244,11 +284,11 @@ async function resolveCognitionProvider(
         new BeliefRerankCognition(),
         buildResolver(true),
       ),
-      contextPolicy,
+      contextPolicy: contextPolicy.policy,
       runSemanticGate: () => runSemanticGate({
         scenarios: heuristicEvaluationScenarios,
         createProvider: createGateProvider,
-        contextPolicy,
+        contextPolicy: contextPolicy.policy,
         // Present only for a model-backed producer. The heuristic is in-process and
         // cannot be unavailable, and a probe that always succeeds would only add a way
         // for the gate to skip — which reads as "not evaluated", the one verdict that

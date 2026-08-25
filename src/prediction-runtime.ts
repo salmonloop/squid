@@ -156,8 +156,12 @@ export class PredictionRuntime {
     this.now = options.now ?? (() => new Date());
     this.capturePolicy = options.capturePolicy ?? new PassthroughCapturePolicy();
     // Defaults are real values, not placeholders: an unconfigured session is
-    // still a distinct session, and an unset trust level conservatively reads
-    // as suggestion-only rather than claiming a gate it never passed.
+    // still a distinct session. Both fallbacks are the conservative spelling —
+    // an unset trust level reads as suggestion-only rather than claiming a gate
+    // it never passed, and an unset egress id reads as deny. These are library
+    // defaults for a caller with no environment to resolve; the watch entry
+    // points always pass explicit values resolved from env, where egress now
+    // defaults open.
     this.runtimeSessionId =
       options.runtimeSessionId ?? `runtime-${crypto.randomUUID()}`;
     this.actionTrust = options.actionTrust ?? "suggestion_only";

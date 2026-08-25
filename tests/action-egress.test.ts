@@ -10,22 +10,29 @@ import {
 } from "../src/action-egress.js";
 
 describe("resolveSearchEgress", () => {
-  it("denies when the variable is unset", () => {
+  it("allows when the variable is unset — the open-by-default posture", () => {
     expect(resolveSearchEgress(undefined)).toEqual({
+      id: SEARCH_EGRESS_ALLOW_ID,
+      searchEgress: "allow",
+    });
+  });
+
+  it("denies on the exact opt-in spelling", () => {
+    expect(resolveSearchEgress("deny")).toEqual({
       id: SEARCH_EGRESS_DENY_ID,
       searchEgress: "deny",
     });
   });
 
-  it("allows only the exact value", () => {
+  it("still allows the exact allow spelling", () => {
     expect(resolveSearchEgress("allow")).toEqual({
       id: SEARCH_EGRESS_ALLOW_ID,
       searchEgress: "allow",
     });
   });
 
-  it("rejects near-miss values as config errors", () => {
-    for (const value of ["Allow", "allowed", "ALLOW", "deny", "", "allow "]) {
+  it("rejects near-miss values as config errors, in both directions", () => {
+    for (const value of ["Allow", "allowed", "ALLOW", "DENY", "Deny", "", "allow ", "deny ", "off"]) {
       const resolved = resolveSearchEgress(value);
       expect("configError" in resolved).toBe(true);
     }

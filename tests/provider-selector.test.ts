@@ -112,8 +112,12 @@ describe("parseProviderMode", () => {
 });
 
 describe("parseProviderGateMode", () => {
-  it("defaults to the probe path when unset and rejects an unrecognized value", () => {
-    expect(parseProviderGateMode(undefined)).toBe("probe");
+  it("defaults to off when unset and rejects an unrecognized value", () => {
+    // Open by default: the gates are measured walls for the current model, so
+    // making measurement the default made every model path speak-only or
+    // unadmittable. Restricting is spelled; absence is not a restriction.
+    expect(parseProviderGateMode(undefined)).toBe("off");
+    expect(parseProviderGateMode("off")).toBe("off");
     expect(parseProviderGateMode("probe")).toBe("probe");
     expect(parseProviderGateMode("replay")).toBe("replay");
     expect(parseProviderGateMode("gate")).toBeNull();
@@ -145,7 +149,9 @@ describe("selectPredictionProvider behind the availability probe", () => {
     expect(selection.provider.name).toBe("pi");
     expect(selection.declineReason).toBeNull();
     expect(selection.actionTrust).toBe("suggestion_only");
-    expect(selection.contextPolicy.id).toBe("redacting");
+    // No policy passed means passthrough — open by default; redaction is an
+    // explicit SQUID_CONTEXT_POLICY=redacting decision at the call site.
+    expect(selection.contextPolicy.id).toBe("passthrough");
     expect(calls).toEqual({ createPi: 1, probePi: 1, runGate: 0 });
   });
 
@@ -180,9 +186,24 @@ describe("selectPredictionProvider behind the replay gate", () => {
     expect(selection.provider.name).toBe("pi");
     expect(selection.declineReason).toBeNull();
     expect(selection.actionTrust).toBe("trusted");
-    expect(selection.contextPolicy.id).toBe("redacting");
+    expect(selection.contextPolicy.id).toBe("passthrough");
     // The gate probes availability itself, so the selector must not probe twice.
     expect(calls).toEqual({ createPi: 1, probePi: 0, runGate: 1 });
+  });
+
+  it("applies a caller-supplied policy verbatim — redaction is the opt-in", async () => {
+    const { seams } = harness({ runGate: async () => gateResult("passed") });
+    const policy = new RedactingContextPolicy();
+    const selection = await selectPredictionProvider({
+      ...seams,
+      mode: "pi",
+      gate: "replay",
+      contextPolicy: policy,
+    });
+
+    // Identity, not just id: the gate and the live run must project through
+    // the same object.
+    expect(selection.contextPolicy).toBe(policy);
   });
 
   it("declines with the measured failures when the gate fails", async () => {
@@ -315,7 +336,7 @@ describe("selectPredictionProvider with the gate off", () => {
     expect(selection.provider.name).toBe("pi");
     expect(selection.declineReason).toBeNull();
     expect(selection.actionTrust).toBe("trusted");
-    expect(selection.contextPolicy.id).toBe("redacting");
+    expect(selection.contextPolicy.id).toBe("passthrough");
     expect(calls).toEqual({ createPi: 1, probePi: 0, runGate: 0 });
   });
 
@@ -330,11 +351,5 @@ describe("selectPredictionProvider with the gate off", () => {
     // The gate would have failed on this stub; that it was never called is the
     // bypass working as spelled.
     expect(calls.runSemanticGate).toBe(0);
-  });
-
-  it("keeps the default at probe even though off exists", async () => {
-    // Absence must never read as bypass: unset still means the fast,
-    // speak-but-don't-act path.
-    expect(parseProviderGateMode(undefined)).toBe("probe");
   });
 });

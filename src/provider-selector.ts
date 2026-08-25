@@ -24,18 +24,18 @@ export function parseProviderMode(value: string | undefined): ProviderMode | nul
 }
 
 /**
- * Reads `SQUID_PROVIDER_GATE`. Absent means the fast `"probe"` path.
+ * Reads `SQUID_PROVIDER_GATE`. Absent means `"off"` — no gate, full trust.
  *
- * `"off"` is the explicit bypass: no gate runs and the provider is admitted as
- * trusted. It exists because both real gates are measured walls for the current
- * model — the replay gate on ranking nondeterminism, the semantic gate on
- * stability — so without it every model path is either unable to speak or
- * unable to act, and no MVP can ship. Off is opt-in by spelling, never by
- * absence; the default stays probe, which admits a reachable model to speak
- * but withholds dispatch trust.
+ * The posture is open-by-default: both real gates are measured walls for the
+ * current model (the replay gate on ranking nondeterminism, the semantic gate
+ * on stability), so making measurement the default made every model path
+ * either speak-only or unadmittable. Restricting is now the explicit act —
+ * `probe` for fast reachability with dispatch withheld, `replay` for the full
+ * measured admission — and an unrecognized value still fails startup rather
+ * than silently choosing a posture.
  */
 export function parseProviderGateMode(value: string | undefined): ProviderGateMode | null {
-  if (value === undefined) return "probe";
+  if (value === undefined) return "off";
   return (providerGateModes as readonly string[]).includes(value) ? (value as ProviderGateMode) : null;
 }
 
@@ -47,6 +47,12 @@ export interface HeuristicProviderOptions {
 export interface ModelProviderOptions {
   readonly mode: "pi";
   readonly gate: ProviderGateMode;
+  /**
+   * The projection the model sees. Absent means passthrough — the open-by-
+   * default posture, where redaction is an explicit `SQUID_CONTEXT_POLICY=
+   * redacting` decision rather than something a provider mode silently applies.
+   */
+  readonly contextPolicy?: ContextPolicy;
   /** Basis for the heuristic provider, used whenever the model is not admitted. */
   readonly heuristic: Predictor;
   readonly createPi: () => PredictionProvider;
@@ -146,20 +152,19 @@ export async function selectPredictionProvider(
     };
   }
   return {
-    // Both admitted paths get a redacting policy, and for the same reason: a
-    // provider that reasons about the projection is an egress boundary whether it
-    // runs out of process or not. Cognition is in-process today, but the belief
-    // producer behind it is a seam a model is meant to fill — and a policy chosen
-    // by where the code happens to run would silently widen the moment it does.
+    // Both admitted paths default to passthrough — open by default, with
+    // redaction as the explicit opt-in via `SQUID_CONTEXT_POLICY=redacting`.
+    // The caller resolves that variable into the policy it passes here; the
+    // selector never reads env itself.
     //
     // Cognition brings its own instance because its belief layer names the policy
     // and its gate has to apply it; the two must be the same object, not two
-    // constructions that share a literal id. Pi constructs one here because
-    // nothing downstream of it reads a policy id — see the note on
+    // constructions that share a literal id. Pi receives one because nothing
+    // downstream of it reads a policy id — see the note on
     // `CognitionProviderOptions.contextPolicy`.
     provider: options.mode === "pi" ? options.createPi() : options.createCognition(),
     contextPolicy: options.mode === "pi"
-      ? new RedactingContextPolicy()
+      ? (options.contextPolicy ?? new PassthroughContextPolicy())
       : options.contextPolicy,
     // Trust follows the gate spelling, and each of the three means something
     // distinct. `replay` earns trust by measurement — "it answers as well as
