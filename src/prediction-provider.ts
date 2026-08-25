@@ -1,3 +1,4 @@
+import type { ToolSummary } from "./tool-catalog.js";
 import type { PredictionCandidate, WorldState } from "./protocol.js";
 import type { Predictor } from "./baseline-predictor.js";
 
@@ -41,6 +42,17 @@ export interface PredictionRequest {
    * prevent; a consumer that needs one degrades instead when it is absent.
    */
   readonly projection?: ProjectionIdentity;
+  /**
+   * What this run can actually do, as prompt-facing summaries of the tool
+   * registry. Absent for callers with no registry — a direct `predict` in a
+   * test, or the heuristic provider, which never reads it.
+   *
+   * Optional rather than defaulted so no caller invents a catalog: a provider
+   * that received none proposes without one, and a provider that received one
+   * must propose from *it* — naming an id this list does not hold is the same
+   * mistake as naming one the planner will refuse.
+   */
+  readonly tools?: readonly ToolSummary[];
 }
 
 export type PredictionStatus =
