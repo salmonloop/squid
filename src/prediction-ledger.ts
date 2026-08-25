@@ -535,8 +535,14 @@ const predictionKindSchema = Type.Union([
   Type.Literal("search_selection"),
   Type.Literal("none"),
 ]);
+// The registered capability a proposal named, or null when it named none.
+// Open-ended by design: the catalog is data, so a tool id is a string here and
+// the ledger records what was proposed even after the tool is gone. Null is a
+// fact (nothing proposed), not missing data — hence required, not optional.
+const toolIdSchema = Type.Union([nonEmptyString(), Type.Null()]);
 const candidateSchema = Type.Object({
   kind: predictionKindSchema,
+  toolId: toolIdSchema,
   rationale: Type.String(),
   confidence: Type.Number(),
   expiresAt: Type.String({ minLength: 1 }),
@@ -549,6 +555,7 @@ const envelopeSchema = Type.Object({
   candidateId: nonEmptyString(),
   ordinal: Type.Integer({ minimum: 0 }),
   kind: predictionKindSchema,
+  toolId: toolIdSchema,
   confidence: Type.Number(),
   expiresAt: timestamp(),
   sourceEventIds: Type.Array(Type.String()),
@@ -714,6 +721,7 @@ export function candidateEnvelopes(
     candidateId: `${requestId}:candidate:${ordinal}`,
     ordinal,
     kind: candidate.kind,
+    toolId: candidate.toolId,
     confidence: candidate.confidence,
     expiresAt: candidate.expiresAt,
     sourceEventIds: [...candidate.sourceEventIds],

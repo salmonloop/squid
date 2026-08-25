@@ -174,6 +174,16 @@ export type PredictionKind =
 
 export interface PredictionCandidate {
   kind: PredictionKind;
+  /**
+   * The registered capability this proposal names, or null when it names none.
+   *
+   * This is the routing key, not `kind`: several tools may share a category,
+   * and a brand-new capability needs no vocabulary change to be proposable.
+   * Null is a fact about the candidate, not missing data — a "do nothing"
+   * proposal (`none`) or an unregistered kind carries no tool by definition,
+   * so the field is `string | null` rather than optional.
+   */
+  toolId: string | null;
   rationale: string;
   confidence: number;
   expiresAt: string;

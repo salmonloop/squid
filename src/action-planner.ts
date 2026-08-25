@@ -6,7 +6,7 @@ import {
   digestCandidateParameters,
   type ImmutableActionPlan,
 } from "./action-plan.js";
-import type { ActionablePredictionKind } from "./action-plan.js";
+import { isActionableCategory, type ActionablePredictionKind } from "./action-plan.js";
 import { detectProject, type ProjectProfile } from "./project-detect.js";
 import type { PredictionCandidate } from "./protocol.js";
 import { renderCommandSummary, buildToolRegistry } from "./tool-descriptors.js";
@@ -34,12 +34,14 @@ export interface ActionPlanFailure {
  * Why a candidate could not become a plan.
  *
  * The path and workdir codes are produced by `path-containment.ts` and pass through
- * unchanged; the planner adds only what it owns. `kind_not_actionable` survives because
- * the evaluation corpus and the belief vocabulary still speak in kinds — a kind with no
- * registered tool has no action to become.
+ * unchanged; the planner adds only what it owns. `tool_unknown` covers both a
+ * candidate naming no tool and one naming a tool this run did not register —
+ * from the plan's point of view they are the same fact: there is nothing here
+ * that can render.
  */
 export type PlanFailureReason =
-  | "kind_not_actionable"
+  | "tool_unknown"
+  | "kind_unactionable"
   | "parameters_invalid"
   | "command_unavailable"
   | "workdir_missing"
@@ -59,7 +61,17 @@ export type PlanFailureReason =
 export interface ActionPlanRequest {
   readonly candidateId: string;
   readonly attemptId: string;
+  /** The semantic category the candidate claims. Used only when it names no tool. */
   readonly kind: PredictionCandidate["kind"];
+  /**
+   * The registered capability the candidate proposes, if it named one.
+   *
+   * Routing is by tool, not by kind: kinds group but do not select, and two
+   * tools may share a category. A candidate that names a tool this registry
+   * does not hold is refused — falling back to "some other tool of the same
+   * category" would execute a capability nobody proposed.
+   */
+  readonly toolId: string | null;
   readonly parameters: PredictionCandidate["parameters"];
 }
 
@@ -86,11 +98,10 @@ export function isPlanFailure(
  * Turns a candidate into a canonical, immutable plan.
  *
  * The capability surface used to be a `switch (kind)` over three cases with two commands
- * hardcoded as string literals. It is now a lookup in the tool catalog: the candidate's
- * kind selects among the tools registered for this project, the registry validates the
- * proposed arguments against the descriptor's schema, and the descriptor's own render
- * produces the invocation. Adding a capability means registering a descriptor; nothing
- * here changes.
+ * hardcoded as string literals. It is now a lookup in the tool catalog by the tool the
+ * candidate names: the registry validates the proposed arguments against the descriptor's
+ * schema, and the descriptor's own render produces the invocation. Adding a capability
+ * means registering a descriptor; nothing here changes.
  *
  * What did not move: canonicalization happens before anything user-visible exists, so
  * the digest covers the resolved truth rather than the string the model produced; and
@@ -101,7 +112,7 @@ export async function planAction(
   request: ActionPlanRequest,
   context: ActionPlanningContext = {},
 ): Promise<PlannedAction | ActionPlanFailure> {
-  const { kind, parameters, candidateId, attemptId } = request;
+  const { kind, toolId, parameters, candidateId, attemptId } = request;
   const resolvePath = context.resolvePath ?? ((path: string) => realpath(path));
   const renderContext: ToolRenderContext = {
     ...(context.workingDirectory !== undefined
@@ -115,12 +126,18 @@ export async function planAction(
     ? new ToolRegistry(registryForProject(context.project))
     : await defaultRegistry(context.workingDirectory);
 
-  // A kind maps onto at most one tool today — the corpus, the belief vocabulary,
-  // and admission all reason in kinds. When several descriptors share a category
-  // this picks the first registered, which is prompt order: the most specific
-  // proposal wins. A category with no tool is simply not actionable.
-  const descriptor = registry.all.find((tool) => tool.category === kind);
-  if (descriptor === undefined) return { reasonCode: "kind_not_actionable" };
+  // The candidate names the tool; the kind only groups. A null toolId is a fact
+  // about the proposal (nothing to do), not missing data, so there is no
+  // category fallback for it — and none for an unknown id either: executing a
+  // different tool of the same category would run something nobody proposed.
+  const descriptor = toolId === null ? undefined : registry.get(toolId);
+  if (descriptor === undefined) return { reasonCode: "tool_unknown" };
+
+  // The catalog may hold tools whose category the rest of the system cannot
+  // score or record. Refusing here keeps the refusal at the boundary where the
+  // mismatch was introduced, rather than letting a plan through whose `kind`
+  // would be unreadable downstream.
+  if (!isActionableCategory(descriptor.category)) return { reasonCode: "kind_unactionable" };
 
   const rendered = await descriptor.render(parameters, renderContext);
   if (isRenderFailure(rendered)) {
@@ -131,9 +148,10 @@ export async function planAction(
 
   return finish({
     planSchemaVersion: 1,
-    // The descriptor's category is the kind admission and the ledger already speak;
-    // the lookup above guarantees it is one of the actionable ones.
     kind: descriptor.category as ActionablePredictionKind,
+    // Frozen so the guard admission runs is the one this plan was rendered by,
+    // even when another registered tool shares the same category.
+    descriptorId: descriptor.id,
     candidateId,
     attemptId,
     tool: rendered.tool,

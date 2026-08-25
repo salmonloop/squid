@@ -32,6 +32,7 @@ const ALLOW: EgressPolicy = { id: SEARCH_EGRESS_ALLOW_ID, searchEgress: "allow" 
 function testsCandidate(): PredictionCandidate {
   return {
     kind: "run_tests",
+    toolId: "run_tests",
     rationale: "file saved by the editor itself",
     confidence: 0.9,
     expiresAt: FUTURE,
@@ -44,6 +45,7 @@ function testsPlan(): ImmutableActionPlan {
   return {
     planSchemaVersion: 1,
     kind: "run_tests",
+    descriptorId: "run_tests",
     candidateId: "req-1:candidate:0",
     attemptId: "req-1",
     tool: "run_command",

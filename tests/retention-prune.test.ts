@@ -124,6 +124,7 @@ function attemptFor(
       latencyMs: 5,
       candidates: [{
         kind: "run_tests",
+        toolId: "run_tests",
         rationale: "saved",
         confidence: 0.9,
         expiresAt: NEW_AT,
@@ -133,6 +134,7 @@ function attemptFor(
     },
     candidates: candidateEnvelopes(requestId, [{
       kind: "run_tests",
+      toolId: "run_tests",
       rationale: "saved",
       confidence: 0.9,
       expiresAt: NEW_AT,

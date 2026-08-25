@@ -32,6 +32,7 @@ export interface LedgerHarness {
 export function candidate(overrides: Partial<PredictionCandidate> = {}): PredictionCandidate {
   return {
     kind: "run_tests",
+    toolId: "run_tests",
     rationale: "a file was saved",
     confidence: 0.8,
     expiresAt: "2026-08-19T10:01:00.000Z",
@@ -269,7 +270,7 @@ export function describePredictionLedgerConformance(
         await harness.ledger.appendAttempt(attempt("req-1"));
 
         await expect(
-          harness.ledger.appendAttempt(attempt("req-1", [candidate({ kind: "inspect_error" })])),
+          harness.ledger.appendAttempt(attempt("req-1", [candidate({ kind: "inspect_error", toolId: "run_check" })])),
         ).rejects.toBeInstanceOf(PredictionLedgerConflictError);
         expect(await harness.ledger.all()).toHaveLength(1);
       } finally {
@@ -286,7 +287,7 @@ export function describePredictionLedgerConformance(
       try {
         await harness.ledger.appendAttempt(attempt("req-1"));
         const divergent = {
-          ...attempt("req-1", [candidate({ kind: "inspect_error" })]),
+          ...attempt("req-1", [candidate({ kind: "inspect_error", toolId: "run_check" })]),
           recordId: "attempt:req-1:retry",
         } as PredictionAttemptRecord;
 
@@ -385,7 +386,7 @@ export function describePredictionLedgerConformance(
       const harness = await createLedger();
       try {
         await harness.ledger.appendAttempt(
-          attempt("req-1", [candidate(), candidate({ kind: "inspect_error" })]),
+          attempt("req-1", [candidate(), candidate({ kind: "inspect_error", toolId: "run_check" })]),
         );
 
         const stored = (await harness.ledger.all())[0] as PredictionAttemptRecord;

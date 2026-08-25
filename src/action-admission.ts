@@ -34,7 +34,8 @@ export type AdmissionReasonCode =
   | "command_outcome_missing"
   | "command_outcome_changed"
   | "command_succeeded"
-  | "plan_kind_unsupported";
+  | "descriptor_unknown"
+  | "descriptor_kind_mismatch";
 
 export type AdmissionResult =
   | { readonly admitted: true }
@@ -104,14 +105,17 @@ export function admitAction(context: AdmissionContext): AdmissionResult {
   if (Date.parse(candidate.expiresAt) <= context.now.getTime()) return refuse("candidate_expired");
 
   /**
-   * The per-kind checks live on the descriptor, not here. Looked up by the
-   * plan's kind over the built-in catalog — the guards are pure world-state
-   * checks, so they need neither the run's project-scoped registry nor the
-   * filesystem. An unknown kind is refused rather than waved through: an
-   * action nobody can vouch for does not run.
+   * The per-tool checks live on the descriptor, not here. Looked up by the
+   * plan's own descriptor id over the built-in catalog — the guards are pure
+   * world-state checks, so they need neither the run's project-scoped registry
+   * nor the filesystem. The plan carries the id it was rendered from, so two
+   * tools sharing a category can never be re-paired with each other's guards.
+   * An unknown descriptor is refused rather than waved through: an action
+   * nobody can vouch for does not run.
    */
-  const descriptor = admissionDescriptors().find((tool) => tool.category === plan.kind);
-  if (descriptor === undefined) return refuse("plan_kind_unsupported");
+  const descriptor = admissionDescriptors().find((tool) => tool.id === plan.descriptorId);
+  if (descriptor === undefined) return refuse("descriptor_unknown");
+  if (descriptor.category !== plan.kind) return refuse("descriptor_kind_mismatch");
   return descriptor.guard?.(context) ?? { admitted: true };
 }
 

@@ -41,6 +41,7 @@ export interface PiRuntimeOptions {
 
 export interface RawPredictionCandidate {
   kind: string;
+  toolId?: string | null;
   rationale: string;
   confidence: number;
   parameters: Record<string, string | number | boolean | null>;
@@ -96,6 +97,7 @@ export class PiRuntime implements PredictionProvider {
       description: "Return exactly one structured next-action prediction and then stop.",
       parameters: Type.Object({
         kind: Type.Union(predictionKinds.map((kind) => Type.Literal(kind))),
+        toolId: Type.Union([Type.String(), Type.Null()]),
         rationale: Type.String(),
         confidence: Type.Number(),
         parameters: Type.Record(Type.String(), Type.Union([
@@ -218,8 +220,16 @@ export function normalizePredictionCandidate(
 
   const expiresAt = new Date(now.getTime() + (kindTtlMs[kind] ?? PREDICTION_TTL_MS)).toISOString();
 
+  // The model names the capability it wants; whether that tool exists is
+  // decided at planning time, not here — this layer has no registry and must
+  // not grow opinions about one. A model omitting the field proposes nothing.
+  const toolId = typeof params.toolId === "string" && params.toolId.trim().length > 0
+    ? params.toolId.trim()
+    : null;
+
   return {
     kind,
+    toolId,
     rationale,
     confidence: Math.max(0, Math.min(1, params.confidence)),
     expiresAt,
@@ -243,6 +253,7 @@ function isPredictionKind(kind: string): kind is PredictionKind {
 function noneCandidate(sourceEventIds: string[], now: Date): PredictionCandidate {
   return {
     kind: "none",
+    toolId: null,
     rationale: "The model emitted an invalid or no prediction.",
     confidence: 0,
     expiresAt: new Date(now.getTime() + kindTtlMs.none).toISOString(),

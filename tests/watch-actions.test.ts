@@ -140,6 +140,12 @@ function candidate(
 ): PredictionCandidate {
   return {
     kind,
+    // Default to the built-in tool of this category; a test proposing without
+    // a capability overrides it to null explicitly.
+    toolId: overrides.toolId ?? (kind === "run_tests" ? "run_tests"
+      : kind === "search_selection" ? "search_selection"
+      : kind === "inspect_error" ? "run_check"
+      : null),
     rationale: `test ${kind}`,
     confidence: 0.5,
     expiresAt: new Date(Date.now() + 60_000).toISOString(),

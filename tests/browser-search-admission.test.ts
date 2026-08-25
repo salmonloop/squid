@@ -117,7 +117,7 @@ async function harness(egressPolicy: EgressPolicy): Promise<Harness> {
     new SquidCore(new InMemoryEventStore()),
     new PredictionCoordinator({
       provider: new FakePredictionProvider({
-        candidates: [candidate("search_selection", 0.9, { selection: SELECTION })],
+        candidates: [candidate("search_selection", 0.9, { selection: SELECTION }, "search_selection")],
       }),
       random: nextRequestId(),
     }),

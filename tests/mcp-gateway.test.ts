@@ -27,7 +27,7 @@ async function plan(
   workingDirectory?: string,
 ): Promise<ImmutableActionPlan> {
   const planned = await planAction(
-    { candidateId: "req:candidate:0", attemptId: "req", kind, parameters },
+    { candidateId: "req:candidate:0", attemptId: "req", kind, toolId: kind, parameters },
     {
       ...(workingDirectory === undefined ? {} : { workingDirectory }),
       project: bunProject,

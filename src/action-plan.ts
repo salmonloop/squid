@@ -3,13 +3,19 @@ import { canonicalJson } from "./state-digest.js";
 import type { PredictionCandidate, PredictionKind } from "./protocol.js";
 
 /**
- * Prediction kinds with a concrete capability mapping.
+ * Prediction kinds that can back a plan at all.
  *
- * This list is the capability surface: a kind absent here can never become an
- * action, no matter what a provider returns. Planning lives in
- * `action-planner.ts` and validation in `action-admission.ts`; this module
- * holds only the shared vocabulary both depend on, so neither has to import
- * the other.
+ * This is *not* the capability surface any more — the tool catalog is. It is the
+ * set of semantic categories the rest of the system can reason about: the
+ * evaluation corpus scores against them, belief values map onto them, and the
+ * ledger groups by them. A descriptor whose category falls outside this list is
+ * refused at planning time rather than admitted with a `kind` the scorer and
+ * the ledger would misread; widening the list is a deliberate act that carries
+ * the corpus, the beliefs, and the ledger schema with it.
+ *
+ * Planning lives in `action-planner.ts` and validation in `action-admission.ts`;
+ * this module holds only the shared vocabulary both depend on, so neither has
+ * to import the other.
  */
 export const actionablePredictionKinds = [
   "search_selection",
@@ -19,33 +25,8 @@ export const actionablePredictionKinds = [
 
 export type ActionablePredictionKind = (typeof actionablePredictionKinds)[number];
 
-/**
- * Command classes an `inspect_error` plan is allowed to re-run.
- *
- * Deliberately a subset of what `classifyCommand` can report. A failed check is
- * safe to run again — it reads the project and reports — while the excluded
- * classes are not: `install` touches the network and a lockfile, `vcs` rewrites
- * history, `container` can deploy, and `other` is by definition unknown. Getting
- * this list wrong would let a failed `kubectl apply` propose running itself
- * again.
- *
- * `build` is excluded for a weaker but real reason: it writes build output, and
- * re-running it tells the user nothing the failure did not already.
- */
-export const reinspectableCommandClasses = ["test", "lint", "typecheck"] as const;
-
-export type ReinspectableCommandClass = (typeof reinspectableCommandClasses)[number];
-
-/** The project script each re-runnable class maps to. */
-export const REINSPECT_COMMANDS: Readonly<Record<ReinspectableCommandClass, readonly string[]>> = {
-  test: ["bun", "test"],
-  lint: ["bun", "run", "lint"],
-  typecheck: ["bun", "run", "typecheck"],
-};
-
-export function isReinspectableCommandClass(value: unknown): value is ReinspectableCommandClass {
-  return typeof value === "string"
-    && (reinspectableCommandClasses as readonly string[]).includes(value);
+export function isActionableCategory(kind: PredictionKind): boolean {
+  return (actionablePredictionKinds as readonly string[]).includes(kind);
 }
 
 /**
@@ -59,6 +40,17 @@ export function isReinspectableCommandClass(value: unknown): value is Reinspecta
 export interface ImmutableActionPlan {
   readonly planSchemaVersion: 1;
   readonly kind: ActionablePredictionKind;
+  /**
+   * Which catalog entry this plan was rendered from — the identity the guard
+   * lookup uses at admission time.
+   *
+   * `kind` groups, this selects. Several tools may share a category (two
+   * different check runners are both `inspect_error`), and a category-keyed
+   * guard lookup would then run the wrong tool's world-state checks. Frozen at
+   * planning so the plan that was approved and the checks it must pass cannot
+   * be re-paired later.
+   */
+  readonly descriptorId: string;
   readonly candidateId: string;
   readonly attemptId: string;
   readonly tool: string;
