@@ -190,15 +190,17 @@ export const containedPathSchema = Type.Object({
 }, { additionalProperties: false });
 
 /**
- * A project check, by name.
+ * A project check class, by name.
  *
  * The command is not in the schema, and that is the point: a model asks for "the lint
  * check", and which command that is comes from `detectProject`. A model naming the command
  * itself would be a model choosing what runs on the machine from a string it composed,
- * which is the one thing the argv discipline exists to prevent.
+ * which is the one thing the argv discipline exists to prevent. The field name follows the
+ * captured fact (`commandClass` in terminal capture and admission) so candidates feed this
+ * schema without translation.
  */
 export function projectCheckSchema(available: readonly ProjectCheck[]): TSchema {
   return Type.Object({
-    check: Type.Union(available.map((check) => Type.Literal(check))),
+    commandClass: Type.Union(available.map((check) => Type.Literal(check))),
   }, { additionalProperties: false });
 }

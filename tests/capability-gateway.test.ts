@@ -12,6 +12,7 @@ import {
 } from "../src/capability-gateway.js";
 import { digestActionPlan, type ImmutableActionPlan } from "../src/action-plan.js";
 import { isPlanFailure, planAction } from "../src/action-planner.js";
+import { bunProject } from "./fixtures/bun-project.js";
 import { SEARCH_EGRESS_DENY_ID, type EgressPolicy } from "../src/action-egress.js";
 import { InMemoryPredictionLedger } from "../src/prediction-ledger.js";
 import { PredictionRuntime } from "../src/prediction-runtime.js";
@@ -123,7 +124,7 @@ async function setup(options: {
       kind: top.kind,
       parameters: top.parameters,
     },
-    { workingDirectory: root },
+    { workingDirectory: root, project: bunProject },
   );
   if (isPlanFailure(planned)) throw new Error(`planning failed: ${planned.reasonCode}`);
 

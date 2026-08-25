@@ -17,6 +17,7 @@ import {
 } from "./action-planner.js";
 import { resolveSearchEgress, type EgressPolicy } from "./action-egress.js";
 import { McpCapabilityGateway } from "./mcp-gateway.js";
+import type { ProjectProfile } from "./project-detect.js";
 import type { PredictionCandidate } from "./protocol.js";
 import type { PredictionLedger } from "./prediction-ledger.js";
 import type { PredictionRuntime } from "./prediction-runtime.js";
@@ -141,6 +142,12 @@ export async function resolveWatchActions(
   env: Record<string, string | undefined> = process.env,
   options: {
     readonly workingDirectory?: string;
+    /**
+     * Detected once by the session layer and threaded through, so every
+     * planning call in this process reuses the same project profile instead of
+     * re-reading the directory.
+     */
+    readonly project?: ProjectProfile;
     readonly actionTrust?: "trusted" | "suggestion_only";
     /**
      * The policy the runtime was built with. Supplying it here keeps one
@@ -260,6 +267,7 @@ export async function resolveWatchActions(
       const operation = dispatchTopCandidate(outcome, candidates, dispatcher, {
         egressPolicy: egress,
         ...(workingDirectory === undefined ? {} : { workingDirectory }),
+        ...(options.project === undefined ? {} : { project: options.project }),
         ...(triggerDisposition === undefined ? {} : { triggerDisposition }),
       });
       pending.add(operation);
@@ -293,6 +301,12 @@ export async function resolveWatchActions(
 export interface DispatchCandidateOptions {
   readonly egressPolicy: EgressPolicy;
   readonly workingDirectory?: string;
+  /**
+   * What the project declares it can run, detected once per session by whoever
+   * owns the watch loop. Omitted means detection runs per planning call —
+   * correct but repeated work on a filesystem-bound path.
+   */
+  readonly project?: ProjectProfile;
   readonly now?: () => Date;
   /**
    * Disposition of the event that triggered this prediction. A late event
@@ -345,7 +359,12 @@ export async function dispatchTopCandidate(
       kind: top.candidate.kind,
       parameters: top.candidate.parameters,
     },
-    options.workingDirectory === undefined ? {} : { workingDirectory: options.workingDirectory },
+    {
+      ...(options.workingDirectory === undefined
+        ? {}
+        : { workingDirectory: options.workingDirectory }),
+      ...(options.project === undefined ? {} : { project: options.project }),
+    },
   );
   if (isPlanFailure(planned)) {
     // An unmappable top candidate is not an error and not a reason to try the

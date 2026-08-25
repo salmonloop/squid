@@ -9,6 +9,7 @@ import { z } from "zod";
 import { McpCapabilityGateway } from "../src/mcp-gateway.js";
 import { planAction, isPlanFailure } from "../src/action-planner.js";
 import { digestActionPlan, type ImmutableActionPlan } from "../src/action-plan.js";
+import { bunProject } from "./fixtures/bun-project.js";
 
 /**
  * The gateway is tested against a real MCP server over the in-memory
@@ -29,6 +30,7 @@ async function plan(
     { candidateId: "req:candidate:0", attemptId: "req", kind, parameters },
     {
       ...(workingDirectory === undefined ? {} : { workingDirectory }),
+      project: bunProject,
       resolvePath: async (path) => path,
     },
   );

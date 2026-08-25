@@ -12,6 +12,7 @@ import {
   type ImmutableActionPlan,
 } from "../src/action-plan.js";
 import { isPlanFailure, planAction } from "../src/action-planner.js";
+import { bunProject } from "./fixtures/bun-project.js";
 import { SEARCH_EGRESS_ALLOW_ID, type EgressPolicy } from "../src/action-egress.js";
 import { candidateEnvelopes, createAttemptRecord } from "../src/prediction-ledger.js";
 import type { PredictionCandidate, WorldState } from "../src/protocol.js";
@@ -128,7 +129,7 @@ describe("planAction for inspect_error", () => {
     for (const commandClass of reinspectableCommandClasses) {
       const planned = await planAction(
         { ...identity, kind: "inspect_error", parameters: { commandClass } },
-        { workingDirectory: root },
+        { workingDirectory: root, project: bunProject },
       );
       if (isPlanFailure(planned)) throw new Error(`${commandClass}: ${planned.reasonCode}`);
       expect(planned.plan.arguments.command).toContain(expected[commandClass]!);
@@ -152,7 +153,7 @@ describe("planAction for inspect_error", () => {
     for (const commandClass of ["install", "vcs", "container", "other", "build"]) {
       const planned = await planAction(
         { ...identity, kind: "inspect_error", parameters: { commandClass } },
-        { workingDirectory: root },
+        { workingDirectory: root, project: bunProject },
       );
       expect(isPlanFailure(planned) && planned.reasonCode).toBe("parameters_invalid");
     }
@@ -163,7 +164,7 @@ describe("planAction for inspect_error", () => {
     for (const parameters of [{}, { commandClass: 7 }, { commandClass: "" }, { commandClass: "TEST" }]) {
       const planned = await planAction(
         { ...identity, kind: "inspect_error", parameters },
-        { workingDirectory: root },
+        { workingDirectory: root, project: bunProject },
       );
       expect(isPlanFailure(planned) && planned.reasonCode).toBe("parameters_invalid");
     }
@@ -174,18 +175,18 @@ describe("planAction for inspect_error", () => {
       ...identity,
       kind: "inspect_error",
       parameters: { commandClass: "test" },
-    });
+    }, { project: bunProject });
     expect(isPlanFailure(missing) && missing.reasonCode).toBe("workdir_missing");
 
     const relative = await planAction(
       { ...identity, kind: "inspect_error", parameters: { commandClass: "test" } },
-      { workingDirectory: "relative/dir" },
+      { workingDirectory: "relative/dir", project: bunProject },
     );
     expect(isPlanFailure(relative) && relative.reasonCode).toBe("workdir_not_absolute");
 
     const absent = await planAction(
       { ...identity, kind: "inspect_error", parameters: { commandClass: "test" } },
-      { workingDirectory: "/definitely/not/here" },
+      { workingDirectory: "/definitely/not/here", project: bunProject },
     );
     expect(isPlanFailure(absent) && absent.reasonCode).toBe("workdir_unresolvable");
   });
@@ -194,7 +195,7 @@ describe("planAction for inspect_error", () => {
     const base = await mkdtemp(join(tmpdir(), "squid inspect "));
     const planned = await planAction(
       { ...identity, kind: "inspect_error", parameters: { commandClass: "test" } },
-      { workingDirectory: base },
+      { workingDirectory: base, project: bunProject },
     );
     if (isPlanFailure(planned)) throw new Error(planned.reasonCode);
     const command = String(planned.plan.arguments.command);
@@ -208,7 +209,7 @@ describe("planAction for inspect_error", () => {
     const root = await mkdtemp(join(tmpdir(), "squid-inspect-"));
     const build = (commandClass: string) => planAction(
       { ...identity, kind: "inspect_error", parameters: { commandClass } },
-      { workingDirectory: root },
+      { workingDirectory: root, project: bunProject },
     );
     const first = await build("test");
     const second = await build("test");
