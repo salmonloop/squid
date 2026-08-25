@@ -88,13 +88,16 @@ function runTestsDescriptor(): ToolDescriptor {
       if (typeof path !== "string" || path.trim().length === 0) {
         return { reasonCode: "arguments_invalid" };
       }
+      // Containment before capability: the path boundary is a security property,
+      // so a bad proposal is refused on those grounds even where no runner
+      // exists — and the workdir diagnostics keep their pre-catalog order.
+      const contained = await containPath(path, context.workingDirectory, context.resolvePath);
+      if ("reasonCode" in contained) return { reasonCode: contained.reasonCode };
+
       const testCommand = context.project?.commands.test;
       if (testCommand === undefined || testCommand.length === 0) {
         return { reasonCode: "command_unavailable" };
       }
-
-      const contained = await containPath(path, context.workingDirectory, context.resolvePath);
-      if ("reasonCode" in contained) return { reasonCode: contained.reasonCode };
 
       const argv = [...testCommand, "--", contained.relativeTarget];
       return {
@@ -115,9 +118,14 @@ function runTestsDescriptor(): ToolDescriptor {
  * Re-runs one of the project's declared checks, project-wide.
  *
  * This is what `inspect_error` was, with the hardcoded table removed. The model names a
- * check — "the lint check" — and which command that is comes from the project. A model
+ * check class — "the lint class" — and which command that is comes from the project. A model
  * naming the command itself would be a model choosing what executes on the machine from a
  * string it composed, which is the thing the argv discipline exists to prevent.
+ *
+ * The argument is named `commandClass` rather than `check` because that is the name the
+ * captured fact already travels under: terminal capture reports it, the ledger stores it
+ * beside the outcome, and admission compares the plan against it. One name from capture to
+ * descriptor means candidates feed this schema with zero translation.
  *
  * `install`, `vcs`, and `container` work has no descriptor at all, rather than a descriptor
  * that refuses: the catalog is the vocabulary, so an absent capability cannot be proposed
@@ -132,19 +140,25 @@ function runCheckDescriptor(available: readonly ProjectCheck[]): ToolDescriptor 
     risk: "mutates_workspace",
     confirmation: "required",
     async render(args, context): Promise<RenderedInvocation | ToolRenderFailure> {
-      const check = args.check;
-      if (typeof check !== "string" || !available.includes(check as ProjectCheck)) {
+      const commandClass = args.commandClass;
+      if (
+        typeof commandClass !== "string"
+        || !available.includes(commandClass as ProjectCheck)
+      ) {
         return { reasonCode: "arguments_invalid" };
       }
-      const command = context.project?.commands[check as ProjectCheck];
+      // Workdir before capability: same ordering rationale as run_tests — the
+      // boundary diagnostics are a property of the request, the command table
+      // is a property of the environment.
+      const workdir = await canonicalizeWorkdir(context.workingDirectory, context.resolvePath);
+      if ("reasonCode" in workdir) return { reasonCode: workdir.reasonCode };
+
+      const command = context.project?.commands[commandClass as ProjectCheck];
       if (command === undefined || command.length === 0) {
         // Reachable when the registry was built against one project profile and rendered
         // against another. Refusing beats falling back to a different check.
         return { reasonCode: "command_unavailable" };
       }
-
-      const workdir = await canonicalizeWorkdir(context.workingDirectory, context.resolvePath);
-      if ("reasonCode" in workdir) return { reasonCode: workdir.reasonCode };
 
       const argv = [...command];
       return {
@@ -204,8 +218,11 @@ function searchSelectionDescriptor(): ToolDescriptor {
  * by a human who may copy it: an unquoted path with a space would paste as two arguments
  * and run something else. The quoting is presentation, not execution — `argv` carries the
  * truth.
+ *
+ * Exported because the plan's `arguments.command` must be byte-identical to the summary
+ * the user approved: one function produces both, so they cannot drift.
  */
-function renderCommandSummary(
+export function renderCommandSummary(
   canonicalWorkingDirectory: string,
   argv: readonly string[],
 ): string {

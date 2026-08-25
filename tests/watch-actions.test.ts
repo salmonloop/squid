@@ -28,6 +28,7 @@ import {
   resolveWatchActions,
 } from "../src/watch-actions.js";
 import type { CapabilityActionPlan } from "../src/action-plan.js";
+import { bunProject } from "./fixtures/bun-project.js";
 
 const SESSION = "watch-session";
 const ALLOW: EgressPolicy = { id: SEARCH_EGRESS_ALLOW_ID, searchEgress: "allow" };
@@ -536,7 +537,7 @@ describe("egress policy agreement", () => {
       { requestId },
       candidates,
       dispatcher,
-      { egressPolicy, workingDirectory: root },
+      { egressPolicy, workingDirectory: root, project: bunProject },
     );
 
     expect(result?.status).toBe("dispatched");
@@ -635,7 +636,7 @@ describe("dispatchTopCandidate", () => {
       { requestId },
       candidates,
       dispatcher,
-      { egressPolicy, workingDirectory: root },
+      { egressPolicy, workingDirectory: root, project: bunProject },
     );
 
     expect(result?.status).toBe("not_accepted");
@@ -667,7 +668,7 @@ describe("dispatchTopCandidate", () => {
       { requestId },
       candidates,
       dispatcher,
-      { egressPolicy, workingDirectory: root },
+      { egressPolicy, workingDirectory: root, project: bunProject },
     );
 
     expect(result?.status).toBe("dispatched");
@@ -699,7 +700,7 @@ describe("dispatchTopCandidate", () => {
       { requestId },
       candidates,
       dispatcher,
-      { egressPolicy, workingDirectory: root },
+      { egressPolicy, workingDirectory: root, project: bunProject },
     );
 
     expect(result?.status).toBe("not_accepted");

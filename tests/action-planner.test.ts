@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isPlanFailure, planAction } from "../src/action-planner.js";
+import { bunProject } from "./fixtures/bun-project.js";
 
 const identity = { candidateId: "req-1:candidate:0", attemptId: "req-1" } as const;
 
@@ -50,7 +51,7 @@ describe("planAction", () => {
 
     const result = await planAction(
       { ...identity, kind: "run_tests", parameters: { path: "src/../src/x.test.ts" } },
-      { workingDirectory: linked },
+      { workingDirectory: linked, project: bunProject },
     );
     if (isPlanFailure(result)) throw new Error(result.reasonCode);
 
@@ -69,13 +70,13 @@ describe("planAction", () => {
 
     const lexical = await planAction(
       { ...identity, kind: "run_tests", parameters: { path: "../etc/passwd" } },
-      { workingDirectory: root },
+      { workingDirectory: root, project: bunProject },
     );
     expect(isPlanFailure(lexical) && lexical.reasonCode).toBe("path_escapes_workdir");
 
     const viaSymlink = await planAction(
       { ...identity, kind: "run_tests", parameters: { path: "src/escape.ts" } },
-      { workingDirectory: root },
+      { workingDirectory: root, project: bunProject },
     );
     expect(isPlanFailure(viaSymlink) && viaSymlink.reasonCode).toBe("path_escapes_workdir");
   });
@@ -84,13 +85,13 @@ describe("planAction", () => {
     const root = await workspace();
     const absolute = await planAction(
       { ...identity, kind: "run_tests", parameters: { path: "/etc/passwd" } },
-      { workingDirectory: root },
+      { workingDirectory: root, project: bunProject },
     );
     expect(isPlanFailure(absolute) && absolute.reasonCode).toBe("path_absolute");
 
     const control = await planAction(
       { ...identity, kind: "run_tests", parameters: { path: "src/x\u0000.ts" } },
-      { workingDirectory: root },
+      { workingDirectory: root, project: bunProject },
     );
     expect(isPlanFailure(control) && control.reasonCode).toBe("path_control_characters");
 
@@ -112,7 +113,7 @@ describe("planAction", () => {
     const root = await workspace();
     const result = await planAction(
       { ...identity, kind: "run_tests", parameters: { path: "src/not-created-yet.test.ts" } },
-      { workingDirectory: root },
+      { workingDirectory: root, project: bunProject },
     );
     if (isPlanFailure(result)) throw new Error(result.reasonCode);
     expect(result.plan.canonicalTarget?.endsWith("src/not-created-yet.test.ts")).toBe(true);
@@ -122,7 +123,7 @@ describe("planAction", () => {
     const root = await workspace();
     const build = (path: string) => planAction(
       { ...identity, kind: "run_tests", parameters: { path } },
-      { workingDirectory: root },
+      { workingDirectory: root, project: bunProject },
     );
     const first = await build("src/x.test.ts");
     const second = await build("src/x.test.ts");
@@ -190,7 +191,7 @@ describe("planAction symlinked-directory containment", () => {
         kind: "run_tests",
         parameters: { path: "link/evil.test.ts" },
       },
-      { workingDirectory: root },
+      { workingDirectory: root, project: bunProject },
     );
 
     expect(isPlanFailure(planned)).toBe(true);
@@ -208,7 +209,7 @@ describe("planAction symlinked-directory containment", () => {
         kind: "run_tests",
         parameters: { path: "link/evil.test.ts" },
       },
-      { workingDirectory: root },
+      { workingDirectory: root, project: bunProject },
     );
 
     expect(isPlanFailure(planned)).toBe(true);
@@ -226,7 +227,7 @@ describe("planAction symlinked-directory containment", () => {
         kind: "run_tests",
         parameters: { path: "tests/not-created-yet.test.ts" },
       },
-      { workingDirectory: root },
+      { workingDirectory: root, project: bunProject },
     );
 
     // The whole point of the ancestor walk: a test file the run will create is
