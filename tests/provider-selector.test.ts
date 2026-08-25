@@ -66,6 +66,40 @@ function gateResult(
   };
 }
 
+const stubCognition: PredictionProvider = {
+  name: "belief-rerank",
+  predict: async (): Promise<readonly PredictionCandidate[]> => [],
+};
+
+function cognitionHarness(result: () => Promise<SemanticGateResult>) {
+  const calls = { createCognition: 0, runSemanticGate: 0 };
+  // The caller supplies the policy so one instance can be shared by the gate,
+  // the belief resolver's claimed id, and the returned selection. Asserting
+  // identity below — not just a matching id — is what would catch a future edit
+  // that reverted to constructing a second one here.
+  const contextPolicy = new RedactingContextPolicy();
+  const seams: Omit<CognitionProviderOptions, "mode" | "gate"> = {
+    heuristic: new HeuristicPredictor(),
+    contextPolicy,
+    createCognition: () => {
+      calls.createCognition += 1;
+      return stubCognition;
+    },
+    runSemanticGate: async () => {
+      calls.runSemanticGate += 1;
+      return result();
+    },
+  };
+  return { calls, seams, contextPolicy };
+}
+
+function semanticResult(
+  status: SemanticGateResult["status"],
+  extra: Partial<SemanticGateResult> = {},
+): SemanticGateResult {
+  return { status, failures: [], ranking: null, stability: null, ...extra };
+}
+
 describe("parseProviderMode", () => {
   it("defaults to heuristic when unset and rejects an unrecognized value", () => {
     expect(parseProviderMode(undefined)).toBe("heuristic");
@@ -201,40 +235,6 @@ describe("selectPredictionProvider behind the replay gate", () => {
  * nothing. What `gate` decides here is only whether a pass earns dispatch trust.
  */
 describe("selectPredictionProvider in cognition mode", () => {
-  const stubCognition: PredictionProvider = {
-    name: "belief-rerank",
-    predict: async (): Promise<readonly PredictionCandidate[]> => [],
-  };
-
-  function cognitionHarness(result: () => Promise<SemanticGateResult>) {
-    const calls = { createCognition: 0, runSemanticGate: 0 };
-    // The caller supplies the policy so one instance can be shared by the gate,
-    // the belief resolver's claimed id, and the returned selection. Asserting
-    // identity below — not just a matching id — is what would catch a future edit
-    // that reverted to constructing a second one here.
-    const contextPolicy = new RedactingContextPolicy();
-    const seams: Omit<CognitionProviderOptions, "mode" | "gate"> = {
-      heuristic: new HeuristicPredictor(),
-      contextPolicy,
-      createCognition: () => {
-        calls.createCognition += 1;
-        return stubCognition;
-      },
-      runSemanticGate: async () => {
-        calls.runSemanticGate += 1;
-        return result();
-      },
-    };
-    return { calls, seams, contextPolicy };
-  }
-
-  function semanticResult(
-    status: SemanticGateResult["status"],
-    extra: Partial<SemanticGateResult> = {},
-  ): SemanticGateResult {
-    return { status, failures: [], ranking: null, stability: null, ...extra };
-  }
-
   it("admits the cognition path when the semantic gate passes", async () => {
     const { calls, seams, contextPolicy } = cognitionHarness(async () => semanticResult("passed"));
     const selection = await selectPredictionProvider({ ...seams, mode: "cognition", gate: "replay" });
@@ -296,5 +296,45 @@ describe("selectPredictionProvider in cognition mode", () => {
     expect(selection.provider.name).toBe("heuristic");
     expect(selection.declineReason).toBe("semantic gate could not run: fixture corpus missing");
     expect(calls.createCognition).toBe(0);
+  });
+});
+
+describe("selectPredictionProvider with the gate off", () => {
+  it("admits the model unmeasured and grants dispatch trust, running no check", async () => {
+    // The explicit bypass. Both real gates are measured walls for the current
+    // model (ranking nondeterminism; stability), so `off` is the one spelling
+    // that lets a model both speak and act today. Nothing runs — not even the
+    // cheap reachability probe — because off means the operator takes the
+    // measurement's place.
+    const { calls, seams } = harness({
+      probePi: async () => "should never be asked",
+      runGate: async () => { throw new Error("no gate may run when off"); },
+    });
+    const selection = await selectPredictionProvider({ ...seams, mode: "pi", gate: "off" });
+
+    expect(selection.provider.name).toBe("pi");
+    expect(selection.declineReason).toBeNull();
+    expect(selection.actionTrust).toBe("trusted");
+    expect(selection.contextPolicy.id).toBe("redacting");
+    expect(calls).toEqual({ createPi: 1, probePi: 0, runGate: 0 });
+  });
+
+  it("skips the semantic gate for cognition and still grants dispatch trust", async () => {
+    const { calls, seams, contextPolicy } = cognitionHarness(async () => semanticResult("failed"));
+    const selection = await selectPredictionProvider({ ...seams, mode: "cognition", gate: "off" });
+
+    expect(selection.provider.name).toBe("belief-rerank");
+    expect(selection.declineReason).toBeNull();
+    expect(selection.actionTrust).toBe("trusted");
+    expect(selection.contextPolicy).toBe(contextPolicy);
+    // The gate would have failed on this stub; that it was never called is the
+    // bypass working as spelled.
+    expect(calls.runSemanticGate).toBe(0);
+  });
+
+  it("keeps the default at probe even though off exists", async () => {
+    // Absence must never read as bypass: unset still means the fast,
+    // speak-but-don't-act path.
+    expect(parseProviderGateMode(undefined)).toBe("probe");
   });
 });

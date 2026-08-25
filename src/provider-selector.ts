@@ -9,7 +9,7 @@ import { PassthroughContextPolicy, RedactingContextPolicy, type ContextPolicy } 
 export const providerModes = ["heuristic", "pi", "cognition"] as const;
 export type ProviderMode = (typeof providerModes)[number];
 
-export const providerGateModes = ["probe", "replay"] as const;
+export const providerGateModes = ["probe", "replay", "off"] as const;
 export type ProviderGateMode = (typeof providerGateModes)[number];
 
 /**
@@ -23,7 +23,17 @@ export function parseProviderMode(value: string | undefined): ProviderMode | nul
   return (providerModes as readonly string[]).includes(value) ? (value as ProviderMode) : null;
 }
 
-/** Reads `SQUID_PROVIDER_GATE`. Absent means the fast `"probe"` path. */
+/**
+ * Reads `SQUID_PROVIDER_GATE`. Absent means the fast `"probe"` path.
+ *
+ * `"off"` is the explicit bypass: no gate runs and the provider is admitted as
+ * trusted. It exists because both real gates are measured walls for the current
+ * model — the replay gate on ranking nondeterminism, the semantic gate on
+ * stability — so without it every model path is either unable to speak or
+ * unable to act, and no MVP can ship. Off is opt-in by spelling, never by
+ * absence; the default stays probe, which admits a reachable model to speak
+ * but withholds dispatch trust.
+ */
 export function parseProviderGateMode(value: string | undefined): ProviderGateMode | null {
   if (value === undefined) return "probe";
   return (providerGateModes as readonly string[]).includes(value) ? (value as ProviderGateMode) : null;
@@ -151,20 +161,26 @@ export async function selectPredictionProvider(
     contextPolicy: options.mode === "pi"
       ? new RedactingContextPolicy()
       : options.contextPolicy,
-    // The same rule the model path uses, and it is the constraint issue #4 names:
-    // an un-gated provider stays `suggestion_only`, so nothing it proposes can be
-    // dispatched. A probe says only "it answers"; a replay says "it answers as
-    // well as the heuristic, and answers the same way twice". Only the second is
-    // grounds for trust — and `action-admission.ts` refuses a claim unless both
-    // the attempt and the runtime are trusted, so a provider cannot grant itself
-    // what this line withholds.
-    actionTrust: options.gate === "replay" ? "trusted" : "suggestion_only",
+    // Trust follows the gate spelling, and each of the three means something
+    // distinct. `replay` earns trust by measurement — "it answers as well as
+    // the heuristic, and answers the same way twice". `off` claims it by
+    // declaration: the operator spelled the bypass, so the model's word alone
+    // authorizes dispatch, and admission still runs every world-state check on
+    // top. `probe` stays untrusted — "it answers" is not grounds for action,
+    // which is the constraint issue #4 names; `action-admission.ts` refuses a
+    // claim unless both the attempt and the runtime are trusted, so no provider
+    // can grant itself what this line withholds.
+    actionTrust: options.gate === "probe" ? "suggestion_only" : "trusted",
     declineReason: null,
   };
 }
 
 /** Returns `null` to admit the model provider, or the reason to decline it. */
 async function admitModelProvider(options: ModelProviderOptions): Promise<string | null> {
+  // Off admits without measuring. The trust decision below is what makes that
+  // deliberate rather than accidental: this spelling, and only this one, hands
+  // the model dispatch authority nobody verified.
+  if (options.gate === "off") return null;
   if (options.gate === "probe") {
     try {
       return await options.probePi();
@@ -196,6 +212,11 @@ async function admitModelProvider(options: ModelProviderOptions): Promise<string
  * only whether a pass earns dispatch trust.
  */
 async function admitCognitionProvider(options: CognitionProviderOptions): Promise<string | null> {
+  // Same bypass as the model path, same reason: the semantic gate's stability
+  // floor is a measured wall for the current producer, and `off` is the one
+  // spelling that says "admit anyway". The gate callback stays wired in
+  // watch-provider so flipping back to replay needs no reassembly.
+  if (options.gate === "off") return null;
   let result: SemanticGateResult;
   try {
     result = await options.runSemanticGate();
