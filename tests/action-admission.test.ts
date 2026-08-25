@@ -308,6 +308,23 @@ describe("admitAction search checks", () => {
     expect(refusal({ state: searchState("something else") })).toBe("selection_changed");
   });
 
+  it("names redaction as the cause when the candidate carries a strict prefix of the selection", () => {
+    // The shape a capped projection leaves: the provider saw only the first
+    // maxTextLength characters and proposed those. Still refused — sending
+    // half of what someone selected is not searching their selection — but
+    // reported as truncation rather than as a generic mismatch (issue #9).
+    const state = searchState("an entire paragraph of selected text");
+    const truncated = searchCandidate("an entire para");
+    const plan = { ...searchPlan(), arguments: { query: "an entire para" } };
+    const result = admitAction(context({
+      plan,
+      candidate: truncated,
+      attempt: attemptFor(truncated),
+      state,
+    }));
+    expect(result).toEqual({ admitted: false, reasonCode: "selection_truncated" });
+  });
+
   it("refuses when no browser page is present", () => {
     expect(refusal({ state: { ...searchState(), currentBrowserPage: null } })).toBe("browser_page_missing");
   });

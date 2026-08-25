@@ -43,6 +43,7 @@ export type PlanFailureReason =
   | "tool_unknown"
   | "kind_unactionable"
   | "parameters_invalid"
+  | "path_ambiguous_after_redaction"
   | "command_unavailable"
   | "workdir_missing"
   | "workdir_not_absolute"
@@ -86,6 +87,21 @@ export interface ActionPlanningContext {
    * positioned to detect once per session.
    */
   readonly project?: ProjectProfile;
+  /**
+   * Resolves a bare basename back to the one raw save that carries it, or null
+   * for none — and the caller refuses rather than guessing when two saves
+   * share it.
+   *
+   * Supplied only by a dispatcher whose projection redacts action targets:
+   * there, a model's proposal names `main.test.ts` because that is all it was
+   * shown, while raw state holds `src/deep/nested/main.test.ts`. Planning from
+   * the basename would canonicalize the wrong file, and admission would refuse
+   * it forever — issue #9. Resolution happens here, before render, so the plan,
+   * its digest, and every downstream check describe the real file rather than
+   * patching any of them afterwards. A policy that does not redact supplies no
+   * resolver: a full-path proposal is used exactly as proposed.
+   */
+  readonly resolveRedactedSave?: (basename: string) => string | null;
 }
 
 export function isPlanFailure(
@@ -139,7 +155,25 @@ export async function planAction(
   // would be unreadable downstream.
   if (!isActionableCategory(descriptor.category)) return { reasonCode: "kind_unactionable" };
 
-  const rendered = await descriptor.render(parameters, renderContext);
+  // Under a redacting projection a path proposal may be the basename the model
+  // was shown rather than the path raw state holds. Resolve it here or not at
+  // all: only a bare basename (no separators on either convention) is a
+  // redaction shape, and only an unambiguous raw save resolves it. Anything
+  // else — a full-path proposal, two saves sharing the name, no save at all —
+  // renders from what was proposed and is admitted or refused on its own
+  // merits.
+  let renderParameters = parameters;
+  if (
+    context.resolveRedactedSave !== undefined
+    && typeof parameters.path === "string"
+    && !/[\\/]/u.test(parameters.path)
+  ) {
+    const resolved = context.resolveRedactedSave(parameters.path);
+    if (resolved === null) return { reasonCode: "path_ambiguous_after_redaction" };
+    renderParameters = { ...parameters, path: resolved };
+  }
+
+  const rendered = await descriptor.render(renderParameters, renderContext);
   if (isRenderFailure(rendered)) {
     return rendered.reasonCode === "arguments_invalid"
       ? { reasonCode: "parameters_invalid" }

@@ -24,6 +24,7 @@ export type AdmissionReasonCode =
   | "egress_policy_mismatch"
   | "candidate_expired"
   | "selection_changed"
+  | "selection_truncated"
   | "selection_empty"
   | "browser_page_missing"
   | "owner_mismatch"

@@ -36,6 +36,62 @@ describe("planAction", () => {
     expect(isPlanFailure(result) && result.reasonCode).toBe("tool_unknown");
   });
 
+  describe("redacted-basename resolution (issue #9)", () => {
+    it("resolves a bare basename through the caller's resolver and plans the real file", async () => {
+      const root = await workspace();
+      const planned = await planAction(
+        { ...identity, kind: "run_tests", toolId: "run_tests", parameters: { path: "x.test.ts" } },
+        {
+          workingDirectory: root,
+          project: bunProject,
+          resolveRedactedSave: (base) => base === "x.test.ts" ? "src/x.test.ts" : null,
+        },
+      );
+      if (isPlanFailure(planned)) throw new Error(planned.reasonCode);
+      // The plan, its digest, and the command all describe the resolved file —
+      // nothing downstream patches a basename-shaped plan after the fact.
+      expect(planned.plan.canonicalTarget).toBe(`${root}/src/x.test.ts`);
+      expect(planned.plan.arguments.command).toContain("bun test -- src/x.test.ts");
+    });
+
+    it("leaves a full-path proposal untouched even when a resolver is armed", async () => {
+      const root = await workspace();
+      let called = false;
+      const planned = await planAction(
+        { ...identity, kind: "run_tests", toolId: "run_tests", parameters: { path: "src/x.test.ts" } },
+        {
+          workingDirectory: root,
+          project: bunProject,
+          resolveRedactedSave: () => {
+            called = true;
+            return "should/not/be/used";
+          },
+        },
+      );
+      if (isPlanFailure(planned)) throw new Error(planned.reasonCode);
+      expect(called).toBe(false);
+      expect(planned.plan.canonicalTarget).toBe(`${root}/src/x.test.ts`);
+    });
+
+    it("refuses with path_ambiguous_after_redaction when the resolver cannot answer uniquely", async () => {
+      const root = await workspace();
+      // Null covers both honest failures the resolver can report: no save with
+      // that basename, and two saves sharing it. Both mean "no answer", and a
+      // guess here would run tests for a file nobody proposed.
+      for (const resolution of [null, undefined]) {
+        const planned = await planAction(
+          { ...identity, kind: "run_tests", toolId: "run_tests", parameters: { path: "x.test.ts" } },
+          {
+            workingDirectory: root,
+            project: bunProject,
+            resolveRedactedSave: () => resolution ?? null,
+          },
+        );
+        expect(isPlanFailure(planned) && planned.reasonCode).toBe("path_ambiguous_after_redaction");
+      }
+    });
+  });
+
   it("refuses a search plan without usable selection text", async () => {
     for (const parameters of [{}, { selection: "   " }, { selection: 7 }]) {
       const result = await planAction({ ...identity, toolId: "search_selection", parameters });
