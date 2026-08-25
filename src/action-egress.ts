@@ -1,9 +1,12 @@
 import { createHmac } from "node:crypto";
 
 /**
- * The egress decision for selection-bearing actions. Search sends user text
- * off the machine, so it needs an explicit opt-in; every other value is a
- * configuration error rather than a silent default.
+ * The egress decision for selection-bearing actions.
+ *
+ * The default posture is `allow` — capabilities work unless a restriction is
+ * spelled — and `deny` is the explicit restriction. Both are first-class
+ * spellings of `SQUID_SEARCH_EGRESS`; anything unrecognized is a startup
+ * error rather than a silent fallback in either direction.
  */
 export type EgressDecision = "deny" | "allow";
 
@@ -12,27 +15,35 @@ export interface EgressPolicy {
   readonly searchEgress: EgressDecision;
 }
 
-/** Audit ID for the deny posture. Also the runtime's conservative default. */
+/** Audit ID for the deny posture. The runtime's fallback when unset elsewhere —
+ *  prediction-runtime has no env to read, so it stays conservative there. */
 export const SEARCH_EGRESS_DENY_ID = "search-egress-deny-v1";
 /** Audit ID for the explicit allow posture. */
 export const SEARCH_EGRESS_ALLOW_ID = "search-egress-allow-v1";
 
 /**
  * Resolves `SQUID_SEARCH_EGRESS` into exactly one of three outcomes:
- * unset = deny, exact "allow" = allow, anything else = startup error.
- * A typo like "Allow" or "allowed" must not widen egress by accident.
+ * unset = allow, exact "allow" = allow, exact "deny" = deny, anything else =
+ * startup error.
+ *
+ * The default is open by decision: Squid's posture is that capabilities work
+ * unless a restriction is spelled, so withholding search until asked made the
+ * flagship outbound action dead on arrival for anyone who did not know the
+ * variable existed. Denying is now the opt-in — `SQUID_SEARCH_EGRESS=deny` —
+ * and a typo still fails startup rather than silently flipping posture in
+ * either direction.
  */
 export function resolveSearchEgress(
   value: string | undefined,
 ): EgressPolicy | { readonly configError: string } {
-  if (value === undefined) {
-    return { id: SEARCH_EGRESS_DENY_ID, searchEgress: "deny" };
-  }
-  if (value === "allow") {
+  if (value === undefined || value === "allow") {
     return { id: SEARCH_EGRESS_ALLOW_ID, searchEgress: "allow" };
   }
+  if (value === "deny") {
+    return { id: SEARCH_EGRESS_DENY_ID, searchEgress: "deny" };
+  }
   return {
-    configError: 'SQUID_SEARCH_EGRESS must be unset (deny) or exactly "allow".',
+    configError: 'SQUID_SEARCH_EGRESS must be unset (allow) or exactly "allow" or "deny".',
   };
 }
 

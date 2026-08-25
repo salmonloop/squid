@@ -91,7 +91,7 @@ bun run watch:screen
 - `src/prediction-coordinator.ts` — one-in-flight async coordinator with timeout, cancellation, stale-episode guard, and heuristic fallback. Applies a `ContextPolicy` to the provider's view of world state.
 - `src/context-policy.ts` — egress boundary for provider context: `ContextPolicy` interface, `PassthroughContextPolicy` (the default), and `RedactingContextPolicy` with a typed allow-list.
 - `src/capture-policy.ts` — ingress boundary for capture: `CapturePolicy` interface, `PassthroughCapturePolicy` (the default), and `RedactingCapturePolicy`, which strips credential content before an event reaches the store. Capture is irreversible, so this narrows what is persisted rather than what is merely shown to a provider.
-- `src/action-egress.ts` — three-state `SQUID_SEARCH_EGRESS` resolution (unset = deny, exact `allow` = allow, anything else a startup error) plus `sanitizeAuditText`, the single deterministic choke point for any text reaching a log, feedback, or the ledger: control characters stripped, credentials redacted, fixed length ceiling. Selections and plan summaries never carry a preview; rationale and tool summaries may.
+- `src/action-egress.ts` — three-state `SQUID_SEARCH_EGRESS` resolution (unset = allow, exact `deny` = deny, anything else a startup error) plus `sanitizeAuditText`, the single deterministic choke point for any text reaching a log, feedback, or the ledger: control characters stripped, credentials redacted, fixed length ceiling. Selections and plan summaries never carry a preview; rationale and tool summaries may.
 - `src/state-digest.ts` — canonical JSON over the full `WorldState` and the `sha256:` digest derived from it. Identical across ordered, late, and restored replays, which is what makes it usable as a claim precondition.
 - `src/prediction-runtime.ts` — live orchestration boundary that feeds accepted/late core state snapshots into the coordinator without coupling provider latency to event ingestion. An outcome is published only after its attempt record is durable, so a caller can immediately dispatch a candidate without racing the write it claims against; a failed write still delivers the prediction as a diagnostic, and the action is then correctly refused rather than silently unauditable. `admitAndClaim` is the linearization point for actions: admission and the ledger claim run together inside the core's critical section, so no ingest can land between "the state still matches" and "this claim is recorded".
 - `src/prediction-ledger.ts` — append-only prediction attempts, feedback, and the action-plan state machine. Attempts are schema v2: `runtimeSessionId`, `stateDigest`, `projectionGeneration`, `triggerEventId`, `episodeId`, `triggerDisposition`, `contextPolicyId`, `actionTrust`, and `egressPolicyId` are all required, because a record missing them could not be audited back to the boundary that authorized it. Actions move through a narrow API — `recordPlan`, `recordDecision`, `recordStateRejection`, `claimDispatch`, `completeDispatch` — so a terminal state cannot be written through the generic append; feedback is limited to how a *prediction* was received (accepted/rejected/expired). `claimDispatch` validates every metadata field, the recorded plan, the candidate, and the legal predecessor state in one atomic operation, and only `claimed` authorizes an outside-world call. A `belief_batch` record keeps one validated belief batch as history, embedding the batch whole rather than flattening it — the belief contract is already an audit shape, and a second spelling of it would drift.
@@ -176,7 +176,9 @@ SQUID_PROVIDER=cognition SQUID_PROVIDER_GATE=replay bun run watch:desktop       
 
 `SQUID_PROVIDER_GATE` picks the admission check, and each spelling decides both whether a check runs and what trust an admitted provider earns. The default `probe` resolves the model once via `PiRuntime.checkAvailability()` — fast, enough to tell an outage from a bad prediction, but the model stays `suggestion_only`: it may speak (its candidates rank and are logged), never act. `replay` runs the same `runProviderGate` that `bun run gate:pi` runs, at startup, admits only on `passed`, and grants dispatch trust on that pass. A `skipped` gate declines, because an unreachable or unevaluated model must not reach the real-time path just because nothing measured a regression against it.
 
-`off` is the explicit bypass for when the gates themselves are the obstacle. Both are measured walls today — the replay gate fails on ranking nondeterminism, the semantic gate requires exact reproducibility across runs — so without this spelling no model path can speak *and* act. With it, no check runs at all and the provider is admitted as `trusted`: its proposals go to planning and dispatch like any other candidate, with every world-state admission check still applied on top. What `off` skips is measurement, not safety checks; what it costs is the evidence a gate pass would have provided, which is why it must be spelled and is never the default.
+`off` is the explicit bypass for when the gates themselves are the obstacle. Both are measured walls today — the replay gate fails on ranking nondeterminism, the semantic gate requires exact reproducibility across runs — so without this spelling no model path can speak *and* act. With it, no check runs at all and the provider is admitted as `trusted`: its proposals go to planning and dispatch like any other candidate, with every world-state admission check still applied on top. What `off` skips is measurement, not safety checks; what it costs is the evidence a gate pass would have provided. It is now the default: the gates are measured walls for the current model, so making measurement the default made every model path speak-only or unadmittable. Restriction is spelled (`probe`, `replay`); absence is not one.
+
+`SQUID_CONTEXT_POLICY` picks what model-mode providers see: unset or `passthrough` sends the full projection, `redacting` narrows window titles, URLs, file paths, focus text, and action targets before anything leaves the process. The policy is resolved once and shared by the selector, the gate, and the belief layer, so all three name and apply the same one; anything else is a startup error.
 
 ```bash
 SQUID_PROVIDER=pi SQUID_PROVIDER_GATE=off bun run watch:desktop -- /absolute/project/root
@@ -394,11 +396,10 @@ The macOS backend is real but not verifiable here: it needs a darwin host with a
 
 ### Dispatching actions
 
-Both watch entry points can close the loop from prediction to action. With `SQUID_ACTIONS=mcp` and an MCP server command, each settled prediction's single top-confidence candidate is considered — never a lower-confidence fallback, and never a candidate from a late-arriving event. Search additionally requires `SQUID_SEARCH_EGRESS=allow`, since it sends selected text off the machine; local test execution requires confirmation, asked either in the terminal or in a native window. The plan, the user's decision, the claim, and the terminal outcome are written to the same ledger as the prediction attempt, as digests rather than raw text.
+Both watch entry points can close the loop from prediction to action. With an MCP server command named (with or without the explicit `SQUID_ACTIONS=mcp`), each settled prediction's single top-confidence candidate is considered — never a lower-confidence fallback, and never a candidate from a late-arriving event. Confirmation is bypassed by default: every registered tool declares `confirmation: "none"`, so a proposal runs as soon as admission's world-state checks pass. `SQUID_ACTION_CONFIRM=terminal` or `graphical` restores prompting with no other change. The plan, any user decision, the claim, and the terminal outcome are written to the same ledger as the prediction attempt, as digests rather than raw text.
 
 ```bash
 # Search needs explicit consent to send selected text off the machine.
-SQUID_ACTIONS=mcp SQUID_SEARCH_EGRESS=allow \
 SQUID_ACTIONS_MCP_COMMAND="bun run /path/to/mcp-server.ts" bun run watch:screen -- frames.json
 
 # Also allow run_tests after showing the exact command and receiving y/yes.
@@ -416,7 +417,7 @@ SQUID_GRAPHICAL_UI_COMMAND=/path/to/squid/ui/target/release/squid-ui \
 bun run watch:desktop -- /absolute/project/root
 ```
 
-Absent variables mean actions stay off — identical to the pre-dispatch behavior. `SQUID_SEARCH_EGRESS` has exactly three outcomes: unset denies search egress, the exact string `allow` permits it, and any other value is a startup configuration error rather than a silent fallback. Without `SQUID_ACTION_CONFIRM`, `run_tests` is still skipped even when ranked highest.
+Actions are on whenever `SQUID_ACTIONS_MCP_COMMAND` names a server — the command is the capability's real opt-in, and the older `SQUID_ACTIONS=mcp` spelling still works beside it. With neither, actions stay off. `SQUID_SEARCH_EGRESS` has three outcomes: unset allows search to send text, the exact string `deny` withholds it, and any other value is a startup configuration error rather than a silent fallback in either direction.
 
 `SQUID_ACTION_CONFIRM` selects the surface, not the rules. `terminal` accepts only `y` or `yes`; `graphical` opens the native window from `ui/` and accepts only a click on Approve. Everything else refuses in both and records the reason: any other answer, timeout, shutdown, an expired candidate, a surface that cannot be reached at all (no TTY, or no UI binary), and a surface that dies mid-question. Expiry is checked before prompting and again after acceptance, so a candidate that goes stale while the question sits on screen is refused after the click.
 
@@ -443,7 +444,7 @@ An admission rule reads the *whole* projection, so what a run can do depends on 
 | `watch:files` | filesystem | no foreground or selection facts | no `activeApplication` |
 | `watch:screen` | screen text | no browser page | no `file_saved` |
 | `watch:desktop` | filesystem + screen text | no browser page | both facts present, but a watcher cannot name the writer, so the owner stays `null` and admission refuses |
-| `watch:desktop` with `SQUID_BROWSER=synthetic` | + scripted browser pages | **dispatches**, with `SQUID_SEARCH_EGRESS=allow` | unchanged |
+| `watch:desktop` with `SQUID_BROWSER=synthetic` | + scripted browser pages | **dispatches** (egress allows by default) | unchanged |
 | `watch:desktop` with `SQUID_BROWSER=darwin` | + observed browser pages | **dispatches** for Chrome and Safari; other browsers produce no page, so refused | unchanged |
 | `watch:desktop` with `SQUID_EDITOR_SAVES=fifo` | + editor-reported saves | unchanged | **dispatches**: the editor names itself, so the owner equals the foreground application |
 
@@ -457,12 +458,11 @@ SQUID_ACTIONS_MCP_COMMAND="bun run /path/to/mcp-server.ts" \
 bun run watch:desktop -- /absolute/project/root
 ```
 
-Browser observation is opt-in rather than on by default. It is the capability that makes search reachable, and search is the one action that sends user text off the machine, so a run gets it by asking. Egress stays a separate decision: `SQUID_BROWSER` lets Squid *see* a page, `SQUID_SEARCH_EGRESS=allow` lets it *send* text, and both are required.
+Browser observation still requires naming a backend (`SQUID_BROWSER=synthetic` or `darwin`) — there is no default browser to observe, so this is capability selection rather than permission. Egress is no longer a second gate: unset already allows sending; `SQUID_SEARCH_EGRESS=deny` is the explicit restriction.
 
 ```bash
 # Search end to end: observe pages, allow egress, and give it a tool to call.
-SQUID_BROWSER=synthetic SQUID_SEARCH_EGRESS=allow SQUID_ACTIONS=mcp \
-SQUID_ACTIONS_MCP_COMMAND="bun run /path/to/mcp-server.ts" \
+SQUID_BROWSER=synthetic SQUID_ACTIONS_MCP_COMMAND="bun run /path/to/mcp-server.ts" \
 bun run watch:desktop -- /absolute/project/root
 
 # Scripted pages instead of the built-in demo (third positional argument).
@@ -514,7 +514,7 @@ One admission heuristic moved from ids to names to make real runs possible at al
 
 ### Actions under a redacting projection
 
-`SQUID_PROVIDER=cognition` and `SQUID_PROVIDER=pi` project state through `RedactingContextPolicy` before the model sees it, which basenames every action target — so a candidate proposes `main.test.ts` where raw state holds `src/deep/nested/main.test.ts`. Planning resolves that shape rather than refusing it: a run whose projection declares it narrows targets (a property on the policy, not an id comparison) hands dispatch a resolver over the triggering ingest's *raw* saves, and a bare basename with exactly one matching save is planned against that real file. The plan, its digest, and every downstream check then describe the truth; nothing is patched after admission.
+Model modes project state through the policy `SQUID_CONTEXT_POLICY` names — unset means passthrough, so what a model sees is the same world state the local fallback reads. `SQUID_CONTEXT_POLICY=redacting` opts into `RedactingContextPolicy`, which basenames every action target — so a candidate proposes `main.test.ts` where raw state holds `src/deep/nested/main.test.ts`. Planning resolves that shape rather than refusing it: a run whose projection declares it narrows targets (a property on the policy, not an id comparison) hands dispatch a resolver over the triggering ingest's *raw* saves, and a bare basename with exactly one matching save is planned against that real file. The plan, its digest, and every downstream check then describe the truth; nothing is patched after admission.
 
 The resolution is deliberately narrow in both directions. Two saves sharing the basename mean no answer, and planning refuses with `path_ambiguous_after_redaction` rather than picking either file; a basename matching no save at all refuses the same way, so a hallucinated name can never be widened into a suffix match — the identity checks (`saved_path_mismatch` for a suffix match or a symlinked sibling) are untouched and still hold through the resolution path. A selection longer than the policy's cap gets the same honesty in refusal form: the guard detects the strict-prefix shape redaction leaves and refuses as `selection_truncated`, naming the cause instead of claiming the selection changed. Sending half of what someone selected was never searching their selection.
 

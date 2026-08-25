@@ -172,18 +172,27 @@ export async function resolveWatchActions(
     readonly redactsActionTargets?: boolean;
   } = {},
 ): Promise<WatchActionsResolution | undefined | { readonly configError: string }> {
+  // Actions are on when the MCP command is present, with or without the
+  // explicit `SQUID_ACTIONS=mcp` spelling — open by default: the command is
+  // the capability's real opt-in and the variable was a second key for the
+  // same door. The explicit spelling still works, and a recognized-but-wrong
+  // value still fails startup rather than silently disabling execution.
+  //
+  // The off check runs before every other validation: a run that never asked
+  // for actions must not fail startup over an unrelated provider-trust or
+  // egress complaint — staying off is the pre-action behavior, not an error.
   const mode = env.SQUID_ACTIONS;
-  if (mode === undefined) {
+  const command = env.SQUID_ACTIONS_MCP_COMMAND?.trim();
+  if (mode === undefined && (command === undefined || command.length === 0)) {
     return undefined;
   }
-  if (mode !== "mcp") {
+  if (mode !== undefined && mode !== "mcp") {
     return { configError: 'SQUID_ACTIONS must be "mcp" or unset.' };
   }
   if (options.actionTrust === "suggestion_only") {
     return { configError: "The selected provider is suggestion-only; actions require a replay-gated trusted provider." };
   }
 
-  const command = env.SQUID_ACTIONS_MCP_COMMAND?.trim();
   if (command === undefined || command.length === 0) {
     return { configError: "SQUID_ACTIONS=mcp requires SQUID_ACTIONS_MCP_COMMAND." };
   }
