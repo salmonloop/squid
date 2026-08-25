@@ -7,10 +7,8 @@ import {
   type AdmissionContext,
   type AdmissionReasonCode,
 } from "../src/action-admission.js";
-import {
-  reinspectableCommandClasses,
-  type ImmutableActionPlan,
-} from "../src/action-plan.js";
+import type { ImmutableActionPlan } from "../src/action-plan.js";
+import { declaredChecks } from "../src/tool-descriptors.js";
 import { isPlanFailure, planAction } from "../src/action-planner.js";
 import { bunProject } from "./fixtures/bun-project.js";
 import { SEARCH_EGRESS_ALLOW_ID, type EgressPolicy } from "../src/action-egress.js";
@@ -29,6 +27,7 @@ const identity = { candidateId: "req-1:candidate:0", attemptId: "req-1" } as con
 function inspectCandidate(commandClass = "test"): PredictionCandidate {
   return {
     kind: "inspect_error",
+    toolId: "run_check",
     rationale: "the most recent terminal command failed",
     confidence: 0.7,
     expiresAt: FUTURE,
@@ -77,6 +76,7 @@ function inspectPlan(commandClass = "test"): ImmutableActionPlan {
   return {
     planSchemaVersion: 1,
     kind: "inspect_error",
+    descriptorId: "run_check",
     candidateId: identity.candidateId,
     attemptId: identity.attemptId,
     tool: "run_command",
@@ -126,9 +126,9 @@ describe("planAction for inspect_error", () => {
       lint: "bun run lint",
       typecheck: "bun run typecheck",
     };
-    for (const commandClass of reinspectableCommandClasses) {
+    for (const commandClass of declaredChecks(bunProject)) {
       const planned = await planAction(
-        { ...identity, kind: "inspect_error", parameters: { commandClass } },
+        { ...identity, toolId: "run_check", parameters: { commandClass } },
         { workingDirectory: root, project: bunProject },
       );
       if (isPlanFailure(planned)) throw new Error(`${commandClass}: ${planned.reasonCode}`);
@@ -152,7 +152,7 @@ describe("planAction for inspect_error", () => {
     const root = await mkdtemp(join(tmpdir(), "squid-inspect-"));
     for (const commandClass of ["install", "vcs", "container", "other", "build"]) {
       const planned = await planAction(
-        { ...identity, kind: "inspect_error", parameters: { commandClass } },
+        { ...identity, toolId: "run_check", parameters: { commandClass } },
         { workingDirectory: root, project: bunProject },
       );
       expect(isPlanFailure(planned) && planned.reasonCode).toBe("parameters_invalid");
@@ -163,7 +163,7 @@ describe("planAction for inspect_error", () => {
     const root = await mkdtemp(join(tmpdir(), "squid-inspect-"));
     for (const parameters of [{}, { commandClass: 7 }, { commandClass: "" }, { commandClass: "TEST" }]) {
       const planned = await planAction(
-        { ...identity, kind: "inspect_error", parameters },
+        { ...identity, toolId: "run_check", parameters },
         { workingDirectory: root, project: bunProject },
       );
       expect(isPlanFailure(planned) && planned.reasonCode).toBe("parameters_invalid");
@@ -173,19 +173,19 @@ describe("planAction for inspect_error", () => {
   it("requires an absolute, resolvable working directory", async () => {
     const missing = await planAction({
       ...identity,
-      kind: "inspect_error",
+      toolId: "run_check",
       parameters: { commandClass: "test" },
     }, { project: bunProject });
     expect(isPlanFailure(missing) && missing.reasonCode).toBe("workdir_missing");
 
     const relative = await planAction(
-      { ...identity, kind: "inspect_error", parameters: { commandClass: "test" } },
+      { ...identity, toolId: "run_check", parameters: { commandClass: "test" } },
       { workingDirectory: "relative/dir", project: bunProject },
     );
     expect(isPlanFailure(relative) && relative.reasonCode).toBe("workdir_not_absolute");
 
     const absent = await planAction(
-      { ...identity, kind: "inspect_error", parameters: { commandClass: "test" } },
+      { ...identity, toolId: "run_check", parameters: { commandClass: "test" } },
       { workingDirectory: "/definitely/not/here", project: bunProject },
     );
     expect(isPlanFailure(absent) && absent.reasonCode).toBe("workdir_unresolvable");
@@ -194,7 +194,7 @@ describe("planAction for inspect_error", () => {
   it("quotes the canonical root so a space in a path cannot split the command", async () => {
     const base = await mkdtemp(join(tmpdir(), "squid inspect "));
     const planned = await planAction(
-      { ...identity, kind: "inspect_error", parameters: { commandClass: "test" } },
+      { ...identity, toolId: "run_check", parameters: { commandClass: "test" } },
       { workingDirectory: base, project: bunProject },
     );
     if (isPlanFailure(planned)) throw new Error(planned.reasonCode);
@@ -208,7 +208,7 @@ describe("planAction for inspect_error", () => {
   it("produces a stable digest for the same class and root", async () => {
     const root = await mkdtemp(join(tmpdir(), "squid-inspect-"));
     const build = (commandClass: string) => planAction(
-      { ...identity, kind: "inspect_error", parameters: { commandClass } },
+      { ...identity, toolId: "run_check", parameters: { commandClass } },
       { workingDirectory: root, project: bunProject },
     );
     const first = await build("test");

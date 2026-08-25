@@ -84,6 +84,7 @@ function beliefRecord(
 function candidate(kind: PredictionCandidate["kind"]): PredictionCandidate {
   return {
     kind,
+    toolId: kind === "run_tests" ? "run_tests" : null,
     rationale: `rationale for ${kind}`,
     confidence: 0.5,
     expiresAt: new Date(now.getTime() + 30_000).toISOString(),

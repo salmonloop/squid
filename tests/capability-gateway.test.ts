@@ -122,6 +122,7 @@ async function setup(options: {
       candidateId,
       attemptId: outcome.requestId,
       kind: top.kind,
+      toolId: top.toolId ?? top.kind,
       parameters: top.parameters,
     },
     { workingDirectory: root, project: bunProject },

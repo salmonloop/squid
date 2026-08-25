@@ -35,6 +35,7 @@ import type { ImmutableActionPlan } from "./action-plan.js";
 const PLAN: ImmutableActionPlan = {
   planSchemaVersion: 1,
   kind: "run_tests",
+  descriptorId: "run_tests",
   candidateId: "smoke:candidate:0",
   attemptId: "smoke:attempt:0",
   tool: "run_command",

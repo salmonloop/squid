@@ -4,6 +4,19 @@ export interface Predictor {
   predict(state: WorldState, now?: Date): readonly PredictionCandidate[];
 }
 
+/**
+ * The built-in tool ids this predictor proposes. They are the ids the catalog
+ * registers, restated here because the predictor runs before any registry
+ * exists; a mismatch surfaces as `tool_unknown` at planning time, which is the
+ * loud failure mode rather than a silent misroute.
+ */
+const TOOL_IDS = {
+  draftCompletion: null,
+  inspectError: "run_check",
+  runTests: "run_tests",
+  searchSelection: "search_selection",
+} as const;
+
 export class HeuristicPredictor implements Predictor {
   predict(state: WorldState, now = new Date()): readonly PredictionCandidate[] {
     const expiresAt = new Date(now.getTime() + 20_000).toISOString();
@@ -18,6 +31,9 @@ export class HeuristicPredictor implements Predictor {
       if (textContext.prefix.trim().length > 0) {
         candidates.push({
           kind: "draft_completion",
+          // No registered capability drafts completions yet, so the proposal
+          // names no tool — it is a suggestion, never an executable plan.
+          toolId: TOOL_IDS.draftCompletion,
           rationale: "A text input has a non-empty prefix and is eligible for completion.",
           confidence: 0.35,
           expiresAt,
@@ -34,6 +50,9 @@ export class HeuristicPredictor implements Predictor {
     if (state.lastEventKind === "terminal_command_completed" && state.lastCommandOutcome?.succeeded === false) {
       candidates.push({
         kind: "inspect_error",
+        // The check class is proposed; which command that is stays with the
+        // project. This is why the id is the check-runner tool, not a command.
+        toolId: TOOL_IDS.inspectError,
         rationale: "The most recent terminal command failed.",
         confidence: 0.7,
         expiresAt,
@@ -54,6 +73,7 @@ export class HeuristicPredictor implements Predictor {
     ) {
       candidates.push({
         kind: "run_tests",
+        toolId: TOOL_IDS.runTests,
         rationale: "A code file was saved while a coding application is active.",
         confidence: 0.3,
         expiresAt,
@@ -78,6 +98,7 @@ export class HeuristicPredictor implements Predictor {
     ) {
       candidates.push({
         kind: "search_selection",
+        toolId: TOOL_IDS.searchSelection,
         rationale: "Text is selected while a browser page is active.",
         confidence: 0.2,
         expiresAt,

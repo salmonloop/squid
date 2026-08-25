@@ -15,16 +15,30 @@ async function workspace(): Promise<string> {
 }
 
 describe("planAction", () => {
-  it("refuses kinds that have no capability mapping", async () => {
+  it("refuses a proposal that names no registered capability", async () => {
+    // A null toolId is a fact about the candidate — nothing to execute. The
+    // kind is carried along for scoring but cannot route by itself.
     for (const kind of ["draft_completion", "none"] as const) {
-      const result = await planAction({ ...identity, kind, parameters: {} });
-      expect(isPlanFailure(result) && result.reasonCode).toBe("kind_not_actionable");
+      const result = await planAction({ ...identity, kind, toolId: null, parameters: {} });
+      expect(isPlanFailure(result) && result.reasonCode).toBe("tool_unknown");
     }
+  });
+
+  it("refuses a named tool this registry does not hold rather than substituting one", async () => {
+    // Falling back to another descriptor of the same category would execute a
+    // capability nobody proposed.
+    const result = await planAction({
+      ...identity,
+      kind: "inspect_error",
+      toolId: "no_such_tool",
+      parameters: {},
+    });
+    expect(isPlanFailure(result) && result.reasonCode).toBe("tool_unknown");
   });
 
   it("refuses a search plan without usable selection text", async () => {
     for (const parameters of [{}, { selection: "   " }, { selection: 7 }]) {
-      const result = await planAction({ ...identity, kind: "search_selection", parameters });
+      const result = await planAction({ ...identity, toolId: "search_selection", parameters });
       expect(isPlanFailure(result) && result.reasonCode).toBe("parameters_invalid");
     }
   });
@@ -33,7 +47,7 @@ describe("planAction", () => {
     const secret = "ultra secret business plan";
     const result = await planAction({
       ...identity,
-      kind: "search_selection",
+      toolId: "search_selection",
       parameters: { selection: secret },
     });
     if (isPlanFailure(result)) throw new Error(result.reasonCode);
@@ -50,7 +64,7 @@ describe("planAction", () => {
     await symlink(root, linked);
 
     const result = await planAction(
-      { ...identity, kind: "run_tests", parameters: { path: "src/../src/x.test.ts" } },
+      { ...identity, toolId: "run_tests", parameters: { path: "src/../src/x.test.ts" } },
       { workingDirectory: linked, project: bunProject },
     );
     if (isPlanFailure(result)) throw new Error(result.reasonCode);
@@ -69,13 +83,13 @@ describe("planAction", () => {
     await symlink(join(outside, "evil.ts"), join(root, "src", "escape.ts"));
 
     const lexical = await planAction(
-      { ...identity, kind: "run_tests", parameters: { path: "../etc/passwd" } },
+      { ...identity, toolId: "run_tests", parameters: { path: "../etc/passwd" } },
       { workingDirectory: root, project: bunProject },
     );
     expect(isPlanFailure(lexical) && lexical.reasonCode).toBe("path_escapes_workdir");
 
     const viaSymlink = await planAction(
-      { ...identity, kind: "run_tests", parameters: { path: "src/escape.ts" } },
+      { ...identity, toolId: "run_tests", parameters: { path: "src/escape.ts" } },
       { workingDirectory: root, project: bunProject },
     );
     expect(isPlanFailure(viaSymlink) && viaSymlink.reasonCode).toBe("path_escapes_workdir");
@@ -84,26 +98,26 @@ describe("planAction", () => {
   it("refuses absolute paths, control characters, and a missing workdir", async () => {
     const root = await workspace();
     const absolute = await planAction(
-      { ...identity, kind: "run_tests", parameters: { path: "/etc/passwd" } },
+      { ...identity, toolId: "run_tests", parameters: { path: "/etc/passwd" } },
       { workingDirectory: root, project: bunProject },
     );
     expect(isPlanFailure(absolute) && absolute.reasonCode).toBe("path_absolute");
 
     const control = await planAction(
-      { ...identity, kind: "run_tests", parameters: { path: "src/x\u0000.ts" } },
+      { ...identity, toolId: "run_tests", parameters: { path: "src/x\u0000.ts" } },
       { workingDirectory: root, project: bunProject },
     );
     expect(isPlanFailure(control) && control.reasonCode).toBe("path_control_characters");
 
     const noWorkdir = await planAction({
       ...identity,
-      kind: "run_tests",
+      toolId: "run_tests",
       parameters: { path: "src/x.test.ts" },
     });
     expect(isPlanFailure(noWorkdir) && noWorkdir.reasonCode).toBe("workdir_missing");
 
     const relativeWorkdir = await planAction(
-      { ...identity, kind: "run_tests", parameters: { path: "src/x.test.ts" } },
+      { ...identity, toolId: "run_tests", parameters: { path: "src/x.test.ts" } },
       { workingDirectory: "relative/dir" },
     );
     expect(isPlanFailure(relativeWorkdir) && relativeWorkdir.reasonCode).toBe("workdir_not_absolute");
@@ -112,7 +126,7 @@ describe("planAction", () => {
   it("plans a target that does not exist yet under the canonical root", async () => {
     const root = await workspace();
     const result = await planAction(
-      { ...identity, kind: "run_tests", parameters: { path: "src/not-created-yet.test.ts" } },
+      { ...identity, toolId: "run_tests", parameters: { path: "src/not-created-yet.test.ts" } },
       { workingDirectory: root, project: bunProject },
     );
     if (isPlanFailure(result)) throw new Error(result.reasonCode);
@@ -122,7 +136,7 @@ describe("planAction", () => {
   it("produces a stable digest for identical plans and a different one otherwise", async () => {
     const root = await workspace();
     const build = (path: string) => planAction(
-      { ...identity, kind: "run_tests", parameters: { path } },
+      { ...identity, toolId: "run_tests", parameters: { path } },
       { workingDirectory: root, project: bunProject },
     );
     const first = await build("src/x.test.ts");
@@ -140,7 +154,7 @@ describe("planAction", () => {
   it("freezes the plan so no later stage can mutate what the user approved", async () => {
     const result = await planAction({
       ...identity,
-      kind: "search_selection",
+      toolId: "search_selection",
       parameters: { selection: "hello" },
     });
     if (isPlanFailure(result)) throw new Error(result.reasonCode);
@@ -151,7 +165,7 @@ describe("planAction", () => {
   it("carries the candidate and attempt identity into the plan", async () => {
     const result = await planAction({
       ...identity,
-      kind: "search_selection",
+      toolId: "search_selection",
       parameters: { selection: "hello" },
     });
     if (isPlanFailure(result)) throw new Error(result.reasonCode);
@@ -188,7 +202,7 @@ describe("planAction symlinked-directory containment", () => {
       {
         candidateId: "req:candidate:0",
         attemptId: "req",
-        kind: "run_tests",
+        toolId: "run_tests",
         parameters: { path: "link/evil.test.ts" },
       },
       { workingDirectory: root, project: bunProject },
@@ -206,7 +220,7 @@ describe("planAction symlinked-directory containment", () => {
       {
         candidateId: "req:candidate:0",
         attemptId: "req",
-        kind: "run_tests",
+        toolId: "run_tests",
         parameters: { path: "link/evil.test.ts" },
       },
       { workingDirectory: root, project: bunProject },
@@ -224,7 +238,7 @@ describe("planAction symlinked-directory containment", () => {
       {
         candidateId: "req:candidate:0",
         attemptId: "req",
-        kind: "run_tests",
+        toolId: "run_tests",
         parameters: { path: "tests/not-created-yet.test.ts" },
       },
       { workingDirectory: root, project: bunProject },

@@ -78,14 +78,19 @@ export class PredictionCancelledError extends Error {
 /**
  * Build a candidate with the given kind and confidence. Helpful for terser test
  * fixtures.
+ *
+ * `toolId` defaults to null — the honest default, since most tests do not care
+ * about routing. Tests that exercise planning pass one explicitly.
  */
 export function candidate(
   kind: PredictionKind,
   confidence = 0.5,
   parameters: PredictionCandidate["parameters"] = {},
+  toolId: string | null = null,
 ): PredictionCandidate {
   return {
     kind,
+    toolId,
     rationale: `fake ${kind}`,
     confidence,
     expiresAt: new Date(Date.now() + 20_000).toISOString(),

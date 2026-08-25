@@ -31,6 +31,7 @@ const DENY: EgressPolicy = { id: SEARCH_EGRESS_DENY_ID, searchEgress: "deny" };
 function searchCandidate(selection = "quantum tunneling"): PredictionCandidate {
   return {
     kind: "search_selection",
+    toolId: "search_selection",
     rationale: "selection in a browser window",
     confidence: 0.8,
     expiresAt: FUTURE,
@@ -42,6 +43,7 @@ function searchCandidate(selection = "quantum tunneling"): PredictionCandidate {
 function testsCandidate(path = "src/x.test.ts"): PredictionCandidate {
   return {
     kind: "run_tests",
+    toolId: "run_tests",
     rationale: "file saved in a coding application",
     confidence: 0.9,
     expiresAt: FUTURE,
@@ -54,6 +56,7 @@ function searchPlan(selection = "quantum tunneling"): ImmutableActionPlan {
   return {
     planSchemaVersion: 1,
     kind: "search_selection",
+    descriptorId: "search_selection",
     candidateId: "req-1:candidate:0",
     attemptId: "req-1",
     tool: "search_web",
@@ -69,6 +72,7 @@ function testsPlan(target = "/repo/src/x.test.ts"): ImmutableActionPlan {
   return {
     planSchemaVersion: 1,
     kind: "run_tests",
+    descriptorId: "run_tests",
     candidateId: "req-1:candidate:0",
     attemptId: "req-1",
     tool: "run_command",
@@ -190,6 +194,7 @@ describe("digestActionPlan", () => {
       summary: plan.summary,
       arguments: plan.arguments,
       tool: plan.tool,
+      descriptorId: plan.descriptorId,
       attemptId: plan.attemptId,
       candidateId: plan.candidateId,
       kind: plan.kind,

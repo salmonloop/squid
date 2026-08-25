@@ -53,6 +53,7 @@ async function seeded(): Promise<PredictionLedger> {
       latencyMs: 5,
       candidates: [{
         kind: "run_tests",
+        toolId: "run_tests",
         rationale: "file saved in editor",
         confidence: 0.9,
         expiresAt: "2099-01-01T00:00:00.000Z",
@@ -62,6 +63,7 @@ async function seeded(): Promise<PredictionLedger> {
     },
     candidates: candidateEnvelopes("req-1", [{
       kind: "run_tests",
+      toolId: "run_tests",
       rationale: "file saved in editor",
       confidence: 0.9,
       expiresAt: "2099-01-01T00:00:00.000Z",

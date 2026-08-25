@@ -107,6 +107,9 @@ describe("prediction candidate identity", () => {
       "ordinal",
       "parametersDigest",
       "sourceEventIds",
+      // Enumerated like the rest: a tool id names a capability, never user
+      // text, so it may travel — but only if this list says so.
+      "toolId",
     ]);
     expect(JSON.stringify(envelope)).not.toContain(secret);
     // The digest still proves which parameters were seen.
