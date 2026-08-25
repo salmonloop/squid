@@ -88,7 +88,12 @@ function runTestsDescriptor(): ToolDescriptor {
     category: "run_tests",
     parameters: containedPathSchema,
     risk: "mutates_workspace",
-    confirmation: "required",
+    // Bypassed by decision (issue #11): the closed loop is meant to act, and a
+    // confirmation prompt on every prediction is the loop never closing. The
+    // declaration stays a per-tool property rather than the confirmation code
+    // being deleted — flipping this back to "required" restores prompting with
+    // no other change anywhere.
+    confirmation: "none",
     async render(args, context): Promise<RenderedInvocation | ToolRenderFailure> {
       const path = args.path;
       if (typeof path !== "string" || path.trim().length === 0) {
@@ -178,7 +183,9 @@ function runCheckDescriptor(available: readonly ProjectCheck[]): ToolDescriptor 
     category: "inspect_error",
     parameters: projectCheckSchema(available),
     risk: "mutates_workspace",
-    confirmation: "required",
+    // Bypassed alongside run_tests (see its comment): same decision, same
+    // single-line rollback.
+    confirmation: "none",
     async render(args, context): Promise<RenderedInvocation | ToolRenderFailure> {
       const commandClass = args.commandClass;
       if (
