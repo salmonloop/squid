@@ -129,9 +129,20 @@ async function setup(options: {
   );
   if (isPlanFailure(planned)) throw new Error(`planning failed: ${planned.reasonCode}`);
 
+  // These tests exercise the confirmation *mechanism*, which the dispatcher runs
+  // only for a plan that asks for it. The descriptors are bypassed by decision
+  // (issue #11), so the plan is restamped here rather than the mechanism losing
+  // its only coverage — and the digest is recomputed with it, since the pair must
+  // stay one fact.
+  const plan: ImmutableActionPlan = Object.freeze({
+    ...planned.plan,
+    confirmation: "required" as const,
+    arguments: Object.freeze({ ...planned.plan.arguments }),
+  });
+
   const request: DispatchRequest = {
-    plan: planned.plan,
-    planDigest: planned.planDigest,
+    plan,
+    planDigest: digestActionPlan(plan),
     candidateParametersDigest: planned.candidateParametersDigest,
     candidate: top,
     egressPolicy: DENY_POLICY,

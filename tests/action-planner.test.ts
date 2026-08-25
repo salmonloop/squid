@@ -73,7 +73,9 @@ describe("planAction", () => {
     expect(result.plan.canonicalWorkingDirectory).not.toBe(linked);
     expect(result.plan.canonicalTarget?.endsWith("src/x.test.ts")).toBe(true);
     expect(result.plan.arguments.command).toContain("bun test");
-    expect(result.plan.confirmation).toBe("required");
+    // Bypassed at registration (issue #11): the plan carries what the descriptor
+    // declares, and the descriptor currently asks for nothing.
+    expect(result.plan.confirmation).toBe("none");
   });
 
   it("rejects paths that escape the working directory lexically or via symlink", async () => {

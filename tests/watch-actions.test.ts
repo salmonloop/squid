@@ -27,7 +27,9 @@ import {
   parseLiteralCommand,
   resolveWatchActions,
 } from "../src/watch-actions.js";
-import type { CapabilityActionPlan } from "../src/action-plan.js";
+import type { CapabilityActionPlan, ImmutableActionPlan } from "../src/action-plan.js";
+import { digestActionPlan } from "../src/action-plan.js";
+import { isPlanFailure, planAction, type PlannedAction } from "../src/action-planner.js";
 import { bunProject } from "./fixtures/bun-project.js";
 
 const SESSION = "watch-session";
@@ -38,6 +40,40 @@ const nextRequestId = () => {
   let sequence = 0;
   return () => `dispatch-${++sequence}`;
 };
+
+/**
+ * Plans for real against this run's attempt identity, then restamps the plan to
+ * require confirmation.
+ *
+ * The descriptors are bypassed by decision (issue #11), so plans no longer ask
+ * for a prompt by default — but the dispatcher's confirmation mechanism still
+ * runs for any plan that does, and these are its tests. Planning with the live
+ * request id keeps every other field exactly what admission expects; only
+ * `confirmation` changes, and the digest is recomputed with it so the pair
+ * remains one fact.
+ */
+async function restampedRequiredPlan(
+  root: string,
+  requestId: string,
+): Promise<{ readonly plan: ImmutableActionPlan; readonly planned: PlannedAction }> {
+  const planned = await planAction(
+    {
+      candidateId: `${requestId}:candidate:0`,
+      attemptId: requestId,
+      kind: "run_tests",
+      toolId: "run_tests",
+      parameters: { path: "tests/foo.test.ts" },
+    },
+    { workingDirectory: root, project: bunProject },
+  );
+  if (isPlanFailure(planned)) throw new Error(planned.reasonCode);
+  const plan = Object.freeze({
+    ...planned.plan,
+    confirmation: "required" as const,
+    arguments: Object.freeze({ ...planned.plan.arguments }),
+  });
+  return { plan, planned };
+}
 
 /**
  * The dispatch loop is tested end-to-end through the production objects: a real
@@ -631,22 +667,28 @@ describe("dispatchTopCandidate", () => {
       confidence: 0.9,
       parameters: { path: "tests/foo.test.ts" },
     })];
+    // Dispatched through a restamped required plan rather than the live path:
+    // descriptors are bypassed by decision (issue #11), so a real plan no longer
+    // asks for confirmation — but a plan that *does* must still be refused when
+    // nothing is wired to ask. This is coverage of that refusal.
     const { commands, dispatcher, requestId, egressPolicy, close } = await setup({
       candidates,
       events: editorSave("tests/foo.test.ts"),
       workingDirectory: root,
       egressPolicy: DENY,
     });
+    const { plan, planned } = await restampedRequiredPlan(root, requestId);
 
-    const result = await dispatchTopCandidate(
-      { requestId },
-      candidates,
-      dispatcher,
-      { egressPolicy, workingDirectory: root, project: bunProject },
-    );
+    const result = await dispatcher.dispatch({
+      plan,
+      planDigest: digestActionPlan(plan),
+      candidateParametersDigest: planned.candidateParametersDigest,
+      candidate: candidates[0]!,
+      egressPolicy: DENY,
+    });
 
-    expect(result?.status).toBe("not_accepted");
-    expect(result?.reasonCode).toBe("confirmation_policy_missing");
+    expect(result.status).toBe("not_accepted");
+    expect(result.reasonCode).toBe("confirmation_policy_missing");
     expect(commands).toEqual([]);
     await close();
   });
@@ -694,22 +736,27 @@ describe("dispatchTopCandidate", () => {
     const confirmation: ActionConfirmationPolicy = {
       confirm: async () => ({ outcome: "rejected", reason: "user_rejected" }),
     };
-    const { commands, ledger, dispatcher, requestId, egressPolicy, close } = await setup({
+    // Required plan restamped for the same reason as the missing-policy test
+    // above: the mechanism is what is under test, not the current declaration.
+    const { commands, ledger, dispatcher, requestId, close } = await setup({
       candidates,
       events: editorSave("tests/foo.test.ts"),
       confirmation,
       workingDirectory: root,
       egressPolicy: DENY,
     });
+    const { plan, planned } = await restampedRequiredPlan(root, requestId);
 
-    const result = await dispatchTopCandidate(
-      { requestId },
-      candidates,
-      dispatcher,
-      { egressPolicy, workingDirectory: root, project: bunProject },
-    );
+    const result = await dispatcher.dispatch({
+      plan,
+      planDigest: digestActionPlan(plan),
+      candidateParametersDigest: planned.candidateParametersDigest,
+      candidate: candidates[0]!,
+      egressPolicy: DENY,
+    });
 
-    expect(result?.status).toBe("not_accepted");
+    expect(result.status).toBe("not_accepted");
+    expect(result.reasonCode).toBe("user_rejected");
     expect(commands).toEqual([]);
     const records = await ledger.all();
     expect(records.filter((r) => r.recordType === "plan_decision")).toHaveLength(1);

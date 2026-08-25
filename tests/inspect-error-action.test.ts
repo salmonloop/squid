@@ -134,9 +134,9 @@ describe("planAction for inspect_error", () => {
       if (isPlanFailure(planned)) throw new Error(`${commandClass}: ${planned.reasonCode}`);
       expect(planned.plan.arguments.command).toContain(expected[commandClass]!);
       expect(planned.plan.tool).toBe("run_command");
-      // Executes locally, so the user sees the exact command first — same posture
-      // as run_tests.
-      expect(planned.plan.confirmation).toBe("required");
+      // Bypassed at registration (issue #11), same posture as run_tests: the
+      // plan carries what the descriptor declares.
+      expect(planned.plan.confirmation).toBe("none");
       // No path parameter, so there is no path boundary for the gateway to
       // re-verify before the call.
       expect(planned.plan.canonicalTarget).toBeNull();
