@@ -89,7 +89,7 @@ export async function resolveWatchProvider(
 
   const gate = parseProviderGateMode(env.SQUID_PROVIDER_GATE);
   if (gate === null) {
-    return { ok: false, configError: 'SQUID_PROVIDER_GATE must be "probe" or "replay".' };
+    return { ok: false, configError: 'SQUID_PROVIDER_GATE must be "probe", "replay", or "off".' };
   }
 
   if (mode === "heuristic") {

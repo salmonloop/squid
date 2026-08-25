@@ -174,7 +174,19 @@ SQUID_PROVIDER=pi SQUID_PROVIDER_GATE=replay bun run watch:screen               
 SQUID_PROVIDER=cognition SQUID_PROVIDER_GATE=replay bun run watch:desktop              # belief-backed, gated
 ```
 
-`SQUID_PROVIDER_GATE` picks the admission check. The default `probe` resolves the model once via `PiRuntime.checkAvailability()` — fast, and enough to tell an outage apart from a bad prediction. `replay` instead runs the same `runProviderGate` that `bun run gate:pi` runs, at startup, and admits the model only on `passed`. A `skipped` gate declines, because an unreachable or unevaluated model must not reach the real-time path just because nothing measured a regression against it.
+`SQUID_PROVIDER_GATE` picks the admission check, and each spelling decides both whether a check runs and what trust an admitted provider earns. The default `probe` resolves the model once via `PiRuntime.checkAvailability()` — fast, enough to tell an outage from a bad prediction, but the model stays `suggestion_only`: it may speak (its candidates rank and are logged), never act. `replay` runs the same `runProviderGate` that `bun run gate:pi` runs, at startup, admits only on `passed`, and grants dispatch trust on that pass. A `skipped` gate declines, because an unreachable or unevaluated model must not reach the real-time path just because nothing measured a regression against it.
+
+`off` is the explicit bypass for when the gates themselves are the obstacle. Both are measured walls today — the replay gate fails on ranking nondeterminism, the semantic gate requires exact reproducibility across runs — so without this spelling no model path can speak *and* act. With it, no check runs at all and the provider is admitted as `trusted`: its proposals go to planning and dispatch like any other candidate, with every world-state admission check still applied on top. What `off` skips is measurement, not safety checks; what it costs is the evidence a gate pass would have provided, which is why it must be spelled and is never the default.
+
+```bash
+SQUID_PROVIDER=pi SQUID_PROVIDER_GATE=off bun run watch:desktop -- /absolute/project/root
+
+# Full loop, unmeasured: model predicts, plans, and dispatches, with the
+# world-state admission checks still applied on every attempt.
+SQUID_PROVIDER=cognition SQUID_PROVIDER_GATE=off SQUID_ACTIONS=mcp \
+SQUID_ACTIONS_MCP_COMMAND="bun run mcp-server.ts" \
+bun run watch:desktop -- /absolute/project/root
+```
 
 `cognition` selects the belief-backed path described under [Beliefs and cognition](#beliefs-and-cognition). It has no probe branch, and the asymmetry is deliberate: reachability is the question worth asking about an out-of-process model, but a cognition provider reorders candidates the heuristic already produced, so it is always reachable and a probe would admit every one of them while measuring nothing. The semantic gate therefore runs in both modes; what `SQUID_PROVIDER_GATE` decides is only whether a pass earns dispatch trust. Under `probe` an admitted cognition provider stays `suggestion_only`, so nothing it proposes can be dispatched — `src/action-admission.ts` refuses a claim unless both the attempt and the runtime are trusted, which is why a provider cannot grant itself what the selector withholds.
 
