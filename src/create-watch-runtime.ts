@@ -16,6 +16,7 @@ import { SquidCore } from "./squid-core.js";
 import type { ContextPolicy } from "./context-policy.js";
 import { PassthroughContextPolicy } from "./context-policy.js";
 import { SEARCH_EGRESS_DENY_ID, type EgressPolicy } from "./action-egress.js";
+import type { ToolSummary } from "./tool-catalog.js";
 
 /**
  * The shared setup both watch entry points need: a store, a ledger, a core
@@ -97,6 +98,14 @@ export interface CreateWatchRuntimeOptions {
   readonly excludeApplications?: string;
   /** Forwards non-fatal runtime diagnostics; omitted in tests. */
   readonly onDiagnostic?: (diagnostic: PredictionRuntimeDiagnostic) => void;
+  /**
+   * The run's capability catalog, as the prompt-facing summaries every outgoing
+   * prediction request carries. Summaries arrive ready-made rather than as a
+   * project profile because this function touches no filesystem — detection is
+   * the caller's job, done once so the prompt view and the action layer cannot
+   * describe different projects.
+   */
+  readonly tools?: readonly ToolSummary[];
 }
 
 export function createWatchRuntime(options: CreateWatchRuntimeOptions): WatchRuntime {
@@ -133,6 +142,7 @@ export function createWatchRuntime(options: CreateWatchRuntimeOptions): WatchRun
     new PredictionCoordinator({
       provider: options.provider,
       contextPolicy,
+      ...(options.tools === undefined ? {} : { tools: options.tools }),
     }),
     {
       ledger,

@@ -18,6 +18,9 @@ import type { PredictionRuntimeIngestResult } from "./prediction-runtime.js";
 import { runRetentionPrune, type RetentionPruneResult } from "./retention-prune.js";
 import { sqliteWatchExclusions } from "./sqlite-event-store.js";
 import { resolveWatchActions, type WatchActionsResolution } from "./watch-actions.js";
+import { detectProject } from "./project-detect.js";
+import { summarizeTools } from "./tool-catalog.js";
+import { buildToolRegistry } from "./tool-descriptors.js";
 import { resolveWatchProvider, type WatchProviderBeliefBatch } from "./watch-provider.js";
 
 /**
@@ -196,6 +199,16 @@ export async function startWatchSession(
     ? await shadowBelief.createProvider()
     : undefined;
 
+  // The project is detected once, here, and both halves of the action loop read
+  // the same profile: the prompt view below tells the model what exists, and
+  // `resolveWatchActions` renders what it proposes against the same facts. Two
+  // detections could disagree — a manifest edited mid-startup — and then the
+  // model would be scored as wrong for following the catalog it was shown.
+  // Detection never throws; a directory with no manifest degrades to no
+  // check-backed tools.
+  const project = await detectProject(options.workingDirectory);
+  const sessionTools = summarizeTools(buildToolRegistry({ project }));
+
   const watch = createWatchRuntime({
     ...(options.databasePath === undefined ? {} : { databasePath: options.databasePath }),
     provider: resolved.selection.provider,
@@ -208,6 +221,7 @@ export async function startWatchSession(
     onDiagnostic: (diagnostic) => {
       logError(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
     },
+    tools: sessionTools,
   });
 
   // Retention prunes before restore, so the projection is rebuilt from the
@@ -364,6 +378,7 @@ export async function startWatchSession(
     workingDirectory: options.workingDirectory,
     actionTrust: resolved.selection.actionTrust,
     egressPolicy: egress,
+    project,
   });
   if (actions !== undefined && "configError" in actions) {
     // Vacuous today — no source has started, so nothing can be in flight — but the

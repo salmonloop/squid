@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import { normalizePredictionCandidate } from "../src/pi-runtime.js";
+import { catalogPromptLines, normalizePredictionCandidate } from "../src/pi-runtime.js";
+import { summarizeTools } from "../src/tool-catalog.js";
+import { buildToolRegistry } from "../src/tool-descriptors.js";
 import { emptyWorldState } from "../src/protocol.js";
 import type { PredictionProvider, PredictionRequest } from "../src/prediction-provider.js";
 import type { PredictionCandidate } from "../src/protocol.js";
@@ -101,6 +103,49 @@ describe("normalizePredictionCandidate", () => {
 
     expect(candidate.kind).toBe("none");
     expect(candidate.sourceEventIds).toEqual([]);
+  });
+});
+
+describe("catalogPromptLines", () => {
+  const bunProject = {
+    ecosystem: "bun" as const,
+    commands: { test: ["bun", "test"] },
+  };
+
+  it("lists every registered tool with its id, category, and verbatim schema", () => {
+    const lines = catalogPromptLines(summarizeTools(buildToolRegistry({ project: bunProject })));
+    expect(lines).toHaveLength(3);
+    // The id is quoted JSON so the model cannot misread where it ends.
+    expect(lines[0]).toContain(`id="run_tests"`);
+    expect(lines[0]).toContain('category="run_tests"');
+    // The schema travels verbatim — the model proposes against the same shape
+    // the planner validates against, so a paraphrase error is impossible.
+    // Parsed rather than string-compared because key order in a serialized
+    // TSchema is an implementation detail, not part of the contract.
+    const schemaStart = lines[0]!.indexOf("{");
+    expect(schemaStart).toBeGreaterThan(0);
+    expect(JSON.parse(lines[0]!.slice(schemaStart))).toEqual({
+      type: "object",
+      required: ["path"],
+      properties: { path: { type: "string", minLength: 1, maxLength: 1024 } },
+      additionalProperties: false,
+    });
+    // The check-backed tool's schema narrows to the one declared class.
+    expect(lines.some((line) => line.includes('category="inspect_error"'))).toBe(true);
+    expect(lines.some((line) => line.includes('"const":"test"'))).toBe(true);
+    expect(lines[2]).toContain('category="search_selection"');
+  });
+
+  it("states an absent catalog instead of inventing one", () => {
+    const lines = catalogPromptLines(undefined);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/No tool catalog was supplied/);
+    expect(lines[0]).toContain("toolId to null");
+  });
+
+  it("states an empty catalog plainly", () => {
+    const lines = catalogPromptLines([]);
+    expect(lines).toEqual(["The tool catalog is empty; set toolId to null."]);
   });
 });
 

@@ -1,4 +1,5 @@
 import { describeErrorForAudit } from "./action-egress.js";
+import type { ToolSummary } from "./tool-catalog.js";
 import { HeuristicPredictor, type Predictor } from "./baseline-predictor.js";
 import {
   PassthroughContextPolicy,
@@ -33,6 +34,17 @@ export interface PredictionCoordinatorOptions {
   readonly now?: () => Date;
   /** Injected for deterministic tests. */
   readonly random?: () => string;
+  /**
+   * The run's tool catalog, forwarded onto every request so a model-backed
+   * provider can propose from what actually exists rather than from a prompt
+   * written when the catalog was three hardcoded commands.
+   *
+   * A constructor option rather than a per-call argument because the registry is
+   * a fact about this process's project, resolved once — the same posture as the
+   * egress policy. Omitted means requests carry no `tools` field and providers
+   * see none.
+   */
+  readonly tools?: readonly ToolSummary[];
 }
 
 export interface PredictionCoordinatorDiagnostic {
@@ -60,6 +72,7 @@ export class PredictionCoordinator {
   private readonly onDiagnostic: ((diagnostic: PredictionCoordinatorDiagnostic) => void) | undefined;
   private readonly now: () => Date;
   private readonly random: () => string;
+  private readonly tools: readonly ToolSummary[] | undefined;
 
   private activeController: AbortController | null = null;
   private activeRequestId: string | null = null;
@@ -77,6 +90,7 @@ export class PredictionCoordinator {
     this.onDiagnostic = options.onDiagnostic;
     this.now = options.now ?? (() => new Date());
     this.random = options.random ?? (() => crypto.randomUUID());
+    this.tools = options.tools;
   }
 
   /**
@@ -108,6 +122,7 @@ export class PredictionCoordinator {
       episodeId,
       triggeredAt,
       ...(projection === undefined ? {} : { projection }),
+      ...(this.tools === undefined ? {} : { tools: this.tools }),
     };
 
     let providerRequest: PredictionRequest;

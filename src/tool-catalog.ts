@@ -184,6 +184,45 @@ export class ToolRegistry {
   }
 }
 
+/**
+ * The prompt-facing view of one registered tool: pure data, no behavior.
+ *
+ * A descriptor's `render` and `guard` are code — closures over path containment
+ * and admission policy — and must never travel toward a model. What a model may
+ * see is exactly what it needs to propose well: the id to name, the title to
+ * understand it by, the category its proposal will be grouped under, the
+ * argument schema to satisfy, and the risk class. Anything more is attack
+ * surface; anything less is guessing.
+ */
+export interface ToolSummary {
+  readonly id: string;
+  readonly title: string;
+  readonly category: PredictionKind;
+  /**
+   * The argument schema itself, sent verbatim rather than paraphrased. A TSchema
+   * is a plain object tree, so it crosses the boundary as data — and sending the
+   * real thing means the prompt and the validator cannot disagree about what
+   * counts as a valid proposal, which a hand-written description eventually
+   * would.
+   */
+  readonly parameters: unknown;
+  readonly risk: ToolRisk;
+}
+
+/**
+ * Summarizes a registry in registration order — which is the order the prompt
+ * lists them in, because that order is itself a signal about what is common.
+ */
+export function summarizeTools(registry: ToolRegistry): readonly ToolSummary[] {
+  return registry.all.map((descriptor) => ({
+    id: descriptor.id,
+    title: descriptor.title,
+    category: descriptor.category,
+    parameters: descriptor.parameters,
+    risk: descriptor.risk,
+  }));
+}
+
 /** Argument schema shared by every tool that names a file inside the project. */
 export const containedPathSchema = Type.Object({
   path: Type.String({ minLength: 1, maxLength: 1024 }),
