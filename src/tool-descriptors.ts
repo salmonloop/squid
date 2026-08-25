@@ -1,5 +1,11 @@
+import { resolve } from "node:path";
 import { Type } from "typebox";
 import { quote } from "shell-quote";
+import type {
+  AdmissionContext,
+  AdmissionReasonCode,
+  AdmissionResult,
+} from "./action-admission.js";
 import { sanitizeAuditText } from "./action-egress.js";
 import { canonicalizeWorkdir, containPath } from "./path-containment.js";
 import { projectChecks, type ProjectCheck, type ProjectProfile } from "./project-detect.js";
@@ -111,6 +117,40 @@ function runTestsDescriptor(): ToolDescriptor {
         canonicalTarget: contained.canonicalTarget,
       };
     },
+    /**
+     * Executes a command locally, so its admission checks are about identity of
+     * the target: the same coding application must still be in front, and the
+     * newest save must still be the file the plan was built for.
+     */
+    guard(context): AdmissionResult {
+      const { state, plan } = context;
+      const application = state.activeApplication;
+      if (application === null || !isCodingApplication(application)) {
+        return refuse("coding_application_mismatch");
+      }
+      const lastSave = state.recentActions.find((action) => action.kind === "file_saved");
+      if (
+        lastSave === undefined ||
+        lastSave.applicationId === null ||
+        lastSave.applicationId !== application.id
+      ) {
+        return refuse("coding_application_mismatch");
+      }
+      if (
+        lastSave.target === null ||
+        plan.canonicalTarget === null ||
+        plan.canonicalWorkingDirectory === null
+      ) {
+        return refuse("saved_path_mismatch");
+      }
+      // Path identity, not a string suffix. `endsWith` would authorize any file whose
+      // path merely *ends* with the saved one — saving `a.ts` would admit a plan
+      // targeting `sub/xa.ts` — and it would accept a target reached through a
+      // symlink, since the resolved path still ends with the saved name.
+      const savedTarget = resolve(plan.canonicalWorkingDirectory, lastSave.target);
+      if (plan.canonicalTarget !== savedTarget) return refuse("saved_path_mismatch");
+      return { admitted: true };
+    },
   };
 }
 
@@ -171,6 +211,30 @@ function runCheckDescriptor(available: readonly ProjectCheck[]): ToolDescriptor 
         canonicalTarget: null,
       };
     },
+    /**
+     * Re-runs a failed check, so its admission checks are about the failure
+     * still being the current one.
+     *
+     * The class must match what the plan was built for, and the command must
+     * still be *failing*. The second condition is the one that matters in
+     * practice: a user who fixes the problem and re-runs successfully before
+     * confirming should not then have the old failure's re-run executed.
+     * Success is not a smaller version of failure — it is the reason to drop
+     * the action.
+     */
+    guard(context): AdmissionResult {
+      const { state, candidate } = context;
+      const outcome = state.lastCommandOutcome;
+      if (outcome === null) return refuse("command_outcome_missing");
+      // Compared against the candidate rather than the plan: the plan holds a
+      // quoted command string, and re-parsing it to recover the class would be a
+      // second implementation of a mapping that already exists.
+      if (candidate?.parameters.commandClass !== outcome.commandClass) {
+        return refuse("command_outcome_changed");
+      }
+      if (outcome.succeeded) return refuse("command_succeeded");
+      return { admitted: true };
+    },
   };
 }
 
@@ -208,7 +272,55 @@ function searchSelectionDescriptor(): ToolDescriptor {
         canonicalTarget: null,
       };
     },
+    /**
+     * Search sends user text off the machine, so its checks are the strictest:
+     * egress must be explicitly allowed, the selection must still be exactly
+     * what was predicted on, and whoever produced the text, whoever owns the
+     * page, and whoever holds the foreground must agree — any disagreement
+     * means the selection belongs to a document that is no longer shown.
+     */
+    guard(context): AdmissionResult {
+      const { state, candidate, plan } = context;
+      // Whether this may leave the machine is the egress policy's decision, and
+      // it comes first: nothing else about the proposal matters if the answer
+      // is no.
+      if (context.egressPolicy.searchEgress !== "allow") return refuse("search_egress_denied");
+
+      const text = state.textContext;
+      const page = state.currentBrowserPage;
+      if (text === null || text.selection.trim().length === 0) return refuse("selection_empty");
+      if (page === null) return refuse("browser_page_missing");
+
+      const predicted = candidate?.parameters.selection;
+      if (typeof predicted !== "string" || predicted !== text.selection) return refuse("selection_changed");
+      if (plan.arguments.query !== text.selection) return refuse("selection_changed");
+
+      const foreground = state.focus === null
+        ? null
+        : { applicationId: state.focus.applicationId, windowTitle: state.focus.windowTitle };
+      if (!sameOwner(text.owner, page.owner) || !sameOwner(text.owner, foreground)) {
+        return refuse("owner_mismatch");
+      }
+      // A selection older than the current page was made against a document
+      // that is no longer shown, whatever its text says.
+      if (text.observationOrdinal <= page.observationOrdinal) return refuse("observation_out_of_order");
+      return { admitted: true };
+    },
   };
+}
+
+/**
+ * Every built-in descriptor, including tools a given project cannot render.
+ *
+ * Admission looks guards up here rather than in the run's own registry: the
+ * guards are pure world-state checks that never touch the project profile, and
+ * a stored plan for a check-backed tool must still find its guard even after
+ * the project stops declaring that check. Refusing such a plan on
+ * `plan_kind_unsupported` would misreport "the world moved" as "the capability
+ * vanished".
+ */
+export function admissionDescriptors(): readonly ToolDescriptor[] {
+  return [runTestsDescriptor(), runCheckDescriptor(projectChecks), searchSelectionDescriptor()];
 }
 
 /**
@@ -227,6 +339,30 @@ export function renderCommandSummary(
   argv: readonly string[],
 ): string {
   return `cd ${quote([canonicalWorkingDirectory])} && ${quote([...argv])}`;
+}
+
+/**
+ * Whether the foreground application is a coding application, decided on its
+ * *name* and never its id. The id is whatever the platform reports it as — on
+ * macOS the screen reader reports a bare unix pid ("4242"), which cannot carry
+ * the "code" signal — while the name is the one field that describes what kind
+ * of application this is. Matching on the id would make every real macOS run
+ * fail here regardless of what is actually in front.
+ */
+function isCodingApplication(application: { id: string; name: string }): boolean {
+  return /code/i.test(application.name);
+}
+
+function sameOwner(
+  left: { applicationId: string; windowTitle: string } | null,
+  right: { applicationId: string; windowTitle: string } | null,
+): boolean {
+  if (left === null || right === null) return false;
+  return left.applicationId === right.applicationId && left.windowTitle === right.windowTitle;
+}
+
+function refuse(reasonCode: AdmissionReasonCode): AdmissionResult {
+  return { admitted: false, reasonCode };
 }
 
 export { isRenderFailure };
