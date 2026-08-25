@@ -18,7 +18,7 @@ import {
 import { resolveSearchEgress, type EgressPolicy } from "./action-egress.js";
 import { McpCapabilityGateway } from "./mcp-gateway.js";
 import type { ProjectProfile } from "./project-detect.js";
-import type { PredictionCandidate } from "./protocol.js";
+import type { PredictionCandidate, WorldState } from "./protocol.js";
 import type { PredictionLedger } from "./prediction-ledger.js";
 import type { PredictionRuntime } from "./prediction-runtime.js";
 import type { IngestDisposition } from "./squid-core.js";
@@ -31,6 +31,14 @@ export interface WatchActionsResolution {
     candidates: readonly PredictionCandidate[],
     /** Disposition of the triggering event; late triggers never dispatch. */
     triggerDisposition?: IngestDisposition,
+    /**
+     * Raw state of the triggering ingest, when the run's projection redacts
+     * action targets — the only situation where a candidate may name a basename
+     * for a file raw state holds as a path. The resolver is built per call so
+     * it reads the state this exact prediction was triggered from, not whatever
+     * happens to be current by the time the provider answers.
+     */
+    rawState?: WorldState,
   ): Promise<DispatchOutcome | null>;
   /** Closes the client transport. */
   close(): Promise<void>;
@@ -155,6 +163,13 @@ export async function resolveWatchActions(
      * which is only safe when no runtime stamped a different id.
      */
     readonly egressPolicy?: EgressPolicy;
+    /**
+     * Whether that projection narrows action targets, declared by the policy
+     * itself rather than inferred from its id. When true, dispatch accepts a
+     * raw-state resolver per call so basename proposals can be resolved before
+     * planning; when false, none is ever built and proposals are taken as-is.
+     */
+    readonly redactsActionTargets?: boolean;
   } = {},
 ): Promise<WatchActionsResolution | undefined | { readonly configError: string }> {
   const mode = env.SQUID_ACTIONS;
@@ -262,13 +277,18 @@ export async function resolveWatchActions(
   return {
     gatewayId: gateway.id,
     egressPolicy: egress,
-    dispatchTopCandidate: (outcome, candidates, triggerDisposition) => {
+    dispatchTopCandidate: (outcome, candidates, triggerDisposition, rawState) => {
       if (closing) return Promise.resolve(null);
       const operation = dispatchTopCandidate(outcome, candidates, dispatcher, {
         egressPolicy: egress,
         ...(workingDirectory === undefined ? {} : { workingDirectory }),
         ...(options.project === undefined ? {} : { project: options.project }),
         ...(triggerDisposition === undefined ? {} : { triggerDisposition }),
+        // Resolution is armed only when the projection actually redacts
+        // targets; the resolver reads the triggering ingest's own raw state.
+        ...(options.redactsActionTargets === true && rawState !== undefined
+          ? { resolveRedactedSave: (base: string) => uniqueSaveTarget(rawState, base) }
+          : {}),
       });
       pending.add(operation);
       void operation.then(
@@ -307,6 +327,13 @@ export interface DispatchCandidateOptions {
    * correct but repeated work on a filesystem-bound path.
    */
   readonly project?: ProjectProfile;
+  /**
+   * Resolves a redacted basename against raw saves, handed down to the planner.
+   * Supplied only when the run's projection redacts action targets — under any
+   * other policy a full-path proposal is used exactly as proposed, and no
+   * inference about the model's view happens at all.
+   */
+  readonly resolveRedactedSave?: (basename: string) => string | null;
   readonly now?: () => Date;
   /**
    * Disposition of the event that triggered this prediction. A late event
@@ -316,6 +343,31 @@ export interface DispatchCandidateOptions {
    * ever ingest in order.
    */
   readonly triggerDisposition?: IngestDisposition;
+}
+
+/**
+ * The one raw save whose target ends with this basename, or null.
+ *
+ * Null covers both honest failures — nothing saved under that name, and two
+ * files sharing it. The ambiguity case is the safety-critical one: resolving a
+ * shared basename by picking either match would run tests for a file nobody
+ * proposed, so both matches mean no answer. Only `file_saved` actions count,
+ * because that is the fact `run_tests`' guard checks against; other action
+ * kinds carry targets but are not what a test run is authorized on.
+ */
+export function uniqueSaveTarget(
+  state: WorldState,
+  base: string,
+): string | null {
+  const targets = state.recentActions
+    .filter((action) => action.kind === "file_saved" && action.target !== null)
+    .map((action) => action.target!)
+    .filter((target) => {
+      const segments = target.split(/[\\/]/u);
+      return segments[segments.length - 1] === base;
+    });
+  const unique = new Set(targets);
+  return unique.size === 1 ? [...unique][0]! : null;
 }
 
 export async function dispatchTopCandidate(
@@ -365,6 +417,9 @@ export async function dispatchTopCandidate(
         ? {}
         : { workingDirectory: options.workingDirectory }),
       ...(options.project === undefined ? {} : { project: options.project }),
+      ...(options.resolveRedactedSave === undefined
+        ? {}
+        : { resolveRedactedSave: options.resolveRedactedSave }),
     },
   );
   if (isPlanFailure(planned)) {

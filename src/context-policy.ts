@@ -11,6 +11,17 @@ import { cloneWorldState } from "./world-state.js";
 export interface ContextPolicy {
   readonly id: string;
   project(state: WorldState): WorldState;
+  /**
+   * Whether this policy narrows action targets, the field `run_tests` plans
+   * from. A caller dispatching under such a policy knows its candidates may
+   * carry basenames for what raw state holds as paths — the fact issue #9
+   * turned into a silent refusal — and can resolve them before planning.
+   *
+   * A declared property rather than an id comparison: "does this policy
+   * redact targets" is a capability of the policy, and hardcoding ids would
+   * make every new policy silently claim the wrong answer.
+   */
+  readonly redactsActionTargets: boolean;
 }
 
 /**
@@ -20,6 +31,7 @@ export interface ContextPolicy {
  */
 export class PassthroughContextPolicy implements ContextPolicy {
   public readonly id = "passthrough";
+  public readonly redactsActionTargets = false;
 
   public project(state: WorldState): WorldState {
     return cloneWorldState(state);
@@ -59,12 +71,17 @@ const REDACTED = "[redacted]";
  */
 export class RedactingContextPolicy implements ContextPolicy {
   public readonly id = "redacting";
+  public readonly redactsActionTargets: boolean;
   private readonly allow: ReadonlySet<RedactableContextField>;
   private readonly maxTextLength: number;
 
   public constructor(options: RedactingContextPolicyOptions = {}) {
     this.allow = new Set(options.allow ?? []);
     this.maxTextLength = options.maxTextLength ?? 512;
+    // Declared from the same allow-set the projection reads, so the two can
+    // never disagree: allowing the field here means the projection above
+    // really does send targets whole.
+    this.redactsActionTargets = !this.allow.has("actionTargets");
   }
 
   public project(state: WorldState): WorldState {

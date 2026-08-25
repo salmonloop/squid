@@ -299,7 +299,23 @@ function searchSelectionDescriptor(): ToolDescriptor {
       if (page === null) return refuse("browser_page_missing");
 
       const predicted = candidate?.parameters.selection;
-      if (typeof predicted !== "string" || predicted !== text.selection) return refuse("selection_changed");
+      if (typeof predicted !== "string" || predicted !== text.selection) {
+        // A strict prefix is the shape redaction leaves: the policy caps the
+        // selection it shows a provider, so a model proposing from that view
+        // carries the head of the truth, not a different selection. Still
+        // refused — sending the first half of what someone selected is not
+        // searching their selection — but named for its cause rather than
+        // folded into a generic mismatch (issue #9).
+        if (
+          typeof predicted === "string"
+          && predicted.length > 0
+          && predicted.length < text.selection.length
+          && text.selection.startsWith(predicted)
+        ) {
+          return refuse("selection_truncated");
+        }
+        return refuse("selection_changed");
+      }
       if (plan.arguments.query !== text.selection) return refuse("selection_changed");
 
       const foreground = state.focus === null

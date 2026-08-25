@@ -379,6 +379,10 @@ export async function startWatchSession(
     actionTrust: resolved.selection.actionTrust,
     egressPolicy: egress,
     project,
+    // Declared by the policy itself, so a policy that stops redacting targets
+    // stops arming resolution with no edit here — and one that starts cannot
+    // be missed.
+    redactsActionTargets: resolved.selection.contextPolicy.redactsActionTargets,
   });
   if (actions !== undefined && "configError" in actions) {
     // Vacuous today — no source has started, so nothing can be in flight — but the
@@ -488,6 +492,10 @@ export async function startWatchSession(
         outcome,
         outcome.candidates,
         ingested.ingest.disposition,
+        // Raw state of this ingest: the ground truth a redacted basename is
+        // resolved against. Passed on every dispatch — arming happens inside,
+        // keyed on whether the projection actually redacts.
+        ingested.ingest.state,
       );
       if (dispatched === null) return;
       // Status and reason codes only: gateway text may echo user content, so

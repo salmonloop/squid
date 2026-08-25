@@ -70,9 +70,23 @@ describe("PassthroughContextPolicy", () => {
     projected.recentFiles.push("mutated");
     expect(state.recentFiles).toHaveLength(2);
   });
+
+  it("declares that action targets arrive whole", () => {
+    // The declaration dispatch reads to decide whether basename resolution is
+    // armed (issue #9). Passthrough sends targets as they are, so a proposal
+    // is always a real path and no inference about the model's view happens.
+    expect(new PassthroughContextPolicy().redactsActionTargets).toBe(false);
+  });
 });
 
 describe("RedactingContextPolicy", () => {
+  it("declares target redaction from the same allow-set the projection reads", () => {
+    // Default narrows; allowing the field widens. The declaration and the
+    // projection cannot disagree because both read this.allow.
+    expect(new RedactingContextPolicy().redactsActionTargets).toBe(true);
+    expect(new RedactingContextPolicy({ allow: ["actionTargets"] }).redactsActionTargets).toBe(false);
+  });
+
   it("redacts window titles while keeping the focused application", () => {
     const projected = new RedactingContextPolicy().project(sensitiveState());
 
