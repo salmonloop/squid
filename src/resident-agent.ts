@@ -7,6 +7,9 @@ import {
   type ModelRuntime,
   type PiSessionHandle,
 } from "./pi-session-factory.js";
+import { sensePromptLines } from "./agent-senses.js";
+import type { ToolSummary } from "./tool-catalog.js";
+import type { WorldState } from "./protocol.js";
 
 /**
  * The resident agent: one long-lived Pi session that is the system's subject.
@@ -31,6 +34,12 @@ export interface ResidentSession {
   waitForIdle(): Promise<void>;
   abort(): Promise<void>;
   getLastAssistantText(): string | undefined;
+  /**
+   * Append an observation to the session history without triggering a turn.
+   * The agent sees it as context on its next prompt — this is how senses feed
+   * memory: a running log of what happened, not an interruption.
+   */
+  observe(customType: string, content: string): Promise<void>;
   dispose(): void;
 }
 
@@ -72,6 +81,11 @@ function adaptHandle(handle: PiSessionHandle): ResidentSession {
     waitForIdle: () => handle.session.waitForIdle(),
     abort: () => handle.session.abort(),
     getLastAssistantText: () => handle.session.getLastAssistantText(),
+    observe: (customType, content) =>
+      handle.session.sendCustomMessage(
+        { customType, content, display: false },
+        { triggerTurn: false },
+      ),
     dispose: () => handle.dispose(),
   };
 }
@@ -83,8 +97,54 @@ export interface CreateResidentAgentOptions {
   readonly cwd: string;
   /** Inline extensions (guards, senses, audit) wired at creation. Phase 0: empty. */
   readonly extensionFactories?: readonly InlineExtension[];
+  /** The tool catalog the agent sees in every context injection. */
+  readonly tools?: readonly ToolSummary[];
   /** Injected in tests; defaults to the real Pi-backed factory. */
   readonly createSession?: ResidentSessionFactory;
+}
+
+/**
+ * The mutable sense buffer a resident agent holds between observations.
+ * `observe` updates it; the `on("context")` hook reads it before every LLM call
+ * to inject the current world-state snapshot. Separated so the hook closure can
+ * be constructed once (at session creation) yet always see fresh state.
+ */
+export interface SenseBuffer {
+  state: WorldState | null;
+  tools: readonly ToolSummary[];
+}
+
+/**
+ * Builds the inline extension that injects the current sense snapshot before
+ * every LLM call. The agent reads "what the world looks like right now" each
+ * time it thinks — not a stale snapshot from the last prompt.
+ *
+ * The injected message is a `custom` message (not a user message): it is system-
+ * supplied context, not something the user said. `convertToLlm` renders custom
+ * messages as user-role content for the LLM, so the model sees them.
+ */
+export function senseExtension(buffer: SenseBuffer): InlineExtension {
+  return {
+    name: "squid-senses",
+    hidden: true,
+    factory: (pi) => {
+      pi.on("context", () => {
+        if (buffer.state === null) return;
+        const lines = sensePromptLines(buffer.state, buffer.tools);
+        return {
+          messages: [
+            {
+              role: "custom",
+              customType: "sense",
+              content: lines.join("\n"),
+              display: false,
+              timestamp: 0,
+            },
+          ],
+        };
+      });
+    },
+  };
 }
 
 export interface ResidentAgent {
@@ -96,6 +156,13 @@ export interface ResidentAgent {
   abort(): Promise<void>;
   /** The agent's last assistant reply, if any. */
   getLastAssistantText(): string | undefined;
+  /**
+   * Feed the agent a new world-state snapshot. Updates the live sense buffer
+   * (so the next LLM call sees it) and appends a one-line observation to the
+   * session history (so the agent remembers the event happened). Does not
+   * trigger a turn — the agent acts on its next prompt.
+   */
+  observe(state: WorldState): Promise<void>;
   /** Tear down the session. After this, further calls throw. */
   dispose(): void;
 }
@@ -110,13 +177,24 @@ export interface ResidentAgent {
 export async function createResidentAgent(
   options: CreateResidentAgentOptions,
 ): Promise<ResidentAgent> {
+  // The sense buffer lives outside the session so the on("context") hook —
+  // constructed once at session creation — always reads fresh state. observe()
+  // writes here; the hook reads here.
+  const senseBuffer: SenseBuffer = {
+    state: null,
+    tools: options.tools ?? [],
+  };
+
+  const extensions: InlineExtension[] = [
+    senseExtension(senseBuffer),
+    ...(options.extensionFactories ?? []),
+  ];
+
   const factory = options.createSession ?? createDefaultResidentSession;
   const session = await factory({
     systemPrompt: options.systemPrompt,
     cwd: options.cwd,
-    ...(options.extensionFactories !== undefined
-      ? { extensionFactories: options.extensionFactories }
-      : {}),
+    extensionFactories: extensions,
   });
 
   let disposed = false;
@@ -140,6 +218,15 @@ export async function createResidentAgent(
     getLastAssistantText(): string | undefined {
       guardLive();
       return session.getLastAssistantText();
+    },
+    async observe(state: WorldState): Promise<void> {
+      guardLive();
+      senseBuffer.state = state;
+      // A one-line observation appended to history: the event kind and the
+      // time. The full state is in the context injection; the history line is
+      // the breadcrumb the agent can refer back to after the snapshot moves on.
+      const summary = state.lastEventKind ?? "state_update";
+      await session.observe("observation", `${summary} @ ${state.updatedAt ?? "(unknown)"}`);
     },
     dispose(): void {
       if (disposed) return;
