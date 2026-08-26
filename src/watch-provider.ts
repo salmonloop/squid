@@ -1,5 +1,6 @@
 import { HeuristicPredictor } from "./baseline-predictor.js";
 import type { BeliefOutcome } from "./belief-provider.js";
+import type { BeliefProvider } from "./belief-provider.js";
 import type { BeliefStateBatch } from "./belief-state.js";
 import {
   PassthroughContextPolicy,
@@ -187,6 +188,18 @@ function resolveContextPolicy(
   };
 }
 
+/**
+ * The producer's own reachability check as a gate hook, or null when the
+ * producer declares none. Narrowing once here keeps the optional method off
+ * every call site that consumes it.
+ */
+function probeProducer(
+  producer: BeliefProvider,
+): (() => Promise<string | null>) | null {
+  const check = producer.checkAvailability;
+  return check === undefined ? null : () => check.call(producer);
+}
+
 async function resolveCognitionProvider(
   gate: ProviderGateMode,
   env: Record<string, string | undefined>,
@@ -269,6 +282,8 @@ async function resolveCognitionProvider(
     ...(observe && observed ? { onOutcome: observeOutcome } : {}),
   });
 
+  const probe = probeProducer(producer);
+
   const createGateProvider = () => new BeliefBackedPredictionProvider(
     new BeliefRerankCognition(),
     buildResolver(false),
@@ -294,9 +309,11 @@ async function resolveCognitionProvider(
         // for the gate to skip — which reads as "not evaluated", the one verdict that
         // must not admit. A model that is merely unreachable must skip rather than fail,
         // since an outage is not evidence about the producer.
-        ...(beliefProvider.probeAvailability === null
-          ? {}
-          : { probeAvailability: beliefProvider.probeAvailability }),
+        // Probed on the already-created producer rather than a throwaway: a
+        // model-backed provider opens its model runtime in its constructor, so
+        // constructing one just to check availability would start — and never
+        // dispose — a second runtime beside the live one.
+        ...(probe === null ? {} : { probeAvailability: probe }),
         // A model call runs 7–15s against the configured endpoint, and the gate makes
         // one per cut point. The default coordinator timeout would score a reachable
         // producer as a failure for being slow.

@@ -24,24 +24,25 @@ describe("resolveBeliefProvider", () => {
     expect((await resolved.createProvider()).name).toBe("heuristic-belief");
   });
 
-  it("offers no availability probe for the heuristic", () => {
+  it("the heuristic producer declares no availability check", async () => {
     // An in-process producer cannot be unavailable, and a probe that always succeeds
     // would only add a way for the gate to skip — which reads as "not evaluated", the
     // one verdict that must not admit.
     const resolved = resolveBeliefProvider({ env: {} });
     if ("configError" in resolved) throw new Error(resolved.configError);
-    expect(resolved.probeAvailability).toBeNull();
+    const producer = await resolved.createProvider();
+    expect(producer.checkAvailability).toBeUndefined();
   });
 
-  it("selects the model-backed producer on request", () => {
+  it("selects the model-backed producer on request, with its own check", () => {
     const resolved = resolveBeliefProvider({ env: { SQUID_BELIEF_PROVIDER: "pi" } });
     if ("configError" in resolved) throw new Error(resolved.configError);
 
     expect(resolved.kind).toBe("pi");
-    // A probe exists here because reachability is a real question about a hosted
-    // endpoint: an outage must skip a gate rather than fail it. Not invoked — that
-    // would contact a model from the offline suite.
-    expect(resolved.probeAvailability).not.toBeNull();
+    // Reachability is declared on the producer instance, not on this resolution —
+    // probing by fresh construction would start a second model runtime. Not invoked;
+    // constructing the provider here would also contact nothing until checkAvailability,
+    // but the constructor starts a runtime, so the offline suite never builds one.
   });
 
   it("refuses an unrecognized producer rather than falling back", () => {

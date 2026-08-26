@@ -27,14 +27,6 @@ export type BeliefProviderResolution =
     readonly kind: BeliefProviderKind;
     /** Built on demand. Call once per provider instance the caller needs. */
     readonly createProvider: () => Promise<BeliefProvider>;
-    /**
-     * Reports whether the producer's model is reachable, or null when reachability is
-     * not a question worth asking. The heuristic is in-process and cannot be
-     * unavailable, so it answers null rather than supplying a probe that always
-     * succeeds — a probe that cannot fail only adds a way for a gate to skip, which
-     * reads as "not evaluated", the one verdict that must not admit.
-     */
-    readonly probeAvailability: (() => Promise<string | null>) | null;
   }
   | { readonly configError: string };
 
@@ -53,7 +45,6 @@ export function resolveBeliefProvider(
         const { HeuristicBeliefProvider } = await import("./heuristic-belief-provider.js");
         return new HeuristicBeliefProvider();
       },
-      probeAvailability: null,
     };
   }
   if (raw !== "pi") {
@@ -62,17 +53,14 @@ export function resolveBeliefProvider(
     };
   }
 
+  // Reachability lives on the provider instance (`checkAvailability`), not on
+  // this resolution: probing by fresh construction would start a second model
+  // runtime beside the live producer's and keep it forever.
   return {
     kind: "pi",
     createProvider: async () => {
       const { PiBeliefProvider } = await import("./pi-belief-provider.js");
       return new PiBeliefProvider();
-    },
-    // Resolved once up front by the caller, so an outage declines with a stated reason
-    // instead of surfacing as a refused batch on every event.
-    probeAvailability: async () => {
-      const { PiBeliefProvider } = await import("./pi-belief-provider.js");
-      return new PiBeliefProvider().checkAvailability();
     },
   };
 }
