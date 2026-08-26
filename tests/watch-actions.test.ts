@@ -1,13 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { z } from "zod";
 import { InMemoryEventStore } from "../src/event-store.js";
-import { CapabilityDispatcher } from "../src/capability-gateway.js";
+import { CapabilityDispatcher, FakeCapabilityGateway } from "../src/capability-gateway.js";
 import type { ActionConfirmationPolicy } from "../src/action-confirmation.js";
 import {
   resolveSearchEgress,
@@ -15,7 +11,6 @@ import {
   SEARCH_EGRESS_DENY_ID,
   type EgressPolicy,
 } from "../src/action-egress.js";
-import { McpCapabilityGateway } from "../src/mcp-gateway.js";
 import { PredictionCoordinator } from "../src/prediction-coordinator.js";
 import { InMemoryPredictionLedger } from "../src/prediction-ledger.js";
 import { PredictionRuntime } from "../src/prediction-runtime.js";
@@ -77,36 +72,10 @@ async function restampedRequiredPlan(
 
 /**
  * The dispatch loop is tested end-to-end through the production objects: a real
- * MCP server over the in-memory transport, a real gateway, a real dispatcher,
- * and a real runtime whose projection is built by ingesting real events — the
- * same chain a live run executes, minus only the stdio wire.
+ * gateway, a real dispatcher, and a real runtime whose projection is built by
+ * ingesting real events — the same chain a live run executes, minus only the Pi
+ * session that would do the work.
  */
-async function connectCapabilityServer(queries: string[], commands: string[]): Promise<Client> {
-  const server = new McpServer({ name: "test-server", version: "0.0.1" });
-  server.registerTool(
-    "search_web",
-    { inputSchema: { query: z.string().min(1) } },
-    async ({ query }) => {
-      queries.push(query);
-      return { content: [{ type: "text", text: `results for ${query}` }] };
-    },
-  );
-  server.registerTool(
-    "run_command",
-    { inputSchema: { command: z.string().min(1) } },
-    async ({ command }) => {
-      commands.push(command);
-      return { content: [{ type: "text", text: `ran ${command}` }] };
-    },
-  );
-  const client = new Client({ name: "squid-test", version: "0.0.1" });
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  await Promise.all([
-    client.connect(clientTransport),
-    server.connect(serverTransport),
-  ]);
-  return client;
-}
 
 /** Events that put a selection in a browser window, owned end to end. */
 function browserSelection(selection: string): readonly ActivityEvent[] {
@@ -210,9 +179,7 @@ async function setup(options: {
   readonly egressPolicy?: EgressPolicy;
 }) {
   const egressPolicy = options.egressPolicy ?? ALLOW;
-  const queries: string[] = [];
-  const commands: string[] = [];
-  const client = await connectCapabilityServer(queries, commands);
+  const gateway = new FakeCapabilityGateway({ details: { tool: "executor", summary: "ok" } });
   const ledger = new InMemoryPredictionLedger();
   const runtime = new PredictionRuntime(
     new SquidCore(new InMemoryEventStore()),
@@ -230,7 +197,6 @@ async function setup(options: {
       egressPolicyId: egressPolicy.id,
     },
   );
-  const gateway = new McpCapabilityGateway({ client });
   const dispatcher = new CapabilityDispatcher({
     runtime,
     gateway,
@@ -248,15 +214,13 @@ async function setup(options: {
   await runtime.awaitIdle();
 
   return {
-    queries,
-    commands,
+    gateway,
     ledger,
     dispatcher,
     requestId,
     egressPolicy,
     close: async () => {
       await runtime.dispose();
-      await client.close();
     },
   };
 }
@@ -280,7 +244,7 @@ describe("resolveWatchActions", () => {
       outcome = await resolveWatchActions(
         unreachable("runtime"),
         unreachable("ledger"),
-        { SQUID_ACTIONS_MCP_COMMAND: "bun server.ts" },
+        { },
       );
     } catch (error) {
       expect((error as Error).message).toContain("Connection closed");
@@ -289,22 +253,22 @@ describe("resolveWatchActions", () => {
     expect(outcome).not.toHaveProperty("configError");
   });
 
-  it("still fails startup when the explicit spelling names no command", async () => {
+  it("rejects the retired mcp spelling rather than silently mapping it", async () => {
+    // SQUID_ACTIONS=mcp named a server to spawn; that transport is gone. The
+    // value must fail startup, not quietly mean local.
     const resolution = await resolveWatchActions(
       unreachable("runtime"),
       unreachable("ledger"),
       { SQUID_ACTIONS: "mcp" },
     );
-    expect(resolution).toEqual({
-      configError: "SQUID_ACTIONS=mcp requires SQUID_ACTIONS_MCP_COMMAND.",
-    });
+    expect(resolution).toEqual({ configError: 'SQUID_ACTIONS must be "local" or unset.' });
   });
 
   it("rejects actions for a provider admitted only in suggestion mode before opening MCP", async () => {
     const resolution = await resolveWatchActions(
       unreachable("runtime"),
       unreachable("ledger"),
-      { SQUID_ACTIONS: "mcp", SQUID_ACTIONS_MCP_COMMAND: "bun server.ts" },
+      { SQUID_ACTIONS: "local" },
       { actionTrust: "suggestion_only" },
     );
     expect(resolution).toEqual({
@@ -320,8 +284,7 @@ describe("resolveWatchActions", () => {
         unreachable("runtime"),
         unreachable("ledger"),
         {
-          SQUID_ACTIONS: "mcp",
-          SQUID_ACTIONS_MCP_COMMAND: "bun server.ts",
+          SQUID_ACTIONS: "local",
           SQUID_SEARCH_EGRESS: value,
         },
       );
@@ -334,15 +297,9 @@ describe("resolveWatchActions", () => {
     expect(resolution).toHaveProperty("configError");
   });
 
-  it("reports a config error for mcp mode without a command", async () => {
-    const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), { SQUID_ACTIONS: "mcp" });
-    expect(resolution).toHaveProperty("configError");
-  });
-
   it("rejects an invalid confirmation mode before touching dependencies", async () => {
     const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), {
-      SQUID_ACTIONS: "mcp",
-      SQUID_ACTIONS_MCP_COMMAND: "bun run server.ts",
+      SQUID_ACTIONS: "local",
       SQUID_ACTION_CONFIRM: "always",
     });
     expect(resolution).toHaveProperty("configError");
@@ -350,8 +307,7 @@ describe("resolveWatchActions", () => {
 
   it("rejects a malformed timeout before touching dependencies", async () => {
     const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), {
-      SQUID_ACTIONS: "mcp",
-      SQUID_ACTIONS_MCP_COMMAND: "bun run server.ts",
+      SQUID_ACTIONS: "local",
       SQUID_ACTION_CONFIRM_TIMEOUT_MS: "zero",
     });
     expect(resolution).toHaveProperty("configError");
@@ -359,8 +315,7 @@ describe("resolveWatchActions", () => {
 
   it("requires some confirmation mode when a confirmation timeout is configured", async () => {
     const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), {
-      SQUID_ACTIONS: "mcp",
-      SQUID_ACTIONS_MCP_COMMAND: "bun run server.ts",
+      SQUID_ACTIONS: "local",
       SQUID_ACTION_CONFIRM_TIMEOUT_MS: "1000",
     });
     expect(resolution).toHaveProperty("configError");
@@ -368,8 +323,7 @@ describe("resolveWatchActions", () => {
 
   it("requires an absolute working directory for terminal confirmation", async () => {
     const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), {
-      SQUID_ACTIONS: "mcp",
-      SQUID_ACTIONS_MCP_COMMAND: "bun run server.ts",
+      SQUID_ACTIONS: "local",
       SQUID_ACTION_CONFIRM: "terminal",
       SQUID_ACTION_WORKDIR: "relative/project",
     });
@@ -386,8 +340,7 @@ describe("resolveWatchActions", () => {
    */
   it("requires a graphical UI command for graphical confirmation", async () => {
     const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), {
-      SQUID_ACTIONS: "mcp",
-      SQUID_ACTIONS_MCP_COMMAND: "bun run server.ts",
+      SQUID_ACTIONS: "local",
       SQUID_ACTION_CONFIRM: "graphical",
       SQUID_ACTION_WORKDIR: "/workspace",
     });
@@ -397,8 +350,7 @@ describe("resolveWatchActions", () => {
   it("rejects a graphical UI command without graphical confirmation", async () => {
     for (const confirmationMode of [undefined, "terminal"]) {
       const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), {
-        SQUID_ACTIONS: "mcp",
-        SQUID_ACTIONS_MCP_COMMAND: "bun run server.ts",
+        SQUID_ACTIONS: "local",
         SQUID_ACTION_WORKDIR: "/workspace",
         SQUID_GRAPHICAL_UI_COMMAND: "squid-ui",
         ...(confirmationMode === undefined ? {} : { SQUID_ACTION_CONFIRM: confirmationMode }),
@@ -410,8 +362,7 @@ describe("resolveWatchActions", () => {
   it("rejects a graphical UI command that would need a shell", async () => {
     for (const command of ["squid-ui && echo nope", "squid-ui $HOME", "squid-ui `echo x`"]) {
       const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), {
-        SQUID_ACTIONS: "mcp",
-        SQUID_ACTIONS_MCP_COMMAND: "bun run server.ts",
+        SQUID_ACTIONS: "local",
         SQUID_ACTION_CONFIRM: "graphical",
         SQUID_ACTION_WORKDIR: "/workspace",
         SQUID_GRAPHICAL_UI_COMMAND: command,
@@ -424,8 +375,7 @@ describe("resolveWatchActions", () => {
 
   it("requires a working directory for graphical confirmation", async () => {
     const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), {
-      SQUID_ACTIONS: "mcp",
-      SQUID_ACTIONS_MCP_COMMAND: "bun run server.ts",
+      SQUID_ACTIONS: "local",
       SQUID_ACTION_CONFIRM: "graphical",
       SQUID_GRAPHICAL_UI_COMMAND: "squid-ui",
     });
@@ -435,8 +385,7 @@ describe("resolveWatchActions", () => {
   it("rejects control characters in the action working directory before opening MCP", async () => {
     for (const workingDirectory of ["/workspace/line\nbreak", "/workspace/escape\u001b[2J"]) {
       const resolution = await resolveWatchActions(unreachable("runtime"), unreachable("ledger"), {
-        SQUID_ACTIONS: "mcp",
-        SQUID_ACTIONS_MCP_COMMAND: "bun run server.ts",
+        SQUID_ACTIONS: "local",
         SQUID_ACTION_CONFIRM: "terminal",
         SQUID_ACTION_WORKDIR: workingDirectory,
       });
@@ -601,7 +550,7 @@ describe("egress policy agreement", () => {
     const confirmation: ActionConfirmationPolicy = {
       confirm: async () => ({ outcome: "accepted", reason: "user_accepted" }),
     };
-    const { commands, dispatcher, requestId, egressPolicy, close } = await setup({
+    const { gateway, dispatcher, requestId, egressPolicy, close } = await setup({
       candidates,
       events: editorSave("tests/foo.test.ts"),
       confirmation,
@@ -618,7 +567,7 @@ describe("egress policy agreement", () => {
     );
 
     expect(result?.status).toBe("dispatched");
-    expect(commands).toHaveLength(1);
+    expect(gateway.recordedInvocations).toHaveLength(1);
     await close();
   });
 });
@@ -629,7 +578,7 @@ describe("dispatchTopCandidate", () => {
       confidence: 0.8,
       parameters: { selection: "typebox" },
     })];
-    const { queries, dispatcher, requestId, egressPolicy, close } = await setup({
+    const { gateway, dispatcher, requestId, egressPolicy, close } = await setup({
       candidates,
       events: browserSelection("typebox"),
     });
@@ -643,7 +592,7 @@ describe("dispatchTopCandidate", () => {
 
     expect(result?.status).toBe("dispatched");
     expect(result?.action?.outcome).toBe("succeeded");
-    expect(queries).toEqual(["typebox"]);
+    expect(gateway.recordedInvocations.map(p => p.arguments.query)).toEqual(["typebox"]);
     await close();
   });
 
@@ -652,7 +601,7 @@ describe("dispatchTopCandidate", () => {
       confidence: 0.8,
       parameters: { selection: "typebox" },
     })];
-    const { queries, dispatcher, requestId, egressPolicy, close } = await setup({
+    const { gateway, dispatcher, requestId, egressPolicy, close } = await setup({
       candidates,
       events: browserSelection("typebox"),
       egressPolicy: DENY,
@@ -666,7 +615,7 @@ describe("dispatchTopCandidate", () => {
     );
 
     expect(result?.status).toBe("not_admitted");
-    expect(queries).toEqual([]);
+    expect(gateway.recordedInvocations).toEqual([]);
     await close();
   });
 
@@ -675,7 +624,7 @@ describe("dispatchTopCandidate", () => {
       confidence: 0.8,
       parameters: { selection: "stale text" },
     })];
-    const { queries, dispatcher, requestId, egressPolicy, close } = await setup({
+    const { gateway, dispatcher, requestId, egressPolicy, close } = await setup({
       candidates,
       // The world holds a different selection than the candidate predicted on.
       events: browserSelection("current text"),
@@ -690,7 +639,7 @@ describe("dispatchTopCandidate", () => {
 
     expect(result?.status).toBe("not_admitted");
     expect(result?.reasonCode).toBe("selection_changed");
-    expect(queries).toEqual([]);
+    expect(gateway.recordedInvocations).toEqual([]);
     await close();
   });
 
@@ -706,7 +655,7 @@ describe("dispatchTopCandidate", () => {
     // descriptors are bypassed by decision (issue #11), so a real plan no longer
     // asks for confirmation — but a plan that *does* must still be refused when
     // nothing is wired to ask. This is coverage of that refusal.
-    const { commands, dispatcher, requestId, egressPolicy, close } = await setup({
+    const { gateway, dispatcher, requestId, egressPolicy, close } = await setup({
       candidates,
       events: editorSave("tests/foo.test.ts"),
       workingDirectory: root,
@@ -724,7 +673,7 @@ describe("dispatchTopCandidate", () => {
 
     expect(result.status).toBe("not_accepted");
     expect(result.reasonCode).toBe("confirmation_policy_missing");
-    expect(commands).toEqual([]);
+    expect(gateway.recordedInvocations).toEqual([]);
     await close();
   });
 
@@ -739,7 +688,7 @@ describe("dispatchTopCandidate", () => {
     const confirmation: ActionConfirmationPolicy = {
       confirm: async () => ({ outcome: "accepted", reason: "user_accepted" }),
     };
-    const { commands, dispatcher, requestId, egressPolicy, close } = await setup({
+    const { gateway, dispatcher, requestId, egressPolicy, close } = await setup({
       candidates,
       events: editorSave("tests/foo.test.ts"),
       confirmation,
@@ -755,8 +704,8 @@ describe("dispatchTopCandidate", () => {
     );
 
     expect(result?.status).toBe("dispatched");
-    expect(commands).toHaveLength(1);
-    expect(commands[0]).toContain("bun test -- tests/foo.test.ts");
+    expect(gateway.recordedInvocations).toHaveLength(1);
+    expect(gateway.recordedInvocations[0]?.arguments.command).toContain("bun test -- tests/foo.test.ts");
     await close();
   });
 
@@ -773,7 +722,7 @@ describe("dispatchTopCandidate", () => {
     };
     // Required plan restamped for the same reason as the missing-policy test
     // above: the mechanism is what is under test, not the current declaration.
-    const { commands, ledger, dispatcher, requestId, close } = await setup({
+    const { gateway, ledger, dispatcher, requestId, close } = await setup({
       candidates,
       events: editorSave("tests/foo.test.ts"),
       confirmation,
@@ -792,7 +741,7 @@ describe("dispatchTopCandidate", () => {
 
     expect(result.status).toBe("not_accepted");
     expect(result.reasonCode).toBe("user_rejected");
-    expect(commands).toEqual([]);
+    expect(gateway.recordedInvocations).toEqual([]);
     const records = await ledger.all();
     expect(records.filter((r) => r.recordType === "plan_decision")).toHaveLength(1);
     expect(records.filter((r) => r.recordType === "plan_dispatch")).toHaveLength(0);
@@ -805,7 +754,7 @@ describe("dispatchTopCandidate", () => {
       confidence: 0.9,
       parameters: { selection: "typebox" },
     })];
-    const { queries, ledger, dispatcher, requestId, egressPolicy, close } = await setup({
+    const { gateway, ledger, dispatcher, requestId, egressPolicy, close } = await setup({
       candidates,
       events: browserSelection("typebox"),
     });
@@ -819,7 +768,7 @@ describe("dispatchTopCandidate", () => {
 
     // Refused before planning: no plan record, no claim, no tool call.
     expect(result).toBeNull();
-    expect(queries).toEqual([]);
+    expect(gateway.recordedInvocations).toEqual([]);
     const records = await ledger.all();
     expect(records.filter((r) => r.recordType === "plan")).toHaveLength(0);
     expect(records.filter((r) => r.recordType === "plan_dispatch")).toHaveLength(0);
@@ -831,7 +780,7 @@ describe("dispatchTopCandidate", () => {
       expiresAt: new Date(Date.now() - 1000).toISOString(),
       parameters: { selection: "stale" },
     })];
-    const { queries, dispatcher, requestId, egressPolicy, close } = await setup({
+    const { gateway, dispatcher, requestId, egressPolicy, close } = await setup({
       candidates,
       events: browserSelection("stale"),
     });
@@ -844,7 +793,7 @@ describe("dispatchTopCandidate", () => {
     );
 
     expect(result).toBeNull();
-    expect(queries).toEqual([]);
+    expect(gateway.recordedInvocations).toEqual([]);
     await close();
   });
 
@@ -855,7 +804,7 @@ describe("dispatchTopCandidate", () => {
       candidate("draft_completion", { confidence: 0.9, parameters: { prefix: "x" } }),
       candidate("search_selection", { confidence: 0.2, parameters: { selection: "typebox" } }),
     ];
-    const { queries, dispatcher, requestId, egressPolicy, close } = await setup({
+    const { gateway, dispatcher, requestId, egressPolicy, close } = await setup({
       candidates,
       events: browserSelection("typebox"),
     });
@@ -868,7 +817,7 @@ describe("dispatchTopCandidate", () => {
     );
 
     expect(result).toBeNull();
-    expect(queries).toEqual([]);
+    expect(gateway.recordedInvocations).toEqual([]);
     await close();
   });
 
@@ -877,7 +826,7 @@ describe("dispatchTopCandidate", () => {
       candidate("search_selection", { confidence: 0.1, parameters: { selection: "low" } }),
       candidate("search_selection", { confidence: 0.8, parameters: { selection: "typebox" } }),
     ];
-    const { queries, dispatcher, requestId, egressPolicy, close } = await setup({
+    const { gateway, dispatcher, requestId, egressPolicy, close } = await setup({
       candidates,
       events: browserSelection("typebox"),
     });
@@ -890,7 +839,7 @@ describe("dispatchTopCandidate", () => {
     );
 
     expect(result?.status).toBe("dispatched");
-    expect(queries).toEqual(["typebox"]);
+    expect(gateway.recordedInvocations.map(p => p.arguments.query)).toEqual(["typebox"]);
     await close();
   });
 });

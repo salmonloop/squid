@@ -1,20 +1,15 @@
 import { describe, expect, it } from "bun:test";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { z } from "zod";
 import {
   SEARCH_EGRESS_DENY_ID,
   type EgressPolicy,
 } from "../src/action-egress.js";
 import { RedactingContextPolicy } from "../src/context-policy.js";
-import { CapabilityDispatcher } from "../src/capability-gateway.js";
+import { CapabilityDispatcher, FakeCapabilityGateway } from "../src/capability-gateway.js";
 import { InMemoryEventStore } from "../src/event-store.js";
 import { FakePredictionProvider, candidate } from "../src/fake-prediction-provider.js";
-import { McpCapabilityGateway } from "../src/mcp-gateway.js";
 import { PredictionCoordinator } from "../src/prediction-coordinator.js";
 import { InMemoryPredictionLedger } from "../src/prediction-ledger.js";
 import { PredictionRuntime } from "../src/prediction-runtime.js";
@@ -55,20 +50,9 @@ const nextRequestId = () => {
   return () => `redacted-${++sequence}`;
 };
 
-async function connectRunCommandServer(commands: string[]): Promise<Client> {
-  const server = new McpServer({ name: "run-server", version: "0.0.1" });
-  server.registerTool(
-    "run_command",
-    { inputSchema: { command: z.string().min(1) } },
-    async ({ command }) => {
-      commands.push(command);
-      return { content: [{ type: "text", text: "ok" }] };
-    },
-  );
-  const client = new Client({ name: "squid-test", version: "0.0.1" });
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
-  return client;
+/** A gateway that records invocations instead of running them. */
+function recordingGateway() {
+  return new FakeCapabilityGateway({ details: { tool: "run_tests", summary: "ok" } });
 }
 
 /**
@@ -128,8 +112,7 @@ async function setupRedacted(options: {
   /** Raw save targets; the last one is the newest save the guard checks. */
   readonly savePaths: readonly string[];
 }) {
-  const commands: string[] = [];
-  const client = await connectRunCommandServer(commands);
+  const gateway = recordingGateway();
   const ledger = new InMemoryPredictionLedger();
   const policy = new RedactingContextPolicy();
 
@@ -189,10 +172,10 @@ async function setupRedacted(options: {
   if (rawState === null || proposed === null || requestId === "") {
     throw new Error("setup produced no projection or no candidate");
   }
-  const dispatcher = new CapabilityDispatcher({ runtime, gateway: new McpCapabilityGateway({ client }), ledger });
+  const dispatcher = new CapabilityDispatcher({ runtime, gateway, ledger });
 
   return {
-    commands,
+    gateway,
     dispatcher,
     requestId,
     rawState,
@@ -200,7 +183,6 @@ async function setupRedacted(options: {
     proposed: proposed as ReturnType<typeof candidate>,
     close: async () => {
       await runtime.dispose();
-      await client.close();
     },
   };
 }
@@ -229,8 +211,8 @@ describe("run_tests under a redacting provider (issue #9)", () => {
     );
 
     expect(result?.status).toBe("dispatched");
-    expect(setup.commands).toHaveLength(1);
-    expect(setup.commands[0]).toContain("bun test -- src/deep/main.test.ts");
+    expect(setup.gateway.recordedInvocations).toHaveLength(1);
+    expect(setup.gateway.recordedInvocations[0]?.arguments.command).toContain("bun test -- src/deep/main.test.ts");
     await setup.close();
   });
 
@@ -257,7 +239,7 @@ describe("run_tests under a redacting provider (issue #9)", () => {
     );
 
     expect(result?.status).toBe("dispatched");
-    expect(setup.commands[0]).toContain("bun test -- tests/foo.test.ts");
+    expect(setup.gateway.recordedInvocations[0]?.arguments.command).toContain("bun test -- tests/foo.test.ts");
     await setup.close();
   });
 
@@ -291,7 +273,7 @@ describe("run_tests under a redacting provider (issue #9)", () => {
     );
 
     expect(result).toBeNull();
-    expect(setup.commands).toEqual([]);
+    expect(setup.gateway.recordedInvocations).toEqual([]);
     await setup.close();
   });
 
@@ -326,7 +308,7 @@ describe("run_tests under a redacting provider (issue #9)", () => {
     );
 
     expect(result).toBeNull();
-    expect(setup.commands).toEqual([]);
+    expect(setup.gateway.recordedInvocations).toEqual([]);
     await setup.close();
   });
 

@@ -1,18 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { z } from "zod";
 import {
   SEARCH_EGRESS_ALLOW_ID,
   SEARCH_EGRESS_DENY_ID,
   type EgressPolicy,
 } from "../src/action-egress.js";
 import { BrowserPageActivitySource, type BrowserPageFrame } from "../src/browser-page-source.js";
-import { CapabilityDispatcher } from "../src/capability-gateway.js";
+import { CapabilityDispatcher, FakeCapabilityGateway } from "../src/capability-gateway.js";
 import { InMemoryEventStore } from "../src/event-store.js";
 import { FakePredictionProvider, candidate } from "../src/fake-prediction-provider.js";
-import { McpCapabilityGateway } from "../src/mcp-gateway.js";
 import { PredictionCoordinator } from "../src/prediction-coordinator.js";
 import { InMemoryPredictionLedger } from "../src/prediction-ledger.js";
 import { PredictionRuntime } from "../src/prediction-runtime.js";
@@ -41,21 +36,7 @@ const nextRequestId = () => {
   return () => `search-${++sequence}`;
 };
 
-async function connectSearchServer(queries: string[]): Promise<Client> {
-  const server = new McpServer({ name: "search-server", version: "0.0.1" });
-  server.registerTool(
-    "search_web",
-    { inputSchema: { query: z.string().min(1) } },
-    async ({ query }) => {
-      queries.push(query);
-      return { content: [{ type: "text", text: "results" }] };
-    },
-  );
-  const client = new Client({ name: "squid-test", version: "0.0.1" });
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
-  return client;
-}
+
 
 /** The foreground facts a screen source produces, before the page is observed. */
 function foreground(): readonly ActivityEvent[] {
@@ -104,14 +85,12 @@ function selectionEvents(selection: string): readonly ActivityEvent[] {
 interface Harness {
   readonly runtime: PredictionRuntime;
   readonly dispatcher: CapabilityDispatcher;
-  readonly queries: string[];
+  readonly gateway: FakeCapabilityGateway;
   readonly ledger: InMemoryPredictionLedger;
   dispose(): Promise<void>;
 }
 
 async function harness(egressPolicy: EgressPolicy): Promise<Harness> {
-  const queries: string[] = [];
-  const client = await connectSearchServer(queries);
   const ledger = new InMemoryPredictionLedger();
   const runtime = new PredictionRuntime(
     new SquidCore(new InMemoryEventStore()),
@@ -128,19 +107,19 @@ async function harness(egressPolicy: EgressPolicy): Promise<Harness> {
       egressPolicyId: egressPolicy.id,
     },
   );
+  const gateway = new FakeCapabilityGateway({ details: { tool: "search_web", summary: "results" } });
   const dispatcher = new CapabilityDispatcher({
     runtime,
-    gateway: new McpCapabilityGateway({ client }),
+    gateway,
     ledger,
   });
   return {
     runtime,
     dispatcher,
-    queries,
+    gateway,
     ledger,
     dispose: async () => {
       await runtime.dispose();
-      await client.close();
     },
   };
 }
@@ -210,8 +189,9 @@ describe("search admission with a real browser source", () => {
 
       expect(dispatched?.status).toBe("dispatched");
       expect(dispatched?.action?.outcome).toBe("succeeded");
-      // The MCP server received the actual selection: the whole chain ran.
-      expect(h.queries).toEqual([SELECTION]);
+      // The gateway received the actual selection as the plan's query: the
+      // whole chain ran.
+      expect(h.gateway.recordedInvocations[0]?.arguments.query).toEqual(SELECTION);
     } finally {
       await h.dispose();
     }
@@ -250,7 +230,7 @@ describe("search admission with a real browser source", () => {
       // `SQUID_SEARCH_EGRESS` are different variables.
       expect(dispatched?.status).toBe("not_admitted");
       expect(dispatched?.reasonCode).toBe("search_egress_denied");
-      expect(h.queries).toEqual([]);
+      expect(h.gateway.recordedInvocations).toEqual([]);
     } finally {
       await h.dispose();
     }
@@ -281,7 +261,7 @@ describe("search admission with a real browser source", () => {
 
       expect(dispatched?.status).toBe("not_admitted");
       expect(dispatched?.reasonCode).toBe("browser_page_missing");
-      expect(h.queries).toEqual([]);
+      expect(h.gateway.recordedInvocations).toEqual([]);
     } finally {
       await h.dispose();
     }
@@ -301,7 +281,7 @@ describe("search admission with a real browser source", () => {
       // change exactly like a mismatched one. Refusing is the safe direction.
       expect(dispatched?.status).toBe("not_admitted");
       expect(dispatched?.reasonCode).toBe("browser_page_missing");
-      expect(h.queries).toEqual([]);
+      expect(h.gateway.recordedInvocations).toEqual([]);
     } finally {
       await h.dispose();
     }
@@ -320,7 +300,7 @@ describe("search admission with a real browser source", () => {
 
       expect(dispatched?.status).toBe("not_admitted");
       expect(dispatched?.reasonCode).toBe("browser_page_missing");
-      expect(h.queries).toEqual([]);
+      expect(h.gateway.recordedInvocations).toEqual([]);
     } finally {
       await h.dispose();
     }
@@ -340,7 +320,7 @@ describe("search admission with a real browser source", () => {
 
       expect(dispatched?.status).toBe("not_admitted");
       expect(dispatched?.reasonCode).toBe("selection_changed");
-      expect(h.queries).toEqual([]);
+      expect(h.gateway.recordedInvocations).toEqual([]);
     } finally {
       await h.dispose();
     }
