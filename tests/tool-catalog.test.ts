@@ -38,11 +38,13 @@ describe("summarizeTools", () => {
       type: "object",
       properties: {
         commandClass: {
+          // No `build` literal: re-running a build tells the user nothing the
+          // failure did not already, so the schema never offers it (restored
+          // from the first inspect_error implementation's exclusion list).
           anyOf: [
             { type: "string", const: "test" },
             { type: "string", const: "lint" },
             { type: "string", const: "typecheck" },
-            { type: "string", const: "build" },
           ],
         },
       },
@@ -69,6 +71,34 @@ describe("summarizeTools", () => {
       project: { ecosystem: "unknown", commands: {} },
     }));
     expect(summaries.map((summary) => summary.id)).toEqual(["run_tests", "search_selection"]);
+  });
+
+  it("offers no run_check to a project whose only declared check is build", () => {
+    // The regression this pins: an earlier refactor dropped the re-runnable
+    // allow-list, so a declared build script made `build` a legal commandClass
+    // and a failed build proposed re-running itself. Build is excluded for the
+    // reason the first inspect_error implementation gave — it only rewrites
+    // output, so re-running tells the user nothing new — so declaring nothing
+    // but build means no re-runnable check exists at all.
+    const summaries = summarizeTools(buildToolRegistry({
+      project: { ecosystem: "bun", commands: { build: ["bun", "run", "build"] } },
+    }));
+    expect(summaries.map((summary) => summary.id)).toEqual(["run_tests", "search_selection"]);
+  });
+
+  it("keeps build out of the schema even beside other declared checks", () => {
+    const summaries = summarizeTools(buildToolRegistry({
+      project: {
+        ecosystem: "bun",
+        commands: {
+          test: ["bun", "test"],
+          build: ["bun", "run", "build"],
+        },
+      },
+    }));
+    const runCheck = summaries.find((summary) => summary.id === "run_check");
+    expect(runCheck).toBeDefined();
+    expect(JSON.stringify(runCheck!.parameters)).not.toContain('"build"');
   });
 });
 
