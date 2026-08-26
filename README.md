@@ -104,10 +104,10 @@ bun run watch:screen
 - `src/action-confirmation.ts` — the confirmation engine and the port a surface implements. One `ActionConfirmationPolicy` implementation, `SerialConfirmationPolicy`, owns the entire fail-closed matrix: prompts are serialized, expiry and timeout race against each other and are reported apart, and an unavailable surface, a thrown surface, closed input, and shutdown all refuse. A `ConfirmationSurface` therefore decides nothing — it renders a question and reports one answer. `ConfirmationPrompt` is a four-scalar projection with no `arguments` field, so no surface can render the selection even if it tried.
 - `src/confirmation-surface-terminal.ts` — the terminal surface. Only explicit `y`/`yes` accepts; a non-TTY, an empty line, and anything else refuse.
 - `src/confirmation-surface-graphical.ts` — the graphical surface and its `GraphicalTransport` port, so the window's location (another process, eventually another machine) is not baked into the surface. `close()` forwards to the transport, because the engine's shutdown is the only thing that can reach a spawned UI.
-- `src/graphical-transport-stdio.ts` — line-delimited JSON over a spawned child's stdio, the same cross-process shape the MCP client already uses. Every prompt carries a monotonic `promptId` and an answer settles the pending ask only on a match: the engine abandons a prompt on timeout and moves to the next candidate, so an uncorrelated late reply would let a click about one plan authorize another. An abort sends `cancel` so the abandoned window closes rather than inviting a click nobody is waiting for.
+- `src/graphical-transport-stdio.ts` — line-delimited JSON over a spawned child's stdio, the same cross-process shape a confirmation surface uses. Every prompt carries a monotonic `promptId` and an answer settles the pending ask only on a match: the engine abandons a prompt on timeout and moves to the next candidate, so an uncorrelated late reply would let a click about one plan authorize another. An abort sends `cancel` so the abandoned window closes rather than inviting a click nobody is waiting for.
 - `ui/` — the Rust/Slint binary that surface spawns. Fully native rendering, no webview; `winit` and `femtovg` are pinned in `Cargo.toml` so a future default change in Slint cannot substitute one. It shows `kind`, `summary`, and expiry and holds no other field. Policy stays in TypeScript: the window writes one correlated answer per click and is otherwise silent, and silence is read as a timeout, never as consent. Closing the window declines rather than hanging, which releases the serial queue for the next candidate.
-- `src/mcp-gateway.ts` — the first real `CapabilityGateway`: executes an approved plan through a connected MCP client (`@modelcontextprotocol/sdk`). It does no planning. Its only remaining judgment is re-resolving the plan's canonical paths immediately before the call, which catches a symlink swapped in after approval — and it may only *verify* the plan it was given, never correct it. A protocol error (`isError`) is a `failed` result; a thrown call is rethrown, because only the dispatcher may decide what an unknown outcome means.
-- `src/watch-actions.ts` — wires the action half of the closed loop into both watch entry points. `resolveWatchActions` validates every variable — including `SQUID_SEARCH_EGRESS` — before opening the stdio MCP client, so a typo fails startup instead of surfacing once a server is running. `dispatchTopCandidate` considers only the top-confidence candidate: falling back to a lower one when the best is refused would mean quietly doing something the ranking did not choose. A late trigger is refused before any planning work.
+- `src/process-gateway.ts` — the real `CapabilityGateway`: executes an approved plan by handing it to a Pi agent session. Pi is the execution base — its own toolbelt (read, bash, edit, write) and its extension/skill ecosystem do the work, so this file owns no tool registry and grows no backend per capability. It does no planning. Its only remaining judgment is re-resolving the plan's canonical paths immediately before the session starts, which catches a symlink swapped in after approval — and it may only *verify* the plan it was given, never correct it. Every tool call the session makes is recorded (`tool_execution_start`) so the audit trail shows the full path the agent took, not just the terminal outcome. A session that settles without calling any tool is a `failed` result ("completed without performing any action"); a thrown session is rethrown, because only the dispatcher may decide what an unknown outcome means.
+- `src/watch-actions.ts` — wires the action half of the closed loop into both watch entry points. `resolveWatchActions` validates every variable — including `SQUID_SEARCH_EGRESS` — before constructing the gateway, so a typo fails startup instead of surfacing once a session is running. `dispatchTopCandidate` considers only the top-confidence candidate: falling back to a lower one when the best is refused would mean quietly doing something the ranking did not choose. A late trigger is refused before any planning work.
 - `src/fake-prediction-provider.ts` — controllable `PredictionProvider` for tests and offline evaluation.
 - `src/pi-runtime.ts` — Pi adapter that implements `PredictionProvider`, requests one typed prediction via a terminating custom tool, respects `AbortSignal`, derives `expiresAt` per kind, and reports model reachability via `checkAvailability()`. Isolated behind an adapter so Node/RPC remains a fallback if deeper Bun incompatibilities appear.
 - `src/squid-core.ts` — orchestrates event ingestion, state reduction, and baseline prediction.
@@ -183,10 +183,9 @@ SQUID_PROVIDER=cognition SQUID_PROVIDER_GATE=replay bun run watch:desktop       
 ```bash
 SQUID_PROVIDER=pi SQUID_PROVIDER_GATE=off bun run watch:desktop -- /absolute/project/root
 
-# Full loop, unmeasured: model predicts, plans, and dispatches, with the
-# world-state admission checks still applied on every attempt.
-SQUID_PROVIDER=cognition SQUID_PROVIDER_GATE=off SQUID_ACTIONS=mcp \
-SQUID_ACTIONS_MCP_COMMAND="bun run mcp-server.ts" \
+# Full loop, unmeasured: model predicts, plans, and dispatches through a Pi
+# session, with the world-state admission checks still applied on every attempt.
+SQUID_PROVIDER=cognition SQUID_PROVIDER_GATE=off SQUID_ACTIONS=local \
 bun run watch:desktop -- /absolute/project/root
 ```
 
@@ -396,32 +395,30 @@ The macOS backend is real but not verifiable here: it needs a darwin host with a
 
 ### Dispatching actions
 
-Both watch entry points can close the loop from prediction to action. With an MCP server command named (with or without the explicit `SQUID_ACTIONS=mcp`), each settled prediction's single top-confidence candidate is considered — never a lower-confidence fallback, and never a candidate from a late-arriving event. Confirmation is bypassed by default: every registered tool declares `confirmation: "none"`, so a proposal runs as soon as admission's world-state checks pass. `SQUID_ACTION_CONFIRM=terminal` or `graphical` restores prompting with no other change. The plan, any user decision, the claim, and the terminal outcome are written to the same ledger as the prediction attempt, as digests rather than raw text.
+Both watch entry points can close the loop from prediction to action. With `SQUID_ACTIONS=local`, each settled prediction's single top-confidence candidate is considered — never a lower-confidence fallback, and never a candidate from a late-arriving event. The approved plan is handed to a Pi agent session, whose own toolbelt (read, bash, edit, write) and extension/skill ecosystem do the work; the gateway records every tool call the session makes and sanitizes the executor's summary before it reaches the ledger. Confirmation is bypassed by default: every registered tool declares `confirmation: "none"`, so a proposal runs as soon as admission's world-state checks pass. `SQUID_ACTION_CONFIRM=terminal` or `graphical` restores prompting with no other change. The plan, any user decision, the claim, and the terminal outcome are written to the same ledger as the prediction attempt, as digests rather than raw text.
 
 ```bash
 # Search needs explicit consent to send selected text off the machine.
-SQUID_ACTIONS_MCP_COMMAND="bun run /path/to/mcp-server.ts" bun run watch:screen -- frames.json
+SQUID_ACTIONS=local bun run watch:screen -- frames.json
 
 # Also allow run_tests after showing the exact command and receiving y/yes.
-SQUID_ACTIONS=mcp \
-SQUID_ACTIONS_MCP_COMMAND='bun run "/path with spaces/mcp-server.ts"' \
+SQUID_ACTIONS=local \
 SQUID_ACTION_CONFIRM=terminal \
 SQUID_ACTION_CONFIRM_TIMEOUT_MS=30000 \
 bun run watch:files -- /absolute/project/root
 
 # Same gate, asked in a native window instead of the terminal.
-SQUID_ACTIONS=mcp \
-SQUID_ACTIONS_MCP_COMMAND='bun run /path/to/mcp-server.ts' \
+SQUID_ACTIONS=local \
 SQUID_ACTION_CONFIRM=graphical \
 SQUID_GRAPHICAL_UI_COMMAND=/path/to/squid/ui/target/release/squid-ui \
 bun run watch:desktop -- /absolute/project/root
 ```
 
-Actions are on whenever `SQUID_ACTIONS_MCP_COMMAND` names a server — the command is the capability's real opt-in, and the older `SQUID_ACTIONS=mcp` spelling still works beside it. With neither, actions stay off. `SQUID_SEARCH_EGRESS` has three outcomes: unset allows search to send text, the exact string `deny` withholds it, and any other value is a startup configuration error rather than a silent fallback in either direction.
+Actions are on whenever `SQUID_ACTIONS=local` is set. With it unset, actions stay off. The retired `SQUID_ACTIONS=mcp` spelling (which named an MCP server to spawn) fails startup rather than silently mapping to `local`. `SQUID_SEARCH_EGRESS` has three outcomes: unset allows search to send text, the exact string `deny` withholds it, and any other value is a startup configuration error rather than a silent fallback in either direction.
 
 `SQUID_ACTION_CONFIRM` selects the surface, not the rules. `terminal` accepts only `y` or `yes`; `graphical` opens the native window from `ui/` and accepts only a click on Approve. Everything else refuses in both and records the reason: any other answer, timeout, shutdown, an expired candidate, a surface that cannot be reached at all (no TTY, or no UI binary), and a surface that dies mid-question. Expiry is checked before prompting and again after acceptance, so a candidate that goes stale while the question sits on screen is refused after the click.
 
-`SQUID_ACTION_CONFIRM_TIMEOUT_MS` belongs to the engine rather than to either surface and requires `SQUID_ACTION_CONFIRM`. `SQUID_GRAPHICAL_UI_COMMAND` is required by — and only accepted with — `SQUID_ACTION_CONFIRM=graphical`; it is parsed into an executable plus literal arguments under the same no-shell rule as the MCP command. Build the binary it names with `cargo build --release` in `ui/`.
+`SQUID_ACTION_CONFIRM_TIMEOUT_MS` belongs to the engine rather than to either surface and requires `SQUID_ACTION_CONFIRM`. `SQUID_GRAPHICAL_UI_COMMAND` is required by — and only accepted with — `SQUID_ACTION_CONFIRM=graphical`; it is parsed into an executable plus literal arguments under a no-shell rule. Build the binary it names with `cargo build --release` in `ui/`.
 
 The window needs a display at run time, and its X11 dependencies are dynamically loaded rather than linked — so a build that succeeds proves nothing about whether a window can open. On a bare Linux host, `libxkbcommon-x11` in particular is absent often enough to be worth naming: without it the process aborts on the first prompt. It runs under a virtual display (`xvfb-run -a squid-ui`), which is how the smoke run below drives it headlessly; a real session needs no wrapper.
 
@@ -433,7 +430,7 @@ bun run ui:smoke
 
 That run is not a substitute for `cargo test` — it is the only check that covers what unit tests structurally cannot: that a window actually maps, that a click reaches the answer channel, and that a refusal stays a refusal on screen.
 
-`watch:desktop` and `watch:files` execute tests from the canonical watched root; `watch:screen` uses its launch directory. `SQUID_ACTION_WORKDIR=/absolute/path` overrides either. The predicted path must remain inside that root. The MCP server command is parsed into an executable plus literal arguments and launched directly, never through a shell: quoted spaces are supported, while variables, substitutions, pipes, redirects, comments, and globs are rejected. This protects server startup configuration separately from the deliberately shell-shaped `run_command` string sent to the MCP server.
+`watch:desktop` and `watch:files` execute tests from the canonical watched root; `watch:screen` uses its launch directory. `SQUID_ACTION_WORKDIR=/absolute/path` overrides either. The predicted path must remain inside that root. The Pi executor session runs in that working directory, and the plan's target must still resolve inside it at execution time — a symlink swapped in between planning and execution is caught and refused.
 
 ### Which entry point can admit which action
 
@@ -453,16 +450,15 @@ An admission rule reads the *whole* projection, so what a run can do depends on 
 ```bash
 # Terminal observation, with a shell hook appending to the path.
 SQUID_TERMINAL=fifo SQUID_TERMINAL_FIFO=/absolute/path/commands.jsonl \
-SQUID_ACTIONS=mcp SQUID_ACTION_CONFIRM=terminal \
-SQUID_ACTIONS_MCP_COMMAND="bun run /path/to/mcp-server.ts" \
+SQUID_ACTIONS=local SQUID_ACTION_CONFIRM=terminal \
 bun run watch:desktop -- /absolute/project/root
 ```
 
 Browser observation still requires naming a backend (`SQUID_BROWSER=synthetic` or `darwin`) — there is no default browser to observe, so this is capability selection rather than permission. Egress is no longer a second gate: unset already allows sending; `SQUID_SEARCH_EGRESS=deny` is the explicit restriction.
 
 ```bash
-# Search end to end: observe pages, allow egress, and give it a tool to call.
-SQUID_BROWSER=synthetic SQUID_ACTIONS_MCP_COMMAND="bun run /path/to/mcp-server.ts" \
+# Search end to end: observe pages and allow egress; the Pi session does the work.
+SQUID_BROWSER=synthetic SQUID_ACTIONS=local \
 bun run watch:desktop -- /absolute/project/root
 
 # Scripted pages instead of the built-in demo (third positional argument).
@@ -584,11 +580,11 @@ Tests use `bun:test`. The test suite covers:
 - `CapabilityGateway`: fake-gateway outcomes, failure details, and thrown invocations; `CapabilityDispatcher` recording the plan, confirming, claiming, and invoking exactly once, never invoking on rejection or without a confirmation policy, recording a structured tool failure as terminal, reporting `reconciliation_required` (never `failed`) when the gateway throws after the claim, refusing a second dispatch of a claimed plan, refusing a plan whose attempt never persisted, and keeping raw command text out of the ledger.
 - Action plan and admission: planner canonicalization through `realpath` (symlinked roots, targets that do not exist yet), traversal/absolute/control-character refusals, digest stability across key order, frozen plans, and the full admission refusal matrix — attempt, session, episode, digest, generation, late trigger, trust, policy, expiry, plus per-kind checks for selection identity, owner agreement, observation ordering, egress, coding application, and saved path.
 - Plan dispatch state machine: claim refused before acceptance, claimed exactly once with an opaque token stored only as a hash, metadata divergence refused, completion only with the exact token, idempotent replay, conflicting outcomes refused, eight parallel claims yielding one winner, cross-restart reconciliation on a real SQLite file, system-side invalidation that never forges a user rejection, and dispatch-lifecycle kinds rejected at the feedback schema boundary.
-- Action planning and confirmation: exact plan reuse between prompt and MCP execution, project-root confinement, shell argument quoting, `--` option termination, explicit yes/no behavior, fail-closed non-TTY/timeout/expiry/input-close/shutdown behavior, and serialized prompts.
+- Action planning and confirmation: exact plan reuse between prompt and execution, project-root confinement, shell argument quoting, `--` option termination, explicit yes/no behavior, fail-closed non-TTY/timeout/expiry/input-close/shutdown behavior, and serialized prompts.
 - Both confirmation surfaces against one shared conformance suite (`tests/confirmation-surface-conformance.ts`), so the fail-closed matrix is proven per surface rather than per engine — a surface that only refuses correctly in the terminal is not a surface. Plus, per surface: that the graphical one sends `summary` and never `arguments`, re-checks availability on every ask instead of caching it, and forwards the engine's `close()` to its transport, which is the only thing that stops a spawned window from outliving the daemon.
 - `createStdioGraphicalTransport` against a stub UI process, one per failure mode: answers passed through, a process that exits mid-question, garbage on stdout, a binary that does not exist, one kept-alive process serving a second prompt, an abort settling the pending ask and closing the window, and an answer whose `promptId` does not match being dropped rather than applied to the ask that replaced it.
 - `ui/`: the wire parser under `cargo test`, including the cases a substring scan would fail — a `"kind":` appearing inside a `summary` value, a duplicate key trying to override the first, `\uXXXX` escapes and astral surrogate pairs, a lone surrogate, and a raw control character.
-- `McpCapabilityGateway`: real MCP server over the in-memory transport — `selection`→`search_web({query})` and safe rooted `path`→`run_command({command})` mapping, unmapped kinds refused, candidates failing their tool contract refused before any call, MCP error results carrying the server's message, thrown handlers becoming failed outcomes, and schema-invalid arguments rejected by the server's own validation.
+- `ProcessCapabilityGateway`: the execution gateway hands an approved plan to a one-shot Pi agent session, re-resolves the plan's paths immediately before the session starts (catching a symlink swapped after approval), records every tool call the session makes for the audit trail, and treats a session that settles without calling any tool as a failed outcome. Offline tests exercise the gateway's contract through `FakeCapabilityGateway`; a live Pi session is exercised by the runtime gate.
 - Async evaluation: provider-based evaluation matching sync results, canned-provider scoring, hard timeout, and heuristic fallback.
 - `runProviderGate`: baseline-equal pass, ranking regression failure, skip (not failure) for an unconstructable provider and for a lazily-resolved provider that reports itself unavailable without spending a baseline run, skip when the probe itself rejects, scoring when the probe reports available, failure for a provider that never answers despite baseline-equal ranking, timeouts counted as fallbacks, full health for a healthy provider, `none`-correctness failure for an over-eager provider, same-corpus comparison, custom slack, and default-threshold bounds.
 - Deterministic replay evaluation: cut-point ranking, MRR, coverage, future-leakage guard, per-scenario predictor isolation, and report stability.
