@@ -160,9 +160,25 @@ function stripUrlSecrets(url: string, host: string): string {
 }
 
 /** Last path segment, preserving both separator conventions. */
-function basename(path: string): string {
+export function basename(path: string): string {
   const segments = path.split(/[/\\]/);
   return segments[segments.length - 1] ?? path;
+}
+
+/**
+ * Whether a proposal's shape is one this policy could have produced.
+ *
+ * Exported beside `basename` because the pair is one contract: a target is
+ * narrowed to its last segment, so a proposal with no separator at all is
+ * exactly the shape redaction leaves — and the resolver that maps such a
+ * proposal back to raw state must agree on that shape or the round trip
+ * breaks. The planner consults this instead of re-deriving it by regex, and
+ * `uniqueSaveTarget` matches with the same function that produced the
+ * narrowed value, so tightening the narrowing (say, to two segments) breaks
+ * compilation here rather than silently reviving issue #9 at run time.
+ */
+export function isRedactedTargetShape(value: string): boolean {
+  return !/[\\/]/u.test(value);
 }
 
 function keepTail(text: string, max: number): string {
