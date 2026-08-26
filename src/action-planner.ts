@@ -140,7 +140,7 @@ export async function planAction(
   };
 
   const registry = context.project !== undefined
-    ? new ToolRegistry(registryForProject(context.project))
+    ? buildToolRegistry({ project: context.project })
     : await defaultRegistry(context.workingDirectory);
 
   // The candidate names the tool; the kind only groups. A null toolId is a fact
@@ -204,11 +204,6 @@ export async function planAction(
     canonicalWorkingDirectory: rendered.canonicalWorkingDirectory,
     canonicalTarget: rendered.canonicalTarget,
   }, parameters);
-}
-
-/** Descriptors for one project's declared capabilities, in prompt order. */
-function registryForProject(project: ProjectProfile) {
-  return buildToolRegistry({ project }).all;
 }
 
 async function defaultRegistry(

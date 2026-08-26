@@ -342,8 +342,21 @@ function searchSelectionDescriptor(): ToolDescriptor {
  * `plan_kind_unsupported` would misreport "the world moved" as "the capability
  * vanished".
  */
+/**
+ * Built once. The guards are pure world-state checks over module constants, so
+ * every construction would be identical — and admitAction runs inside the
+ * serial projection critical section, where per-call allocation of three
+ * descriptors and a four-literal schema union blocks concurrent ingests for
+ * work whose answer never changes.
+ */
+const ADMISSION_DESCRIPTORS: readonly ToolDescriptor[] = [
+  runTestsDescriptor(),
+  runCheckDescriptor(projectChecks),
+  searchSelectionDescriptor(),
+];
+
 export function admissionDescriptors(): readonly ToolDescriptor[] {
-  return [runTestsDescriptor(), runCheckDescriptor(projectChecks), searchSelectionDescriptor()];
+  return ADMISSION_DESCRIPTORS;
 }
 
 /**
