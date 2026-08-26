@@ -4,7 +4,6 @@ import { describeErrorForAudit, resolveSearchEgress } from "./action-egress.js";
 import { CaptureGateActivitySource } from "./capture-gate-source.js";
 import { resolveCaptureGate } from "./resolve-capture-gate.js";
 import { HOUR_MS, resolveRetention } from "./resolve-retention.js";
-import { resolveBeliefProvider } from "./resolve-belief-provider.js";
 import { resolveShadowCognition } from "./resolve-shadow-cognition.js";
 import { evidenceTimeline } from "./belief-evidence.js";
 import { BeliefRerankCognition } from "./belief-rerank-cognition.js";
@@ -192,11 +191,12 @@ export async function startWatchSession(
    * configuration rather than only in the one that happens to observe it. The heuristic
    * branch loads no model graph, so the default pays nothing for this.
    */
-  const shadowBelief = resolveBeliefProvider({ env });
-  if ("configError" in shadowBelief) return { configError: shadowBelief.configError };
-  const shadowBeliefKind = shadowBelief.kind;
+  // From the resolution the provider step already produced — one read of
+  // SQUID_BELIEF_PROVIDER per run, and live and shadow cannot disagree about
+  // which producer kind they name.
+  const shadowBeliefKind = resolved.belief.kind;
   const shadowBeliefProvider = shadow.enabled
-    ? await shadowBelief.createProvider()
+    ? await resolved.belief.createProvider()
     : undefined;
 
   // The project is detected once, here, and both halves of the action loop read

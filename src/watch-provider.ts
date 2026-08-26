@@ -1,6 +1,7 @@
 import { HeuristicPredictor } from "./baseline-predictor.js";
 import type { BeliefOutcome } from "./belief-provider.js";
 import type { BeliefProvider } from "./belief-provider.js";
+import type { BeliefProviderKind } from "./resolve-belief-provider.js";
 import type { BeliefStateBatch } from "./belief-state.js";
 import {
   PassthroughContextPolicy,
@@ -33,7 +34,21 @@ import { DEFAULT_PROVIDER_GATE_TIMEOUT_MS } from "./provider-gate.js";
  * model" true only of execution, not of startup.
  */
 export type WatchProviderResolution =
-  | { readonly ok: true; readonly selection: ProviderSelection }
+  | {
+    readonly ok: true;
+    readonly selection: ProviderSelection;
+    /**
+     * Which belief producer the run is configured for, and how to build one —
+     * threaded through because the shadow path needs a producer from the same
+     * variable, and a second `resolveBeliefProvider` call there would read env
+     * twice for one fact. The live cognition path builds its own instance
+     * internally; this factory exists for callers that need another one.
+     */
+    readonly belief: {
+      readonly kind: BeliefProviderKind;
+      readonly createProvider: () => Promise<BeliefProvider>;
+    };
+  }
   /** A recognized variable held an unrecognized value. The caller reports and exits. */
   | { readonly ok: false; readonly configError: string };
 
@@ -97,6 +112,26 @@ export async function resolveWatchProvider(
     return { ok: false, configError: 'SQUID_PROVIDER_GATE must be "probe", "replay", or "off".' };
   }
 
+  // Resolved in every mode — even ones that never use it — so a typo in the
+  // variable fails startup everywhere rather than only where a belief layer
+  // happens to be observed. The resolution itself is cheap: the producer is
+  // built on demand, and the default's module graph loads no model.
+  const beliefResolution = resolveBeliefProvider({ env });
+  if ("configError" in beliefResolution) {
+    return { ok: false, configError: beliefResolution.configError };
+  }
+  const belief = { kind: beliefResolution.kind, createProvider: beliefResolution.createProvider };
+
+  // The policy spelling is validated in every mode, not just the ones that
+  // consume it: a typo must fail startup wherever it appears, or the
+  // "unrecognized value is a startup error" contract holds only for some
+  // providers — and a heuristic run would silently take passthrough while an
+  // identical cognition run refused to start.
+  const contextPolicy = resolveContextPolicy(env);
+  if ("configError" in contextPolicy) {
+    return { ok: false, configError: contextPolicy.configError };
+  }
+
   if (mode === "heuristic") {
     return {
       ok: true,
@@ -104,16 +139,12 @@ export async function resolveWatchProvider(
         mode,
         heuristic: new HeuristicPredictor(),
       }),
+      belief,
     };
   }
 
   if (mode === "cognition") {
-    return resolveCognitionProvider(gate, env, options);
-  }
-
-  const contextPolicy = resolveContextPolicy(env);
-  if ("configError" in contextPolicy) {
-    return { ok: false, configError: contextPolicy.configError };
+    return resolveCognitionProvider(gate, env, options, belief);
   }
 
   const [{ PiRuntime }, { runProviderGate }, { heuristicEvaluationScenarios }] = await Promise.all([
@@ -141,7 +172,7 @@ export async function resolveWatchProvider(
     }),
   });
 
-  return { ok: true, selection };
+  return { ok: true, selection, belief };
 }
 
 /**
@@ -204,15 +235,15 @@ async function resolveCognitionProvider(
   gate: ProviderGateMode,
   env: Record<string, string | undefined>,
   options: ResolveWatchProviderOptions,
+  belief: {
+    readonly kind: BeliefProviderKind;
+    readonly createProvider: () => Promise<BeliefProvider>;
+  },
 ): Promise<WatchProviderResolution> {
   // Which producer sits behind the seam is a config question, answered before any
   // model graph loads: a typo must fail startup rather than silently run the
-  // deterministic rules while an operator believes a model is being scored.
-  const beliefProvider = resolveBeliefProvider({ env });
-  if ("configError" in beliefProvider) {
-    return { ok: false, configError: beliefProvider.configError };
-  }
-
+  // deterministic rules while an operator believes a model is being scored. The
+  // resolution itself arrives from the caller — one read of the variable per run.
   const contextPolicy = resolveContextPolicy(env);
   if ("configError" in contextPolicy) {
     return { ok: false, configError: contextPolicy.configError };
@@ -275,7 +306,7 @@ async function resolveCognitionProvider(
   // the model-backed one opens a model runtime in its constructor — the gate builds a
   // provider per scenario per replay, so constructing a producer alongside each would
   // open that runtime 57 times to answer 57 questions.
-  const producer = await beliefProvider.createProvider();
+  const producer = await belief.createProvider();
   const buildResolver = (observe: boolean) => createBeliefResolver({
     beliefProvider: producer,
     contextPolicyId: contextPolicy.policy.id,
@@ -291,6 +322,7 @@ async function resolveCognitionProvider(
 
   return {
     ok: true,
+    belief,
     selection: await selectPredictionProvider({
       mode: "cognition",
       gate,
@@ -317,7 +349,7 @@ async function resolveCognitionProvider(
         // A model call runs 7–15s against the configured endpoint, and the gate makes
         // one per cut point. The default coordinator timeout would score a reachable
         // producer as a failure for being slow.
-        ...(beliefProvider.kind === "heuristic" ? {} : { timeoutMs: BELIEF_GATE_TIMEOUT_MS }),
+        ...(belief.kind === "heuristic" ? {} : { timeoutMs: BELIEF_GATE_TIMEOUT_MS }),
       }),
     }),
   };
