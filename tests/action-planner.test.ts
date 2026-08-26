@@ -29,7 +29,6 @@ describe("planAction", () => {
     // capability nobody proposed.
     const result = await planAction({
       ...identity,
-      kind: "inspect_error",
       toolId: "no_such_tool",
       parameters: {},
     });
@@ -40,7 +39,7 @@ describe("planAction", () => {
     it("resolves a bare basename through the caller's resolver and plans the real file", async () => {
       const root = await workspace();
       const planned = await planAction(
-        { ...identity, kind: "run_tests", toolId: "run_tests", parameters: { path: "x.test.ts" } },
+        { ...identity, toolId: "run_tests", parameters: { path: "x.test.ts" } },
         {
           workingDirectory: root,
           project: bunProject,
@@ -58,7 +57,7 @@ describe("planAction", () => {
       const root = await workspace();
       let called = false;
       const planned = await planAction(
-        { ...identity, kind: "run_tests", toolId: "run_tests", parameters: { path: "src/x.test.ts" } },
+        { ...identity, toolId: "run_tests", parameters: { path: "src/x.test.ts" } },
         {
           workingDirectory: root,
           project: bunProject,
@@ -80,7 +79,7 @@ describe("planAction", () => {
       // guess here would run tests for a file nobody proposed.
       for (const resolution of [null, undefined]) {
         const planned = await planAction(
-          { ...identity, kind: "run_tests", toolId: "run_tests", parameters: { path: "x.test.ts" } },
+          { ...identity, toolId: "run_tests", parameters: { path: "x.test.ts" } },
           {
             workingDirectory: root,
             project: bunProject,

@@ -417,5 +417,3 @@ function refuse(reasonCode: AdmissionReasonCode): AdmissionResult {
   return { admitted: false, reasonCode };
 }
 
-export { isRenderFailure };
-export type { ToolRenderContext };

@@ -63,8 +63,6 @@ export type PlanFailureReason =
 export interface ActionPlanRequest {
   readonly candidateId: string;
   readonly attemptId: string;
-  /** The semantic category the candidate claims. Used only when it names no tool. */
-  readonly kind: PredictionCandidate["kind"];
   /**
    * The registered capability the candidate proposes, if it named one.
    *
@@ -129,7 +127,7 @@ export async function planAction(
   request: ActionPlanRequest,
   context: ActionPlanningContext = {},
 ): Promise<PlannedAction | ActionPlanFailure> {
-  const { kind, toolId, parameters, candidateId, attemptId } = request;
+  const { toolId, parameters, candidateId, attemptId } = request;
   const resolvePath = context.resolvePath ?? ((path: string) => realpath(path));
   const renderContext: ToolRenderContext = {
     ...(context.workingDirectory !== undefined
