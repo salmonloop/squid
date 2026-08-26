@@ -66,10 +66,26 @@ export function buildToolRegistry(options: BuildRegistryOptions = {}): ToolRegis
   return new ToolRegistry(descriptors);
 }
 
-/** Checks the project actually declares, in a stable order. */
+/**
+ * The classes a failed check may propose re-running itself.
+ *
+ * A subset of what terminal capture reports, because the exclusions are the
+ * point: `install` touches the network and a lockfile, `vcs` rewrites history,
+ * `container` can deploy — none of those may propose running themselves again.
+ * `build` is excluded for a weaker but real reason carried over from the first
+ * inspect_error implementation: it only rewrites build output, so re-running
+ * it tells the user nothing the failure did not already. A project declaring
+ * `scripts.build` therefore gets no run_check capability for build failures,
+ * and the schema never offers the literal — a model cannot propose what the
+ * catalog does not name.
+ */
+const REINSPECTABLE_CLASSES = ["test", "lint", "typecheck"] as const satisfies
+  readonly ProjectCheck[];
+
+/** Checks the project both declares and allows re-running, in a stable order. */
 export function declaredChecks(project: ProjectProfile | undefined): readonly ProjectCheck[] {
   if (project === undefined) return [];
-  return projectChecks.filter((check) => project.commands[check] !== undefined);
+  return REINSPECTABLE_CLASSES.filter((check) => project.commands[check] !== undefined);
 }
 
 /**
@@ -351,7 +367,7 @@ function searchSelectionDescriptor(): ToolDescriptor {
  */
 const ADMISSION_DESCRIPTORS: readonly ToolDescriptor[] = [
   runTestsDescriptor(),
-  runCheckDescriptor(projectChecks),
+  runCheckDescriptor(REINSPECTABLE_CLASSES),
   searchSelectionDescriptor(),
 ];
 
