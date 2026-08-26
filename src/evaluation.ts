@@ -1,6 +1,7 @@
 import { orderActivityEvents } from "./chronicle-ordering.js";
 import { InMemoryEventStore } from "./event-store.js";
 import type { Predictor } from "./baseline-predictor.js";
+import type { ToolSummary } from "./tool-catalog.js";
 import type { ContextPolicy } from "./context-policy.js";
 import type { ActivityEvent, PredictionCandidate, PredictionKind } from "./protocol.js";
 import { SquidCore } from "./squid-core.js";
@@ -73,6 +74,14 @@ export interface ProviderEvaluationOptions {
    * was given.
    */
   readonly contextPolicy?: ContextPolicy;
+  /**
+   * The tool catalog the live run attaches to every request. Settable for the
+   * same reason as the policy: a gate whose prompts omit the catalog scores a
+   * provider answering "no tools were supplied, name nothing" while the live
+   * run sends the full list — the verdict would describe a prompt that never
+   * executes.
+   */
+  readonly tools?: readonly ToolSummary[];
 }
 
 export async function evaluateScenarios(
@@ -108,6 +117,7 @@ export async function evaluateWithProvider(
       provider,
       ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
       ...(options.contextPolicy !== undefined ? { contextPolicy: options.contextPolicy } : {}),
+      ...(options.tools === undefined ? {} : { tools: options.tools }),
       random: () => {
         if (nextRequestId === null) {
           throw new Error("Evaluation coordinator requested an ID outside a cut point.");

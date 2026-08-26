@@ -1,3 +1,4 @@
+import type { ToolSummary } from "./tool-catalog.js";
 import type { ContextPolicy } from "./context-policy.js";
 import { evaluateWithProvider } from "./evaluation.js";
 import { runProviderGate, type ProviderGateResult, type ProviderGateThresholds } from "./provider-gate.js";
@@ -83,6 +84,12 @@ export interface SemanticGateOptions {
    * whatever id it was handed, so request and batch agree either way.
    */
   readonly contextPolicy?: ContextPolicy;
+  /**
+   * The tool catalog the live run sends, forwarded to both halves of this
+   * gate. Ranking and stability must score the prompt being authorized, and
+   * the live prompt carries the catalog.
+   */
+  readonly tools?: readonly ToolSummary[];
 }
 
 const MAX_REPORTED_UNSTABLE = 8;
@@ -104,6 +111,7 @@ export async function runSemanticGate(
     thresholds,
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     ...(options.contextPolicy === undefined ? {} : { contextPolicy: options.contextPolicy }),
+    ...(options.tools === undefined ? {} : { tools: options.tools }),
   });
 
   // A skip is not a pass and not a failure: an unreachable provider is not
@@ -161,6 +169,7 @@ async function measureStability(
       // different projection than ranking would let a provider pass two halves of
       // a gate that never agreed on what it was scoring.
       ...(options.contextPolicy === undefined ? {} : { contextPolicy: options.contextPolicy }),
+      ...(options.tools === undefined ? {} : { tools: options.tools }),
     });
     const topByCutPoint = new Map<string, string>();
     for (const result of report.results) {

@@ -1,5 +1,6 @@
 import { HeuristicPredictor } from "./baseline-predictor.js";
 import type { BeliefOutcome } from "./belief-provider.js";
+import type { ToolSummary } from "./tool-catalog.js";
 import type { BeliefProvider } from "./belief-provider.js";
 import type { BeliefProviderKind } from "./resolve-belief-provider.js";
 import type { BeliefStateBatch } from "./belief-state.js";
@@ -71,6 +72,12 @@ export interface WatchProviderBeliefBatch {
 }
 
 export interface ResolveWatchProviderOptions {
+  /**
+   * The tool catalog the live run attaches to every request. The replay gate
+   * scores the candidate against the same catalog, so the measured prompt is
+   * the prompt being authorized rather than a catalog-less stand-in.
+   */
+  readonly tools?: readonly ToolSummary[];
   /**
    * Reports belief outcomes for a cognition run.
    *
@@ -166,6 +173,13 @@ export async function resolveWatchProvider(
       scenarios: heuristicEvaluationScenarios,
       createProvider: () => new PiRuntime(),
       probeAvailability: () => new PiRuntime().checkAvailability(),
+      // The same policy the live selection carries. Without it the gate scores
+      // the model on unprojected fixtures while the live run projects through
+      // this policy — a measured pass describing a configuration that never
+      // executes, which is exactly the mismatch the cognition branch threads
+      // its own policy to avoid.
+      ...(contextPolicy.policy === undefined ? {} : { contextPolicy: contextPolicy.policy }),
+      ...(options.tools === undefined ? {} : { tools: options.tools }),
       // Matches `gate:pi`: well above the observed single-call latency, below
       // the point where a hung provider would stall startup indefinitely.
       timeoutMs: DEFAULT_PROVIDER_GATE_TIMEOUT_MS,
@@ -336,6 +350,7 @@ async function resolveCognitionProvider(
         scenarios: heuristicEvaluationScenarios,
         createProvider: createGateProvider,
         contextPolicy: contextPolicy.policy,
+        ...(options.tools === undefined ? {} : { tools: options.tools }),
         // Present only for a model-backed producer. The heuristic is in-process and
         // cannot be unavailable, and a probe that always succeeds would only add a way
         // for the gate to skip — which reads as "not evaluated", the one verdict that
