@@ -1,4 +1,3 @@
-import { Compile } from "typebox/compile";
 import { Type, type TSchema } from "typebox";
 import type { AdmissionContext, AdmissionResult } from "./action-admission.js";
 import type { ProjectCheck, ProjectProfile } from "./project-detect.js";
@@ -137,7 +136,6 @@ export function isRenderFailure(
  */
 export class ToolRegistry {
   private readonly byId = new Map<string, ToolDescriptor>();
-  private readonly validators = new Map<string, ReturnType<typeof Compile>>();
 
   public constructor(descriptors: readonly ToolDescriptor[] = []) {
     for (const descriptor of descriptors) this.register(descriptor);
@@ -148,39 +146,15 @@ export class ToolRegistry {
       throw new TypeError(`Tool ${descriptor.id} is already registered.`);
     }
     this.byId.set(descriptor.id, descriptor);
-    // Compiled once at registration. The validator is used on every prediction, and
-    // compiling per call would put schema compilation on the prediction path.
-    this.validators.set(descriptor.id, Compile(descriptor.parameters));
   }
 
   public get(toolId: string): ToolDescriptor | undefined {
     return this.byId.get(toolId);
   }
 
-  public has(toolId: string): boolean {
-    return this.byId.has(toolId);
-  }
-
   /** Registration order, which is the order a prompt lists them in. */
   public get all(): readonly ToolDescriptor[] {
     return [...this.byId.values()];
-  }
-
-  public get ids(): readonly string[] {
-    return [...this.byId.keys()];
-  }
-
-  /**
-   * True when these arguments satisfy the tool's schema.
-   *
-   * Separate from `render` so a caller can refuse a malformed proposal before doing
-   * filesystem work, and so the model-facing normalization and the planner share one
-   * answer about validity rather than each having an opinion.
-   */
-  public validateArguments(toolId: string, args: unknown): boolean {
-    const validator = this.validators.get(toolId);
-    if (validator === undefined) return false;
-    return validator.Check(args);
   }
 }
 
