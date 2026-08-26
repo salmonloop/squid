@@ -489,14 +489,14 @@ describe("createConfirmation", () => {
 
 describe("parseLiteralCommand", () => {
   it("preserves quoted arguments without starting a shell", () => {
-    expect(parseLiteralCommand('bun run "/tmp/server with spaces.ts"', "SQUID_ACTIONS_MCP_COMMAND")).toEqual({
+    expect(parseLiteralCommand('bun run "/tmp/server with spaces.ts"', "SQUID_GRAPHICAL_UI_COMMAND")).toEqual({
       command: "bun",
       args: ["run", "/tmp/server with spaces.ts"],
     });
   });
 
   it("rejects an empty executable", () => {
-    expect(parseLiteralCommand('\"\"', "SQUID_ACTIONS_MCP_COMMAND")).toHaveProperty("configError");
+    expect(parseLiteralCommand('\"\"', "SQUID_GRAPHICAL_UI_COMMAND")).toHaveProperty("configError");
   });
 
   it("rejects operators, variables, comments, and globs", () => {
@@ -507,22 +507,21 @@ describe("parseLiteralCommand", () => {
       "bun run *.ts",
       "bun run `echo server.ts`",
     ]) {
-      expect(parseLiteralCommand(command, "SQUID_ACTIONS_MCP_COMMAND")).toHaveProperty("configError");
+      expect(parseLiteralCommand(command, "SQUID_GRAPHICAL_UI_COMMAND")).toHaveProperty("configError");
     }
   });
 
   /**
-   * More than one variable now holds a spawnable command. A config error that
-   * blames the wrong one sends the operator to edit a variable that is already
-   * correct, so the message has to name the variable the value came from.
+   * The config error must name the variable the value came from, so an operator
+   * is sent to edit the right one. With one spawnable variable remaining
+   * (`SQUID_GRAPHICAL_UI_COMMAND`), the error it produces names that variable.
    */
-  it("blames the variable the command came from", () => {
+  it("names the variable the command came from", () => {
     for (const rejected of ["", "bun run `echo ui`", "bun run $HOME/ui"]) {
       const result = parseLiteralCommand(rejected, "SQUID_GRAPHICAL_UI_COMMAND");
       expect(result).toHaveProperty("configError");
       const { configError } = result as { readonly configError: string };
       expect(configError).toContain("SQUID_GRAPHICAL_UI_COMMAND");
-      expect(configError).not.toContain("SQUID_ACTIONS_MCP_COMMAND");
     }
   });
 });
