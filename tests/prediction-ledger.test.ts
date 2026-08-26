@@ -7,6 +7,7 @@ import { candidate } from "../src/fake-prediction-provider.js";
 import type { PredictionOutcome } from "../src/prediction-provider.js";
 import {
   candidateEnvelopes,
+  parsePredictionLedgerRecord,
   createAttemptRecord,
   createFeedbackRecord,
   InMemoryPredictionLedger,
@@ -114,6 +115,38 @@ describe("prediction candidate identity", () => {
     expect(JSON.stringify(envelope)).not.toContain(secret);
     // The digest still proves which parameters were seen.
     expect(envelope!.parametersDigest).toBe(digestCandidateParameters({ selection: secret }));
+  });
+});
+
+describe("ledger pre-catalog rejection", () => {
+  // Envelopes written before the catalog opened carry no toolId. This build
+  // does not read them: schema strictness is the contract, and the failure is
+  // named for its cause so an upgraded session reports the upgrade instead of
+  // a bare validation error.
+  const PRE_CATALOG_V2 = {
+    schemaVersion: 2, recordId: "old-r1", recordType: "attempt", requestId: "req-old",
+    episodeId: null, triggerEventId: "evt-1",
+    triggeredAt: "2026-08-01T00:00:00.000Z", completedAt: "2026-08-01T00:00:00.100Z",
+    provider: "heuristic", status: "succeeded", latencyMs: 1,
+    runtimeSessionId: "session-old", stateDigest: `sha256:${"a".repeat(64)}`,
+    projectionGeneration: 0, triggerDisposition: "accepted",
+    contextPolicyId: "passthrough", actionTrust: "trusted",
+    egressPolicyId: "search-egress-deny-v1",
+    candidates: [{
+      candidateId: "req-old:candidate:0", ordinal: 0, kind: "none",
+      confidence: 0, expiresAt: "2026-08-01T00:00:20.000Z", sourceEventIds: [],
+      parametersDigest: `sha256:${"b".repeat(64)}`,
+    }],
+  };
+
+  it("rejects a pre-catalog attempt, naming toolId and the upgrade", () => {
+    expect(() => parsePredictionLedgerRecord(structuredClone(PRE_CATALOG_V2)))
+      .toThrow(/toolId/);
+  });
+
+  it("keeps the generic message for corruption that is not that shape", () => {
+    expect(() => parsePredictionLedgerRecord({ recordType: "nonsense" }))
+      .toThrow(/^Prediction ledger record failed protocol validation\.$/);
   });
 });
 

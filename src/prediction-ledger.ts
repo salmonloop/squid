@@ -822,6 +822,23 @@ export function createBeliefBatchRecord(input: {
 
 export function parsePredictionLedgerRecord(value: unknown): PredictionLedgerRecord {
   if (!recordValidator.Check(value)) {
+    // The one shape this message names is the one that actually occurs in the
+    // wild: an attempt written before candidates carried `toolId`. Every other
+    // rejection is corruption or a bug, and stays generic. Naming the upgrade
+    // beats a bare "failed validation" — the operator's next question is
+    // always "which record, and what changed".
+    const looksLikePreToolIdAttempt = typeof value === "object" && value !== null
+      && (value as Record<string, unknown>).schemaVersion === 2
+      && (value as Record<string, unknown>).recordType === "attempt"
+      && Array.isArray((value as Record<string, unknown>).candidates)
+      && ((value as Record<string, unknown>).candidates as readonly unknown[])
+        .some((candidate) => typeof candidate === "object" && candidate !== null
+          && !("toolId" in candidate));
+    if (looksLikePreToolIdAttempt) {
+      throw new TypeError(
+        "Prediction ledger record failed protocol validation: this ledger holds attempts from before candidates carried toolId (the open tool catalog). Old records are not readable by this build; delete the ledger file or re-run the previous version.",
+      );
+    }
     throw new TypeError("Prediction ledger record failed protocol validation.");
   }
   const record = recordValidator.Parse(value) as PredictionLedgerRecord;
