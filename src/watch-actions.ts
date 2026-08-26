@@ -16,6 +16,7 @@ import {
   type ActionPlanningContext,
 } from "./action-planner.js";
 import { resolveSearchEgress, type EgressPolicy } from "./action-egress.js";
+import { basename } from "./context-policy.js";
 import { McpCapabilityGateway } from "./mcp-gateway.js";
 import type { ProjectProfile } from "./project-detect.js";
 import type { PredictionCandidate, WorldState } from "./protocol.js";
@@ -368,13 +369,13 @@ export function uniqueSaveTarget(
   state: WorldState,
   base: string,
 ): string | null {
+  // Matching uses the same `basename` that produced the narrowed targets, so
+  // resolution and redaction are one contract in one file — a change to how
+  // basenames are taken cannot leave this side matching on a stale spelling.
   const targets = state.recentActions
     .filter((action) => action.kind === "file_saved" && action.target !== null)
     .map((action) => action.target!)
-    .filter((target) => {
-      const segments = target.split(/[\\/]/u);
-      return segments[segments.length - 1] === base;
-    });
+    .filter((target) => basename(target) === base);
   const unique = new Set(targets);
   return unique.size === 1 ? [...unique][0]! : null;
 }

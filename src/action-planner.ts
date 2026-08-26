@@ -7,6 +7,7 @@ import {
   type ImmutableActionPlan,
 } from "./action-plan.js";
 import { isActionableCategory, type ActionablePredictionKind } from "./action-plan.js";
+import { isRedactedTargetShape } from "./context-policy.js";
 import { detectProject, type ProjectProfile } from "./project-detect.js";
 import type { PredictionCandidate } from "./protocol.js";
 import { renderCommandSummary, buildToolRegistry } from "./tool-descriptors.js";
@@ -157,16 +158,16 @@ export async function planAction(
 
   // Under a redacting projection a path proposal may be the basename the model
   // was shown rather than the path raw state holds. Resolve it here or not at
-  // all: only a bare basename (no separators on either convention) is a
-  // redaction shape, and only an unambiguous raw save resolves it. Anything
-  // else — a full-path proposal, two saves sharing the name, no save at all —
-  // renders from what was proposed and is admitted or refused on its own
-  // merits.
+  // all: only a redaction-shaped value (the shape `isRedactedTargetShape`
+  // declares, beside the narrowing that produces it) and an unambiguous raw
+  // save resolve. Anything else — a full-path proposal, two saves sharing the
+  // name, no save at all — renders from what was proposed and is admitted or
+  // refused on its own merits.
   let renderParameters = parameters;
   if (
     context.resolveRedactedSave !== undefined
     && typeof parameters.path === "string"
-    && !/[\\/]/u.test(parameters.path)
+    && isRedactedTargetShape(parameters.path)
   ) {
     const resolved = context.resolveRedactedSave(parameters.path);
     if (resolved === null) return { reasonCode: "path_ambiguous_after_redaction" };
