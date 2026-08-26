@@ -5,10 +5,11 @@ import {
   ModelRuntime,
   SessionManager,
   type AgentSession,
+  type InlineExtension,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 
-export type { ModelRuntime };
+export type { ModelRuntime, InlineExtension };
 
 /**
  * The shared spine of every Squid-Pi session.
@@ -73,6 +74,11 @@ export interface PiSessionSpec {
   /** Custom tool allowlist + definitions, for the single-tool prediction/belief prompts. */
   readonly tools?: readonly string[];
   readonly customTools?: readonly ToolDefinition[];
+  /**
+   * Inline extensions wired into the resource loader — the mount point for guard,
+   * sense, and audit hooks on a long-lived resident agent. One-shot callers omit it.
+   */
+  readonly extensionFactories?: readonly InlineExtension[];
   /** When supplied, abort disposes the session; when omitted, the caller owns disposal. */
   readonly signal?: AbortSignal;
 }
@@ -107,6 +113,9 @@ export async function createPiSession(spec: PiSessionSpec): Promise<PiSessionHan
     ...(spec.noContextFiles === true ? { noContextFiles: true } : {}),
     systemPrompt: spec.systemPrompt,
     appendSystemPrompt: [],
+    ...(spec.extensionFactories !== undefined
+      ? { extensionFactories: [...spec.extensionFactories] }
+      : {}),
   });
   await loader.reload();
 
