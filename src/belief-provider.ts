@@ -35,6 +35,19 @@ export interface BeliefProvider {
    * block a prediction.
    */
   infer(request: BeliefRequest, signal: AbortSignal): Promise<BeliefStateBatch>;
+  /**
+   * Reports whether this producer's model is reachable, or null when
+   * reachability is not a question worth asking.
+   *
+   * Lives on the instance rather than on the resolver's factory because the
+   * honest probe is one asked of an already-running producer: a model-backed
+   * provider opens its model runtime in its constructor, so probing by fresh
+   * construction starts a second runtime beside the live one and keeps it
+   * forever. The heuristic is in-process and cannot be unavailable; it omits
+   * the method rather than supplying one that always succeeds, which would
+   * only add a way for a gate to skip.
+   */
+  checkAvailability?(): Promise<string | null>;
 }
 
 /**
