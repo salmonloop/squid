@@ -164,7 +164,7 @@ export async function resolveWatchProvider(
     mode,
     gate,
     heuristic: new HeuristicPredictor(),
-    ...(contextPolicy.policy === undefined ? {} : { contextPolicy: contextPolicy.policy }),
+    contextPolicy: contextPolicy.policy,
     createPi: () => new PiRuntime(),
     // Resolve the model once up front, so an outage declines with a stated
     // reason instead of surfacing as a failed prediction on the first event.

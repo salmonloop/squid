@@ -35,10 +35,9 @@ import {
  * decision, and today the answer is still no — see the
  * `filesystem-save-run-tests` fixture.
  *
- * The browser source is opt-in via `SQUID_BROWSER`. Observing a browser is what
- * makes search reachable, and search is the one action that sends user text off
- * the machine, so a run gets it by asking rather than by default. Egress remains
- * a separate decision: `SQUID_SEARCH_EGRESS=allow` is still required.
+ * The browser source is opt-in via `SQUID_BROWSER` — there is no default
+ * browser to observe, so this names a capability rather than lifting a gate.
+ * Egress allows by default; `SQUID_SEARCH_EGRESS=deny` is the restriction.
  */
 
 const root = process.argv[2];

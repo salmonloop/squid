@@ -418,7 +418,6 @@ export async function dispatchTopCandidate(
     {
       candidateId,
       attemptId: outcome.requestId,
-      kind: top.candidate.kind,
       toolId: top.candidate.toolId,
       parameters: top.candidate.parameters,
     },
