@@ -1,6 +1,7 @@
 import { describeErrorForAudit } from "./action-egress.js";
 import { HeuristicPredictor } from "./baseline-predictor.js";
 import type { ContextPolicy } from "./context-policy.js";
+import type { ToolSummary } from "./tool-catalog.js";
 import type { EvaluationReport, PredictionProviderFactory, ReplayScenario } from "./evaluation.js";
 import { evaluateScenarios, evaluateWithProvider } from "./evaluation.js";
 import type { PredictionProvider } from "./prediction-provider.js";
@@ -96,6 +97,13 @@ export interface ProviderGateOptions {
    * is asked.
    */
   readonly contextPolicy?: ContextPolicy;
+  /**
+   * The tool catalog the live run attaches to every request, forwarded to the
+   * candidate's evaluation for the same reason as the policy: the gate must
+   * score the prompt the live run sends, and a catalog-less prompt is not
+   * that prompt.
+   */
+  readonly tools?: readonly ToolSummary[];
 }
 
 /**
@@ -143,6 +151,7 @@ export async function runProviderGate(
     candidate = await evaluateWithProvider(scenarios, () => observer.wrap(createProvider()), {
       ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
       ...(options.contextPolicy !== undefined ? { contextPolicy: options.contextPolicy } : {}),
+      ...(options.tools === undefined ? {} : { tools: options.tools }),
     });
   } catch (error) {
     return {

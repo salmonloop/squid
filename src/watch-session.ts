@@ -131,7 +131,16 @@ export async function startWatchSession(
   // Choose the primary predictor before opening any sink: a config error or a
   // declined model must not leave a half-created database behind. The default
   // `SQUID_PROVIDER=heuristic` never touches a model.
+  // Detected before the provider resolves so the gate can score the same
+  // catalog the live run will send — a gate run without it would measure a
+  // prompt that names no tools, which is not the prompt being authorized.
+  // Detection never throws; a directory with no manifest degrades to no
+  // check-backed tools.
+  const project = await detectProject(options.workingDirectory);
+  const sessionTools = summarizeTools(buildToolRegistry({ project }));
+
   const resolved = await resolveWatchProvider(env, {
+    tools: sessionTools,
     // Belief outcomes go to the same stderr channel every other diagnostic uses.
     // Without this a cognition run cannot be told apart from one whose belief
     // layer has been silently refusing every batch — the ranking would differ,
@@ -198,16 +207,6 @@ export async function startWatchSession(
   const shadowBeliefProvider = shadow.enabled
     ? await resolved.belief.createProvider()
     : undefined;
-
-  // The project is detected once, here, and both halves of the action loop read
-  // the same profile: the prompt view below tells the model what exists, and
-  // `resolveWatchActions` renders what it proposes against the same facts. Two
-  // detections could disagree — a manifest edited mid-startup — and then the
-  // model would be scored as wrong for following the catalog it was shown.
-  // Detection never throws; a directory with no manifest degrades to no
-  // check-backed tools.
-  const project = await detectProject(options.workingDirectory);
-  const sessionTools = summarizeTools(buildToolRegistry({ project }));
 
   const watch = createWatchRuntime({
     ...(options.databasePath === undefined ? {} : { databasePath: options.databasePath }),
