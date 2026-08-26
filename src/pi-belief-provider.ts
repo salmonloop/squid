@@ -1,11 +1,4 @@
-import {
-  createAgentSession,
-  DefaultResourceLoader,
-  defineTool,
-  getAgentDir,
-  ModelRuntime,
-  SessionManager,
-} from "@earendil-works/pi-coding-agent";
+import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { describeErrorForAudit } from "./action-egress.js";
 import {
@@ -17,6 +10,14 @@ import {
 import { evidenceTimeline } from "./belief-evidence.js";
 import { NoBeliefsError, type BeliefProvider, type BeliefRequest } from "./belief-provider.js";
 import { beliefValues, type BeliefStateBatch } from "./belief-state.js";
+import {
+  createPiSession,
+  resolveModel,
+  resolvePiModel,
+  startPiModelRuntime,
+  type ModelRuntime,
+  type ResolvedModel,
+} from "./pi-session-factory.js";
 
 /**
  * A model-backed `BeliefProvider`: the model names the intent, a pure reducer decides.
@@ -61,10 +62,11 @@ export class PiBeliefProvider implements BeliefProvider {
   private readonly modelRuntimePromise: Promise<ModelRuntime>;
 
   public constructor(options: PiBeliefProviderOptions = {}) {
-    this.provider = options.provider ?? process.env.PI_MODEL_PROVIDER ?? "bifrost";
-    this.modelId = options.modelId ?? process.env.PI_MODEL_ID ?? "deepseek-v4-flash";
+    const resolved = resolvePiModel(options);
+    this.provider = resolved.provider;
+    this.modelId = resolved.modelId;
     this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
-    this.modelRuntimePromise = ModelRuntime.create({ allowModelNetwork: false });
+    this.modelRuntimePromise = startPiModelRuntime();
   }
 
   /**
@@ -76,9 +78,9 @@ export class PiBeliefProvider implements BeliefProvider {
   public async checkAvailability(): Promise<string | null> {
     try {
       const modelRuntime = await this.modelRuntimePromise;
-      return modelRuntime.getModel(this.provider, this.modelId)
-        ? null
-        : `Pi belief model is unavailable: ${this.provider}/${this.modelId}`;
+      return resolveModel(modelRuntime, this.provider, this.modelId) === null
+        ? `Pi belief model is unavailable: ${this.provider}/${this.modelId}`
+        : null;
     } catch (error) {
       return describeErrorForAudit(error);
     }
@@ -86,8 +88,8 @@ export class PiBeliefProvider implements BeliefProvider {
 
   public async infer(request: BeliefRequest, signal: AbortSignal): Promise<BeliefStateBatch> {
     const modelRuntime = await this.modelRuntimePromise;
-    const model = modelRuntime.getModel(this.provider, this.modelId);
-    if (!model) {
+    const model = resolveModel(modelRuntime, this.provider, this.modelId);
+    if (model === null) {
       throw new Error(`Pi belief model is unavailable: ${this.provider}/${this.modelId}`);
     }
 
@@ -114,10 +116,7 @@ export class PiBeliefProvider implements BeliefProvider {
   }
 
   private async propose(
-    // Taken from the runtime's own return type rather than re-imported: `getModel`
-    // returns `Model<T> | undefined`, and the caller has already refused the undefined
-    // case, so narrowing here keeps that refusal the single place it happens.
-    model: NonNullable<ReturnType<ModelRuntime["getModel"]>>,
+    model: ResolvedModel,
     modelRuntime: ModelRuntime,
     request: BeliefRequest,
     citableEvents: ReadonlyMap<string, string>,
@@ -151,57 +150,31 @@ export class PiBeliefProvider implements BeliefProvider {
       },
     });
 
-    const loader = new DefaultResourceLoader({
-      cwd: process.cwd(),
-      agentDir: getAgentDir(),
-      noExtensions: true,
-      noSkills: true,
-      noPromptTemplates: true,
-      noThemes: true,
-      noContextFiles: true,
-      systemPrompt: beliefSystemPrompt(citableEvents),
-      appendSystemPrompt: [],
-    });
-    await loader.reload();
-
-    const { session } = await createAgentSession({
+    const handle = await createPiSession({
       model,
       modelRuntime,
-      resourceLoader: loader,
-      // Naming an intent over a small projection needs no deep reasoning, and the
-      // endpoint's time-to-first-byte already varies 7–15s. Matches `PiRuntime`.
-      thinkingLevel: "low",
+      cwd: process.cwd(),
+      systemPrompt: beliefSystemPrompt(citableEvents),
+      noExtensions: true,
+      noSkills: true,
+      noContextFiles: true,
       tools: ["emit_beliefs"],
       customTools: [emitBeliefs],
-      sessionManager: SessionManager.inMemory(),
+      signal,
     });
 
+    // A signal already aborted before the session existed is a cancellation the
+    // caller's own error names. The factory wired disposal to a later abort.
     if (signal.aborted) {
-      await session.abort().catch(() => undefined);
-      session.dispose();
+      handle.dispose();
       throw new NoBeliefsError(request.id);
     }
 
-    // Disposal is bound to the abort as well as to the finally: a session that never
-    // settles after an abort would leave the finally unreachable and leak it.
-    let disposed = false;
-    const disposeOnce = (): void => {
-      if (disposed) return;
-      disposed = true;
-      session.dispose();
-    };
-    const onAbort = (): void => {
-      session.abort().catch(() => undefined);
-      disposeOnce();
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-
     try {
-      await session.prompt(JSON.stringify({ worldState: request.worldState }));
+      await handle.session.prompt(JSON.stringify({ worldState: request.worldState }));
       return proposals;
     } finally {
-      signal.removeEventListener("abort", onAbort);
-      disposeOnce();
+      handle.dispose();
     }
   }
 }

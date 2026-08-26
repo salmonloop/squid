@@ -1,10 +1,10 @@
 import {
-  createAgentSession,
-  DefaultResourceLoader,
-  getAgentDir,
-  ModelRuntime,
-  SessionManager,
-} from "@earendil-works/pi-coding-agent";
+  createPiSession,
+  resolveModel,
+  resolvePiModel,
+  startPiModelRuntime,
+  type ModelRuntime,
+} from "./pi-session-factory.js";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, relative, sep } from "node:path";
 import type {
@@ -54,7 +54,7 @@ export class ProcessCapabilityGateway implements CapabilityGateway {
   public constructor(options: ProcessCapabilityGatewayOptions = {}) {
     this.id = options.id ?? "pi";
     this.resolvePath = options.resolvePath ?? ((path: string) => realpath(path));
-    this.modelRuntimePromise = ModelRuntime.create({ allowModelNetwork: false });
+    this.modelRuntimePromise = startPiModelRuntime();
   }
 
   public async invoke(plan: ImmutableActionPlan): Promise<ActionResult> {
@@ -95,10 +95,9 @@ export class ProcessCapabilityGateway implements CapabilityGateway {
     plan: ImmutableActionPlan,
   ): Promise<{ readonly summary?: string; readonly error?: string }> {
     const modelRuntime = await this.modelRuntimePromise;
-    const provider = process.env.PI_MODEL_PROVIDER ?? "bifrost";
-    const modelId = process.env.PI_MODEL_ID ?? "deepseek-v4-flash";
-    const model = modelRuntime.getModel(provider, modelId);
-    if (!model) {
+    const { provider, modelId } = resolvePiModel({});
+    const model = resolveModel(modelRuntime, provider, modelId);
+    if (model === null) {
       return { error: `No execution model is configured: ${provider}/${modelId}` };
     }
 
@@ -107,11 +106,10 @@ export class ProcessCapabilityGateway implements CapabilityGateway {
     // presentation concerns this path has no use for; context files are the
     // project's own CLAUDE-style notes, which an executor working in that
     // project should read.
-    const loader = new DefaultResourceLoader({
+    const handle = await createPiSession({
+      model,
+      modelRuntime,
       cwd: plan.canonicalWorkingDirectory ?? process.cwd(),
-      agentDir: getAgentDir(),
-      noPromptTemplates: true,
-      noThemes: true,
       systemPrompt: [
         "You are Squid's action executor.",
         "Complete exactly the task you are given, then stop.",
@@ -119,22 +117,10 @@ export class ProcessCapabilityGateway implements CapabilityGateway {
         "Prefer the smallest change that completes the task; do not fix unrelated problems you notice.",
         "Report concisely what you did.",
       ].join("\n"),
-      appendSystemPrompt: [],
-    });
-    await loader.reload();
-
-    const { session } = await createAgentSession({
-      model,
-      modelRuntime,
-      resourceLoader: loader,
-      // A scoped single-task execution needs no deep reasoning, and the
-      // endpoint's time-to-first-byte is already seconds. Matches prediction.
-      thinkingLevel: "low",
-      sessionManager: SessionManager.inMemory(),
     });
 
     let toolCalls = 0;
-    const unsubscribe = session.subscribe((event) => {
+    const unsubscribe = handle.session.subscribe((event) => {
       if (event.type === "tool_execution_start") toolCalls += 1;
     });
 
@@ -143,13 +129,13 @@ export class ProcessCapabilityGateway implements CapabilityGateway {
         `Working directory: ${plan.canonicalWorkingDirectory ?? "(none)"}`,
         `Task: ${plan.summary}`,
       ].join("\n");
-      await session.prompt(task);
-      await session.waitForIdle();
+      await handle.session.prompt(task);
+      await handle.session.waitForIdle();
       if (toolCalls === 0) {
         // A settled session that never called a tool did not do the work.
         return { error: "The executor completed without performing any action." };
       }
-      const summary = session.getLastAssistantText();
+      const summary = handle.session.getLastAssistantText();
       const sanitized = summary === undefined
         ? undefined
         : sanitizeAuditText(summary, "mcp_summary");
@@ -158,8 +144,7 @@ export class ProcessCapabilityGateway implements CapabilityGateway {
       };
     } finally {
       unsubscribe();
-      await session.abort().catch(() => undefined);
-      session.dispose();
+      handle.dispose();
     }
   }
 
