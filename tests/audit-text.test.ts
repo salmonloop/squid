@@ -1,43 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import {
   AUDIT_TEXT_MAX_LENGTH,
-  SEARCH_EGRESS_ALLOW_ID,
-  SEARCH_EGRESS_DENY_ID,
   auditTextDigest,
   describeErrorForAudit,
-  resolveSearchEgress,
   sanitizeAuditText,
-} from "../src/action-egress.js";
-
-describe("resolveSearchEgress", () => {
-  it("allows when the variable is unset — the open-by-default posture", () => {
-    expect(resolveSearchEgress(undefined)).toEqual({
-      id: SEARCH_EGRESS_ALLOW_ID,
-      searchEgress: "allow",
-    });
-  });
-
-  it("denies on the exact opt-in spelling", () => {
-    expect(resolveSearchEgress("deny")).toEqual({
-      id: SEARCH_EGRESS_DENY_ID,
-      searchEgress: "deny",
-    });
-  });
-
-  it("still allows the exact allow spelling", () => {
-    expect(resolveSearchEgress("allow")).toEqual({
-      id: SEARCH_EGRESS_ALLOW_ID,
-      searchEgress: "allow",
-    });
-  });
-
-  it("rejects near-miss values as config errors, in both directions", () => {
-    for (const value of ["Allow", "allowed", "ALLOW", "DENY", "Deny", "", "allow ", "deny ", "off"]) {
-      const resolved = resolveSearchEgress(value);
-      expect("configError" in resolved).toBe(true);
-    }
-  });
-});
+} from "../src/audit-text.js";
 
 describe("sanitizeAuditText", () => {
   it("is deterministic for identical input", () => {
@@ -139,7 +106,9 @@ describe("describeErrorForAudit", () => {
 
   it("drops the stack, which would name the machine's directory layout", () => {
     const error = new Error("boom");
-    expect(error.stack).toContain("action-egress.test");
+    // Precondition, spelled without naming this file: the stack really does
+    // carry an absolute path, which is what makes dropping it meaningful.
+    expect(error.stack).toContain(import.meta.dir);
     expect(describeErrorForAudit(error)).toBe("boom");
   });
 

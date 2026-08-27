@@ -6,8 +6,6 @@ import {
 } from "../src/capture-exclusion.js";
 import { RedactingCapturePolicy, type CapturePolicy } from "../src/capture-policy.js";
 import { InMemoryEventStore } from "../src/event-store.js";
-import { FakePredictionProvider, candidate } from "../src/fake-prediction-provider.js";
-import { PredictionCoordinator } from "../src/prediction-coordinator.js";
 import { createActivityEvent, type ActivityEvent } from "../src/protocol.js";
 import { PredictionRuntime } from "../src/prediction-runtime.js";
 import { SquidCore } from "../src/squid-core.js";
@@ -136,16 +134,8 @@ describe("resolveCaptureExclusion", () => {
 
 describe("exclusion through the live runtime", () => {
   async function runtimeWith(policy: CapturePolicy) {
-    const provider = new FakePredictionProvider({
-      name: "fake-exclusion",
-      candidates: [candidate("run_tests")],
-    });
     const store = new InMemoryEventStore();
-    const runtime = new PredictionRuntime(
-      new SquidCore(store),
-      new PredictionCoordinator({ provider, random: () => "exclude-1" }),
-      { capturePolicy: policy },
-    );
+    const runtime = new PredictionRuntime(new SquidCore(store), { capturePolicy: policy });
     return { runtime, store };
   }
 
@@ -167,7 +157,6 @@ describe("exclusion through the live runtime", () => {
       }),
     );
     expect(refused.ingest).toBeNull();
-    expect(refused.prediction).toBeNull();
     expect(await store.all()).toHaveLength(0);
 
     const kept = await runtime.ingest(

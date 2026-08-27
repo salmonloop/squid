@@ -352,7 +352,11 @@ export async function sqliteHarness(): Promise<StoreHarness> {
         store: instance,
         dispose: async () => {
           instance.close();
-          await rm(`${filePath}-wal`, `${filePath}-shm`, { force: true }).catch(() => {});
+          // Two calls, not one: `rm` takes (path, options), so passing a second
+          // path put it where `options` belonged — the `-shm` file was never
+          // removed and `force` never applied to it.
+          await rm(`${filePath}-wal`, { force: true }).catch(() => {});
+          await rm(`${filePath}-shm`, { force: true }).catch(() => {});
         },
       });
     },

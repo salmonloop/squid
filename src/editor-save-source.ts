@@ -4,7 +4,7 @@ import type {
   ActivitySource,
   ActivitySourceDiagnostic,
 } from "./activity-source.js";
-import { describeErrorForAudit } from "./action-egress.js";
+import { describeErrorForAudit } from "./audit-text.js";
 import {
   createActivityEvent,
   type ActivityEvent,

@@ -165,31 +165,21 @@ export interface WorldState {
   captureGate: CaptureGateState | null;
 }
 
+/**
+ * The semantic categories a capability can belong to.
+ *
+ * Survives the move to an agent-driven runtime because it is a vocabulary, not
+ * a pipeline stage: a tool declares which kind of work it does, and the agent
+ * reads that category in the catalog to tell "run the tests" from "look at the
+ * error". What it no longer names is a ranked proposal — there are no
+ * candidates now, only tools the agent may choose to call.
+ */
 export type PredictionKind =
   | "draft_completion"
   | "run_tests"
   | "inspect_error"
   | "search_selection"
   | "none";
-
-export interface PredictionCandidate {
-  kind: PredictionKind;
-  /**
-   * The registered capability this proposal names, or null when it names none.
-   *
-   * This is the routing key, not `kind`: several tools may share a category,
-   * and a brand-new capability needs no vocabulary change to be proposable.
-   * Null is a fact about the candidate, not missing data — a "do nothing"
-   * proposal (`none`) or an unregistered kind carries no tool by definition,
-   * so the field is `string | null` rather than optional.
-   */
-  toolId: string | null;
-  rationale: string;
-  confidence: number;
-  expiresAt: string;
-  sourceEventIds: string[];
-  parameters: Record<string, string | number | boolean | null>;
-}
 
 const nonEmptyString = () => Type.String({ minLength: 1 });
 const timestamp = () => Type.String({ format: "date-time", minLength: 1 });

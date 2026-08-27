@@ -1,8 +1,7 @@
 import { isAbsolute, resolve } from "node:path";
-import { describeErrorForAudit } from "./action-egress.js";
+import { describeErrorForAudit } from "./audit-text.js";
 import { parseDeletionRange } from "./event-store.js";
 import { SqliteEventStore } from "./sqlite-event-store.js";
-import { SqlitePredictionLedger } from "./sqlite-prediction-ledger.js";
 import { deleteHistoryRange } from "./retention-prune.js";
 
 /**
@@ -11,9 +10,8 @@ import { deleteHistoryRange } from "./retention-prune.js";
  * Issue #6's Done-when asks for deletion "from a stated interface"; this is
  * it. The watch session's startup prune enforces retention going forward;
  * this command covers the deliberate one-off: "delete everything between
- * lunch and dinner". It opens the same two databases a durable run wrote,
- * deletes the ranged events, and lets the ledger close over what history
- * lost — so no attempt survives without its trigger event.
+ * lunch and dinner". It opens the same database a durable run wrote and
+ * deletes the ranged events.
  *
  * The database path is required and absolute, mirroring SQUID_DB's posture:
  * the command refuses to guess which file the user means, because deleting
@@ -25,10 +23,7 @@ const USAGE = `Usage: bun run history:delete -- <events.db> <from> <until>
 
   <events.db>  absolute path to the SQLite event database (the SQUID_DB value)
   <from>       inclusive ISO start of the range to delete
-  <until>      inclusive ISO end of the range to delete
-
-The prediction ledger (<events.db>.ledger.db) is pruned automatically, so no
-record survives without its trigger event.`;
+  <until>      inclusive ISO end of the range to delete`;
 
 if (import.meta.main) {
   const [databaseArg, from, until] = process.argv.slice(2);
@@ -52,15 +47,13 @@ if (import.meta.main) {
   }
 
   const store = new SqliteEventStore(databasePath);
-  const ledger = new SqlitePredictionLedger(`${databasePath}.ledger.db`);
   try {
-    const result = await deleteHistoryRange(store, ledger, { from, until });
+    const result = await deleteHistoryRange(store, { from, until });
     console.log(JSON.stringify(result));
   } catch (error) {
     console.error("history:delete failed:", describeErrorForAudit(error));
     process.exitCode = 1;
   } finally {
     store.close();
-    ledger.close();
   }
 }

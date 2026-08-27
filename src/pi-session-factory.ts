@@ -14,16 +14,16 @@ export type { ModelRuntime, InlineExtension };
 /**
  * The shared spine of every Squid-Pi session.
  *
- * Three callers — `PiRuntime` (prediction), `PiBeliefProvider` (belief), and
- * `ProcessCapabilityGateway` (execution) — each built the same chain by hand:
- * resolve the model, load resources with a per-call system prompt, create an
- * in-memory session at `thinkingLevel: "low"`, and bind disposal to an abort
- * signal. The differences between them are small and named below; the
- * repetition was not small and was the thing worth removing.
+ * It was written when three callers — prediction, belief, and execution — each
+ * built the same chain by hand and threw the session away afterwards. Those
+ * callers are gone; the resident agent is the one that remains, and it keeps its
+ * session for the life of the run. The spine is unchanged because the setup was
+ * never what differed: resolve the model, load resources with a system prompt,
+ * create a session at `thinkingLevel: "low"`, bind disposal to an abort signal.
  *
  * What this module does not own: the `ModelRuntime` instance. That is started
- * once per provider object (constructor) and awaited across every call on it,
- * so it stays the caller's field. This module owns the per-call session only.
+ * once by whoever holds the session and awaited across every call on it, so it
+ * stays the caller's field. This module owns session construction only.
  */
 
 export interface PiModelOptions {
@@ -75,10 +75,22 @@ export interface PiSessionSpec {
   readonly tools?: readonly string[];
   readonly customTools?: readonly ToolDefinition[];
   /**
-   * Inline extensions wired into the resource loader — the mount point for guard,
-   * sense, and audit hooks on a long-lived resident agent. One-shot callers omit it.
+   * Inline extensions wired into the resource loader — the mount point for sense
+   * injection on a long-lived resident agent. Transient callers omit it.
    */
   readonly extensionFactories?: readonly InlineExtension[];
+  /**
+   * Where the conversation is kept.
+   *
+   * `memory` (the default) keeps it in the process, which is what a test wants
+   * and all the transient callers ever needed. `persist` writes it to Pi's
+   * session directory for `cwd`, and `continue` reopens the most recent one
+   * there — and that persistence is not a convenience: it is the audit trail.
+   * The agent's tool calls live in its session history rather than in a ledger
+   * Squid maintains beside it, so a durable run needs a durable session or the
+   * record of what the agent did dies with the process.
+   */
+  readonly history?: "memory" | "persist" | "continue";
   /** When supplied, abort disposes the session; when omitted, the caller owns disposal. */
   readonly signal?: AbortSignal;
 }
@@ -126,7 +138,7 @@ export async function createPiSession(spec: PiSessionSpec): Promise<PiSessionHan
     thinkingLevel: "low",
     ...(spec.tools !== undefined ? { tools: [...spec.tools] } : {}),
     ...(spec.customTools !== undefined ? { customTools: [...spec.customTools] } : {}),
-    sessionManager: SessionManager.inMemory(),
+    sessionManager: resolveSessionManager(spec),
   });
 
   let disposed = false;
@@ -152,4 +164,25 @@ export async function createPiSession(spec: PiSessionSpec): Promise<PiSessionHan
   }
 
   return { session, dispose };
+}
+
+/**
+ * Picks the session store for one spec.
+ *
+ * `continue` reopens the most recent session under `cwd`, which is what a restart
+ * of a long-running watch wants: the agent picks up the history it already has
+ * rather than waking up amnesiac. `persist` always starts a fresh durable one.
+ * Both write under Pi's own session directory — Squid does not choose the path,
+ * because a second opinion about where sessions live is how two processes end up
+ * disagreeing about which file is the record.
+ */
+function resolveSessionManager(spec: PiSessionSpec): SessionManager {
+  switch (spec.history ?? "memory") {
+    case "persist":
+      return SessionManager.create(spec.cwd);
+    case "continue":
+      return SessionManager.continueRecent(spec.cwd);
+    default:
+      return SessionManager.inMemory(spec.cwd);
+  }
 }

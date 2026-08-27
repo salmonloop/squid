@@ -1,5 +1,5 @@
 import { isAbsolute } from "node:path";
-import { sanitizeAuditText } from "./action-egress.js";
+import { sanitizeAuditText } from "./audit-text.js";
 import { resolveScreenReader } from "./resolve-screen-reader.js";
 import { ScreenTextActivitySource } from "./screen-text-source.js";
 import { installWatchSignalHandlers, startWatchSession } from "./watch-session.js";

@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { describeErrorForAudit } from "./action-egress.js";
+import { describeErrorForAudit } from "./audit-text.js";
 import { createMacosScreenTextReader } from "./screen-text-reader-macos.js";
 import {
   createSyntheticScreenTextReader,

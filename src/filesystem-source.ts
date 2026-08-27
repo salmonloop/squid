@@ -2,7 +2,7 @@ import { watch } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ActivityEventEmitter, ActivitySource, ActivitySourceDiagnostic } from "./activity-source.js";
-import { describeErrorForAudit } from "./action-egress.js";
+import { describeErrorForAudit } from "./audit-text.js";
 import { createActivityEvent, type ActivityEvent, type FilePayload } from "./protocol.js";
 
 const DEFAULT_DEBOUNCE_MS = 25;

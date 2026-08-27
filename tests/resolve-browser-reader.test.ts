@@ -18,6 +18,9 @@ describe("resolveBrowserReader", () => {
   it("enables the synthetic backend on the exact value", async () => {
     const resolved = await resolveBrowserReader({ env: { SQUID_BROWSER: "synthetic" } });
     if ("configError" in resolved) throw new Error(resolved.configError);
+    // The disabled arm carries no readerKind, and `configError` narrowing does
+    // not exclude it — an explicit value asked for a reader, so assert it got one.
+    if (!resolved.enabled) throw new Error("expected the synthetic reader to be enabled");
     expect(resolved.readerKind).toBe("synthetic");
   });
 
@@ -48,6 +51,7 @@ describe("resolveBrowserReader", () => {
       platform: "darwin",
     });
     if ("configError" in resolved) throw new Error(resolved.configError);
+    if (!resolved.enabled) throw new Error("expected the darwin reader to be enabled");
     expect(resolved.readerKind).toBe("darwin");
   });
 

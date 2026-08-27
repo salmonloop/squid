@@ -1,31 +1,26 @@
 import { realpath } from "node:fs/promises";
 import { createWatchRuntime, type WatchRuntime } from "./create-watch-runtime.js";
-import { describeErrorForAudit, resolveSearchEgress } from "./action-egress.js";
+import { describeErrorForAudit } from "./audit-text.js";
 import { CaptureGateActivitySource } from "./capture-gate-source.js";
 import { resolveCaptureGate } from "./resolve-capture-gate.js";
 import { HOUR_MS, resolveRetention } from "./resolve-retention.js";
-import { resolveShadowCognition } from "./resolve-shadow-cognition.js";
-import { evidenceTimeline } from "./belief-evidence.js";
-import { BeliefRerankCognition } from "./belief-rerank-cognition.js";
-import { createBeliefBatchRecord } from "./prediction-ledger.js";
-import { createShadowAttemptRecord } from "./shadow-ledger.js";
-import { ShadowCognitionRunner } from "./shadow-cognition.js";
+import {
+  createResidentAgent,
+  residentAgentSystemPrompt,
+  type ResidentAgent,
+  type ResidentSessionFactory,
+} from "./resident-agent.js";
 import type { ActivitySource, ActivitySourceDiagnostic } from "./activity-source.js";
 import type { ActivityEvent } from "./protocol.js";
-import type { PredictionOutcome } from "./prediction-provider.js";
 import type { PredictionRuntimeIngestResult } from "./prediction-runtime.js";
 import { runRetentionPrune, type RetentionPruneResult } from "./retention-prune.js";
 import { sqliteWatchExclusions } from "./sqlite-event-store.js";
-import { resolveWatchActions, type WatchActionsResolution } from "./watch-actions.js";
-import { detectProject } from "./project-detect.js";
-import { summarizeTools } from "./tool-catalog.js";
-import { buildToolRegistry } from "./tool-descriptors.js";
-import { resolveWatchProvider, type WatchProviderBeliefBatch } from "./watch-provider.js";
+import type { ToolSummary } from "./tool-catalog.js";
 
 /**
- * The whole watch pipeline minus the sources: provider admission, egress
- * resolution, store/ledger/runtime construction, restore, action wiring, the
- * ingest loop, and shutdown ordering.
+ * The whole watch pipeline minus the sources: store and runtime construction,
+ * retention, restore, the resident agent, the ingest loop, and shutdown
+ * ordering.
  *
  * Extracted because every entry point needs all of it identically. Two copies
  * had already drifted apart in comments while agreeing in behavior; a third
@@ -33,19 +28,23 @@ import { resolveWatchProvider, type WatchProviderBeliefBatch } from "./watch-pro
  * source-specific parts — which sources exist, what a log line says, where
  * commands run — stay with the entry point as callbacks.
  *
- * Sources are a list, not a single source. A prediction is a function of the
- * *whole* projection, and several admission rules need facts that no single
- * source can produce: `run_tests` compares a save's owner against the
- * foreground application, which means a filesystem source and a screen source
- * must feed one core before the check can ever pass.
+ * What used to live here and no longer does: provider admission, egress
+ * resolution, a shadow cognition runner, a belief batch sink, and an action
+ * dispatcher. Those were the machinery of a system that decided for itself what
+ * to do next and had to record why. The resident agent decides now — it is told
+ * what the sensors saw and chooses its own tools — so this module's job narrows
+ * to feeding it and shutting it down in the right order.
+ *
+ * Sources are a list, not a single source. What the agent can conclude is a
+ * function of the *whole* projection: telling "the tests just failed" from "a
+ * file changed" needs a filesystem source and a terminal source feeding one core
+ * before either observation means anything.
  */
 
 /** Everything a source factory may need, available only after the sinks exist. */
 export interface WatchSourceContext {
   /** Absolute path of the event database, or undefined when in memory. */
   readonly databasePath: string | undefined;
-  /** Absolute path of the ledger database, or undefined when in memory. */
-  readonly ledgerPath: string | undefined;
   /** Pass to every source so diagnostics reach the same sink. */
   readonly onDiagnostic: (diagnostic: ActivitySourceDiagnostic) => void;
 }
@@ -53,12 +52,12 @@ export interface WatchSourceContext {
 export interface WatchSessionOptions {
   /** Validated by the caller; only presence decides durability here. */
   readonly databasePath?: string;
-  /** Absolute directory `run_tests` commands execute in. */
+  /** Absolute directory the agent works in. */
   readonly workingDirectory: string;
   /**
    * Builds the sources once the runtime exists. Filesystem exclusions depend on
-   * the ledger path, which is derived during construction, so sources cannot be
-   * passed in ready-made.
+   * the database path, which is derived during construction, so sources cannot
+   * be passed in ready-made.
    */
   readonly createSources: (context: WatchSourceContext) => Promise<readonly ActivitySource[]>;
   /**
@@ -72,22 +71,34 @@ export interface WatchSessionOptions {
     event: ActivityEvent,
     result: PredictionRuntimeIngestResult & { readonly ingest: NonNullable<PredictionRuntimeIngestResult["ingest"]> },
   ) => Record<string, string | number | boolean | null>;
+  /**
+   * Supplementary capabilities described to the agent on top of Pi's own tools.
+   * Empty by default: Pi's built-ins are the execution surface, and a catalog
+   * exists only when this run genuinely adds something to them.
+   */
+  readonly tools?: readonly ToolSummary[];
   /** Entry-point-specific fields merged into the startup line. */
   readonly banner?: Record<string, string | number | boolean | null>;
   /** Injected in tests. */
   readonly env?: Record<string, string | undefined>;
   readonly log?: (line: string) => void;
   readonly logError?: (line: string) => void;
+  /**
+   * Injected in tests so no suite starts a real model runtime. Production omits
+   * it and gets the Pi-backed session.
+   */
+  readonly createAgentSession?: ResidentSessionFactory;
 }
 
 export interface WatchSession {
   /** Startup summary, already merged with the caller's fields. */
   readonly banner: Record<string, string | number | boolean | null>;
   readonly runtime: WatchRuntime;
-  readonly actions: WatchActionsResolution | undefined;
+  /** The live agent. Held so a caller can prompt or inspect it directly. */
+  readonly agent: ResidentAgent;
   /** Every source that started, in start order. */
   readonly sourceIds: readonly string[];
-  /** Drains sources, settles pending actions, then closes sinks. Idempotent. */
+  /** Drains sources, settles the agent, then closes sinks. Idempotent. */
   stop(): Promise<void>;
 }
 
@@ -95,80 +106,12 @@ export type WatchSessionResult =
   | { readonly configError: string }
   | { readonly session: WatchSession };
 
-/**
- * Ceiling for one shadow belief attempt when a model produces the beliefs.
- *
- * The runner's 15s default was set against an in-process producer; the configured model
- * endpoint answers in 7–15s, so a reachable producer would time out on roughly half its
- * observations and the shadow report would read as an outage rather than as a slow
- * producer. Still bounded — a shadow run that never settles would hold up shutdown.
- */
-const SHADOW_MODEL_TIMEOUT_MS = 60_000;
-
 export async function startWatchSession(
   options: WatchSessionOptions,
 ): Promise<WatchSessionResult> {
   const env = options.env ?? process.env;
   const log = options.log ?? ((line: string) => console.log(line));
   const logError = options.logError ?? ((line: string) => console.error(line));
-
-  /**
-   * Where a validated belief batch goes, once there is a ledger to put it in.
-   *
-   * An indirection because the two ends cannot be wired in one step: the provider
-   * is resolved *before* any sink opens, deliberately — a config error or a
-   * declined model must not leave a half-created database behind — while the
-   * ledger only exists after `createWatchRuntime`. So the provider is handed a
-   * stable closure now and the real destination is installed below.
-   *
-   * Undefined is not a dropped record. Nothing can produce a batch until a source
-   * starts, and sources start last, long after the assignment; the guard exists so
-   * an early-return path that disposes before that point cannot write into a
-   * ledger that is already closing.
-   */
-  let beliefBatchSink: ((observed: WatchProviderBeliefBatch) => void) | undefined;
-
-  // Choose the primary predictor before opening any sink: a config error or a
-  // declined model must not leave a half-created database behind. The default
-  // `SQUID_PROVIDER=heuristic` never touches a model.
-  // Detected before the provider resolves so the gate can score the same
-  // catalog the live run will send — a gate run without it would measure a
-  // prompt that names no tools, which is not the prompt being authorized.
-  // Detection never throws; a directory with no manifest degrades to no
-  // check-backed tools.
-  const project = await detectProject(options.workingDirectory);
-  const sessionTools = summarizeTools(buildToolRegistry({ project }));
-
-  const resolved = await resolveWatchProvider(env, {
-    tools: sessionTools,
-    // Belief outcomes go to the same stderr channel every other diagnostic uses.
-    // Without this a cognition run cannot be told apart from one whose belief
-    // layer has been silently refusing every batch — the ranking would differ,
-    // which reads as a bad model rather than a starved one.
-    onDiagnostic: (diagnostic) => {
-      logError(JSON.stringify({
-        diagnostic: diagnostic.kind,
-        provider: diagnostic.provider,
-        status: diagnostic.status,
-        ...(diagnostic.reasonCode === undefined ? {} : { reasonCode: diagnostic.reasonCode }),
-      }));
-    },
-    onBeliefBatch: (observed) => beliefBatchSink?.(observed),
-  });
-  if (!resolved.ok) return { configError: resolved.configError };
-  if (resolved.selection.declineReason !== null) {
-    logError(JSON.stringify({
-      provider: resolved.selection.provider.name,
-      declined: resolved.selection.declineReason,
-    }));
-  }
-
-  // One egress resolution for the whole process: the runtime stamps its id onto
-  // every attempt and admission compares that id against the policy the
-  // dispatcher presents. Resolving twice could stamp deny and dispatch allow,
-  // which refuses every action — including kinds unrelated to egress.
-  const egress = resolveSearchEgress(env.SQUID_SEARCH_EGRESS);
-  if ("configError" in egress) return { configError: egress.configError };
 
   // The capture gate resolves with the other capabilities, before any sink
   // opens: a typo in SQUID_CONTROL must fail startup rather than silently
@@ -182,45 +125,11 @@ export async function startWatchSession(
   const retention = resolveRetention({ env });
   if ("configError" in retention) return { configError: retention.configError };
 
-  // Shadow mode resolves with the rest, before any sink opens. A typo that
-  // silently disabled it would leave an operator reading a ledger with no shadow
-  // attempts and concluding the cognition path agrees with the heuristic
-  // everywhere, when in fact it never ran.
-  const shadow = resolveShadowCognition({ env });
-  if ("configError" in shadow) return { configError: shadow.configError };
-
-  /**
-   * The producer behind the shadow path's belief layer.
-   *
-   * Resolved from the same variable the live path reads, so one run cannot score a model
-   * live while shadowing the heuristic — the two would then disagree about what was
-   * measured, and `top1Agrees` would be comparing two different questions.
-   *
-   * Built even when shadow mode is off, so a typo in the variable fails startup in every
-   * configuration rather than only in the one that happens to observe it. The heuristic
-   * branch loads no model graph, so the default pays nothing for this.
-   */
-  // From the resolution the provider step already produced — one read of
-  // SQUID_BELIEF_PROVIDER per run, and live and shadow cannot disagree about
-  // which producer kind they name.
-  const shadowBeliefKind = resolved.belief.kind;
-  const shadowBeliefProvider = shadow.enabled
-    ? await resolved.belief.createProvider()
-    : undefined;
-
   const watch = createWatchRuntime({
     ...(options.databasePath === undefined ? {} : { databasePath: options.databasePath }),
-    provider: resolved.selection.provider,
-    contextPolicy: resolved.selection.contextPolicy,
-    actionTrust: resolved.selection.actionTrust,
-    egressPolicy: egress,
     // Resolved inside createWatchRuntime, but the raw value passes through so
     // a malformed list fails this startup rather than silently capturing all.
     ...(env.SQUID_EXCLUDE === undefined ? {} : { excludeApplications: env.SQUID_EXCLUDE }),
-    onDiagnostic: (diagnostic) => {
-      logError(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
-    },
-    tools: sessionTools,
   });
 
   // Retention prunes before restore, so the projection is rebuilt from the
@@ -231,7 +140,7 @@ export async function startWatchSession(
   let pruneSummary: RetentionPruneResult | undefined;
   if (retention.enabled) {
     try {
-      pruneSummary = await runRetentionPrune(watch.store, watch.ledger, {
+      pruneSummary = await runRetentionPrune(watch.store, {
         cutoffMs: Date.now() - retention.hours * HOUR_MS,
       });
     } catch (error) {
@@ -245,156 +154,78 @@ export async function startWatchSession(
   const restored = await watch.runtime.restore();
 
   /**
-   * Everything a resolved prediction goes on to do: the log line, the shadow run,
-   * the dispatch. The runtime drains the prediction itself but knows nothing about
-   * what a caller chained onto it, so shutdown has to await these first — see the
-   * ordering comment in `stop`.
+   * The agent is created after the store is open and before any source starts.
+   *
+   * Eagerly, so a missing model configuration fails startup rather than on the
+   * first observation — by which point sources are running and events are being
+   * captured into a session no agent will ever read. A failure here disposes the
+   * store it already opened; a half-created database is exactly what the
+   * pre-sink resolution order exists to prevent.
    */
-  const outcomeContinuations = new Set<Promise<void>>();
-
-  // The shadow path is built after the ledger exists and before any source starts.
-  // Its ledger writes are tracked here rather than by the runtime: the runtime
-  // drains what *it* wrote, and a shadow record appended after the sinks closed
-  // would be lost — so `stop` awaits these explicitly, in order.
-  const shadowWrites = new Set<Promise<void>>();
+  let agent: ResidentAgent;
+  try {
+    agent = await createResidentAgent({
+      systemPrompt: residentAgentSystemPrompt(),
+      cwd: options.workingDirectory,
+      tools: options.tools ?? [],
+      ...(options.createAgentSession !== undefined
+        ? { createSession: options.createAgentSession }
+        : {}),
+    });
+  } catch (error) {
+    await watch.dispose();
+    return { configError: `The resident agent could not start: ${describeErrorForAudit(error)}` };
+  }
 
   /**
-   * Persists every validated belief batch as history, and closes the seam the
-   * provider was resolved with.
+   * Turns the agent's observations into turns, one at a time.
    *
-   * The provider is chosen before any sink exists — a config error must not leave
-   * a half-created database behind — so it cannot be handed a ledger at
-   * construction time. The seam is therefore a mutable sink assigned here, which
-   * is also what makes the reverse order safe: a batch produced before this line
-   * runs finds no sink and is dropped rather than written to a ledger that is not
-   * open yet. Nothing can produce one that early in practice, because no source
-   * has started.
-   *
-   * Same posture as the shadow writes beside it: a failed append is a diagnostic,
-   * never a failure of the live prediction, and the write is tracked so shutdown
-   * drains it before closing the ledger.
+   * Serialized deliberately. Two prompts overlapping on one session is not two
+   * opinions — it is one conversation with interleaved turns, and the agent would
+   * be reasoning about a half-written history. So each observation waits for the
+   * previous turn to settle. Events keep arriving during that wait and land in the
+   * sense buffer, which means a busy agent sees the *latest* world when it next
+   * thinks rather than a queue of stale ones. That is the correct trade for a
+   * sensor stream: the newest observation is the useful one.
    */
-  const beliefWrites = new Set<Promise<void>>();
-  beliefBatchSink = (observed) => {
-    // `provider` is not passed: the record takes it from the batch, which is the
-    // producer's own claim about itself. Accepting it separately here would create
-    // two spellings that could disagree.
-    const write = watch.ledger.appendBeliefBatch(createBeliefBatchRecord({
-      requestId: observed.requestId,
-      batch: observed.batch,
-    })).catch((error: unknown) => {
-      logError(JSON.stringify({ beliefLedgerError: describeErrorForAudit(error) }));
+  const agentTurns = new Set<Promise<void>>();
+  let turnTail: Promise<void> = Promise.resolve();
+
+  const promptAgent = (): void => {
+    const turn = turnTail.then(async () => {
+      await agent.prompt(AGENT_TURN_PROMPT);
+      await agent.waitForIdle();
+      const reply = agent.getLastAssistantText();
+      // Reported, not interpreted. Whether the agent acted, and how, is in its
+      // session history; this line is the operator's window into a loop that is
+      // otherwise silent.
+      if (reply !== undefined && reply.trim().length > 0) {
+        log(JSON.stringify({ agent: "replied", text: reply }));
+      }
+    }).catch((error: unknown) => {
+      // One failed turn must not end the ingest loop: the next observation gets
+      // a fresh attempt, and the agent's session survives a rejected prompt.
+      logError(JSON.stringify({ agentTurnError: describeErrorForAudit(error) }));
     });
-    beliefWrites.add(write);
-    void write.then(
-      () => beliefWrites.delete(write),
-      () => beliefWrites.delete(write),
+    // The tail advances even on failure, so a rejected turn cannot wedge the
+    // chain — every later observation would otherwise inherit the rejection.
+    turnTail = turn;
+    agentTurns.add(turn);
+    void turn.then(
+      () => agentTurns.delete(turn),
+      () => agentTurns.delete(turn),
     );
   };
-  const shadowRunner = shadowBeliefProvider !== undefined
-    ? new ShadowCognitionRunner({
-        beliefProvider: shadowBeliefProvider,
-        cognition: new BeliefRerankCognition(),
-        // A model-backed producer runs 7–15s against the configured endpoint, which sits
-        // inside the runner's 15s default — a reachable producer would time out on most
-        // observations and the shadow report would read as an outage. The heuristic keeps
-        // the default, since raising it there would only delay a shutdown.
-        ...(shadowBeliefKind === "heuristic" ? {} : { timeoutMs: SHADOW_MODEL_TIMEOUT_MS }),
-        onObservation: (observation) => {
-          // Kinds, statuses, and counts only. `beliefValues` is a closed
-          // vocabulary and candidate kinds are an enum, so nothing here can echo
-          // a selection or a path the shadow run happened to read.
-          log(JSON.stringify({
-            shadowProvider: observation.shadowProvider,
-            requestId: observation.requestId,
-            shadowStatus: observation.shadowStatus,
-            beliefStatus: observation.beliefStatus,
-            beliefValues: observation.beliefValues,
-            shadowPredictions: observation.shadowCandidates.map((candidate) => candidate.kind),
-            top1Agrees: observation.top1Agrees,
-          }));
-          const write = watch.ledger.appendAttempt(createShadowAttemptRecord({
-            observation,
-            completedAt: new Date().toISOString(),
-            runtimeSessionId: watch.runtimeSessionId,
-            egressPolicyId: egress.id,
-          })).catch((error: unknown) => {
-            // A shadow record that cannot be written is a diagnostic, never a
-            // failure of the live run — exactly the posture the runtime takes for
-            // its own attempt records.
-            logError(JSON.stringify({ shadowLedgerError: describeErrorForAudit(error) }));
-          });
-          shadowWrites.add(write);
-          void write.then(
-            () => shadowWrites.delete(write),
-            () => shadowWrites.delete(write),
-          );
-        },
-      })
-    : undefined;
 
-  /**
-   * Settles everything a prediction set in motion that the runtime does not own,
-   * in the one order that loses nothing.
-   *
-   * Each step is needed for a different reason. First the outcome continuations: a
-   * shadow run only *starts* inside one, so disposing the runner before they settle
-   * makes `observe` hit its disposed guard and return — producing no run, no
-   * record, and no diagnostic. Then the shadow runner, so every observation has
-   * fired, then the appends those observations began, because closing the ledger
-   * under a write still in flight would drop the record. Then the belief writes,
-   * for the same reason.
-   *
-   * The belief drain is unconditional, unlike the shadow half. A belief write is
-   * started from inside the prediction itself rather than from an observation, so
-   * it is in flight on any cognition run whether or not shadow mode is on — an
-   * early return past it would drop the record in exactly the default
-   * configuration.
-   *
-   * Awaiting a continuation implicitly awaits the prediction behind it, so this
-   * needs no new runtime hook. Every path that disposes calls this, including the
-   * early returns, so the ordering lives in one place rather than three.
-   */
-  const drainDerivedWrites = async (): Promise<void> => {
-    while (outcomeContinuations.size > 0) {
-      await Promise.allSettled([...outcomeContinuations]);
-    }
-    if (shadowRunner !== undefined) {
-      await shadowRunner.dispose();
-      while (shadowWrites.size > 0) {
-        await Promise.allSettled([...shadowWrites]);
-      }
-    }
-    while (beliefWrites.size > 0) {
-      await Promise.allSettled([...beliefWrites]);
+  /** Settles every turn the agent has in flight. Awaited before the agent is disposed. */
+  const drainAgentTurns = async (): Promise<void> => {
+    while (agentTurns.size > 0) {
+      await Promise.allSettled([...agentTurns]);
     }
   };
-
-  // The action half of the closed loop, off unless SQUID_ACTIONS opts in. Like
-  // the provider above it resolves before any source starts: a typo must fail
-  // loudly here, not silently disable execution.
-  const actions = await resolveWatchActions(watch.runtime, watch.ledger, env, {
-    workingDirectory: options.workingDirectory,
-    actionTrust: resolved.selection.actionTrust,
-    egressPolicy: egress,
-    project,
-    // Declared by the policy itself, so a policy that stops redacting targets
-    // stops arming resolution with no edit here — and one that starts cannot
-    // be missed.
-    redactsActionTargets: resolved.selection.contextPolicy.redactsActionTargets,
-  });
-  if (actions !== undefined && "configError" in actions) {
-    // Vacuous today — no source has started, so nothing can be in flight — but the
-    // runner exists by now, and a path that disposes without draining is the
-    // asymmetry a later edit turns into a lost record.
-    await drainDerivedWrites();
-    await watch.dispose();
-    return { configError: actions.configError };
-  }
 
   const sources = [...await options.createSources({
     databasePath: watch.databasePath,
-    ledgerPath: watch.ledgerPath,
     onDiagnostic: (diagnostic) => {
       logError(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
     },
@@ -411,55 +242,21 @@ export async function startWatchSession(
     }));
   }
   if (sources.length === 0) {
-    await drainDerivedWrites();
+    await drainAgentTurns();
+    agent.dispose();
     await watch.dispose();
     return { configError: "A watch session needs at least one activity source." };
   }
 
   /**
-   * Hands one live outcome to the shadow path, projected exactly as the live
-   * provider saw it.
+   * The closed loop, in three lines: capture and project, hand the projection to
+   * the agent's senses, let it think.
    *
-   * The projection is redone here rather than reused because the coordinator
-   * projects internally and keeps the result: passing the raw state instead would
-   * hand the belief layer fields the policy withheld, while still claiming that
-   * policy's id — a leak and a false claim in one line. A policy that throws is
-   * treated the way the coordinator treats it: no egress, and the shadow run is
-   * skipped rather than run on unprojected state.
+   * `observe` always runs; `prompt` follows it. The split matters — observe is
+   * what updates the agent's view of the world and appends the breadcrumb, and it
+   * must happen even for an event that arrives while a turn is already running,
+   * or the agent's next thought would be about a world two events out of date.
    */
-  const observeInShadow = (
-    outcome: PredictionOutcome,
-    ingested: PredictionRuntimeIngestResult & {
-      readonly ingest: NonNullable<PredictionRuntimeIngestResult["ingest"]>;
-    },
-  ): void => {
-    if (shadowRunner === undefined) return;
-    let projected;
-    try {
-      projected = watch.contextPolicy.project(ingested.ingest.state);
-    } catch (error) {
-      logError(JSON.stringify({ shadowProjectionError: describeErrorForAudit(error) }));
-      return;
-    }
-    shadowRunner.observe({
-      outcome,
-      worldState: projected,
-      context: {
-        triggerEventId: ingested.ingest.triggerEventId,
-        triggeredAt: ingested.ingest.triggeredAt,
-        // A duplicate never reaches here — the runtime returns a null prediction
-        // for one — so the only two dispositions left are the record's own.
-        triggerDisposition: ingested.ingest.disposition === "late" ? "late" : "accepted",
-        stateDigest: ingested.ingest.stateDigest,
-        projectionGeneration: ingested.ingest.projectionGeneration,
-        contextPolicyId: watch.contextPolicy.id,
-      },
-      // Derived from the projected state, so a belief can only cite an event the
-      // provider could actually see.
-      eventOccurredAt: evidenceTimeline(projected),
-    });
-  };
-
   const ingest = async (event: ActivityEvent): Promise<void> => {
     const result = await watch.runtime.ingest(event);
     // A capture-policy exclusion lands here as ingest === null: the event was
@@ -469,59 +266,15 @@ export async function startWatchSession(
       log(JSON.stringify({ kind: event.kind, disposition: "excluded" }));
       return;
     }
-    // Narrowed for the callback below, which also reads the disposition.
     const ingested = result as PredictionRuntimeIngestResult & {
       readonly ingest: NonNullable<PredictionRuntimeIngestResult["ingest"]>;
     };
     log(JSON.stringify(options.describeEvent(event, ingested)));
-    if (result.prediction === null) return;
-    const settled = result.prediction.then(async (outcome) => {
-      log(JSON.stringify({
-        requestId: outcome.requestId,
-        status: outcome.status,
-        provider: outcome.provider,
-        predictions: outcome.candidates.map((prediction) => prediction.kind),
-      }));
-      // Shadow runs after the live outcome is in hand and is never awaited: it
-      // must not be able to delay a real prediction, and it has no dispatcher to
-      // reach even if it wanted one.
-      observeInShadow(outcome, ingested);
-      if (actions === undefined) return;
-      const dispatched = await actions.dispatchTopCandidate(
-        outcome,
-        outcome.candidates,
-        ingested.ingest.disposition,
-        // Raw state of this ingest: the ground truth a redacted basename is
-        // resolved against. Passed on every dispatch — arming happens inside,
-        // keyed on whether the projection actually redacts.
-        ingested.ingest.state,
-      );
-      if (dispatched === null) return;
-      // Status and reason codes only: gateway text may echo user content, so
-      // stdout carries the same sanitized shape the ledger stores.
-      log(JSON.stringify({
-        status: dispatched.status,
-        planDigest: dispatched.planDigest,
-        ...(dispatched.reasonCode === undefined ? {} : { reasonCode: dispatched.reasonCode }),
-        ...(dispatched.action === null ? {} : { outcome: dispatched.action.outcome }),
-      }));
-    }).catch((error) => {
-      // The prediction promise itself never rejects (the coordinator resolves
-      // every request); this guards the dispatch half so one failed dispatch
-      // cannot take down the ingest loop.
-      logError(JSON.stringify({ dispatchError: describeErrorForAudit(error) }));
-    });
-    // Tracked rather than `void`ed. Everything downstream of an outcome — the
-    // shadow run and its ledger append — happens in this continuation, and the
-    // runtime does not know it exists: `runtime.dispose()` drains the prediction,
-    // not what a caller chained onto it. Untracked, a shutdown drains the runtime
-    // *after* the shadow runner is already disposed, so the observation is dropped
-    // with no record and no diagnostic.
-    outcomeContinuations.add(settled);
-    void settled.then(
-      () => outcomeContinuations.delete(settled),
-      () => outcomeContinuations.delete(settled),
-    );
+    // A duplicate changed nothing about the world, so there is nothing new for
+    // the agent to see and no reason to spend a turn on it.
+    if (ingested.ingest.disposition === "duplicate") return;
+    await agent.observe(ingested.ingest.state);
+    promptAgent();
   };
 
   // Started one at a time rather than with Promise.all: a source that rejects
@@ -536,10 +289,10 @@ export async function startWatchSession(
     for (const source of started.reverse()) {
       await source.stop().catch(() => {});
     }
-    // A source that failed mid-start may already have emitted, so this path is the
-    // one where a drop is reachable rather than theoretical: `source.start(ingest)`
-    // ran, predictions may be in flight, and their shadow runs have not begun.
-    await drainDerivedWrites();
+    // A source that failed mid-start may already have emitted, so a turn can be
+    // in flight on this path rather than only in theory.
+    await drainAgentTurns();
+    agent.dispose();
     await watch.dispose();
     return { configError: `A source failed to start: ${describeErrorForAudit(error)}` };
   }
@@ -549,36 +302,30 @@ export async function startWatchSession(
     banner: {
       ...(options.banner ?? {}),
       sources: sources.map((source) => source.id).join(","),
-      provider: resolved.selection.provider.name,
-      ...(actions === undefined ? {} : { actions: actions.gatewayId }),
       store: watch.databasePath ?? "memory",
-      ledger: watch.ledgerPath ?? "memory",
+      agent: "resident",
       control: gate.enabled ? gate.readerKind : "off",
       retention: retention.enabled ? retention.hours : "off",
-      shadow: shadowRunner === undefined ? "off" : "cognition",
-      ...(pruneSummary === undefined ? {} : {
-        prunedEvents: pruneSummary.removedEvents,
-        prunedRecords: pruneSummary.removedRecords,
-      }),
+      ...(pruneSummary === undefined ? {} : { prunedEvents: pruneSummary.removedEvents }),
       restoredActions: restored.recentActions.length,
     },
     runtime: watch,
-    actions,
+    agent,
     sourceIds: sources.map((source) => source.id),
     stop: async () => {
       if (stopped) return;
       stopped = true;
-      // Drain every source before disposing: a prediction whose outcome has not
-      // been written still has a ledger write in flight, and closing the sinks
-      // first drops that record. Sources stop in reverse start order so a later
-      // source never emits into one already torn down.
+      // Sources first, in reverse start order, so a later source never emits
+      // into one already torn down.
       for (const source of [...sources].reverse()) {
         await source.stop();
       }
-      // Settle confirmation and dispatch while the runtime is still open:
-      // rejection and terminal action feedback must reach the ledger.
-      if (actions !== undefined) await actions.close();
-      await drainDerivedWrites();
+      // Then the agent's turns, while its session is still open: a turn cut off
+      // mid-flight loses whatever the agent was doing, and its session history is
+      // the only record that it happened. Only then the agent itself, and only
+      // then the store — an in-flight ingest still needs somewhere to land.
+      await drainAgentTurns();
+      agent.dispose();
       await watch.dispose();
     },
   };
@@ -586,7 +333,20 @@ export async function startWatchSession(
 }
 
 /**
- * Paths a filesystem source must ignore because Squid's own sinks live there.
+ * What the agent is asked on each new observation.
+ *
+ * Deliberately not a task. The world state and the tool catalog arrive through
+ * the sense injection, so restating them here would give the model two versions
+ * of the same facts. What this line supplies is the only thing the injection
+ * cannot: permission to do nothing. Without it, a model handed a fresh
+ * observation every few seconds treats each one as a request for action, and the
+ * loop's steady state becomes activity rather than attention.
+ */
+const AGENT_TURN_PROMPT =
+  "New observations have arrived. Act only if something useful is clearly warranted; otherwise stop without acting.";
+
+/**
+ * Paths a filesystem source must ignore because Squid's own sink lives there.
  *
  * A database inside the watched root feeds its own writes back into the
  * timeline: every append updates `-wal`, the watcher reports that write, and
@@ -595,7 +355,7 @@ export async function startWatchSession(
  * would silently match nothing and let the loop back in.
  *
  * Returns an empty set for an in-memory run, and `sqliteWatchExclusions` returns
- * nothing when a sink lives outside the root, so an unrelated sibling path can
+ * nothing when the sink lives outside the root, so an unrelated sibling path can
  * never be excluded by accident.
  */
 export async function watchedSinkExclusions(
@@ -603,13 +363,9 @@ export async function watchedSinkExclusions(
   canonicalRoot: string,
 ): Promise<ReadonlySet<string>> {
   const excluded = new Set<string>();
-  if (context.databasePath === undefined || context.ledgerPath === undefined) {
-    return excluded;
-  }
-  for (const sinkPath of [context.databasePath, context.ledgerPath]) {
-    for (const path of sqliteWatchExclusions(canonicalRoot, await realpath(sinkPath))) {
-      excluded.add(path);
-    }
+  if (context.databasePath === undefined) return excluded;
+  for (const path of sqliteWatchExclusions(canonicalRoot, await realpath(context.databasePath))) {
+    excluded.add(path);
   }
   return excluded;
 }
