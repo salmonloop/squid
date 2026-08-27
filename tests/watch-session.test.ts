@@ -1,6 +1,8 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { connect, type Socket } from "node:net";
 import { describe, expect, it } from "bun:test";
 import type {
   ActivityEventEmitter,
@@ -585,5 +587,373 @@ describe("the resident agent in the ingest loop", () => {
       .map((line) => JSON.parse(line) as Record<string, unknown>)
       .find((line) => line.disposition === "excluded");
     expect(excluded?.kind).toBe("application_activated");
+  });
+});
+
+/**
+ * A real socket client against the panel server the session started.
+ *
+ * These tests do not read the server's internals — they connect the way the
+ * Rust panel does, read framed lines, and send one back. A fake here would test
+ * the wiring against itself.
+ */
+
+/**
+ * A real socket client against the panel server the session started.
+ *
+ * These tests do not read the server's internals — they connect the way the
+ * Rust panel does, read framed lines, and send one back. A fake here would test
+ * the wiring against itself.
+ */
+
+/**
+ * A real socket client against the panel server the session started.
+ *
+ * These tests do not read the server's internals — they connect the way the
+ * Rust panel does, read framed lines, and send one back. A fake here would test
+ * the wiring against itself.
+ */
+class PanelTestClient {
+  readonly lines: string[] = [];
+  private buffer = "";
+  private readonly socket: Socket;
+  private readonly opened: Promise<void>;
+
+  public constructor(socketPath: string) {
+    this.socket = connect(socketPath);
+    this.socket.setEncoding("utf8");
+    this.opened = new Promise((resolve, reject) => {
+      this.socket.once("connect", resolve);
+      this.socket.once("error", reject);
+    });
+    this.socket.on("data", (chunk: string) => {
+      this.buffer += chunk;
+      for (;;) {
+        const index = this.buffer.indexOf("\n");
+        if (index === -1) break;
+        this.lines.push(this.buffer.slice(0, index));
+        this.buffer = this.buffer.slice(index + 1);
+      }
+    });
+  }
+
+  public async ready(): Promise<void> {
+    await this.opened;
+  }
+
+  public send(line: string): void {
+    this.socket.write(`${line}\n`);
+  }
+
+  public close(): Promise<void> {
+    return new Promise((resolve) => this.socket.end(resolve));
+  }
+}
+
+function parsePanelLine(line: string): Record<string, unknown> {
+  return JSON.parse(line) as Record<string, unknown>;
+}
+
+/** Polls until the probe finds something, so tests do not sleep on wall-clock guesses. */
+async function waitForLine(
+  probe: () => Record<string, unknown> | undefined,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + 2000;
+  for (;;) {
+    const found = probe();
+    if (found !== undefined) return found;
+    if (Date.now() > deadline) throw new Error("timed out waiting for a panel line");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+/**
+ * A text selection the sensors could really observe: distinctive enough to grep
+ * the whole wire for, and deliberately *not* credential-shaped. A selection that
+ * tripped `capture-policy`'s credential patterns would reach the panel already
+ * replaced by `"[redacted]"`, and the length assertion would then be measuring
+ * the redaction placeholder instead of the privacy boundary this test is about.
+ */
+const PLAIN_SELECTION = "SELECT invoice_total FROM ledger WHERE marker_zqxjkv = 1";
+
+describe("the control panel on a watch session", () => {
+  it("delivers world state to a connected panel over the real socket", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+    const socketPath = join(dir, "panel.sock");
+    const source = new ScriptedSource("alpha", []);
+    const { result } = await startSession({
+      sources: [source],
+      env: { SQUID_PANEL_SOCKET: socketPath },
+    });
+    if ("configError" in result) throw new Error(result.configError);
+    try {
+      expect(result.session.banner.panel).toBe(socketPath);
+      const client = new PanelTestClient(socketPath);
+      await client.ready();
+
+      await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
+      const line = await waitForLine(() =>
+        client.lines
+          .map(parsePanelLine)
+          .find((parsed) => parsed.type === "world_state"),
+      );
+      expect(line.lastEvent).toBe("file_saved");
+      expect(line.episodeEvents).toBe(1);
+
+      await client.close();
+    } finally {
+      await result.session.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("announces a replied agent turn on the panel", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+    const socketPath = join(dir, "panel.sock");
+    const source = new ScriptedSource("alpha", []);
+    const { result } = await startSession({
+      sources: [source],
+      env: { SQUID_PANEL_SOCKET: socketPath },
+      agentOptions: { reply: "ran the tests; they pass" },
+    });
+    if ("configError" in result) throw new Error(result.configError);
+    try {
+      const client = new PanelTestClient(socketPath);
+      await client.ready();
+
+      await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
+      const line = await waitForLine(() =>
+        client.lines
+          .map(parsePanelLine)
+          .find((parsed) => parsed.type === "agent"),
+      );
+      expect(line.status).toBe("replied");
+      expect(line.text).toBe("ran the tests; they pass");
+
+      await client.close();
+    } finally {
+      await result.session.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("announces a failed agent turn on the panel", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+    const socketPath = join(dir, "panel.sock");
+    const source = new ScriptedSource("alpha", []);
+    const { result } = await startSession({
+      sources: [source],
+      env: { SQUID_PANEL_SOCKET: socketPath },
+      agentOptions: { promptError: new Error("the model refused") },
+    });
+    if ("configError" in result) throw new Error(result.configError);
+    try {
+      const client = new PanelTestClient(socketPath);
+      await client.ready();
+
+      await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
+      const line = await waitForLine(() =>
+        client.lines
+          .map(parsePanelLine)
+          .find((parsed) => parsed.type === "agent"),
+      );
+      expect(line.status).toBe("failed");
+      expect(String(line.text)).toContain("the model refused");
+
+      await client.close();
+    } finally {
+      await result.session.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never puts the raw selection on the wire, only its length", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+    const socketPath = join(dir, "panel.sock");
+    const source = new ScriptedSource("screen", []);
+    const { result } = await startSession({
+      sources: [source],
+      env: { SQUID_PANEL_SOCKET: socketPath },
+    });
+    if ("configError" in result) throw new Error(result.configError);
+    try {
+      const client = new PanelTestClient(socketPath);
+      await client.ready();
+
+      await source.emit!(applicationActivated("ev-1", "9"));
+      await source.emit!(createActivityEvent({
+        kind: "focus_changed",
+        eventId: "ev-2",
+        source: { kind: "host", instanceId: "screen-1" },
+        sessionId: "screen-session",
+        sequence: 2,
+        payload: { applicationId: "9", windowTitle: "vault.sql", role: "editor", label: null },
+      }));
+      await source.emit!(createActivityEvent({
+        kind: "text_context_changed",
+        eventId: "ev-3",
+        source: { kind: "host", instanceId: "screen-1" },
+        sessionId: "screen-session",
+        sequence: 3,
+        payload: { prefix: "before", suffix: "after", selection: PLAIN_SELECTION, language: "sql" },
+      }));
+
+      const line = await waitForLine(() =>
+        client.lines
+          .map(parsePanelLine)
+          .find((parsed) => parsed.type === "world_state" && parsed.selectionLength !== undefined),
+      );
+      expect(line.selectionLength).toBe(PLAIN_SELECTION.length);
+      for (const raw of client.lines) {
+        expect(raw).not.toContain(PLAIN_SELECTION);
+        expect(raw).not.toContain("invoice_total");
+      }
+
+      await client.close();
+    } finally {
+      await result.session.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("routes a panel pause press into the capture-gate command path", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+    const socketPath = join(dir, "panel.sock");
+    const commandPath = join(dir, "gate.fifo");
+    const source = new ScriptedSource("alpha", []);
+    const { result } = await startSession({
+      sources: [source],
+      env: {
+        SQUID_PANEL_SOCKET: socketPath,
+        SQUID_CONTROL: "fifo",
+        SQUID_CONTROL_FIFO: commandPath,
+        SQUID_CONTROL_POLL_MS: "10",
+      },
+    });
+    if ("configError" in result) throw new Error(result.configError);
+    try {
+      const client = new PanelTestClient(socketPath);
+      await client.ready();
+
+      client.send(JSON.stringify({ type: "control", op: "pause" }));
+      const deadline = Date.now() + 2000;
+      let appended = "";
+      while (!appended.includes('"op":"pause"')) {
+        if (Date.now() > deadline) throw new Error("pause never reached the gate command path");
+        appended = await readFile(commandPath, "utf8").catch(() => "");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      await client.close();
+    } finally {
+      await result.session.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("ships with the panel off and says so in the banner", async () => {
+    const source = new ScriptedSource("alpha", []);
+    const { result } = await startSession({ sources: [source] });
+    if ("configError" in result) throw new Error(result.configError);
+    try {
+      expect(result.session.banner.panel).toBe("off");
+    } finally {
+      await result.session.stop();
+    }
+  });
+
+  it("refuses a malformed SQUID_PANEL_SOCKET before any source starts", async () => {
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result } = await startSession({
+      sources: [source],
+      env: { SQUID_PANEL_SOCKET: "relative/panel.sock" },
+    });
+    expect("configError" in result && result.configError.includes("absolute")).toBe(true);
+    expect(lifecycle).toEqual([]);
+  });
+
+  it("removes the socket file on stop", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+    const socketPath = join(dir, "panel.sock");
+    const source = new ScriptedSource("alpha", []);
+    const { result } = await startSession({
+      sources: [source],
+      env: { SQUID_PANEL_SOCKET: socketPath },
+    });
+    if ("configError" in result) throw new Error(result.configError);
+    try {
+      expect(existsSync(socketPath)).toBe(true);
+      await result.session.stop();
+      expect(existsSync(socketPath)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("closes the panel even when a source fails to start", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+    const socketPath = join(dir, "panel.sock");
+    const broken = new ScriptedSource("broken", [], new Error("no display"));
+    const { result } = await startSession({
+      sources: [broken],
+      env: { SQUID_PANEL_SOCKET: socketPath },
+    });
+    expect("configError" in result).toBe(true);
+    expect(existsSync(socketPath)).toBe(false);
+    await rm(dir, { recursive: true, force: true });
+  });
+});
+
+describe("the control panel and the capture policy's redaction", () => {
+  /**
+   * The panel reports the selection's length, and the capture policy replaces a
+   * credential-shaped selection with `"[redacted]"` before it is ever stored.
+   * Those two facts meet here: the length the panel shows must be the redacted
+   * placeholder's, not the original's. Reporting the original length would leak
+   * the size of a secret the policy just decided nobody may see — a smaller leak
+   * than the text, but a leak the projection is not supposed to be capable of.
+   */
+  it("reports the redacted placeholder's length, not the secret's", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+    const socketPath = join(dir, "panel.sock");
+    const source = new ScriptedSource("screen", []);
+    const secret = "password = hunter2_marker_zqxjkv_and_a_long_tail_to_be_sure";
+    const { result } = await startSession({
+      sources: [source],
+      env: { SQUID_PANEL_SOCKET: socketPath },
+    });
+    if ("configError" in result) throw new Error(result.configError);
+    try {
+      const client = new PanelTestClient(socketPath);
+      await client.ready();
+
+      await source.emit!(createActivityEvent({
+        kind: "text_context_changed",
+        eventId: "ev-1",
+        source: { kind: "host", instanceId: "screen-1" },
+        sessionId: "screen-session",
+        sequence: 1,
+        payload: { prefix: "before", suffix: "after", selection: secret, language: null },
+      }));
+
+      const line = await waitForLine(() =>
+        client.lines
+          .map(parsePanelLine)
+          .find((parsed) => parsed.type === "world_state" && parsed.selectionLength !== undefined),
+      );
+      // "[redacted]" is ten characters. The secret is not.
+      expect(line.selectionLength).toBe("[redacted]".length);
+      expect(line.selectionLength).not.toBe(secret.length);
+      for (const raw of client.lines) {
+        expect(raw).not.toContain("hunter2");
+        expect(raw).not.toContain("marker_zqxjkv");
+      }
+
+      await client.close();
+    } finally {
+      await result.session.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

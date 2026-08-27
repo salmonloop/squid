@@ -16,6 +16,10 @@ import type { PredictionRuntimeIngestResult } from "./prediction-runtime.js";
 import { runRetentionPrune, type RetentionPruneResult } from "./retention-prune.js";
 import { sqliteWatchExclusions } from "./sqlite-event-store.js";
 import type { ToolSummary } from "./tool-catalog.js";
+import { resolvePanel } from "./resolve-panel.js";
+import { startPanelServer, type PanelServer } from "./panel-server.js";
+import { panelAgentLine, panelWorldState } from "./panel-view.js";
+import { appendGateCommand } from "./panel-control.js";
 
 /**
  * The whole watch pipeline minus the sources: store and runtime construction,
@@ -125,6 +129,14 @@ export async function startWatchSession(
   const retention = resolveRetention({ env });
   if ("configError" in retention) return { configError: retention.configError };
 
+  // The panel resolves here for the same reason as the rest: a malformed
+  // SQUID_PANEL_SOCKET must fail before a store exists, not after. It is also
+  // the one capability whose misconfiguration could destroy data — binding a
+  // Unix socket over a regular file overwrites it silently — so the resolution
+  // refuses a relative path and the server refuses a non-socket one.
+  const panel = resolvePanel({ env });
+  if ("configError" in panel) return { configError: panel.configError };
+
   const watch = createWatchRuntime({
     ...(options.databasePath === undefined ? {} : { databasePath: options.databasePath }),
     // Resolved inside createWatchRuntime, but the raw value passes through so
@@ -178,6 +190,42 @@ export async function startWatchSession(
   }
 
   /**
+   * The panel starts after the agent and before any source, so an observation
+   * emitted by a starting source is never missed and the socket exists before
+   * the banner claims it does. Its failure path disposes everything above it:
+   * a half-created agent plus store is the same non-state the pre-sink
+   * resolution order exists to prevent.
+   *
+   * `onControl` never touches capture state directly — it appends to the gate's
+   * command path, so a pause lands in the timeline as a `capture_gate_changed`
+   * event like every other gate change. With the gate off there is nothing to
+   * append to and the press is answered with a diagnostic, not silence.
+   */
+  let panelServer: PanelServer | undefined;
+  if (panel.enabled) {
+    const commandPath = env.SQUID_CONTROL_FIFO;
+    try {
+      panelServer = await startPanelServer({
+        socketPath: panel.socketPath,
+        onControl: (op) => {
+          if (commandPath === undefined) {
+            logError(JSON.stringify({ panelControl: op, error: "The capture gate is off." }));
+            return;
+          }
+          void appendGateCommand(commandPath, op).catch((error: unknown) => {
+            logError(JSON.stringify({ panelControl: op, error: describeErrorForAudit(error) }));
+          });
+        },
+        onDiagnostic: (line) => logError(line),
+      });
+    } catch (error) {
+      agent.dispose();
+      await watch.dispose();
+      return { configError: `The panel could not start: ${describeErrorForAudit(error)}` };
+    }
+  }
+
+  /**
    * Turns the agent's observations into turns, one at a time.
    *
    * Serialized deliberately. Two prompts overlapping on one session is not two
@@ -201,11 +249,14 @@ export async function startWatchSession(
       // otherwise silent.
       if (reply !== undefined && reply.trim().length > 0) {
         log(JSON.stringify({ agent: "replied", text: reply }));
+        panelServer?.broadcast(panelAgentLine({ status: "replied", text: reply }));
       }
     }).catch((error: unknown) => {
       // One failed turn must not end the ingest loop: the next observation gets
       // a fresh attempt, and the agent's session survives a rejected prompt.
-      logError(JSON.stringify({ agentTurnError: describeErrorForAudit(error) }));
+      const described = describeErrorForAudit(error);
+      logError(JSON.stringify({ agentTurnError: described }));
+      panelServer?.broadcast(panelAgentLine({ status: "failed", text: described }));
     });
     // The tail advances even on failure, so a rejected turn cannot wedge the
     // chain — every later observation would otherwise inherit the rejection.
@@ -242,6 +293,7 @@ export async function startWatchSession(
     }));
   }
   if (sources.length === 0) {
+    if (panelServer !== undefined) await panelServer.close();
     await drainAgentTurns();
     agent.dispose();
     await watch.dispose();
@@ -274,6 +326,14 @@ export async function startWatchSession(
     // the agent to see and no reason to spend a turn on it.
     if (ingested.ingest.disposition === "duplicate") return;
     await agent.observe(ingested.ingest.state);
+    // The panel reads the same projection the senses do — one view of the world,
+    // two windows onto it. `panelWorldState` returns null when there is nothing
+    // to report, and a null is skipped rather than sent: the wire format has no
+    // way to say "empty".
+    const panelMessage = panelWorldState(ingested.ingest.state);
+    if (panelServer !== undefined && panelMessage !== null) {
+      panelServer.broadcast(panelMessage);
+    }
     promptAgent();
   };
 
@@ -291,6 +351,7 @@ export async function startWatchSession(
     }
     // A source that failed mid-start may already have emitted, so a turn can be
     // in flight on this path rather than only in theory.
+    if (panelServer !== undefined) await panelServer.close();
     await drainAgentTurns();
     agent.dispose();
     await watch.dispose();
@@ -304,6 +365,7 @@ export async function startWatchSession(
       sources: sources.map((source) => source.id).join(","),
       store: watch.databasePath ?? "memory",
       agent: "resident",
+      panel: panel.enabled ? panel.socketPath : "off",
       control: gate.enabled ? gate.readerKind : "off",
       retention: retention.enabled ? retention.hours : "off",
       ...(pruneSummary === undefined ? {} : { prunedEvents: pruneSummary.removedEvents }),
@@ -322,9 +384,12 @@ export async function startWatchSession(
       }
       // Then the agent's turns, while its session is still open: a turn cut off
       // mid-flight loses whatever the agent was doing, and its session history is
-      // the only record that it happened. Only then the agent itself, and only
-      // then the store — an in-flight ingest still needs somewhere to land.
+      // the only record that it happened. The panel closes after that drain, so
+      // a turn settling during shutdown still reaches the window. Only then the
+      // agent itself, and only then the store — an in-flight ingest still needs
+      // somewhere to land.
       await drainAgentTurns();
+      if (panelServer !== undefined) await panelServer.close();
       agent.dispose();
       await watch.dispose();
     },
