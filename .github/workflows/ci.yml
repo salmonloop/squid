@@ -1,0 +1,87 @@
+# The gate, on every pull request and every push to `main`.
+#
+# This exists because `release.yml` triggers on a tag, and a tag can be pushed at
+# any commit. Without a gate on the way in, the release workflow would be the
+# first thing to ever run the tests on that code — and it would be running them
+# to decide whether to publish a binary it had already built. The gate belongs
+# where the code enters `main`, and the release re-runs it on the exact checkout
+# it ships from.
+#
+# Both halves of the repository are gated: the TypeScript senses and the Rust
+# panel. They are separate jobs so a red run names which half broke.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A force-push or a quick second commit makes the earlier run's answer stale.
+# Unlike the release workflow, cancelling here loses nothing.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bun:
+    name: bun
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.11
+
+      - run: bun install --frozen-lockfile
+
+      # Two passes, `src` then the suites. A test asserting against a type that
+      # no longer exists is the failure this second pass was added to catch.
+      - run: bun run typecheck
+
+      # Offline by construction: no model runtime, no network, no secret. That is
+      # what lets the whole suite gate a pull request from a fork.
+      - run: bun test
+
+      - run: bun run build
+
+  ui:
+    name: ui
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # femtovg links fontconfig and freetype; winit needs xkbcommon. Without
+      # these headers the panel does not link on a clean runner.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libfontconfig1-dev \
+            libfreetype-dev \
+            libxkbcommon-dev
+
+      # Formatting is checked first because it needs no compilation, so a
+      # whitespace-only mistake fails in seconds instead of after a full build.
+      - run: cargo fmt --all -- --check
+
+      # `--all-targets` reaches the test code too. The parser in `src/protocol.rs`
+      # is hand-written against untrusted bytes and most of its assertions live in
+      # `#[cfg(test)]`, so linting only the library would skip the code that
+      # documents the parser's edges.
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+      - run: cargo test --locked

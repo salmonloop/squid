@@ -813,7 +813,8 @@ mod tests {
     fn tolerates_an_unknown_scalar_field_on_the_new_variants() {
         // Forward compatibility, same as the prompt path: a field this build does
         // not know about must not cost the user the reading.
-        let line = "{\"type\":\"world_state\",\"updatedAt\":\"t\",\"future\":true,\"gate\":\"open\"}";
+        let line =
+            "{\"type\":\"world_state\",\"updatedAt\":\"t\",\"future\":true,\"gate\":\"open\"}";
         match parse_incoming(line).expect("recognized") {
             Incoming::WorldState(state) => assert_eq!(state.gate, Some("open".to_owned())),
             other => panic!("expected a world_state, got {other:?}"),

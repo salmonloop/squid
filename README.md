@@ -324,6 +324,40 @@ That last point is worth stating as a rule. A green gate cannot see a requiremen
 was never wired: every module could typecheck and every other suite pass while the ingest
 closure quietly never reached the agent. The loop tests exist to assert the wiring itself.
 
+## Continuous integration and releases
+
+Two workflows, and the split between them matters. `.github/workflows/ci.yml` runs the
+gate on every pull request and every push to `main`: `typecheck`, `bun test`, and
+`bun run build` on the TypeScript side, and `cargo fmt`, `cargo clippy -D warnings`, and
+`cargo test` on the panel. Both halves run as separate jobs so a red run names which one
+broke. The whole gate is offline and needs no secret, which is what lets it run on a
+pull request from a fork.
+
+`.github/workflows/release.yml` triggers on a tag matching `v*.*.*-*` — semver with a
+mandatory pre-release suffix, so a tag claiming stability has to change that file first.
+It re-runs the same gate on its own checkout, builds the panel in release profile, and
+publishes a GitHub pre-release carrying the binary plus a `sha256` of it:
+
+```bash
+git tag v0.1.0-alpha.1
+git push origin v0.1.0-alpha.1
+```
+
+The gate runs again there rather than trusting the pull request's green run, because this
+workflow builds the binary it uploads. A tag can be pushed at any commit; without its own
+gate, the release job would be publishing an artifact built from code nothing had tested.
+`workflow_dispatch` runs everything except the publish step, which is how the build gets
+proven on a clean runner without spending a tag on it.
+
+Only the publish job holds `contents: write`, and it shells out to the `gh` already on
+the runner instead of delegating that token to a third-party action. Every action that
+is third-party is pinned by commit SHA. This is the argument `ui/Cargo.toml` makes about
+the panel's own dependencies, applied to the pipeline that signs its releases.
+
+The published asset is `x86_64-unknown-linux-gnu` only. It needs `libfontconfig1`,
+`libfreetype6`, and `libxkbcommon0` at runtime — femtovg and winit link them, and the
+workflow installs the matching `-dev` packages to build.
+
 ## What is not yet implemented
 
 - No supplementary tools ship. The agent works with Pi's built-ins; `ToolSummary` is the
