@@ -1,3 +1,3 @@
 fn main() {
-    slint_build::compile("prompt.slint").expect("prompt.slint must compile");
+    slint_build::compile("panel.slint").expect("panel.slint must compile");
 }
