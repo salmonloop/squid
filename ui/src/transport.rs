@@ -135,7 +135,10 @@ impl Outgoing {
     /// things the projection reports.
     #[cfg(test)]
     fn is_connected(&self) -> bool {
-        self.stream.lock().map(|slot| slot.is_some()).unwrap_or(false)
+        self.stream
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
     }
 }
 
@@ -199,7 +202,11 @@ pub fn read_messages<R: Read>(source: R, mut deliver: impl FnMut(Incoming)) {
         // one. And `lines()` decodes before it frames, so one invalid UTF-8 byte
         // becomes an error for the whole iterator; framing is defined on bytes
         // here and decoding happens per line, so a bad byte costs one line.
-        let count = match reader.by_ref().take(MAX_LINE_BYTES).read_until(b'\n', &mut line) {
+        let count = match reader
+            .by_ref()
+            .take(MAX_LINE_BYTES)
+            .read_until(b'\n', &mut line)
+        {
             Ok(0) => return,
             Ok(count) => count,
             Err(_) => return,
@@ -323,7 +330,10 @@ mod tests {
         // The stream ended mid-object. Parsing the prefix would mean acting on a
         // message whose sender never finished writing it.
         let bytes = format!("{CANCEL}\n{{\"type\":\"cancel\",\"promptI");
-        assert_eq!(messages(bytes.as_bytes()), vec![Incoming::Cancel { prompt_id: 4 }]);
+        assert_eq!(
+            messages(bytes.as_bytes()),
+            vec![Incoming::Cancel { prompt_id: 4 }]
+        );
     }
 
     #[test]
@@ -333,7 +343,10 @@ mod tests {
         // newline rather than reframing the remainder into lines of its own.
         let huge = "x".repeat((MAX_LINE_BYTES as usize) * 3);
         let bytes = format!("{{\"type\":\"cancel\",\"summary\":\"{huge}\"}}\n{CANCEL}\n");
-        assert_eq!(messages(bytes.as_bytes()), vec![Incoming::Cancel { prompt_id: 4 }]);
+        assert_eq!(
+            messages(bytes.as_bytes()),
+            vec![Incoming::Cancel { prompt_id: 4 }]
+        );
     }
 
     #[test]
@@ -347,7 +360,10 @@ mod tests {
     #[test]
     fn an_unparseable_line_costs_only_itself() {
         let bytes = format!("not json\n{{}}\n{CANCEL}\n");
-        assert_eq!(messages(bytes.as_bytes()), vec![Incoming::Cancel { prompt_id: 4 }]);
+        assert_eq!(
+            messages(bytes.as_bytes()),
+            vec![Incoming::Cancel { prompt_id: 4 }]
+        );
     }
 
     #[test]
@@ -368,7 +384,10 @@ mod tests {
         // A `\r` is not part of the object, and the parser rejects trailing
         // content, so it has to come off before parsing.
         let bytes = format!("{CANCEL}\r\n");
-        assert_eq!(messages(bytes.as_bytes()), vec![Incoming::Cancel { prompt_id: 4 }]);
+        assert_eq!(
+            messages(bytes.as_bytes()),
+            vec![Incoming::Cancel { prompt_id: 4 }]
+        );
     }
 
     #[test]
@@ -413,7 +432,10 @@ mod tests {
         // it settles rather than growing without bound.
         for _ in 0..40 {
             delay = next_backoff(delay);
-            assert!(delay <= MAX_BACKOFF, "backoff must stay capped, got {delay:?}");
+            assert!(
+                delay <= MAX_BACKOFF,
+                "backoff must stay capped, got {delay:?}"
+            );
         }
         assert_eq!(delay, MAX_BACKOFF);
     }
@@ -466,7 +488,9 @@ mod tests {
         let (ours, theirs) = UnixStream::pair().expect("socketpair");
         let outgoing = Outgoing::new();
         outgoing.adopt(ours);
-        outgoing.send(&crate::protocol::control_line(crate::protocol::Control::Pause));
+        outgoing.send(&crate::protocol::control_line(
+            crate::protocol::Control::Pause,
+        ));
         outgoing.send(&crate::protocol::answer_line(
             3,
             crate::protocol::Answer::Approved,
