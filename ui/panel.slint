@@ -1,0 +1,398 @@
+import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
+
+// One label/value row. Factored out because the placeholder rule below has to
+// hold for *every* field, and a rule re-implemented eight times is a rule that
+// will be got wrong once.
+component Field inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+
+    spacing: 8px;
+
+    Text {
+        text: root.label;
+        // Fixed label column so the values form a readable second column; the
+        // panel is scanned, not read, and a ragged left edge defeats scanning.
+        width: 122px;
+        font-size: 12px;
+        color: #8a8a8a;
+        // Top-aligned so a wrapped value keeps its label on the first line.
+        vertical-alignment: top;
+        wrap: no-wrap;
+    }
+
+    Text {
+        // An empty string here is not a missing value to hide — it is the real
+        // state "nothing observed yet" (the protocol omits absent fields rather
+        // than sending null, precisely so this stays distinguishable). Blank
+        // space would read as a rendering bug; the em dash reads as an answer.
+        text: root.value == "" ? "—" : root.value;
+        font-size: 12px;
+        wrap: word-wrap;
+        horizontal-stretch: 1;
+    }
+}
+
+component SectionHeader inherits Text {
+    font-size: 11px;
+    font-weight: 700;
+    color: #666666;
+    wrap: no-wrap;
+}
+
+component Divider inherits Rectangle {
+    // Explicit height, otherwise the enclosing vertical layout would stretch a
+    // Rectangle to fill whatever space is going.
+    height: 1px;
+    background: #e0e0e0;
+}
+
+// The resident control panel: what the sensors observed, what the agent last
+// did, and the one capture setting the user can change from here.
+//
+// This is the deliberate inversion of `PromptWindow`. That window was
+// `always-on-top`, existed only while a question was pending, and hid itself on
+// answer — its presence *was* the message. A panel that behaved that way would
+// be a window that fights every other window all day for a foreground it does
+// not need. So: not always-on-top, visible from launch, and it stays visible.
+// Nothing here is deadline-bound except the confirmation area, and that area
+// borrows attention by appearing inside the panel rather than above everything.
+//
+// Read-mostly by construction: the only outbound signals are pause/resume and a
+// prompt answer. The panel does not compute or cache world state — it renders
+// the projection it was pushed, so what is on screen is what the watch session
+// last observed and nothing inferred on top of it.
+export component PanelWindow inherits Window {
+    // --- A. World state: what the sensors observed -----------------------
+    // One property per `world_state` field in docs/panel-protocol.md, same
+    // names, no derived or aggregated extras. A panel that computed its own
+    // view of the world would be a second projection to keep in sync.
+    in property <string> updated-at;
+    in property <string> last-event;
+    in property <string> application;
+    in property <string> window-title;
+    // "open" | "paused" | "" — empty until a gate event has been seen. The
+    // unknown case is kept distinct from both real states on purpose; see the
+    // capture control below for why guessing would be worse than admitting it.
+    in property <string> gate;
+    // A LENGTH, never the selected text. `textContext.selection` does not cross
+    // the wire at all — only `sanitizeAuditText(...).originalLength` does — so
+    // this integer is the entire extent of what this process may know about the
+    // selection. It is labelled as a length and rendered in characters for that
+    // reason: nothing on screen should suggest the text itself is available
+    // here, or invite a later edit that tries to show it.
+    // -1 means no selection was observed.
+    in property <int> selection-length: -1;
+    // ";"-joined kinds, newest last, rendered verbatim. The wire keeps this a
+    // joined string to hold the parser flat, and the panel does no string
+    // surgery on it either — a display-side split would be the same parsing
+    // work in a place with no tests.
+    in property <string> recent-actions;
+    in property <int> episode-events: -1;
+
+    // --- B. Agent activity: the most recent turn -------------------------
+    // Only the latest turn, not a feed. A scrolling transcript would make this
+    // window the place you read agent output, which is what the terminal and
+    // the timeline are for; here it answers "did the last turn land".
+    in property <string> agent-status; // "replied" | "failed" | ""
+    in property <string> agent-text;
+    in property <string> agent-at;
+
+    // --- C. Capture settings ---------------------------------------------
+    // These do not flip capture state locally. They append one line to the
+    // existing capture-gate command path, so a pause still produces a
+    // `capture_gate_changed` event in the timeline — the trace that tells a
+    // deliberate gap apart from an idle machine. The panel therefore has no
+    // local "paused" flag to drift out of step with the projection.
+    callback pause();
+    callback resume();
+
+    // --- D. Confirmation area --------------------------------------------
+    // Retained by explicit request even though no caller produces prompts
+    // today (tool-layer safety is Pi's sandbox), so an external confirmation
+    // can be wired in later without redesigning this surface.
+    in property <bool> prompt-pending;
+    in property <string> prompt-kind;
+    in property <string> prompt-summary;
+    in property <string> prompt-expires-at;
+
+    callback approve();
+    callback decline();
+
+    title: "Squid";
+    // Explicitly not always-on-top — see the component comment. A resident
+    // window earns its place by being findable, not by being unavoidable.
+    always-on-top: false;
+    // Sized for its content: a two-column field list at a readable 12px, plus
+    // room for a couple of wrapped lines of agent text.
+    preferred-width: 480px;
+    preferred-height: 520px;
+    min-width: 380px;
+
+    VerticalBox {
+        padding: 16px;
+        spacing: 10px;
+        alignment: start;
+
+        // Header. `updated-at` sits next to the title rather than inside the
+        // field list because it dates everything below it: a stale panel and a
+        // quiet machine look identical without it.
+        HorizontalLayout {
+            spacing: 8px;
+
+            Text {
+                text: "Squid";
+                font-size: 15px;
+                font-weight: 700;
+                wrap: no-wrap;
+            }
+
+            Text {
+                text: root.updated-at == "" ? "no observations yet" : "as of " + root.updated-at;
+                font-size: 11px;
+                color: #999999;
+                vertical-alignment: bottom;
+                horizontal-alignment: right;
+                wrap: no-wrap;
+                horizontal-stretch: 1;
+            }
+        }
+
+        Divider { }
+
+        // --- A. World state ---
+        SectionHeader { text: "WORLD"; }
+
+        Field {
+            label: "Application";
+            value: root.application;
+        }
+
+        Field {
+            label: "Window";
+            // Already through `sanitizeAuditText(title, "diagnostic")` on the
+            // TS side, because a window title can carry a credential. Shown
+            // verbatim from there: re-sanitizing here would only disagree.
+            value: root.window-title;
+        }
+
+        Field {
+            label: "Last event";
+            value: root.last-event;
+        }
+
+        Field {
+            label: "Recent actions";
+            value: root.recent-actions;
+        }
+
+        Field {
+            label: "Selection length";
+            // Reuses Field's empty-string rule for the unknown case rather than
+            // rendering "-1", which would read as data. Pluralised because "1
+            // characters" is the kind of detail that makes a panel look untended.
+            value: root.selection-length < 0
+                ? ""
+                : (root.selection-length == 1 ? "1 character" : "\{root.selection-length} characters");
+        }
+
+        Field {
+            label: "Episode events";
+            value: root.episode-events < 0 ? "" : "\{root.episode-events}";
+        }
+
+        Divider { }
+
+        // --- B. Agent activity ---
+        SectionHeader { text: "LAST AGENT TURN"; }
+
+        HorizontalLayout {
+            spacing: 8px;
+
+            Text {
+                text: "Status";
+                width: 122px;
+                font-size: 12px;
+                color: #8a8a8a;
+                vertical-alignment: top;
+                wrap: no-wrap;
+            }
+
+            Text {
+                text: root.agent-status == "" ? "—" : root.agent-status;
+                font-size: 12px;
+                // Colour only distinguishes replied from failed; the word is
+                // still there for anyone who cannot see the difference.
+                color: root.agent-status == "failed"
+                    ? #b3261e
+                    : (root.agent-status == "replied" ? #1b6b2f : #8a8a8a);
+                font-weight: root.agent-status == "" ? 400 : 700;
+                wrap: no-wrap;
+                horizontal-stretch: 1;
+            }
+
+            Text {
+                text: root.agent-at;
+                font-size: 11px;
+                color: #999999;
+                horizontal-alignment: right;
+                wrap: no-wrap;
+            }
+        }
+
+        Text {
+            // Sanitized on the TS side as "rationale". Capped and elided rather
+            // than allowed to grow: a long reply must not resize a resident
+            // window, and the full text belongs in the terminal or the timeline.
+            text: root.agent-text == "" ? "—" : root.agent-text;
+            font-size: 12px;
+            color: root.agent-text == "" ? #8a8a8a : #333333;
+            wrap: word-wrap;
+            overflow: elide;
+            max-height: 76px;
+        }
+
+        Divider { }
+
+        // --- C. Capture settings ---
+        SectionHeader { text: "CAPTURE"; }
+
+        HorizontalLayout {
+            spacing: 8px;
+
+            Text {
+                text: "Gate";
+                width: 122px;
+                font-size: 12px;
+                color: #8a8a8a;
+                wrap: no-wrap;
+            }
+
+            Text {
+                text: root.gate == "" ? "not observed yet" : root.gate;
+                font-size: 12px;
+                color: root.gate == "paused" ? #8a5a00 : (root.gate == "open" ? #1b6b2f : #8a8a8a);
+                font-weight: root.gate == "" ? 400 : 700;
+                wrap: no-wrap;
+                horizontal-stretch: 1;
+            }
+        }
+
+        // The control offers the *opposite* of what the projection reports, and
+        // nothing else. The panel is not the source of truth for whether
+        // capture is paused — the projection is — so a single toggle button
+        // holding its own idea of the state would eventually contradict the
+        // line of text directly above it.
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+
+            if root.gate == "open": Button {
+                text: "Pause capture";
+                clicked => {
+                    root.pause();
+                }
+            }
+
+            if root.gate == "paused": Button {
+                text: "Resume capture";
+                primary: true;
+                clicked => {
+                    root.resume();
+                }
+            }
+
+            // No gate event seen yet, so there is no state to invert. Both
+            // actions are offered instead of picking one: a lone "Pause" here
+            // would assert capture is running, which is exactly the thing not
+            // yet known. Either click resolves the ambiguity for real, because
+            // the command produces a gate event that comes back as `gate`.
+            if root.gate != "open" && root.gate != "paused": HorizontalLayout {
+                spacing: 8px;
+
+                Button {
+                    text: "Pause capture";
+                    clicked => {
+                        root.pause();
+                    }
+                }
+
+                Button {
+                    text: "Resume capture";
+                    clicked => {
+                        root.resume();
+                    }
+                }
+            }
+        }
+
+        // --- D. Confirmation area ---
+        // Conditional rather than merely transparent: when nothing is pending
+        // there are no buttons on screen to be clicked by a stray keystroke,
+        // and no stale summary left sitting under them.
+        if root.prompt-pending: VerticalLayout {
+            spacing: 8px;
+
+            Divider { }
+
+            SectionHeader { text: "CONFIRMATION"; }
+
+            Text {
+                text: "Squid wants to run: " + root.prompt-kind;
+                font-size: 13px;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
+
+            // The plan's `summary`, verbatim and alone.
+            //
+            // There is no `arguments` property on this component and there must
+            // never be one: the wire has no `arguments` field either, so the
+            // selection cannot reach this process at all. `summary` is built
+            // selection-free upstream — for a search it carries the selection's
+            // *length*, never its text. Rendering the selection would be an
+            // egress decision, not a display detail, and this is the wrong file
+            // to make it in.
+            //
+            // Monospace because this is a command line: a proportional font
+            // makes whitespace and lookalike characters harder to inspect, and
+            // inspecting it is the entire point of asking.
+            Text {
+                text: root.prompt-summary;
+                font-family: "monospace";
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: root.prompt-expires-at == "" ? "" : "Expires at " + root.prompt-expires-at;
+                font-size: 11px;
+                color: #999999;
+                wrap: no-wrap;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+
+                // Decline first in reading order, and not the primary button:
+                // the safe answer should never be the one a reflex click lands
+                // on.
+                Button {
+                    text: "Decline";
+                    clicked => {
+                        root.decline();
+                    }
+                }
+
+                Button {
+                    text: "Approve";
+                    primary: true;
+                    clicked => {
+                        root.approve();
+                    }
+                }
+            }
+        }
+    }
+}

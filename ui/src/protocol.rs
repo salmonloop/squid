@@ -1,37 +1,92 @@
 //! The line protocol the TypeScript transport speaks, parsed and written
 //! without a JSON library.
 //!
-//! Incoming, one JSON object per line on stdin:
+//! The spec both sides are written against is `docs/panel-protocol.md`; this
+//! module is the Rust half of it.
+//!
+//! Incoming, one JSON object per line:
 //!
 //! ```jsonc
+//! {"type":"world_state","updatedAt":"...","lastEvent":"file_saved","application":"Code","window":"main.ts","gate":"open","selectionLength":42,"recentActions":"copy;file_saved","episodeEvents":17}
+//! {"type":"agent","at":"...","status":"replied","text":"ran the tests; they pass"}
 //! {"type":"prompt","promptId":1,"candidateId":"...","kind":"run_tests","summary":"...","expiresAt":"..."}
 //! {"type":"cancel","promptId":1}
 //! ```
 //!
-//! Outgoing, one per line on stdout:
+//! Outgoing, one per line:
 //!
 //! ```jsonc
-//! {"promptId":1,"answer":"approved"}
+//! {"type":"control","op":"pause"}
+//! {"type":"answer","promptId":1,"answer":"approved"}
 //! ```
 //!
 //! Hand-written rather than `serde_json` because this process is the one that
-//! turns a click into permission to run a command: five flat scalar fields with
-//! no nesting is less code than the dependency, and all of it is auditable here.
+//! turns a click into permission to run a command, and into a pause of the
+//! machine's own capture: flat objects of scalar fields with no nesting are less
+//! code than the dependency, and all of it is auditable here. The panel's supply
+//! chain is part of its threat model, so `Cargo.toml` gains nothing for this.
 //!
-//! It is a real structural parser, not a substring search. `summary` carries
-//! command text, and a scan for `"kind":` would happily find one *inside* that
-//! string — a summary containing `{"kind":"run_tests"}` could then rewrite the
-//! very field describing what is about to run. Keys are only read where a key
-//! can appear.
+//! It is a real structural parser, not a substring search. `summary` and `text`
+//! carry command output and assistant prose, and a scan for `"kind":` would
+//! happily find one *inside* that string — a summary containing
+//! `{"kind":"run_tests"}` could then rewrite the very field describing what is
+//! about to run, and an agent `text` containing `{"type":"control","op":"pause"}`
+//! could otherwise read as a message rather than as something the agent said.
+//! Keys are only read where a key can appear.
 
 /// A recognized incoming message.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Incoming {
+    /// The projection changed. Every field here has already passed the TS side's
+    /// sanitizers, because what the panel shows is what the sensors just read.
+    WorldState(WorldState),
+    /// The agent finished a turn.
+    Agent(AgentLine),
     Prompt(Prompt),
     /// The engine gave up on this prompt; close it without answering.
     Cancel {
         prompt_id: i64,
     },
+}
+
+/// The projection as the panel is allowed to see it.
+///
+/// Only `updated_at` is required: every other field describes something that may
+/// simply not have been observed yet. "No foreground application has been seen"
+/// is a real state, and the panel renders it as a dash rather than inventing a
+/// value for it.
+///
+/// `selection_length` is a length and never the text. The selection is the one
+/// piece of content that needs explicit consent to leave the machine, so it does
+/// not cross this wire at all — there is no field here that could carry it.
+///
+/// `recent_actions` is a `;`-joined string rather than a list because the parser
+/// is flat by design. Making it an array would mean growing array support, which
+/// is exactly the second half-tested JSON implementation this module refuses to
+/// become.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct WorldState {
+    pub updated_at: String,
+    pub last_event: Option<String>,
+    pub application: Option<String>,
+    pub window: Option<String>,
+    pub gate: Option<String>,
+    pub selection_length: Option<i64>,
+    pub recent_actions: Option<String>,
+    pub episode_events: Option<i64>,
+}
+
+/// One finished agent turn.
+///
+/// `text` is optional because a failed turn may have nothing to quote. It is
+/// sanitized upstream; this side treats it as opaque display text and, being
+/// parsed structurally, cannot mistake a message-shaped fragment inside it for a
+/// message.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct AgentLine {
+    pub at: String,
+    pub status: String,
+    pub text: Option<String>,
 }
 
 /// The four fields a prompt is allowed to carry.
@@ -65,34 +120,82 @@ enum Value {
 /// missing answer as `timed_out`, never as consent.
 pub fn parse_incoming(line: &str) -> Option<Incoming> {
     let fields = parse_object(line)?;
-    let prompt_id = match field(&fields, "promptId")? {
-        Value::Int(id) => *id,
-        _ => return None,
-    };
     let kind_of_message = match field(&fields, "type")? {
         Value::Str(text) => text.as_str(),
         _ => return None,
     };
+    // `type` decides which fields are required, so it is read before any of
+    // them. `promptId` is only meaningful for the confirmation messages; a
+    // `world_state` line does not carry one and must not be rejected for it.
     match kind_of_message {
+        "world_state" => Some(Incoming::WorldState(WorldState {
+            updated_at: text_field(&fields, "updatedAt")?,
+            last_event: optional_text_field(&fields, "lastEvent"),
+            application: optional_text_field(&fields, "application"),
+            window: optional_text_field(&fields, "window"),
+            gate: optional_text_field(&fields, "gate"),
+            selection_length: optional_int_field(&fields, "selectionLength"),
+            recent_actions: optional_text_field(&fields, "recentActions"),
+            episode_events: optional_int_field(&fields, "episodeEvents"),
+        })),
+        "agent" => Some(Incoming::Agent(AgentLine {
+            at: text_field(&fields, "at")?,
+            status: text_field(&fields, "status")?,
+            text: optional_text_field(&fields, "text"),
+        })),
         "prompt" => Some(Incoming::Prompt(Prompt {
-            prompt_id,
+            prompt_id: int_field(&fields, "promptId")?,
             kind: text_field(&fields, "kind")?,
             summary: text_field(&fields, "summary")?,
             expires_at: text_field(&fields, "expiresAt")?,
         })),
-        "cancel" => Some(Incoming::Cancel { prompt_id }),
+        "cancel" => Some(Incoming::Cancel {
+            prompt_id: int_field(&fields, "promptId")?,
+        }),
         _ => None,
     }
 }
 
+/// Serializes a control line, newline included.
+///
+/// Pause and resume are the whole vocabulary, so a [`Control`] cannot name a
+/// third operation the TS side would drop.
+pub fn control_line(op: Control) -> String {
+    format!("{{\"type\":\"control\",\"op\":\"{}\"}}\n", op.as_wire())
+}
+
+/// The only two control operations that exist.
+///
+/// Neither one changes capture state here. They are appended to the existing
+/// capture-gate command path, so a pause still produces a `capture_gate_changed`
+/// event — the trace that tells a deliberate gap apart from an idle machine.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Control {
+    Pause,
+    Resume,
+}
+
+impl Control {
+    fn as_wire(self) -> &'static str {
+        match self {
+            Control::Pause => "pause",
+            Control::Resume => "resume",
+        }
+    }
+}
+
 /// Serializes an answer line, newline included.
+///
+/// Tagged with `"type":"answer"` because the outgoing channel now carries control
+/// lines too, and a reader that had to guess a message's kind from which fields
+/// it happens to have is a reader that can guess wrong.
 ///
 /// `answer` is not a free string: the two spellings the TypeScript side accepts
 /// are the only two an [`Answer`] can hold, so this cannot emit a third that
 /// would read as a broken surface.
 pub fn answer_line(prompt_id: i64, answer: Answer) -> String {
     format!(
-        "{{\"promptId\":{},\"answer\":\"{}\"}}\n",
+        "{{\"type\":\"answer\",\"promptId\":{},\"answer\":\"{}\"}}\n",
         prompt_id,
         answer.as_wire()
     )
@@ -127,6 +230,39 @@ fn field<'a>(fields: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
 fn text_field(fields: &[(String, Value)], name: &str) -> Option<String> {
     match field(fields, name)? {
         Value::Str(text) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn int_field(fields: &[(String, Value)], name: &str) -> Option<i64> {
+    match field(fields, name)? {
+        Value::Int(number) => Some(*number),
+        _ => None,
+    }
+}
+
+/// Reads an optional string field.
+///
+/// Absent and unreadable collapse to the same `None` on purpose. The spec says
+/// absent fields are omitted rather than sent as `null`, so a `null` arriving is
+/// already a sender not holding to the contract — but it means "nothing observed",
+/// which is exactly `None`, and losing the other seven fields of a `world_state`
+/// over it would cost the user the whole reading. A wrong *type* is treated the
+/// same way for the same reason: this is display text, not a decision.
+fn optional_text_field(fields: &[(String, Value)], name: &str) -> Option<String> {
+    match field(fields, name) {
+        Some(Value::Str(text)) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// Reads an optional integer field. Absent, `null`, or a non-integer all read as
+/// "not observed" — see [`optional_text_field`] for why that is not a silent
+/// failure. A fractional number never gets this far: `parse_number` refuses it,
+/// so the line is rejected outright rather than rounded into a plausible count.
+fn optional_int_field(fields: &[(String, Value)], name: &str) -> Option<i64> {
+    match field(fields, name) {
+        Some(Value::Int(number)) => Some(*number),
         _ => None,
     }
 }
@@ -489,11 +625,198 @@ mod tests {
     fn writes_both_answers() {
         assert_eq!(
             answer_line(7, Answer::Approved),
-            "{\"promptId\":7,\"answer\":\"approved\"}\n"
+            "{\"type\":\"answer\",\"promptId\":7,\"answer\":\"approved\"}\n"
         );
         assert_eq!(
             answer_line(7, Answer::Declined),
-            "{\"promptId\":7,\"answer\":\"declined\"}\n"
+            "{\"type\":\"answer\",\"promptId\":7,\"answer\":\"declined\"}\n"
         );
+    }
+
+    #[test]
+    fn writes_both_control_ops() {
+        assert_eq!(
+            control_line(Control::Pause),
+            "{\"type\":\"control\",\"op\":\"pause\"}\n"
+        );
+        assert_eq!(
+            control_line(Control::Resume),
+            "{\"type\":\"control\",\"op\":\"resume\"}\n"
+        );
+    }
+
+    #[test]
+    fn parses_a_world_state_with_every_field() {
+        let line = "{\"type\":\"world_state\",\"updatedAt\":\"2026-08-27T10:00:00.000Z\",\"lastEvent\":\"file_saved\",\"application\":\"Code\",\"window\":\"main.ts\",\"gate\":\"open\",\"selectionLength\":42,\"recentActions\":\"copy;file_saved\",\"episodeEvents\":17}";
+        assert_eq!(
+            parse_incoming(line),
+            Some(Incoming::WorldState(WorldState {
+                updated_at: "2026-08-27T10:00:00.000Z".to_owned(),
+                last_event: Some("file_saved".to_owned()),
+                application: Some("Code".to_owned()),
+                window: Some("main.ts".to_owned()),
+                gate: Some("open".to_owned()),
+                selection_length: Some(42),
+                recent_actions: Some("copy;file_saved".to_owned()),
+                episode_events: Some(17),
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_a_world_state_with_every_optional_field_absent() {
+        // The first observation of a fresh run: a timestamp and nothing else seen
+        // yet. Requiring more would mean the panel shows nothing until the
+        // machine happens to have looked at an application.
+        assert_eq!(
+            parse_incoming("{\"type\":\"world_state\",\"updatedAt\":\"2026-08-27T10:00:00.000Z\"}"),
+            Some(Incoming::WorldState(WorldState {
+                updated_at: "2026-08-27T10:00:00.000Z".to_owned(),
+                last_event: None,
+                application: None,
+                window: None,
+                gate: None,
+                selection_length: None,
+                recent_actions: None,
+                episode_events: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn a_null_optional_field_reads_as_absent() {
+        // The spec says omit rather than send null, so this line is a sender not
+        // holding to it. It still means "nothing observed", and dropping the whole
+        // reading over one off-spec key would cost the user the other seven fields.
+        let line = "{\"type\":\"world_state\",\"updatedAt\":\"t\",\"application\":null,\"selectionLength\":null,\"gate\":\"paused\"}";
+        match parse_incoming(line).expect("recognized") {
+            Incoming::WorldState(state) => {
+                assert_eq!(state.application, None);
+                assert_eq!(state.selection_length, None);
+                assert_eq!(state.gate, Some("paused".to_owned()));
+            }
+            other => panic!("expected a world_state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_world_state_needs_its_timestamp() {
+        for line in [
+            // updatedAt missing entirely
+            "{\"type\":\"world_state\"}",
+            // present but not a string: a misdated observation is worse than none
+            "{\"type\":\"world_state\",\"updatedAt\":17}",
+            "{\"type\":\"world_state\",\"updatedAt\":null}",
+            // a fractional count is refused outright rather than rounded
+            "{\"type\":\"world_state\",\"updatedAt\":\"t\",\"episodeEvents\":1.5}",
+        ] {
+            assert_eq!(parse_incoming(line), None, "should reject: {line}");
+        }
+    }
+
+    #[test]
+    fn parses_an_agent_line_with_and_without_text() {
+        let line = "{\"type\":\"agent\",\"at\":\"2026-08-27T10:00:01.000Z\",\"status\":\"replied\",\"text\":\"ran the tests; they pass\"}";
+        assert_eq!(
+            parse_incoming(line),
+            Some(Incoming::Agent(AgentLine {
+                at: "2026-08-27T10:00:01.000Z".to_owned(),
+                status: "replied".to_owned(),
+                text: Some("ran the tests; they pass".to_owned()),
+            }))
+        );
+        // A failed turn may have nothing to quote.
+        assert_eq!(
+            parse_incoming("{\"type\":\"agent\",\"at\":\"t\",\"status\":\"failed\"}"),
+            Some(Incoming::Agent(AgentLine {
+                at: "t".to_owned(),
+                status: "failed".to_owned(),
+                text: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn an_agent_line_needs_its_instant_and_status() {
+        for line in [
+            "{\"type\":\"agent\",\"status\":\"replied\"}",
+            "{\"type\":\"agent\",\"at\":\"t\"}",
+            "{\"type\":\"agent\",\"at\":\"t\",\"status\":null}",
+        ] {
+            assert_eq!(parse_incoming(line), None, "should reject: {line}");
+        }
+    }
+
+    #[test]
+    fn a_control_message_inside_agent_text_cannot_inject() {
+        // The panel's own outgoing line, quoted verbatim by the agent. Structural
+        // parsing is what keeps it prose: a scan for `"op":` would find one here,
+        // and this text is written by whatever the agent was told to summarize.
+        let line = "{\"type\":\"agent\",\"at\":\"t\",\"status\":\"replied\",\"text\":\"I sent {\\\"type\\\":\\\"control\\\",\\\"op\\\":\\\"pause\\\"}\"}";
+        match parse_incoming(line).expect("recognized") {
+            Incoming::Agent(agent) => {
+                assert_eq!(agent.status, "replied");
+                assert_eq!(
+                    agent.text,
+                    Some("I sent {\"type\":\"control\",\"op\":\"pause\"}".to_owned())
+                );
+            }
+            other => panic!("expected an agent line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_type_inside_a_world_state_string_cannot_retype_the_line() {
+        // Same invariant from the other direction: an embedded `"type"` in a
+        // window title must not turn a world_state into some other message.
+        let line = "{\"type\":\"world_state\",\"updatedAt\":\"t\",\"window\":\"{\\\"type\\\":\\\"prompt\\\"}\"}";
+        match parse_incoming(line).expect("recognized") {
+            Incoming::WorldState(state) => {
+                assert_eq!(state.window, Some("{\"type\":\"prompt\"}".to_owned()));
+            }
+            other => panic!("expected a world_state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_new_variants_keep_the_shared_invariants() {
+        // First key wins, no trailing object, no nesting, no raw control bytes —
+        // the same rules the prompt path is held to, checked on the new types so
+        // a later refactor cannot quietly exempt them.
+        match parse_incoming(
+            "{\"type\":\"world_state\",\"updatedAt\":\"first\",\"updatedAt\":\"second\"}",
+        )
+        .expect("recognized")
+        {
+            Incoming::WorldState(state) => assert_eq!(state.updated_at, "first"),
+            other => panic!("expected a world_state, got {other:?}"),
+        }
+        let raw_control = format!(
+            "{{\"type\":\"agent\",\"at\":\"t\",\"status\":\"replied\",\"text\":\"bad{}\"}}",
+            "\u{0007}"
+        );
+        for line in [
+            // a second object smuggled onto the same line
+            "{\"type\":\"world_state\",\"updatedAt\":\"a\"}{\"type\":\"world_state\",\"updatedAt\":\"b\"}",
+            // recentActions stays a joined string; an array is outside the shape
+            "{\"type\":\"world_state\",\"updatedAt\":\"t\",\"recentActions\":[\"copy\"]}",
+            "{\"type\":\"agent\",\"at\":\"t\",\"status\":\"replied\",\"text\":{\"y\":1}}",
+            // a lone surrogate is refused, not replaced with U+FFFD
+            "{\"type\":\"agent\",\"at\":\"t\",\"status\":\"replied\",\"text\":\"\\uD83D alone\"}",
+            raw_control.as_str(),
+        ] {
+            assert_eq!(parse_incoming(line), None, "should reject: {line}");
+        }
+    }
+
+    #[test]
+    fn tolerates_an_unknown_scalar_field_on_the_new_variants() {
+        // Forward compatibility, same as the prompt path: a field this build does
+        // not know about must not cost the user the reading.
+        let line = "{\"type\":\"world_state\",\"updatedAt\":\"t\",\"future\":true,\"gate\":\"open\"}";
+        match parse_incoming(line).expect("recognized") {
+            Incoming::WorldState(state) => assert_eq!(state.gate, Some("open".to_owned())),
+            other => panic!("expected a world_state, got {other:?}"),
+        }
     }
 }
