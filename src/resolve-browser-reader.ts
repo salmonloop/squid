@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { describeErrorForAudit } from "./action-egress.js";
+import { describeErrorForAudit } from "./audit-text.js";
 import type { BrowserPageFrame, BrowserPageReaderFactory } from "./browser-page-source.js";
 import { createMacosBrowserPageReader } from "./browser-page-reader-macos.js";
 import {

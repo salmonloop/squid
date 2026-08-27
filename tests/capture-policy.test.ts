@@ -5,8 +5,6 @@ import {
   type CapturePolicy,
 } from "../src/capture-policy.js";
 import { InMemoryEventStore } from "../src/event-store.js";
-import { FakePredictionProvider, candidate } from "../src/fake-prediction-provider.js";
-import { PredictionCoordinator } from "../src/prediction-coordinator.js";
 import { createActivityEvent, isActivityEvent, parseActivityEvent } from "../src/protocol.js";
 import { PredictionRuntime } from "../src/prediction-runtime.js";
 import { SquidCore } from "../src/squid-core.js";
@@ -19,16 +17,8 @@ import type {
 } from "../src/protocol.js";
 
 function createRuntime(capturePolicy: CapturePolicy) {
-  const provider = new FakePredictionProvider({
-    name: "fake-capture",
-    candidates: [candidate("run_tests")],
-  });
   const store = new InMemoryEventStore();
-  const runtime = new PredictionRuntime(
-    new SquidCore(store),
-    new PredictionCoordinator({ provider, random: () => "capture-1" }),
-    { capturePolicy },
-  );
+  const runtime = new PredictionRuntime(new SquidCore(store), { capturePolicy });
   return { runtime, store };
 }
 
@@ -289,7 +279,7 @@ describe("capture at the runtime ingress", () => {
       }),
     );
 
-    const stored = (await store.all())[0];
+    const stored = (await store.all())[0]!;
     const payload = stored.payload as WindowChangedPayload;
 
     expect(payload.title).toBe("[redacted]");
@@ -305,6 +295,6 @@ describe("capture at the runtime ingress", () => {
       }),
     );
 
-    expect("redacted" in (await store.all())[0]).toBe(false);
+    expect("redacted" in (await store.all())[0]!).toBe(false);
   });
 });

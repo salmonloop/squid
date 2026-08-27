@@ -1,51 +1,20 @@
 import { createHmac } from "node:crypto";
 
 /**
- * The egress decision for selection-bearing actions.
+ * The choke point for text that is about to be logged.
  *
- * The default posture is `allow` — capabilities work unless a restriction is
- * spelled — and `deny` is the explicit restriction. Both are first-class
- * spellings of `SQUID_SEARCH_EGRESS`; anything unrecognized is a startup
- * error rather than a silent fallback in either direction.
- */
-export type EgressDecision = "deny" | "allow";
-
-export interface EgressPolicy {
-  readonly id: "search-egress-deny-v1" | "search-egress-allow-v1";
-  readonly searchEgress: EgressDecision;
-}
-
-/** Audit ID for the deny posture. The runtime's fallback when unset elsewhere —
- *  prediction-runtime has no env to read, so it stays conservative there. */
-export const SEARCH_EGRESS_DENY_ID = "search-egress-deny-v1";
-/** Audit ID for the explicit allow posture. */
-export const SEARCH_EGRESS_ALLOW_ID = "search-egress-allow-v1";
-
-/**
- * Resolves `SQUID_SEARCH_EGRESS` into exactly one of three outcomes:
- * unset = allow, exact "allow" = allow, exact "deny" = deny, anything else =
- * startup error.
+ * This module carried a second half: an `EgressPolicy` resolved from
+ * `SQUID_SEARCH_EGRESS`, deciding whether a selection-bearing action was allowed
+ * to leave the machine. That decision belonged to an action layer Squid no longer
+ * has — Pi's sandbox governs what its tools may reach — so the policy is gone and
+ * what remains is the sanitizer.
  *
- * The default is open by decision: Squid's posture is that capabilities work
- * unless a restriction is spelled, so withholding search until asked made the
- * flagship outbound action dead on arrival for anyone who did not know the
- * variable existed. Denying is now the opt-in — `SQUID_SEARCH_EGRESS=deny` —
- * and a typo still fails startup rather than silently flipping posture in
- * either direction.
+ * It is still load-bearing, for a reason unrelated to egress: nearly every source
+ * funnels its failures through `describeErrorForAudit`, and an error message
+ * routinely quotes the thing that failed — a path, a window title, a tool's own
+ * stderr. Without this, a diagnostic line is an unaudited channel for whatever the
+ * sensors just read.
  */
-export function resolveSearchEgress(
-  value: string | undefined,
-): EgressPolicy | { readonly configError: string } {
-  if (value === undefined || value === "allow") {
-    return { id: SEARCH_EGRESS_ALLOW_ID, searchEgress: "allow" };
-  }
-  if (value === "deny") {
-    return { id: SEARCH_EGRESS_DENY_ID, searchEgress: "deny" };
-  }
-  return {
-    configError: 'SQUID_SEARCH_EGRESS must be unset (allow) or exactly "allow" or "deny".',
-  };
-}
 
 /**
  * Stable length ceiling for sanitized audit text. Long enough for a useful

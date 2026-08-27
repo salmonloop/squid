@@ -6,8 +6,27 @@ import {
   type ResidentSession,
   type SenseBuffer,
 } from "../src/resident-agent.js";
-import { sensePromptLines } from "../src/agent-senses.js";
-import { emptyWorldState } from "../src/protocol.js";
+import { emptyWorldState, type WorldState } from "../src/protocol.js";
+import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-agent";
+
+/**
+ * What `pi.on("context", …)` hands back: either messages to inject, or nothing.
+ * Spelled locally because these tests call the handler directly rather than
+ * through a live Pi, and the handler's contract is the thing being asserted.
+ */
+type ContextHandler = () => { messages?: unknown[] } | undefined;
+
+/**
+ * The factory out of an `InlineExtension`.
+ *
+ * The type is a union — a bare factory function, or an object carrying one under
+ * `name`/`hidden` — so reaching for `.factory` unconditionally does not typecheck
+ * even when the value in hand is the object form. Narrowing here keeps that
+ * detail out of every test body.
+ */
+function extensionFactory(extension: InlineExtension): (pi: ExtensionAPI) => void {
+  return typeof extension === "function" ? extension : extension.factory;
+}
 
 /**
  * A fake session that records calls and returns canned assistant text.
@@ -133,6 +152,42 @@ describe("createResidentAgent", () => {
   });
 });
 
+describe("createResidentAgent history", () => {
+  it("leaves the history choice to the factory when the caller states none", async () => {
+    const specs: { readonly history?: string }[] = [];
+    await createResidentAgent({
+      systemPrompt: "p",
+      cwd: ".",
+      createSession: async (spec) => {
+        specs.push(spec);
+        return fakeSession({});
+      },
+    });
+
+    // Absent, not "memory": the default factory turns absence into `continue`,
+    // and a value passed here would override that. The agent's session history is
+    // the audit trail, so an in-memory default would mean a durable run kept no
+    // record of what the agent did.
+    expect(specs).toHaveLength(1);
+    expect(specs[0]!.history).toBeUndefined();
+  });
+
+  it("forwards an explicit history choice, which is how tests stay in memory", async () => {
+    const specs: { readonly history?: string }[] = [];
+    await createResidentAgent({
+      systemPrompt: "p",
+      cwd: ".",
+      history: "memory",
+      createSession: async (spec) => {
+        specs.push(spec);
+        return fakeSession({});
+      },
+    });
+
+    expect(specs[0]!.history).toBe("memory");
+  });
+});
+
 describe("createResidentAgent observe", () => {
   it("appends an observation without triggering a turn", async () => {
     const session = fakeSession({});
@@ -142,16 +197,21 @@ describe("createResidentAgent observe", () => {
       createSession: async () => session,
     });
 
-    const state = { ...emptyWorldState(), lastEventKind: "window_changed", updatedAt: "2026-08-26T00:00:00Z" };
+    const state: WorldState = {
+      ...emptyWorldState(),
+      lastEventKind: "window_changed",
+      updatedAt: "2026-08-26T00:00:00Z",
+    };
     await agent.observe(state);
 
     // Exactly one observe call — no prompt, no turn.
     expect(session.calls.prompt).toHaveLength(0);
     expect(session.calls.observe).toHaveLength(1);
-    expect(session.calls.observe[0].customType).toBe("observation");
+    const breadcrumb = session.calls.observe[0]!;
+    expect(breadcrumb.customType).toBe("observation");
     // The breadcrumb records the event kind and the time.
-    expect(session.calls.observe[0].content).toContain("window_changed");
-    expect(session.calls.observe[0].content).toContain("2026-08-26T00:00:00Z");
+    expect(breadcrumb.content).toContain("window_changed");
+    expect(breadcrumb.content).toContain("2026-08-26T00:00:00Z");
   });
 
   it("refuses after dispose", async () => {
@@ -173,30 +233,34 @@ describe("senseExtension", () => {
     const ext = senseExtension(buffer);
     // The factory is the inline-extension body; invoke it with a fake pi that
     // records the context handler so we can call it back directly.
-    let contextHandler: (() => { messages?: unknown[] } | undefined) | undefined;
+    let contextHandler: ContextHandler | undefined;
     const fakePi = {
-      on(event: string, handler: () => unknown): void {
+      on(event: string, handler: ContextHandler): void {
         if (event === "context") contextHandler = handler;
       },
     };
-    ext.factory(fakePi as never);
+    extensionFactory(ext)(fakePi as never);
     expect(contextHandler).toBeDefined();
     expect(contextHandler!()).toBeUndefined();
   });
 
   it("injects a custom sense message once state is present", () => {
     const buffer: SenseBuffer = {
-      state: { ...emptyWorldState(), lastEventKind: "focus_changed", updatedAt: "2026-08-26T00:00:00Z" },
+      state: {
+        ...emptyWorldState(),
+        lastEventKind: "focus_changed",
+        updatedAt: "2026-08-26T00:00:00Z",
+      },
       tools: [],
     };
     const ext = senseExtension(buffer);
-    let contextHandler: (() => { messages?: unknown[] } | undefined) | undefined;
+    let contextHandler: ContextHandler | undefined;
     const fakePi = {
-      on(event: string, handler: () => unknown): void {
+      on(event: string, handler: ContextHandler): void {
         if (event === "context") contextHandler = handler;
       },
     };
-    ext.factory(fakePi as never);
+    extensionFactory(ext)(fakePi as never);
 
     const result = contextHandler!();
     expect(result).toBeDefined();

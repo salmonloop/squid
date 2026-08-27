@@ -1,4 +1,4 @@
-import { describeErrorForAudit } from "./action-egress.js";
+import { describeErrorForAudit } from "./audit-text.js";
 import type {
   ScreenTextFocusRole,
   ScreenTextFrame,

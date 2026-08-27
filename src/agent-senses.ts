@@ -1,4 +1,4 @@
-import { catalogPromptLines } from "./pi-runtime.js";
+import { catalogPromptLines } from "./tool-catalog.js";
 import type { ToolSummary } from "./tool-catalog.js";
 import type { WorldState } from "./protocol.js";
 

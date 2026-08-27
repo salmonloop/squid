@@ -9,7 +9,7 @@ const tool: ToolSummary = {
   title: "Run tests",
   category: "run_tests",
   parameters: {},
-  risk: "low",
+  risk: "mutates_workspace",
 };
 
 describe("sensePromptLines", () => {
@@ -126,7 +126,7 @@ describe("sensePromptLines", () => {
   it("renders the tool catalog via catalogPromptLines (reuse, not re-implementation)", () => {
     const tools: readonly ToolSummary[] = [
       tool,
-      { id: "run_check", title: "Run check", category: "run_check", parameters: {}, risk: "medium" },
+      { id: "run_check", title: "Run check", category: "inspect_error", parameters: {}, risk: "read_only" },
     ];
     const lines = sensePromptLines(emptyWorldState(), tools);
     // Both tool ids appear in the catalog section, after the catalog header.

@@ -61,6 +61,6 @@ describe("parseBrowserFrame", () => {
     const frame = parseBrowserFrame(`742${US}${US}https://example.com/`);
     expect(frame).not.toBeNull();
     expect(frame?.title).toBeUndefined();
-    expect(frame?.owner.windowTitle).toBe("");
+    expect(frame?.owner?.windowTitle).toBe("");
   });
 });

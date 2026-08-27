@@ -6,7 +6,7 @@ import {
 } from "../src/capture-gate-source.js";
 import { SquidCore } from "../src/squid-core.js";
 import { InMemoryEventStore } from "../src/event-store.js";
-import { createActivityEvent } from "../src/protocol.js";
+import { createActivityEvent, type ActivityEvent } from "../src/protocol.js";
 import { buildWorldState } from "../src/world-state.js";
 
 /**

@@ -29,7 +29,15 @@ const events = [
   }),
 ];
 
+// What the core produces is a projection, not a suggestion. Predictions used to
+// be printed here from a rule-based predictor the core owned; the resident agent
+// reads the projection and decides for itself now, so what this demo shows is the
+// world state a sequence of events builds up.
 for (const event of events) {
   const result = await core.ingest(event);
-  console.log(JSON.stringify({ event: event.kind, predictions: result.baselinePredictions }, null, 2));
+  console.log(JSON.stringify({
+    event: event.kind,
+    disposition: result.disposition,
+    state: result.state,
+  }, null, 2));
 }

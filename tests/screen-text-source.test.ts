@@ -70,7 +70,7 @@ const fullFrame: ScreenTextFrame = {
   occurredAt: "2026-08-20T10:00:00.000Z",
 };
 
-const allKinds = [
+const allKinds: ActivityEvent["kind"][] = [
   "application_activated",
   "window_changed",
   "focus_changed",

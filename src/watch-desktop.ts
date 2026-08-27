@@ -1,6 +1,6 @@
 import { realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import { sanitizeAuditText } from "./action-egress.js";
+import { sanitizeAuditText } from "./audit-text.js";
 import { BrowserPageActivitySource } from "./browser-page-source.js";
 import { EditorSaveActivitySource } from "./editor-save-source.js";
 import { FilesystemActivitySource } from "./filesystem-source.js";

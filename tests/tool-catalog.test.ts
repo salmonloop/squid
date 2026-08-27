@@ -1,195 +1,79 @@
 import { describe, expect, it } from "bun:test";
-import { emptyWorldState } from "../src/protocol.js";
-import { PredictionCoordinator } from "../src/prediction-coordinator.js";
-import { FakePredictionProvider, candidate } from "../src/fake-prediction-provider.js";
-import type { ToolSummary } from "../src/tool-catalog.js";
-import { summarizeTools, type ToolRegistry } from "../src/tool-catalog.js";
-import { buildToolRegistry } from "../src/tool-descriptors.js";
-import type { PredictionRequest } from "../src/prediction-provider.js";
+import { catalogPromptLines, type ToolSummary } from "../src/tool-catalog.js";
 
-/** A bun-style project: every check class declared. */
-const bunProject = {
-  ecosystem: "bun" as const,
-  commands: {
-    test: ["bun", "test"],
-    lint: ["bun", "run", "lint"],
-    typecheck: ["bun", "run", "typecheck"],
-    build: ["bun", "run", "build"],
+/**
+ * The catalog is prompt surface, and this file pins its contract.
+ *
+ * It used to assert two other things: that `summarizeTools` stripped the `render`
+ * and `guard` closures off a descriptor before it could reach a model, and that a
+ * coordinator forwarded the catalog onto every outgoing request. Both are gone —
+ * there are no descriptors carrying behavior and no coordinator forwarding
+ * anything, because Pi's own tools are the execution surface and the agent reads
+ * this catalog directly through its sense injection.
+ *
+ * What is left is worth pinning precisely because it is the whole boundary: a
+ * schema is sent verbatim rather than paraphrased, and an absent catalog is
+ * *stated* rather than invented.
+ */
+
+const runTests: ToolSummary = {
+  id: "run_tests",
+  title: "Run the project's test suite",
+  category: "run_tests",
+  parameters: {
+    type: "object",
+    properties: { commandClass: { const: "test" } },
+    required: ["commandClass"],
+    additionalProperties: false,
   },
+  risk: "mutates_workspace",
 };
 
-describe("summarizeTools", () => {
-  it("exposes id, title, category, schema, and risk — in registration order", () => {
-    const summaries = summarizeTools(buildToolRegistry({ project: bunProject }));
-    expect(summaries.map((summary) => summary.id)).toEqual([
-      "run_tests",
-      "run_check",
-      "search_selection",
-    ]);
-    expect(summaries[0].category).toBe("run_tests");
-    expect(summaries[1].category).toBe("inspect_error");
-    expect(summaries[2].risk).toBe("external");
+const searchSelection: ToolSummary = {
+  id: "search_selection",
+  title: "Search the web for the current selection",
+  category: "search_selection",
+  parameters: { type: "object", properties: {}, additionalProperties: false },
+  risk: "external",
+};
+
+describe("catalogPromptLines", () => {
+  it("renders one line per tool, in the order given", () => {
+    const lines = catalogPromptLines([runTests, searchSelection]);
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('id="run_tests"');
+    expect(lines[1]).toContain('id="search_selection"');
   });
 
-  it("carries the real argument schema so prompt and validator cannot drift", () => {
-    const summaries = summarizeTools(buildToolRegistry({ project: bunProject }));
-    const runCheck = summaries.find((summary) => summary.id === "run_check");
-    expect(runCheck === undefined ? [] : runCheck.parameters).toEqual({
-      type: "object",
-      properties: {
-        commandClass: {
-          // No `build` literal: re-running a build tells the user nothing the
-          // failure did not already, so the schema never offers it (restored
-          // from the first inspect_error implementation's exclusion list).
-          anyOf: [
-            { type: "string", const: "test" },
-            { type: "string", const: "lint" },
-            { type: "string", const: "typecheck" },
-          ],
-        },
-      },
-      required: ["commandClass"],
-      additionalProperties: false,
-    });
+  it("names the id, category, risk, and title on each line", () => {
+    const [line] = catalogPromptLines([runTests]);
+    expect(line).toContain('id="run_tests"');
+    expect(line).toContain('category="run_tests"');
+    expect(line).toContain("risk=mutates_workspace");
+    expect(line).toContain("Run the project's test suite");
   });
 
-  it("never leaks behavior: no render or guard reaches the summary", () => {
-    const summaries = summarizeTools(buildToolRegistry({ project: bunProject }));
-    for (const summary of summaries) {
-      // The summary is a plain data record; walking its own enumerable keys is
-      // enough because a function-valued field would have to be a key on it.
-      for (const key of Object.keys(summary)) {
-        expect(typeof (summary as unknown as Record<string, unknown>)[key]).not.toBe("function");
-      }
-      expect(JSON.stringify(summary)).not.toContain("render");
-      expect(JSON.stringify(summary)).not.toContain("guard");
-    }
+  it("serializes the schema verbatim so the prompt cannot drift from the real shape", () => {
+    const [line] = catalogPromptLines([runTests]);
+    // The exact JSON, not a paraphrase: a hand-written description would
+    // eventually disagree with the schema about field names, and the model would
+    // be proposing against the description.
+    expect(line).toContain(JSON.stringify(runTests.parameters));
   });
 
-  it("omits the check-backed tool when the project declares nothing", () => {
-    const summaries = summarizeTools(buildToolRegistry({
-      project: { ecosystem: "unknown", commands: {} },
-    }));
-    expect(summaries.map((summary) => summary.id)).toEqual(["run_tests", "search_selection"]);
+  it("states the absence of a catalog rather than inventing one", () => {
+    const lines = catalogPromptLines(undefined);
+    expect(lines).toHaveLength(1);
+    // No tool ids appear — the honest rendering of "nothing arrived" points the
+    // agent at its built-ins instead of at a name it would have to guess.
+    expect(lines[0]).toContain("built-in tools");
+    expect(lines[0]).not.toContain("id=");
   });
 
-  it("offers no run_check to a project whose only declared check is build", () => {
-    // The regression this pins: an earlier refactor dropped the re-runnable
-    // allow-list, so a declared build script made `build` a legal commandClass
-    // and a failed build proposed re-running itself. Build is excluded for the
-    // reason the first inspect_error implementation gave — it only rewrites
-    // output, so re-running tells the user nothing new — so declaring nothing
-    // but build means no re-runnable check exists at all.
-    const summaries = summarizeTools(buildToolRegistry({
-      project: { ecosystem: "bun", commands: { build: ["bun", "run", "build"] } },
-    }));
-    expect(summaries.map((summary) => summary.id)).toEqual(["run_tests", "search_selection"]);
+  it("states an empty catalog distinctly from an absent one", () => {
+    const empty = catalogPromptLines([]);
+    expect(empty).toHaveLength(1);
+    expect(empty[0]).toContain("empty");
+    expect(empty[0]).not.toEqual(catalogPromptLines(undefined)[0]);
   });
-
-  it("keeps build out of the schema even beside other declared checks", () => {
-    const summaries = summarizeTools(buildToolRegistry({
-      project: {
-        ecosystem: "bun",
-        commands: {
-          test: ["bun", "test"],
-          build: ["bun", "run", "build"],
-        },
-      },
-    }));
-    const runCheck = summaries.find((summary) => summary.id === "run_check");
-    expect(runCheck).toBeDefined();
-    expect(JSON.stringify(runCheck!.parameters)).not.toContain('"build"');
-  });
-});
-
-describe("PredictionCoordinator tool forwarding", () => {
-  const counter = (() => {
-    let n = 0;
-    return (): string => `req-${++n}`;
-  })();
-
-  /** A provider that records what it was handed instead of answering from a script. */
-  function capturingProvider(
-    requests: readonly PredictionRequest[],
-    tools: readonly ToolSummary[] | undefined,
-  ) {
-    return new FakePredictionProvider({
-      candidates: [candidate("none", 0)],
-      delayMs: 0,
-      name: "probe",
-    }) as FakePredictionProvider & { predict(request: PredictionRequest, signal: AbortSignal): Promise<readonly PredictionCandidateLike[]> };
-  }
-
-  type PredictionCandidateLike = ReturnType<typeof candidate>;
-
-  it("forwards the catalog onto every request when configured", async () => {
-    const seen: (readonly ToolSummary[] | undefined)[] = [];
-    const registry: ToolRegistry = buildToolRegistry({ project: bunProject });
-    const coordinator = new PredictionCoordinator({
-      provider: {
-        name: "probe",
-        predict: async (request) => {
-          seen.push(request.tools);
-          return [candidate("none", 0)];
-        },
-      },
-      tools: summarizeTools(registry),
-    });
-    await coordinator.request(emptyWorldState());
-    expect(seen).toHaveLength(1);
-    expect(seen[0]?.map((tool) => tool.id)).toEqual([
-      "run_tests",
-      "run_check",
-      "search_selection",
-    ]);
-  });
-
-  it("sends no tools field when none was configured", async () => {
-    let sawKey: boolean | undefined;
-    const coordinator = new PredictionCoordinator({
-      provider: {
-        name: "probe",
-        predict: async (request) => {
-          sawKey = "tools" in request;
-          return [candidate("none", 0)];
-        },
-      },
-    });
-    await coordinator.request(emptyWorldState());
-    // Absent means absent: a provider must be able to tell "no catalog" apart
-    // from an empty one, and `"tools": undefined` in JSON would erase both.
-    expect(sawKey).toBe(false);
-  });
-
-  it("keeps forwarding after a superseded request", async () => {
-    const seen: number[] = [];
-    // First call hangs on the signal (so supersede aborts it); the second
-    // answers at once. Mirrors the supersede shape the coordinator tests use.
-    let calls = 0;
-    const coordinator = new PredictionCoordinator({
-      provider: {
-        name: "probe",
-        predict: async (request, signal) => {
-          if (request.tools !== undefined) seen.push(request.tools.length);
-          calls += 1;
-          if (calls === 1) {
-            return new Promise<never>((_resolve, reject) => {
-              signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
-            });
-          }
-          return [candidate("none", 0)];
-        },
-      },
-      tools: summarizeTools(buildToolRegistry()),
-      random: counter,
-    });
-    const first = coordinator.request(emptyWorldState());
-    await coordinator.request(emptyWorldState());
-    expect((await first).status).toBe("stale");
-    // No project profile, so the registry is the two unconditional tools.
-    expect(seen).toEqual([2, 2]);
-  });
-
-  // Guard against the capturing helper above rotting into dead code.
-  void capturingProvider;
 });

@@ -1,5 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import { HeuristicPredictor } from "../src/baseline-predictor.js";
 import {
   createActivityEvent,
   parseActivityEvent,
@@ -169,8 +168,13 @@ describe("WorldState evidence ordering and prediction eligibility", () => {
 
     expect(state.currentBrowserPage?.observationOrdinal).toBe(4);
     expect(state.textContext?.observationOrdinal).toBe(5);
-    expect(new HeuristicPredictor().predict(state).map((candidate) => candidate.kind))
-      .toContain("search_selection");
+    // Ownership survived the ordinal bookkeeping: the page and the selection
+    // belong to the same foreground application, which is what makes a selection
+    // searchable at all.
+    expect(state.currentBrowserPage?.owner).toEqual({
+      applicationId: "browser",
+      windowTitle: "Docs",
+    });
   });
 
   it("restores a legacy ownerless page but never treats it as search evidence", () => {
@@ -186,11 +190,9 @@ describe("WorldState evidence ordering and prediction eligibility", () => {
     const state = buildWorldState([legacy]);
 
     expect(state.currentBrowserPage?.owner).toBeNull();
-    expect(new HeuristicPredictor().predict(state).some((candidate) => candidate.kind === "search_selection"))
-      .toBe(false);
   });
 
-  it("does not search when page ownership mismatches the foreground", () => {
+  it("drops page ownership when it mismatches the foreground", () => {
     const events = browserScene("mismatch");
     const page = events.find((item) => item.kind === "browser_navigated")!;
     const state = buildWorldState(events.map((item) => item === page
@@ -207,11 +209,9 @@ describe("WorldState evidence ordering and prediction eligibility", () => {
       : item));
 
     expect(state.currentBrowserPage?.owner).toBeNull();
-    expect(new HeuristicPredictor().predict(state).some((candidate) => candidate.kind === "search_selection"))
-      .toBe(false);
   });
 
-  it("does not repeat inspect_error after an unrelated event", () => {
+  it("stops treating a failure as the latest outcome after an unrelated event", () => {
     const failed = event({
       eventId: "failed-command", sequence: 0, occurredAt: "2026-08-21T13:00:00.000Z",
       kind: "terminal_command_completed",
@@ -226,9 +226,12 @@ describe("WorldState evidence ordering and prediction eligibility", () => {
       }),
     ]);
 
-    expect(new HeuristicPredictor().predict(afterFailure).map((candidate) => candidate.kind))
-      .toContain("inspect_error");
-    expect(new HeuristicPredictor().predict(afterPointer).map((candidate) => candidate.kind))
-      .not.toContain("inspect_error");
+    // The failure is the projection's last command outcome right after it lands,
+    // and `lastEventKind` moves on once anything else happens — which is how a
+    // reader tells "the tests just failed" from "they failed a while ago".
+    expect(afterFailure.lastCommandOutcome?.succeeded).toBe(false);
+    expect(afterFailure.lastEventKind).toBe("terminal_command_completed");
+    expect(afterPointer.lastCommandOutcome?.succeeded).toBe(false);
+    expect(afterPointer.lastEventKind).toBe("pointer_action");
   });
 });

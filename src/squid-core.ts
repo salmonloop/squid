@@ -1,7 +1,6 @@
 import { compareActivityEvents, eventIdentity, orderActivityEvents } from "./chronicle-ordering.js";
 import type { EventStore } from "./event-store.js";
-import { HeuristicPredictor, type Predictor } from "./baseline-predictor.js";
-import { parseActivityEvent, type ActivityEvent, type PredictionCandidate, type WorldState } from "./protocol.js";
+import { parseActivityEvent, type ActivityEvent, type WorldState } from "./protocol.js";
 import { buildWorldState, cloneWorldState, reduceWorldState } from "./world-state.js";
 import { digestWorldState } from "./state-digest.js";
 
@@ -12,7 +11,6 @@ export interface IngestResult {
   state: WorldState;
   stateDigest: string;
   projectionGeneration: number;
-  baselinePredictions: readonly PredictionCandidate[];
 }
 
 export class ChronicleConflictError extends Error {
@@ -30,10 +28,7 @@ export class SquidCore {
   private operationTail: Promise<void> = Promise.resolve();
   private generation = 0;
 
-  public constructor(
-    private readonly eventStore: EventStore,
-    private readonly predictor: Predictor = new HeuristicPredictor(),
-  ) {}
+  public constructor(private readonly eventStore: EventStore) {}
 
   public get currentState(): WorldState {
     return cloneWorldState(this.state);
@@ -104,7 +99,7 @@ export class SquidCore {
     this.state = reduceWorldState(this.state, event);
     this.latestProjectedEvent = event;
     this.generation += 1;
-    return this.result("accepted", event.occurredAt);
+    return this.result("accepted");
   }
 
   private async restoreInternal(): Promise<WorldState> {
@@ -145,18 +140,13 @@ export class SquidCore {
     this.latestProjectedEvent = canonicalEvents.at(-1) ?? null;
   }
 
-  private result(disposition: IngestDisposition, predictionTime = this.state.updatedAt): IngestResult {
+  private result(disposition: IngestDisposition): IngestResult {
     const state = cloneWorldState(this.state);
-    const baselinePredictions = predictionTime === null
-      ? []
-      : this.predictor.predict(cloneWorldState(this.state), new Date(predictionTime));
-
     return {
       disposition,
       state,
       stateDigest: digestWorldState(state),
       projectionGeneration: this.generation,
-      baselinePredictions: structuredClone(baselinePredictions),
     };
   }
 

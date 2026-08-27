@@ -1,11 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { type Predictor } from "../src/baseline-predictor.js";
 import { InMemoryEventStore } from "../src/event-store.js";
 import { createActivityEvent } from "../src/protocol.js";
 import { ChronicleConflictError, SquidCore } from "../src/squid-core.js";
 
 describe("SquidCore", () => {
-  it("reconstructs focus context and emits a completion baseline", async () => {
+  it("reconstructs focus context and text ownership across events", async () => {
     const core = new SquidCore(new InMemoryEventStore());
 
     await core.ingest(createActivityEvent({
@@ -25,7 +24,6 @@ describe("SquidCore", () => {
     expect(result.state.activeApplication?.id).toBe("editor");
     expect(result.state.textContext?.prefix).toBe("Hello");
     expect(result.state.textContext?.owner).toEqual({ applicationId: "editor", windowTitle: "draft.md" });
-    expect(result.baselinePredictions[0]?.kind).toBe("draft_completion");
   });
 
   it("restores state from the event store", async () => {
@@ -192,23 +190,6 @@ describe("SquidCore", () => {
 
     await core.ingest(first);
     expect((await core.ingest(equivalent)).disposition).toBe("duplicate");
-  });
-
-  it("does not let a predictor mutate core state", async () => {
-    const mutatingPredictor: Predictor = {
-      predict(state) {
-        state.focus = null;
-        return [];
-      },
-    };
-    const core = new SquidCore(new InMemoryEventStore(), mutatingPredictor);
-
-    await core.ingest(createActivityEvent({
-      kind: "focus_changed",
-      payload: { applicationId: "editor", windowTitle: "main.ts", role: "editor", label: null },
-    }));
-
-    expect(core.currentState.focus?.windowTitle).toBe("main.ts");
   });
 
   it("isolates published state snapshots", async () => {

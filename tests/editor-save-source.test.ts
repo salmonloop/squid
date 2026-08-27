@@ -75,6 +75,8 @@ function harness() {
     source: EditorSaveActivitySource;
     events: ActivityEvent[];
     emit(frame: EditorSaveFrame): Promise<void>;
+    /** Pushes a frame the reader could never really produce, for the refusal paths. */
+    emitRaw(frame: EditorSaveFrame): void;
     stop(): Promise<void>;
   }> {
     const source = new EditorSaveActivitySource({
@@ -94,6 +96,7 @@ function harness() {
         push!(frame);
         return source["deliveryTail"];
       },
+      emitRaw: (frame) => push!(frame),
       stop: () => source.stop(),
     };
   }
@@ -132,7 +135,7 @@ describe("EditorSaveActivitySource", () => {
     // One bad report must not wedge delivery: the editor keeps saving.
     const h = await harness();
     try {
-      push!({} as EditorSaveFrame); // reaches deliver, projection throws/refuses
+      h.emitRaw({} as EditorSaveFrame); // reaches deliver, projection throws/refuses
     } catch {
       // handleFrame serializes through the tail, so nothing escapes
     }

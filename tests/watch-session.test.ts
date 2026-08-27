@@ -10,9 +10,7 @@ import type {
 import { createActivityEvent, type ActivityEvent } from "../src/protocol.js";
 import { startWatchSession, type WatchSourceContext } from "../src/watch-session.js";
 import { SqliteEventStore } from "../src/sqlite-event-store.js";
-import { SqlitePredictionLedger } from "../src/sqlite-prediction-ledger.js";
-import { buildLedgerReport } from "../src/ledger-report.js";
-import { isShadowProvider } from "../src/shadow-ledger.js";
+import type { ResidentSession, ResidentSessionFactory } from "../src/resident-agent.js";
 
 /**
  * A source that emits exactly what a test hands it, recording lifecycle so the
@@ -44,6 +42,53 @@ class ScriptedSource implements ActivitySource {
   }
 }
 
+/**
+ * A recording stand-in for the agent's Pi session.
+ *
+ * No suite in this repository starts a real `ModelRuntime`, and the resident
+ * agent is no exception: what these tests need to see is *that the loop reached
+ * the agent*, in what order, and with what — which a fake records exactly and a
+ * live model would only obscure.
+ */
+interface AgentLog {
+  readonly calls: string[];
+  readonly observed: string[];
+  readonly prompts: string[];
+  disposed: number;
+}
+
+function fakeAgentFactory(
+  log: AgentLog,
+  options: { readonly promptError?: Error; readonly reply?: string } = {},
+): ResidentSessionFactory {
+  return async (): Promise<ResidentSession> => ({
+    async prompt(text: string): Promise<void> {
+      log.calls.push("prompt");
+      log.prompts.push(text);
+      if (options.promptError !== undefined) throw options.promptError;
+    },
+    async observe(customType: string, content: string): Promise<void> {
+      log.calls.push("observe");
+      log.observed.push(`${customType}:${content}`);
+    },
+    async waitForIdle(): Promise<void> {
+      log.calls.push("waitForIdle");
+    },
+    async abort(): Promise<void> {},
+    getLastAssistantText(): string | undefined {
+      return options.reply;
+    },
+    dispose(): void {
+      log.calls.push("dispose");
+      log.disposed += 1;
+    },
+  });
+}
+
+function emptyAgentLog(): AgentLog {
+  return { calls: [], observed: [], prompts: [], disposed: 0 };
+}
+
 /** A save the filesystem source could really produce: path known, owner not. */
 function fileSaved(eventId: string, path: string): ActivityEvent {
   return createActivityEvent({
@@ -69,18 +114,6 @@ function fileSavedAt(eventId: string, occurredAt: string): ActivityEvent {
   });
 }
 
-/** A failed test run: the world both the heuristic and `debug_failure` fire on. */
-function terminalCommandFailed(eventId: string): ActivityEvent {
-  return createActivityEvent({
-    kind: "terminal_command_completed",
-    eventId,
-    source: { kind: "host", instanceId: "term-1" },
-    sessionId: "term-session",
-    sequence: 0,
-    payload: { commandClass: "test", succeeded: false, exitCode: 1 },
-  });
-}
-
 /** A foreground fact only a screen source can produce. */
 function applicationActivated(eventId: string, applicationId: string): ActivityEvent {
   return createActivityEvent({
@@ -93,7 +126,7 @@ function applicationActivated(eventId: string, applicationId: string): ActivityE
   });
 }
 
-/** Env with actions and any model off: the default posture both watches ship. */
+/** The default posture both watches ship with: no capability variables set. */
 const OFFLINE_ENV: Record<string, string | undefined> = {};
 
 async function startSession(options: {
@@ -101,13 +134,17 @@ async function startSession(options: {
   readonly env?: Record<string, string | undefined>;
   readonly log?: (line: string) => void;
   readonly logError?: (line: string) => void;
+  readonly agentLog?: AgentLog;
+  readonly agentOptions?: { readonly promptError?: Error; readonly reply?: string };
 }) {
   const seenContexts: WatchSourceContext[] = [];
+  const agentLog = options.agentLog ?? emptyAgentLog();
   const result = await startWatchSession({
     workingDirectory: "/tmp",
     env: options.env ?? OFFLINE_ENV,
     log: options.log ?? (() => {}),
     logError: options.logError ?? (() => {}),
+    createAgentSession: fakeAgentFactory(agentLog, options.agentOptions ?? {}),
     createSources: async (context) => {
       seenContexts.push(context);
       return options.sources;
@@ -117,7 +154,19 @@ async function startSession(options: {
       disposition: ingested.ingest.disposition,
     }),
   });
-  return { result, seenContexts };
+  return { result, seenContexts, agentLog };
+}
+
+/**
+ * Settles the ingest pipeline *and* the agent turn it started.
+ *
+ * `awaitIdle` drains the runtime's own ingests; the agent turn is chained onto
+ * one and the runtime does not know it exists. A test that awaited only the
+ * runtime would assert against a turn still in flight — which is exactly the
+ * drop `stop` orders itself to avoid, so it must not be papered over here.
+ */
+async function settle(session: { stop(): Promise<void> }): Promise<void> {
+  await session.stop();
 }
 
 describe("startWatchSession", () => {
@@ -132,17 +181,16 @@ describe("startWatchSession", () => {
     expect(result.session.sourceIds).toEqual(["alpha", "beta"]);
 
     await result.session.stop();
-    // Reverse order matters: a later source must never emit into a runtime a
+    // Reverse order matters: a later source must never emit into a runtime an
     // earlier one has already begun tearing down.
     expect(lifecycle).toEqual(["start:alpha", "start:beta", "stop:beta", "stop:alpha"]);
   });
 
   /**
-   * The reason this module exists. `admitRunTests` compares the owner of the
-   * newest save against the foreground application, and no single source can
-   * produce both facts: the filesystem source reports a path with
-   * `applicationId: null`, and only a screen source knows what is in front.
-   * A session must therefore project both streams into one state.
+   * The reason this module exists. What the agent can conclude about a save
+   * depends on facts no single source produces: the filesystem source reports a
+   * path with `applicationId: null`, and only a screen source knows what is in
+   * front. A session must therefore project both streams into one state.
    */
   it("projects events from two independent sources into one world state", async () => {
     const lifecycle: string[] = [];
@@ -162,14 +210,13 @@ describe("startWatchSession", () => {
     const save = state.recentActions.find((action) => action.kind === "file_saved");
     expect(save?.target).toBe("src/x.test.ts");
     // The save's owner stays unknown. Attributing it to whatever happened to be
-    // in the foreground is the guess the projection refuses to make, and
-    // admission still rejects on it — see the filesystem-save-run-tests fixture.
+    // in the foreground is the guess the projection refuses to make.
     expect(save?.applicationId).toBeNull();
 
-    await result.session.stop();
+    await settle(result.session);
   });
 
-  it("shares one store, ledger, and runtime across sources", async () => {
+  it("shares one store and runtime across sources", async () => {
     const lifecycle: string[] = [];
     const first = new ScriptedSource("alpha", lifecycle);
     const second = new ScriptedSource("beta", lifecycle);
@@ -180,9 +227,8 @@ describe("startWatchSession", () => {
     await second.emit!(fileSaved("fs-2", "b.ts"));
     await result.session.runtime.runtime.awaitIdle();
 
-    const stored = await result.session.runtime.store.all();
-    expect(stored).toHaveLength(2);
-    await result.session.stop();
+    expect(await result.session.runtime.store.all()).toHaveLength(2);
+    await settle(result.session);
   });
 
   it("hands every source the same diagnostic sink and sink paths", async () => {
@@ -196,10 +242,9 @@ describe("startWatchSession", () => {
     if ("configError" in result) throw new Error(result.configError);
 
     const context = seenContexts[0]!;
-    // In-memory run: no sink paths, which is what keeps a filesystem source from
+    // In-memory run: no sink path, which is what keeps a filesystem source from
     // computing exclusions it does not need.
     expect(context.databasePath).toBeUndefined();
-    expect(context.ledgerPath).toBeUndefined();
 
     const diagnostic: ActivitySourceDiagnostic = {
       kind: "watcher_error",
@@ -209,7 +254,7 @@ describe("startWatchSession", () => {
     context.onDiagnostic(diagnostic);
     expect(logged.some((line) => line.includes("a watcher failed"))).toBe(true);
 
-    await result.session.stop();
+    await settle(result.session);
   });
 
   it("refuses a session with no sources instead of running a blind core", async () => {
@@ -222,7 +267,7 @@ describe("startWatchSession", () => {
     const healthy = new ScriptedSource("alpha", lifecycle);
     const broken = new ScriptedSource("beta", lifecycle, new Error("reader unavailable"));
 
-    const { result } = await startSession({ sources: [healthy, broken] });
+    const { result, agentLog } = await startSession({ sources: [healthy, broken] });
 
     // A half-started session is worse than none: the caller has no handle to
     // stop the source that did start, so the session must unwind itself.
@@ -231,27 +276,12 @@ describe("startWatchSession", () => {
       expect(result.configError).toContain("reader unavailable");
     }
     expect(healthy.stopped).toBe(true);
+    // The agent was created before the sources started, so the unwind has to
+    // dispose it too — otherwise a failed startup leaks a live session.
+    expect(agentLog.disposed).toBe(1);
   });
 
-  it("reports a config error rather than starting when egress is malformed", async () => {
-    const lifecycle: string[] = [];
-    const source = new ScriptedSource("alpha", lifecycle);
-    const result = await startWatchSession({
-      workingDirectory: "/tmp",
-      env: { SQUID_SEARCH_EGRESS: "Allow" },
-      log: () => {},
-      logError: () => {},
-      createSources: async () => [source],
-      describeEvent: () => ({}),
-    });
-
-    expect("configError" in result).toBe(true);
-    // Refused before the source was ever constructed.
-    expect(lifecycle).toEqual([]);
-    expect(source.started).toBe(false);
-  });
-
-  it("names every source in the startup banner", async () => {
+  it("names every source and the agent in the startup banner", async () => {
     const lifecycle: string[] = [];
     const { result } = await startSession({
       sources: [new ScriptedSource("filesystem", lifecycle), new ScriptedSource("screen", lifecycle)],
@@ -260,19 +290,22 @@ describe("startWatchSession", () => {
 
     expect(result.session.banner.sources).toBe("filesystem,screen");
     expect(result.session.banner.store).toBe("memory");
-    expect(result.session.banner.ledger).toBe("memory");
-    await result.session.stop();
+    expect(result.session.banner.agent).toBe("resident");
+    await settle(result.session);
   });
 
   it("is idempotent on stop so a second signal cannot double-dispose", async () => {
     const lifecycle: string[] = [];
     const source = new ScriptedSource("alpha", lifecycle);
-    const { result } = await startSession({ sources: [source] });
+    const { result, agentLog } = await startSession({ sources: [source] });
     if ("configError" in result) throw new Error(result.configError);
 
     await result.session.stop();
     await result.session.stop();
     expect(lifecycle.filter((entry) => entry === "stop:alpha")).toHaveLength(1);
+    // The agent's session is disposed once too: a second signal must not tear
+    // down a session that is already gone.
+    expect(agentLog.disposed).toBe(1);
   });
 
   it("logs one described line per ingested event", async () => {
@@ -287,7 +320,7 @@ describe("startWatchSession", () => {
 
     const described = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
     expect(described.some((line) => line.kind === "file_saved")).toBe(true);
-    await result.session.stop();
+    await settle(result.session);
   });
 
   it("reports a config error rather than starting when retention is malformed", async () => {
@@ -298,6 +331,7 @@ describe("startWatchSession", () => {
       env: { SQUID_RETENTION_HOURS: "soon" },
       log: () => {},
       logError: () => {},
+      createAgentSession: fakeAgentFactory(emptyAgentLog()),
       createSources: async () => [source],
       describeEvent: () => ({}),
     });
@@ -306,8 +340,8 @@ describe("startWatchSession", () => {
     if ("configError" in result) {
       expect(result.configError).toContain("SQUID_RETENTION_HOURS");
     }
-    // Same refusal posture as egress: nothing starts on a policy that cannot
-    // be honored, and the error names the variable the user must fix.
+    // Nothing starts on a policy that cannot be honored, and the error names the
+    // variable the user must fix.
     expect(lifecycle).toEqual([]);
     expect(source.started).toBe(false);
   });
@@ -317,9 +351,8 @@ describe("startWatchSession", () => {
    * test hook: the prune through the durable database it empties (the seeded
    * ancient event is gone), the ordering through the dedupe index — an event
    * restored from history replays as "duplicate", while one deleted before
-   * restore is accepted as new. The session needs a real SQLite pairing here
-   * because the in-memory stores have nothing to persist between seeding and
-   * startup.
+   * restore is accepted as new. The session needs a real SQLite store here
+   * because the in-memory one has nothing to persist between seeding and startup.
    */
   it("states the retention bound in the banner and prunes old history before restore", async () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-watch-retention-"));
@@ -338,6 +371,7 @@ describe("startWatchSession", () => {
         databasePath,
         log: () => {},
         logError: () => {},
+        createAgentSession: fakeAgentFactory(emptyAgentLog()),
         createSources: async () => [source],
         describeEvent: () => ({}),
       });
@@ -366,320 +400,190 @@ describe("startWatchSession", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+});
 
-  it("reports a config error rather than starting when shadow mode is malformed", async () => {
+/**
+ * The closed loop, asserted end to end.
+ *
+ * This is the requirement the whole pivot exists to satisfy, and a green gate
+ * cannot see it: every module could typecheck and every other test pass while the
+ * ingest closure quietly never reached the agent. So these assert the wiring
+ * itself — an event arrives, the agent's senses are updated, and it is given a
+ * turn.
+ */
+describe("the resident agent in the ingest loop", () => {
+  it("observes the projection and then takes a turn, in that order", async () => {
     const lifecycle: string[] = [];
     const source = new ScriptedSource("alpha", lifecycle);
-    const result = await startWatchSession({
-      workingDirectory: "/tmp",
-      env: { SQUID_SHADOW_COGNITION: "yes" },
-      log: () => {},
-      logError: () => {},
-      createSources: async () => [source],
-      describeEvent: () => ({}),
-    });
-
-    expect("configError" in result).toBe(true);
-    if ("configError" in result) {
-      expect(result.configError).toContain("SQUID_SHADOW_COGNITION");
-    }
-    // A typo that quietly disabled shadow mode would leave an operator reading a
-    // ledger with no shadow attempts and concluding the cognition path agrees with
-    // the heuristic everywhere, when in fact it never ran.
-    expect(source.started).toBe(false);
-  });
-
-  it("refuses a malformed belief producer before starting a source", async () => {
-    // Checked in every configuration, not only when shadow mode observes it: a typo that
-    // silently selected the heuristic would leave an operator reading a report of
-    // deterministic rules and concluding a model agrees with them everywhere.
-    const lifecycle: string[] = [];
-    const source = new ScriptedSource("alpha", lifecycle);
-    const result = await startWatchSession({
-      workingDirectory: "/tmp",
-      env: { ...OFFLINE_ENV, SQUID_BELIEF_PROVIDER: "gpt" },
-      log: () => {},
-      logError: () => {},
-      createSources: async () => [source],
-      describeEvent: () => ({}),
-    });
-
-    expect("configError" in result).toBe(true);
-    if ("configError" in result) {
-      expect(result.configError).toContain("SQUID_BELIEF_PROVIDER");
-    }
-    expect(source.started).toBe(false);
-  });
-
-  it("refuses a malformed belief producer on the cognition path too", async () => {
-    // The live path resolves the same variable, and it resolves it before any sink opens.
-    // Two readers of one variable is the point: a run must not be able to score a model
-    // live while shadowing the heuristic, since `top1Agrees` would then be comparing two
-    // different questions.
-    const result = await startWatchSession({
-      workingDirectory: "/tmp",
-      env: { ...OFFLINE_ENV, SQUID_PROVIDER: "cognition", SQUID_BELIEF_PROVIDER: "gpt" },
-      log: () => {},
-      logError: () => {},
-      createSources: async () => [new ScriptedSource("alpha", [])],
-      describeEvent: () => ({}),
-    });
-
-    expect("configError" in result).toBe(true);
-    if ("configError" in result) {
-      expect(result.configError).toContain("SQUID_BELIEF_PROVIDER");
-    }
-  });
-
-  it("says shadow mode is off by default, changing nothing about the ledger", async () => {
-    const lifecycle: string[] = [];
-    const source = new ScriptedSource("alpha", lifecycle);
-    const { result } = await startSession({ sources: [source] });
+    const { result, agentLog } = await startSession({ sources: [source] });
     if ("configError" in result) throw new Error(result.configError);
 
-    expect(result.session.banner.shadow).toBe("off");
-
-    await source.emit!(terminalCommandFailed("term-1"));
-    await result.session.runtime.runtime.awaitIdle();
+    await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
     await result.session.stop();
 
-    const attempts = (await result.session.runtime.ledger.all())
-      .filter((record) => record.recordType === "attempt");
-    expect(attempts).toHaveLength(1);
-    expect(attempts.every((attempt) => !isShadowProvider(attempt.provider))).toBe(true);
+    // Observe before prompt: the prompt is what makes the agent think, and it
+    // must think about the world *including* this event, not the one before it.
+    const observeAt = agentLog.calls.indexOf("observe");
+    const promptAt = agentLog.calls.indexOf("prompt");
+    expect(observeAt).toBeGreaterThanOrEqual(0);
+    expect(promptAt).toBeGreaterThan(observeAt);
   });
 
-  /**
-   * The fourth done-when of issue #4, end to end: both paths run, both are
-   * ledgered, `bun run ledger:report` distinguishes them, and neither shadow
-   * record can be dispatched.
-   */
-  it("runs both paths, ledgers both, and dispatches neither", async () => {
+  it("appends an observation naming the event kind", async () => {
     const lifecycle: string[] = [];
     const source = new ScriptedSource("alpha", lifecycle);
-    const { result } = await startSession({
-      sources: [source],
-      env: { ...OFFLINE_ENV, SQUID_SHADOW_COGNITION: "on" },
-    });
-    if ("configError" in result) throw new Error(result.configError);
-    const { session } = result;
-
-    expect(session.banner.shadow).toBe("cognition");
-
-    await source.emit!(terminalCommandFailed("term-1"));
-    await session.runtime.runtime.awaitIdle();
-    // Drains the shadow runs and their ledger appends, then closes the sinks.
-    await session.stop();
-
-    const report = buildLedgerReport(await session.runtime.ledger.all());
-    // One ingest, two opinions about it, told apart by provider name.
-    expect(report.paths.live.attempts).toBe(1);
-    expect(report.paths.shadow.attempts).toBe(1);
-    expect(report.paths.live.byProvider).toEqual({ heuristic: 1 });
-    expect(report.paths.shadow.byProvider).toEqual({ "shadow:belief-rerank": 1 });
-    // The top level is still the live path alone, so a report predating shadow
-    // mode is comparing the same quantity.
-    expect(report.attempts).toBe(1);
-
-    const records = await session.runtime.ledger.all();
-    const shadow = records.find(
-      (record) => record.recordType === "attempt" && isShadowProvider(record.provider),
-    );
-    const live = records.find(
-      (record) => record.recordType === "attempt" && !isShadowProvider(record.provider),
-    );
-    if (shadow?.recordType !== "attempt" || live?.recordType !== "attempt") {
-      throw new Error("expected one live and one shadow attempt");
-    }
-
-    // Both describe the same ingest, so retention deletion removes them together
-    // rather than orphaning one.
-    expect(shadow.triggerEventId).toBe(live.triggerEventId);
-    expect(shadow.stateDigest).toBe(live.stateDigest);
-    // And the shadow record is unreachable by a claim: its request id is outside
-    // the namespace `claimDispatch` looks in, and its trust level is what
-    // `action-admission.ts` refuses on.
-    expect(shadow.requestId).toBe(`${live.requestId}:shadow`);
-    expect(shadow.actionTrust).toBe("suggestion_only");
-    // The belief layer really ran — the failed command is a world the
-    // `debug_failure` rule fires on.
-    expect(shadow.fallbackReason).toBe("beliefs=succeeded");
-    expect(shadow.candidates.map((candidate) => candidate.kind)).toEqual(["inspect_error"]);
-  });
-
-  /**
-   * A cognition run must be distinguishable from one whose belief layer is
-   * refusing every batch. Both predict; they differ only in the ranking, and a
-   * wrong ranking reads as a bad model rather than a starved one — so the belief
-   * status has to be observable, or the fidelity of the gate is unverifiable in
-   * production.
-   */
-  it("reports belief outcomes in a cognition run", async () => {
-    const errors: string[] = [];
-    const lifecycle: string[] = [];
-    const source = new ScriptedSource("alpha", lifecycle);
-    const { result } = await startSession({
-      sources: [source],
-      // `probe` keeps the run at suggestion_only, which is enough to observe the
-      // belief layer without also admitting dispatch.
-      env: { ...OFFLINE_ENV, SQUID_PROVIDER: "cognition", SQUID_PROVIDER_GATE: "probe" },
-      logError: (line) => errors.push(line),
-    });
+    const { result, agentLog } = await startSession({ sources: [source] });
     if ("configError" in result) throw new Error(result.configError);
 
-    expect(result.session.banner.provider).toBe("belief-rerank");
-
-    await source.emit!(terminalCommandFailed("term-1"));
-    await result.session.runtime.runtime.awaitIdle();
+    await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
     await result.session.stop();
 
-    const outcomes = errors
-      .map((line) => JSON.parse(line) as Record<string, unknown>)
-      .filter((line) => line.diagnostic === "belief_outcome");
-    expect(outcomes.length).toBeGreaterThan(0);
-    expect(outcomes[0]!.provider).toBe("heuristic-belief");
-    // A failed command is a world the `debug_failure` rule fires on, so this run
-    // genuinely had beliefs rather than merely reporting a status.
-    expect(outcomes[0]!.status).toBe("succeeded");
-    // Status and reason codes only — never the batch, whose beliefs stay inside
-    // the prediction path.
-    expect(outcomes[0]).not.toHaveProperty("batch");
-    expect(outcomes[0]).not.toHaveProperty("beliefs");
+    expect(agentLog.observed).toHaveLength(1);
+    expect(agentLog.observed[0]).toContain("observation:");
+    expect(agentLog.observed[0]).toContain("file_saved");
   });
 
-  /**
-   * Issue #12's first half, end to end: a belief is inferred, used to rank one
-   * prediction, and now *kept*. Before this the batch was discarded the moment the
-   * request settled, so a session accumulated nothing — the ledger held attempts
-   * and no record of what the belief layer had asserted.
-   *
-   * Asserted through a real session rather than by calling the ledger directly,
-   * because what was missing was the wiring: the provider is resolved before any
-   * sink exists, so nothing had a ledger to write to at the point beliefs were
-   * produced. A unit test of `appendBeliefBatch` would have passed throughout.
-   */
-  it("persists the belief batch a cognition run inferred", async () => {
+  it("leaves the agent alone when an event changed nothing", async () => {
     const lifecycle: string[] = [];
     const source = new ScriptedSource("alpha", lifecycle);
-    const { result } = await startSession({
-      sources: [source],
-      env: { ...OFFLINE_ENV, SQUID_PROVIDER: "cognition", SQUID_PROVIDER_GATE: "probe" },
-    });
-    if ("configError" in result) throw new Error(result.configError);
-    const { session } = result;
-
-    await source.emit!(terminalCommandFailed("term-1"));
-    await session.runtime.runtime.awaitIdle();
-    // Belief writes start inside the prediction, so the drain in `stop` is what
-    // makes them observable — closing the ledger under one would lose the record.
-    await session.stop();
-
-    const records = await session.runtime.ledger.all();
-    const batches = records.filter((record) => record.recordType === "belief_batch");
-    expect(batches).toHaveLength(1);
-    const batch = batches[0]!;
-    if (batch.recordType !== "belief_batch") throw new Error("expected a belief batch");
-
-    // The failed command is a world the `debug_failure` rule fires on, so this
-    // asserts a real inference was stored rather than an empty shell.
-    expect(batch.provider).toBe("heuristic-belief");
-    expect(batch.batch.beliefs.map((belief) => belief.value)).toEqual(["debug_failure"]);
-
-    // Stored against the projection it actually described. The digest is what makes
-    // the record auditable — and what makes reusing it as evidence impossible,
-    // since the next ingest moves it.
-    const live = records.find(
-      (record) => record.recordType === "attempt" && !isShadowProvider(record.provider),
-    );
-    if (live?.recordType !== "attempt") throw new Error("expected a live attempt");
-    expect(batch.batch.stateDigest).toBe(live.stateDigest);
-    expect(batch.batch.projectionGeneration).toBe(live.projectionGeneration);
-    expect(batch.requestId).toBe(live.requestId);
-
-    // And the beliefs cite the event that produced them, which is what retention
-    // deletion follows.
-    expect(batch.batch.beliefs.flatMap((belief) => belief.evidenceEventIds))
-      .toContain(live.triggerEventId);
-
-    // Legible to an operator through the same report the rest of the run is.
-    expect(buildLedgerReport(records).beliefs).toEqual({
-      batches: 1,
-      byProvider: { "heuristic-belief": 1 },
-      byValue: { debug_failure: 1 },
-    });
-  });
-
-  it("writes no belief record on the default heuristic path", async () => {
-    // The default provider has no belief layer, so a batch appearing here would
-    // mean something was fabricating one. Kept as a test because the seam is
-    // wired unconditionally — only the cognition branch installs an observer.
-    const lifecycle: string[] = [];
-    const source = new ScriptedSource("alpha", lifecycle);
-    const { result } = await startSession({ sources: [source] });
+    const { result, agentLog } = await startSession({ sources: [source] });
     if ("configError" in result) throw new Error(result.configError);
 
-    await source.emit!(terminalCommandFailed("term-1"));
-    await result.session.runtime.runtime.awaitIdle();
+    const save = fileSaved("fs-1", "src/x.test.ts");
+    await source.emit!(save);
+    await source.emit!(save);
     await result.session.stop();
 
-    const records = await result.session.runtime.ledger.all();
-    expect(records.filter((record) => record.recordType === "belief_batch")).toEqual([]);
+    // Two emissions, one turn: the duplicate moved nothing in the world, so
+    // there is nothing new to think about and no turn to spend.
+    expect(agentLog.calls.filter((call) => call === "prompt")).toHaveLength(1);
+    expect(agentLog.calls.filter((call) => call === "observe")).toHaveLength(1);
   });
 
-  /**
-   * The drop this covers is invisible by construction, which is why it needs a
-   * test rather than an inspection: a shadow run only starts inside the
-   * continuation chained onto a resolved prediction, and the runtime drains the
-   * prediction but knows nothing about that chain. Stop without awaiting it and
-   * `observe` hits its disposed guard — no run, no record, and no diagnostic
-   * either, so the ledger simply has one fewer shadow attempt than ingests.
-   *
-   * Stopping without `awaitIdle` first is exactly the shutdown a signal handler
-   * performs, so this is the real ordering rather than a contrived one.
-   */
-  it("records a shadow run for a prediction still in flight at stop", async () => {
+  it("gives the agent permission to do nothing", async () => {
     const lifecycle: string[] = [];
     const source = new ScriptedSource("alpha", lifecycle);
-    const { result } = await startSession({
-      sources: [source],
-      env: { ...OFFLINE_ENV, SQUID_SHADOW_COGNITION: "on" },
-    });
+    const { result, agentLog } = await startSession({ sources: [source] });
     if ("configError" in result) throw new Error(result.configError);
 
-    await source.emit!(terminalCommandFailed("term-1"));
-    // Deliberately no `awaitIdle()`: stop() has to settle the shadow path itself.
+    await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
     await result.session.stop();
 
-    const report = buildLedgerReport(await result.session.runtime.ledger.all());
-    expect(report.paths.live.attempts).toBe(1);
-    expect(report.paths.shadow.attempts).toBe(1);
+    // Without this the loop's steady state is activity rather than attention: a
+    // model handed a fresh observation every few seconds reads each one as a
+    // request for action.
+    expect(agentLog.prompts[0]).toContain("otherwise stop without acting");
   });
 
-  it("logs the shadow run in counts and kinds, never in content", async () => {
+  it("serializes turns so two observations never interleave on one session", async () => {
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result, agentLog } = await startSession({ sources: [source] });
+    if ("configError" in result) throw new Error(result.configError);
+
+    await source.emit!(fileSaved("fs-1", "a.ts"));
+    await source.emit!(fileSaved("fs-2", "b.ts"));
+    await result.session.stop();
+
+    // Each prompt is followed by its own idle wait before the next begins.
+    // Overlapping prompts on one session are not two opinions — they are one
+    // conversation with interleaved turns.
+    const turnCalls = agentLog.calls.filter((call) => call === "prompt" || call === "waitForIdle");
+    expect(turnCalls).toEqual(["prompt", "waitForIdle", "prompt", "waitForIdle"]);
+  });
+
+  it("logs what the agent said", async () => {
+    const lifecycle: string[] = [];
     const lines: string[] = [];
-    const lifecycle: string[] = [];
     const source = new ScriptedSource("alpha", lifecycle);
     const { result } = await startSession({
       sources: [source],
-      env: { ...OFFLINE_ENV, SQUID_SHADOW_COGNITION: "on" },
+      log: (line) => lines.push(line),
+      agentOptions: { reply: "ran the tests; they pass" },
+    });
+    if ("configError" in result) throw new Error(result.configError);
+
+    await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
+    await result.session.stop();
+
+    const reported = lines
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find((line) => line.agent === "replied");
+    expect(reported?.text).toBe("ran the tests; they pass");
+  });
+
+  it("survives a failed turn and keeps ingesting", async () => {
+    const lifecycle: string[] = [];
+    const errors: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result, agentLog } = await startSession({
+      sources: [source],
+      logError: (line) => errors.push(line),
+      agentOptions: { promptError: new Error("the model refused") },
+    });
+    if ("configError" in result) throw new Error(result.configError);
+
+    await source.emit!(fileSaved("fs-1", "a.ts"));
+    await source.emit!(fileSaved("fs-2", "b.ts"));
+    await result.session.stop();
+
+    // A rejected turn is a diagnostic, never the end of the loop — and the
+    // second event still got its own attempt rather than inheriting the first
+    // failure through the serialization chain.
+    expect(errors.some((line) => line.includes("agentTurnError"))).toBe(true);
+    expect(agentLog.calls.filter((call) => call === "prompt")).toHaveLength(2);
+    // Both events still reached history: the agent failing does not stop capture.
+    expect(await result.session.runtime.store.all()).toHaveLength(2);
+  });
+
+  it("drains in-flight turns before disposing the agent, then the store", async () => {
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result, agentLog } = await startSession({ sources: [source] });
+    if ("configError" in result) throw new Error(result.configError);
+
+    await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
+    await result.session.stop();
+
+    // A turn cut off mid-flight loses whatever the agent was doing, and its
+    // session history is the only record that it happened — so dispose must come
+    // after the last turn call, not before it.
+    const disposeAt = agentLog.calls.indexOf("dispose");
+    const lastTurnAt = agentLog.calls.lastIndexOf("waitForIdle");
+    expect(disposeAt).toBeGreaterThan(lastTurnAt);
+    expect(agentLog.disposed).toBe(1);
+  });
+
+  it("says nothing to the agent about an event capture excluded", async () => {
+    const lifecycle: string[] = [];
+    const lines: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result, agentLog } = await startSession({
+      sources: [source],
+      env: { ...OFFLINE_ENV, SQUID_EXCLUDE: "Vault" },
       log: (line) => lines.push(line),
     });
     if ("configError" in result) throw new Error(result.configError);
 
-    await source.emit!(terminalCommandFailed("term-1"));
-    await result.session.runtime.runtime.awaitIdle();
+    await source.emit!(createActivityEvent({
+      kind: "application_activated",
+      eventId: "vault-1",
+      source: { kind: "host", instanceId: "screen-1" },
+      sessionId: "screen-session",
+      sequence: 0,
+      payload: { applicationId: "9", applicationName: "Vault" },
+    }));
     await result.session.stop();
 
-    const shadowLine = lines
+    // The user asked for this application to be invisible. An excluded event
+    // reaches neither history nor the agent's senses, and the log line says only
+    // that something was excluded.
+    expect(await result.session.runtime.store.all()).toHaveLength(0);
+    expect(agentLog.observed).toHaveLength(0);
+    expect(agentLog.calls).not.toContain("prompt");
+    const excluded = lines
       .map((line) => JSON.parse(line) as Record<string, unknown>)
-      .find((line) => line.shadowProvider !== undefined);
-    expect(shadowLine).toBeDefined();
-    expect(shadowLine!.shadowProvider).toBe("belief-rerank");
-    expect(shadowLine!.beliefStatus).toBe("succeeded");
-    // Closed vocabularies only: belief values are an enum and candidate kinds are
-    // an enum, so nothing here can echo a selection or a path.
-    expect(shadowLine!.beliefValues).toEqual(["debug_failure"]);
-    expect(shadowLine!.shadowPredictions).toEqual(["inspect_error"]);
-    expect(shadowLine!.top1Agrees).toBe(true);
+      .find((line) => line.disposition === "excluded");
+    expect(excluded?.kind).toBe("application_activated");
   });
 });

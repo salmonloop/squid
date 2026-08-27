@@ -1,4 +1,4 @@
-import { describeErrorForAudit } from "./action-egress.js";
+import { describeErrorForAudit } from "./audit-text.js";
 import type { BrowserPageFrame, BrowserPageReaderFactory } from "./browser-page-source.js";
 
 const DEFAULT_POLL_MS = 1_000;
