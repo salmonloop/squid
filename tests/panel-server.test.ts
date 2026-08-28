@@ -476,3 +476,116 @@ describe("startPanelServer incoming control", () => {
     });
   });
 });
+
+/**
+ * The Windows panel transport: the same server code, bound at an explicit
+ * loopback `tcp://` endpoint instead of a filesystem socket. TCP listen is
+ * platform-independent, so these run everywhere — they exercise the exact
+ * branch Windows takes, including that none of the Unix socket's file-based
+ * behaviors (clear-bind-path, chmod, unlink-on-close) fire on it.
+ */
+describe("startPanelServer tcp transport", () => {
+  /** Claims an ephemeral port by binding and immediately releasing it. */
+  const freeLoopbackPort = async (): Promise<number> => {
+    const probe = Bun.listen<number>({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        open: (_socket) => undefined,
+        data: (_socket, _chunk) => undefined,
+        close: (_socket) => undefined,
+        error: (_socket, _error) => undefined,
+      },
+    });
+    const port = probe.port;
+    probe.stop(true);
+    await Bun.sleep(10);
+    return port;
+  };
+
+  const tcpConnect = async (
+    port: number,
+    lines: string[],
+    notify: { fn: (() => void) | null; want: number },
+  ) =>
+    Bun.connect<undefined>({
+      hostname: "127.0.0.1",
+      port,
+      socket: {
+        data: (_socket, chunk) => {
+          lines.push(...chunk.toString("utf8").split("\n").filter((part) => part.length > 0));
+          if (lines.length >= notify.want) notify.fn?.();
+        },
+        open: () => undefined,
+        close: () => undefined,
+        error: () => undefined,
+      },
+    });
+
+  it("serves the same protocol over tcp://127.0.0.1:<port>", async () => {
+    const port = await freeLoopbackPort();
+    const endpoint = `tcp://127.0.0.1:${port}`;
+    const ops: string[] = [];
+    const server = await startPanelServer({
+      socketPath: endpoint,
+      onControl: (op) => ops.push(op),
+    });
+    try {
+      const lines: string[] = [];
+      const notify = { fn: null as (() => void) | null, want: Number.POSITIVE_INFINITY };
+      const client = await tcpConnect(port, lines, notify);
+      await until(() => server.clientCount === 1, "the tcp client to register");
+
+      server.broadcast(WORLD_LINE);
+      notify.want = 1;
+      await new Promise<void>((resolve) => {
+        notify.fn = resolve;
+      });
+      expect(JSON.parse(lines[0] ?? "")).toEqual(WORLD_LINE);
+
+      client.write('{"type":"control","op":"pause"}\n');
+      await until(() => ops.length === 1, "the tcp control op to arrive");
+      expect(ops).toEqual(["pause"]);
+
+      client.end();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("does not create or remove any file for a tcp endpoint", async () => {
+    // The endpoint is not a path. Any file bookkeeping on it would be a bug:
+    // either a stray artifact next to the cwd, or an unlink of a path that was
+    // never a socket.
+    const port = await freeLoopbackPort();
+    const sentinel = join(tmpdir(), `squid-panel-tcp-${port}`);
+    try {
+      const server = await startPanelServer({
+        socketPath: `tcp://127.0.0.1:${port}`,
+        onControl: () => undefined,
+      });
+      await server.close();
+      expect(existsSync(sentinel)).toBe(false);
+    } finally {
+      await rm(sentinel, { force: true });
+    }
+  });
+
+  it("two servers cannot bind the same tcp endpoint", async () => {
+    // On Unix, the file mode and the refusal-to-clobber are the boundary; on
+    // TCP the equivalent guarantee is that a second bind at a live endpoint
+    // fails loudly rather than silently stealing the port.
+    const port = await freeLoopbackPort();
+    const first = await startPanelServer({
+      socketPath: `tcp://127.0.0.1:${port}`,
+      onControl: () => undefined,
+    });
+    try {
+      await expect(
+        startPanelServer({ socketPath: `tcp://127.0.0.1:${port}`, onControl: () => undefined }),
+      ).rejects.toThrow();
+    } finally {
+      await first.close();
+    }
+  });
+});

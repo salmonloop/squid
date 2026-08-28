@@ -7,22 +7,37 @@ a protocol that has already diverged.
 
 ## Transport
 
-A Unix domain socket. TS listens, the panel connects and retries — so the panel
-can start before or after the watch session, and a restart of either reconnects
-rather than requiring a restart of the other.
+TS listens, the panel connects and retries — so the panel can start before or
+after the watch session, and a restart of either reconnects rather than requiring
+a restart of the other.
 
-- Path comes from `SQUID_PANEL_SOCKET`. **Off by default**, like every capability
-  variable: opening a panel declares that this run can be observed and controlled.
-- The server unlinks a stale socket file before binding (`stop()` does not remove
-  it) and unlinks again on close.
-- **The server must refuse to start when the path exists and is not a socket.**
-  Measured: `Bun.listen({ unix })` binds over a regular file, destroys its
-  contents, and reports no error. Unlinking first does not help — the overwrite
-  happens either way. So a mistyped `SQUID_PANEL_SOCKET` naming real data must
-  fail loudly rather than eat the file.
-- **The server must `chmod 600` the socket immediately after binding.** Measured
-  default is `775`, which lets any user in the group connect. The file mode is the
-  access boundary; there is no other authentication.
+The endpoint comes from `SQUID_PANEL_SOCKET`. **Off by default**, like every
+capability variable: opening a panel declares that this run can be observed and
+controlled. The spelling names the transport, and each platform accepts exactly
+one:
+
+- **Unix: a filesystem socket path** (absolute). The server unlinks a stale
+  socket file before binding (`stop()` does not remove it) and unlinks again on
+  close.
+  - **The server must refuse to start when the path exists and is not a socket.**
+    Measured: `Bun.listen({ unix })` binds over a regular file, destroys its
+    contents, and reports no error. Unlinking first does not help — the overwrite
+    happens either way. So a mistyped `SQUID_PANEL_SOCKET` naming real data must
+    fail loudly rather than eat the file.
+  - **The server must `chmod 600` the socket immediately after binding.**
+    Measured default is `775`, which lets any user in the group connect. The file
+    mode is the access boundary; there is no other authentication.
+  - Socket paths are limited to roughly 108 bytes by `sun_path`; a longer one
+    fails as an ordinary bind error.
+- **Windows: `tcp://127.0.0.1:<port>`, and nothing else.** `std::os::unix` does
+  not exist there, so the Rust panel builds a `TcpStream` against a loopback
+  endpoint and the TS side binds the same spelling. Loopback only is the
+  boundary: there is no file mode to chmod, and the control wire is
+  unauthenticated, so a general host would turn the panel into a network
+  service. `resolvePanel` refuses every other spelling on `win32`, and refuses
+  the `tcp://` spelling on every other platform — the two ends pick their
+  transport from the same string, so letting either guess would let them
+  disagree.
 - Both directions: **one JSON object per line**, `\n`-terminated, UTF-8.
 - **A writer must honour short writes.** Measured: `socket.write()` accepts about
   214 KB per call under backpressure and returns the count actually taken, or `-1`
@@ -33,10 +48,10 @@ rather than requiring a restart of the other.
 - **Bun does not report `EADDRINUSE` for a live listener on the same path.** Two
   watch sessions pointed at one socket path both appear to bind and split
   connections unpredictably. Not enforced today; worth knowing before running two.
+  (TCP does refuse a second bind at the same loopback endpoint; the TCP tests
+  assert it.)
 - `stop()` alone leaves connected sockets writable and their handles alive, so the
   process will not exit while a panel is attached. Close with `stop(true)`.
-- Socket paths are limited to roughly 108 bytes by `sun_path`; a longer one fails
-  as an ordinary bind error.
 
 ## Message shape rules
 

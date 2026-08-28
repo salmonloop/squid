@@ -1,4 +1,4 @@
-//! The Unix-socket client half of `docs/panel-protocol.md`.
+//! The panel transport client half of `docs/panel-protocol.md`.
 //!
 //! The watch session listens; this process connects, reads pushed lines, and
 //! writes control and answer lines back. Only the standard library: a socket, a
@@ -18,11 +18,20 @@
 //!   until its `\n` has arrived.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+#[cfg(windows)]
+use std::net::TcpStream;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+
+#[cfg(unix)]
+type PanelStream = UnixStream;
+#[cfg(windows)]
+type PanelStream = TcpStream;
 
 use crate::protocol::{parse_incoming, Incoming};
 
@@ -75,7 +84,7 @@ fn path_from(raw: Option<String>) -> Option<PathBuf> {
 /// write.
 #[derive(Clone)]
 pub struct Outgoing {
-    stream: Arc<Mutex<Option<UnixStream>>>,
+    stream: Arc<Mutex<Option<PanelStream>>>,
 }
 
 impl Outgoing {
@@ -118,7 +127,7 @@ impl Outgoing {
         }
     }
 
-    fn adopt(&self, stream: UnixStream) {
+    fn adopt(&self, stream: PanelStream) {
         if let Ok(mut slot) = self.stream.lock() {
             *slot = Some(stream);
         }
@@ -151,7 +160,7 @@ impl Outgoing {
 pub fn run(socket_path: &Path, outgoing: &Outgoing, mut deliver: impl FnMut(Incoming)) {
     let mut backoff = FIRST_BACKOFF;
     loop {
-        if let Ok(stream) = UnixStream::connect(socket_path) {
+        if let Ok(stream) = connect(socket_path) {
             // Two handles on one socket: one for this thread to read from, one
             // parked in `outgoing` for the UI thread to write to. Sharing a
             // single handle would mean the UI thread waiting on whatever the
@@ -170,6 +179,32 @@ pub fn run(socket_path: &Path, outgoing: &Outgoing, mut deliver: impl FnMut(Inco
         // thread as fast as the kernel can complete a connect.
         thread::sleep(backoff);
         backoff = next_backoff(backoff);
+    }
+}
+
+/// Connects using the platform transport selected by the build target.
+///
+/// Unix keeps the existing filesystem socket and its mode-600 boundary. Windows
+/// uses a loopback TCP endpoint because `std::os::unix::net::UnixStream` does not
+/// exist there; the TypeScript server binds the same `tcp://127.0.0.1:<port>`
+/// spelling. The endpoint is still explicit and local-only, so it does not widen
+/// the panel to the network.
+fn connect(socket_path: &Path) -> io::Result<PanelStream> {
+    #[cfg(unix)]
+    {
+        PanelStream::connect(socket_path)
+    }
+
+    #[cfg(windows)]
+    {
+        let raw = socket_path.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "panel endpoint is not valid UTF-8",
+            )
+        })?;
+        let address = raw.strip_prefix("tcp://").unwrap_or(raw);
+        PanelStream::connect(address)
     }
 }
 
@@ -464,6 +499,7 @@ mod tests {
         assert!(!outgoing.is_connected());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_write_to_a_closed_peer_drops_the_connection_rather_than_the_process() {
         // The reconnect contract from the writing side: a dead socket must leave
@@ -481,6 +517,7 @@ mod tests {
         assert!(!outgoing.is_connected());
     }
 
+    #[cfg(unix)]
     #[test]
     fn what_is_written_arrives_as_whole_lines() {
         // The other half of the seam: the framing this side produces is what the

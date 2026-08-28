@@ -3,13 +3,14 @@ import type { Socket } from "bun";
 import { describeErrorForAudit } from "./audit-text.js";
 import type { PanelMessage } from "./panel-view.js";
 import { panelLine } from "./panel-view.js";
+import { parsePanelTcpEndpoint } from "./resolve-panel.js";
 
 /**
  * The watch session's listening end of the panel wire (`docs/panel-protocol.md`).
  *
- * A Unix domain socket, and TS listens rather than connects: the panel can start
- * before or after the session and reconnect on its own, so neither side's
- * restart forces the other's.
+ * On Unix this is a domain socket; on Windows it is a loopback TCP endpoint.
+ * TS listens rather than connects: the panel can start before or after the
+ * session and reconnect on its own, so neither side's restart forces the other's.
  *
  * ## Access control is the file mode, and nothing else
  *
@@ -27,7 +28,7 @@ import { panelLine } from "./panel-view.js";
  * also binds over a **regular file** and destroys its contents with no error, so
  * a mistyped `SQUID_PANEL_SOCKET` naming real data would be silently lost.
  * `startPanelServer` therefore refuses to start when the path holds something
- * that is not a socket.
+ * that is not a socket. TCP endpoints have no filesystem path to clear.
  *
  * ## A dead panel must not take down the watch session
  *
@@ -38,7 +39,7 @@ import { panelLine } from "./panel-view.js";
  *
  * ## Stream framing
  *
- * UDS delivers bytes, not lines. A single JSON object routinely arrives in two
+ * The transport delivers bytes, not lines. A single JSON object routinely arrives in two
  * chunks, so each connection carries its own buffer and lines are cut on `\n`.
  * The buffer is bounded: a client that sends megabytes with no newline is
  * dropped rather than allowed to grow the process without limit.
@@ -81,7 +82,8 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
     onDiagnostic?.(line);
   };
 
-  clearBindPath(socketPath);
+  const tcpEndpoint = parsePanelTcpEndpoint(socketPath);
+  if (tcpEndpoint === null) clearBindPath(socketPath);
 
   const clients = new Set<Client>();
   const clientOf = new WeakMap<Socket<undefined>, Client>();
@@ -170,61 +172,69 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
     diagnostic("Panel line refused: unrecognized type.");
   };
 
-  const server = Bun.listen<undefined>({
-    unix: socketPath,
-    socket: {
-      open: (socket) => {
-        const client: Client = { socket, buffer: "", outbound: "", dropped: false };
-        clients.add(client);
-        clientOf.set(socket, client);
-      },
-      data: (socket, chunk) => {
-        const client = clientOf.get(socket);
-        if (client === undefined || client.dropped) return;
-        client.buffer += chunk.toString("utf8");
-        // Bound first, then split: a client that never sends a newline must be
-        // dropped rather than allowed to grow this string without limit.
-        if (client.buffer.length > MAX_LINE_BYTES) {
-          drop(client, `line exceeded ${MAX_LINE_BYTES} bytes without a newline`);
-          return;
-        }
-        const parts = client.buffer.split("\n");
-        // The tail is whatever follows the last newline — an incomplete line,
-        // possibly empty. It waits for the next chunk instead of being parsed.
-        client.buffer = parts.pop() ?? "";
-        for (const part of parts) {
-          if (client.dropped) return;
-          handleLine(client, part);
-        }
-      },
-      drain: (socket) => {
-        const client = clientOf.get(socket);
-        if (client !== undefined) flush(client);
-      },
-      close: (socket) => {
-        const client = clientOf.get(socket);
-        if (client === undefined || client.dropped) return;
-        client.dropped = true;
-        clients.delete(client);
-      },
-      error: (socket, error) => {
-        const client = clientOf.get(socket);
-        if (client !== undefined) drop(client, describeErrorForAudit(error));
-      },
+  const socketHandlers = {
+    open: (socket: Socket<undefined>) => {
+      const client: Client = { socket, buffer: "", outbound: "", dropped: false };
+      clients.add(client);
+      clientOf.set(socket, client);
     },
-  });
+    data: (socket: Socket<undefined>, chunk: Uint8Array) => {
+      const client = clientOf.get(socket);
+      if (client === undefined || client.dropped) return;
+      client.buffer += chunk.toString();
+      // Bound first, then split: a client that never sends a newline must be
+      // dropped rather than allowed to grow this string without limit.
+      if (client.buffer.length > MAX_LINE_BYTES) {
+        drop(client, `line exceeded ${MAX_LINE_BYTES} bytes without a newline`);
+        return;
+      }
+      const parts = client.buffer.split("\n");
+      // The tail is whatever follows the last newline — an incomplete line,
+      // possibly empty. It waits for the next chunk instead of being parsed.
+      client.buffer = parts.pop() ?? "";
+      for (const part of parts) {
+        if (client.dropped) return;
+        handleLine(client, part);
+      }
+    },
+    drain: (socket: Socket<undefined>) => {
+      const client = clientOf.get(socket);
+      if (client !== undefined) flush(client);
+    },
+    close: (socket: Socket<undefined>) => {
+      const client = clientOf.get(socket);
+      if (client === undefined || client.dropped) return;
+      client.dropped = true;
+      clients.delete(client);
+    },
+    error: (socket: Socket<undefined>, error: Error) => {
+      const client = clientOf.get(socket);
+      if (client !== undefined) drop(client, describeErrorForAudit(error));
+    },
+  };
+
+  const server = tcpEndpoint === null
+    ? Bun.listen<undefined>({ unix: socketPath, socket: socketHandlers })
+    : Bun.listen<undefined>({
+      hostname: tcpEndpoint.hostname,
+      port: tcpEndpoint.port,
+      socket: socketHandlers,
+      exclusive: true,
+    });
 
   // Immediately after binding, before any client could have connected. Measured
   // default is 775; the mode is the only thing standing between this socket and
   // any other user in the group.
-  try {
-    chmodSync(socketPath, 0o600);
-  } catch (error) {
-    // A socket we cannot restrict is worse than no panel: it would hand the
-    // world state to the group. Tear down rather than serve it.
-    server.stop(true);
-    removeOwnSocket(socketPath);
-    throw new Error(`Panel socket could not be restricted to mode 600: ${describeErrorForAudit(error)}`);
+  if (tcpEndpoint === null) {
+    try {
+      chmodSync(socketPath, 0o600);
+    } catch (error) {
+      // A socket we cannot restrict is worse than no panel: it would hand the
+      // world state to the group. Tear down rather than serve it.
+      server.stop(true);
+      removeOwnSocket(socketPath);
+      throw new Error(`Panel socket could not be restricted to mode 600: ${describeErrorForAudit(error)}`);
+    }
   }
 
   let closed = false;
@@ -266,9 +276,9 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
       // `true` closes live connections. Without it a panel holding the socket
       // keeps the listener's handles alive and the process will not exit.
       server.stop(true);
-      // Measured: `stop()` does not remove the socket file. Leaving it behind
-      // makes the next run look like a server is already listening.
-      removeOwnSocket(socketPath);
+      // Measured: `stop()` does not remove the Unix socket file. Leaving it
+      // behind makes the next run look like a server is already listening.
+      if (tcpEndpoint === null) removeOwnSocket(socketPath);
       await Promise.resolve();
     },
   };
