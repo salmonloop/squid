@@ -28,6 +28,7 @@
 //! to simply do nothing.
 
 mod protocol;
+mod startup;
 mod transport;
 
 use std::sync::{Arc, Mutex};
@@ -37,6 +38,7 @@ use protocol::{
     answer_line, control_line, AgentLine, Answer, Control, Incoming, Prompt, WorldState,
 };
 use slint::{ComponentHandle, SharedString};
+use startup::Startup;
 use transport::Outgoing;
 
 slint::include_modules!();
@@ -54,21 +56,28 @@ type Pending = Arc<Mutex<Option<i64>>>;
 /// anyway is the one outcome worse than not answering.
 const POISONED: &str = "pending prompt lock poisoned; refusing to answer";
 
-fn main() -> Result<(), slint::PlatformError> {
+/// Returns `()` rather than `Result`, because there is no failure here worth
+/// printing the way `Result` from `main` prints one: `Err` out of `main` reaches
+/// the user as a one-line `Debug` rendering on a stderr that a double-clicked
+/// console binary is about to close. Every exit path goes through
+/// `startup::abort`, which is the only thing that gets seen in that case.
+fn main() {
     // Refuse to start rather than opening a window that can never say anything.
     // The variable is off by default like every capability variable, so an unset
     // one is a run that was not meant to be observed — and a panel sitting there
     // reporting "no observations yet" forever would be indistinguishable from a
     // quiet machine, which is the same class of lie the protocol warns about.
     let Some(socket_path) = transport::socket_path() else {
-        eprintln!(
-            "squid-ui: {} is not set; nothing to connect to.",
-            transport::SOCKET_ENV
-        );
-        std::process::exit(2);
+        startup::abort(Startup::Unconfigured);
     };
 
-    let window = PanelWindow::new()?;
+    // Not `?`: a window that cannot be created is the other startup failure a
+    // user meets as a vanishing black box, and it is the one whose cause —
+    // no display, no OpenGL — is least guessable from the outside.
+    let window = match PanelWindow::new() {
+        Ok(window) => window,
+        Err(error) => startup::abort(Startup::Platform(error.to_string())),
+    };
     let pending: Pending = Arc::new(Mutex::new(None));
     // One outgoing half, shared. The reader thread hands it a socket on connect
     // and takes it back on disconnect; the callbacks below only ever write.
@@ -130,7 +139,14 @@ fn main() -> Result<(), slint::PlatformError> {
     // An ordinary `run()`: the window is up from launch and stays up. The old
     // `run_event_loop_until_quit` existed only to keep a *hidden* window's
     // process alive between prompts, which is a shape this panel does not have.
-    window.run()
+    //
+    // A failure here is the same class as a failure to create the window — the
+    // display went away, or the loop could not start — and reaches a
+    // double-clicked user through the same console that is about to close, so it
+    // is reported the same way rather than returned.
+    if let Err(error) = window.run() {
+        startup::abort(Startup::Platform(error.to_string()));
+    }
 }
 
 /// Moves one message onto the UI thread and applies it.
