@@ -343,9 +343,17 @@ It re-runs the same gate on its own checkout, builds the panel in release profil
 publishes a GitHub pre-release carrying the binary plus a `sha256` of it:
 
 ```bash
+# Bump `version` in package.json and ui/Cargo.toml to the exact release, commit,
+# then tag that commit.
 git tag v0.1.0-alpha.1
 git push origin v0.1.0-alpha.1
 ```
+
+The tag is the version ledger. A `version` job reconciles it against the two manifests
+before anything is built — the tag minus its leading `v` must equal what `package.json`
+and `ui/Cargo.toml` already say, or the run goes red in seconds and nothing ships. The
+panel binary itself answers `--version` with the version compiled in from `Cargo.toml`,
+so a downloaded binary can say which release it belongs to without trusting the filename.
 
 The gate runs again there rather than trusting the pull request's green run, because this
 workflow builds the binary it uploads. A tag can be pushed at any commit; without its own
