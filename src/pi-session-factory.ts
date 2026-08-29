@@ -73,6 +73,13 @@ export interface PiSessionSpec {
   readonly noContextFiles?: boolean;
   /** Custom tool allowlist + definitions, for the single-tool prediction/belief prompts. */
   readonly tools?: readonly string[];
+  /**
+   * Passed to Pi as `noTools`: `"all"` starts the session with no tools enabled
+   * at all. The corpus eval wants that shape — a reading exercise where a tool
+   * call is a wrong answer, and the model has demonstrated it will not obey
+   * prose telling it so — while every other caller keeps its tools.
+   */
+  readonly noTools?: "all" | "builtin";
   readonly customTools?: readonly ToolDefinition[];
   /**
    * Inline extensions wired into the resource loader — the mount point for sense
@@ -137,6 +144,7 @@ export async function createPiSession(spec: PiSessionSpec): Promise<PiSessionHan
     resourceLoader: loader,
     thinkingLevel: "low",
     ...(spec.tools !== undefined ? { tools: [...spec.tools] } : {}),
+    ...(spec.noTools !== undefined ? { noTools: spec.noTools } : {}),
     ...(spec.customTools !== undefined ? { customTools: [...spec.customTools] } : {}),
     sessionManager: resolveSessionManager(spec),
   });

@@ -184,6 +184,10 @@ against a type that no longer existed and still pass.
   terminal commands, and editor saves into one core.
 - `src/watch-files.ts` — live filesystem ingestion; durable when `SQUID_DB` is set.
 - `src/watch-screen.ts` — live foreground-window-text ingestion.
+- `eval/eval-agent.ts` — the live corpus runner (`bun run eval:agent`): each scenario's
+  events project through a real core, and a fresh toolless resident agent is asked what
+  the user is doing; its answer prints beside the scenario's expected reading. A
+  hand-run harness — live judgment is not a CI assertion.
 - `src/main.ts` — demo: three events through the core, printing the projection each one
   builds.
 
@@ -383,8 +387,11 @@ to its console, which is exactly the double-clicked case.
   PowerShell/Win32 — but both report window identity only: focus roles and selection
   text wait for an AT-SPI or full UIA backend.
 - The evaluation corpus (`eval/corpus.ts`) is a start, not an endpoint: five scenarios
-  with a deterministic CI consumer. Live-judgment evaluation — scoring what the agent
-  actually concludes — has no runner yet.
+  with a deterministic CI consumer and a live runner (`bun run eval:agent`) that prints
+  a real agent's reading beside each expected one. What no run has yet measured is a
+  second model: on the current default, the agent reads every scenario's state correctly
+  but answers in conversation rather than the requested reading phrase, so the runner
+  records the mismatch and a human judges.
 
 ## Archived documents
 

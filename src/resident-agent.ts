@@ -58,6 +58,8 @@ export type ResidentSessionFactory = (spec: {
   readonly extensionFactories?: readonly InlineExtension[];
   /** Custom Pi tools (e.g. the sensory-history queries) wired into the session. */
   readonly customTools?: readonly ToolDefinition[];
+  /** Start the session with no tools enabled; see `PiSessionSpec.noTools`. */
+  readonly noTools?: boolean;
   /** Where the conversation is kept. See `PiSessionSpec.history`. */
   readonly history?: "memory" | "persist" | "continue";
 }) => Promise<ResidentSession>;
@@ -83,6 +85,7 @@ export const createDefaultResidentSession: ResidentSessionFactory = async (spec)
       ? { extensionFactories: spec.extensionFactories }
       : {}),
     ...(spec.customTools !== undefined ? { customTools: spec.customTools } : {}),
+    ...(spec.noTools === true ? { noTools: "all" as const } : {}),
   });
   return adaptHandle(handle);
 };
@@ -115,6 +118,13 @@ export interface CreateResidentAgentOptions {
    * by Pi's own runtime; the session history records each call.
    */
   readonly customTools?: readonly ToolDefinition[];
+  /**
+   * Start the session with no tools enabled; see `PiSessionSpec.noTools`. A
+   * reading-only agent answers from its senses, and a tool call in that shape
+   * is a wrong answer the runtime now cannot perform, not merely one it was
+   * asked not to.
+   */
+  readonly noTools?: boolean;
   /** The tool catalog the agent sees in every context injection. */
   readonly tools?: readonly ToolSummary[];
   /**
@@ -219,6 +229,7 @@ export async function createResidentAgent(
     cwd: options.cwd,
     extensionFactories: extensions,
     ...(options.customTools !== undefined ? { customTools: options.customTools } : {}),
+    ...(options.noTools === true ? { noTools: true } : {}),
     ...(options.history !== undefined ? { history: options.history } : {}),
   });
 
