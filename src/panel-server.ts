@@ -3,32 +3,51 @@ import type { Socket } from "bun";
 import { describeErrorForAudit } from "./audit-text.js";
 import type { PanelMessage } from "./panel-view.js";
 import { panelLine } from "./panel-view.js";
-import { parsePanelTcpEndpoint } from "./resolve-panel.js";
+import { isPanelNamedPipe } from "./resolve-panel.js";
 
 /**
  * The watch session's listening end of the panel wire (`docs/panel-protocol.md`).
  *
- * On Unix this is a domain socket; on Windows it is a loopback TCP endpoint.
+ * On Unix this is a domain socket; on Windows a named pipe. Both bind through
+ * the same `Bun.listen({ unix })` call: Bun inspects the string and takes its
+ * named-pipe branch when the value spells one, so the endpoint names the
+ * transport and there is exactly one listen path to reason about.
+ *
  * TS listens rather than connects: the panel can start before or after the
  * session and reconnect on its own, so neither side's restart forces the other's.
  *
- * ## Access control is the file mode, and nothing else
+ * ## Neither transport is authenticated
  *
- * There is no authentication on this socket. Anything that can `connect()` can
- * read the world state — foreground application, sanitized window titles, agent
- * replies — and can send `pause`. The measured default mode after
+ * Anything that can connect can read the world state — foreground application,
+ * sanitized window titles, agent replies — and can send `pause`.
+ *
+ * On Unix the file mode is the whole boundary. The measured default after
  * `Bun.listen({ unix })` is **775**, which lets any user in the group connect,
- * so `startPanelServer` chmods to **600** immediately after binding. That chmod
- * is the entire access boundary; do not remove it and do not widen it.
+ * so `startPanelServer` chmods to **600** immediately after binding. Do not
+ * remove that chmod and do not widen it.
  *
- * ## The bind path is cleared, not blindly overwritten
+ * On Windows there is no equivalent. Bun binds through `uv_pipe_bind`, which
+ * passes NULL security attributes, and exposes neither a chmod parameter nor the
+ * pipe HANDLE — so the pipe carries the default named-pipe DACL, under which
+ * **any local user can read it**. That is a known and accepted limitation of
+ * this phase, not an oversight, and it is why the Windows spelling is the pipe
+ * namespace rather than a loopback port: a port would have been reachable by
+ * anything that could route to the host, where a pipe at least stays local.
+ *
+ * ## The bind path is cleared, not blindly overwritten — on Unix only
  *
  * `stop()` does not remove the socket file, so a crashed run leaves one behind
  * and it must be unlinked before re-binding. But measured: `Bun.listen({ unix })`
  * also binds over a **regular file** and destroys its contents with no error, so
  * a mistyped `SQUID_PANEL_SOCKET` naming real data would be silently lost.
  * `startPanelServer` therefore refuses to start when the path holds something
- * that is not a socket. TCP endpoints have no filesystem path to clear.
+ * that is not a socket.
+ *
+ * A named pipe has no filesystem entry at all: nothing to stat, nothing to
+ * unlink, nothing to chmod. Every one of those three steps is gated on the
+ * endpoint spelling *and* the platform, via `isPanelNamedPipe` — the same
+ * function the startup check reads, so “is this a pipe” has one answer in this
+ * codebase rather than one per call site.
  *
  * ## A dead panel must not take down the watch session
  *
@@ -82,8 +101,10 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
     onDiagnostic?.(line);
   };
 
-  const tcpEndpoint = parsePanelTcpEndpoint(socketPath);
-  if (tcpEndpoint === null) clearBindPath(socketPath);
+  // The spelling decides, not `process.platform`: it is what Bun itself reads to
+  // choose a transport, so a value that is a pipe here is a pipe there.
+  const isNamedPipe = isPanelNamedPipe(socketPath);
+  if (!isNamedPipe) clearBindPath(socketPath);
 
   const clients = new Set<Client>();
   const clientOf = new WeakMap<Socket<undefined>, Client>();
@@ -213,19 +234,14 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
     },
   };
 
-  const server = tcpEndpoint === null
-    ? Bun.listen<undefined>({ unix: socketPath, socket: socketHandlers })
-    : Bun.listen<undefined>({
-      hostname: tcpEndpoint.hostname,
-      port: tcpEndpoint.port,
-      socket: socketHandlers,
-      exclusive: true,
-    });
+  // One call for both transports. On Windows, Bun matches the pipe prefix and
+  // binds through libuv; anything else falls through to AF_UNIX.
+  const server = Bun.listen<undefined>({ unix: socketPath, socket: socketHandlers });
 
   // Immediately after binding, before any client could have connected. Measured
   // default is 775; the mode is the only thing standing between this socket and
   // any other user in the group.
-  if (tcpEndpoint === null) {
+  if (!isNamedPipe) {
     try {
       chmodSync(socketPath, 0o600);
     } catch (error) {
@@ -278,7 +294,7 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
       server.stop(true);
       // Measured: `stop()` does not remove the Unix socket file. Leaving it
       // behind makes the next run look like a server is already listening.
-      if (tcpEndpoint === null) removeOwnSocket(socketPath);
+      if (!isNamedPipe) removeOwnSocket(socketPath);
       await Promise.resolve();
     },
   };

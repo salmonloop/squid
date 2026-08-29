@@ -478,39 +478,28 @@ describe("startPanelServer incoming control", () => {
 });
 
 /**
- * The Windows panel transport: the same server code, bound at an explicit
- * loopback `tcp://` endpoint instead of a filesystem socket. TCP listen is
- * platform-independent, so these run everywhere — they exercise the exact
- * branch Windows takes, including that none of the Unix socket's file-based
- * behaviors (clear-bind-path, chmod, unlink-on-close) fire on it.
+ * The Windows panel transport: the same server code, the same `Bun.listen`
+ * call, bound at a named pipe instead of a filesystem socket.
+ *
+ * Skipped rather than emulated off Windows, and that is the whole point. Bun's
+ * named-pipe listen branch is `#[cfg(windows)]`, so on Linux the identical
+ * endpoint string falls through to AF_UNIX — a suite that "passed" here would
+ * be asserting against a Unix socket wearing a pipe's name, which is precisely
+ * the confusion `isPanelNamedPipe` exists to prevent. These assertions are real
+ * on the platform that has pipes and honest about being unmeasured elsewhere.
  */
-describe("startPanelServer tcp transport", () => {
-  /** Claims an ephemeral port by binding and immediately releasing it. */
-  const freeLoopbackPort = async (): Promise<number> => {
-    const probe = Bun.listen<number>({
-      hostname: "127.0.0.1",
-      port: 0,
-      socket: {
-        open: (_socket) => undefined,
-        data: (_socket, _chunk) => undefined,
-        close: (_socket) => undefined,
-        error: (_socket, _error) => undefined,
-      },
-    });
-    const port = probe.port;
-    probe.stop(true);
-    await Bun.sleep(10);
-    return port;
-  };
+describe.skipIf(process.platform !== "win32")("startPanelServer named pipe", () => {
+  /** A pipe name no other test or run can collide with. */
+  const freePipeName = (): string =>
+    `\\\\.\\pipe\\squid-panel-test-${process.pid}-${Math.random().toString(36).slice(2)}`;
 
-  const tcpConnect = async (
-    port: number,
+  const pipeConnect = async (
+    pipeName: string,
     lines: string[],
     notify: { fn: (() => void) | null; want: number },
   ) =>
     Bun.connect<undefined>({
-      hostname: "127.0.0.1",
-      port,
+      unix: pipeName,
       socket: {
         data: (_socket, chunk) => {
           lines.push(...chunk.toString("utf8").split("\n").filter((part) => part.length > 0));
@@ -522,19 +511,18 @@ describe("startPanelServer tcp transport", () => {
       },
     });
 
-  it("serves the same protocol over tcp://127.0.0.1:<port>", async () => {
-    const port = await freeLoopbackPort();
-    const endpoint = `tcp://127.0.0.1:${port}`;
+  it("serves the same protocol over a named pipe", async () => {
+    const pipeName = freePipeName();
     const ops: string[] = [];
     const server = await startPanelServer({
-      socketPath: endpoint,
+      socketPath: pipeName,
       onControl: (op) => ops.push(op),
     });
     try {
       const lines: string[] = [];
       const notify = { fn: null as (() => void) | null, want: Number.POSITIVE_INFINITY };
-      const client = await tcpConnect(port, lines, notify);
-      await until(() => server.clientCount === 1, "the tcp client to register");
+      const client = await pipeConnect(pipeName, lines, notify);
+      await until(() => server.clientCount === 1, "the pipe client to register");
 
       server.broadcast(WORLD_LINE);
       notify.want = 1;
@@ -543,8 +531,10 @@ describe("startPanelServer tcp transport", () => {
       });
       expect(JSON.parse(lines[0] ?? "")).toEqual(WORLD_LINE);
 
+      // Byte mode on both ends, so newline framing means the same thing in both
+      // directions; a control op is the round trip that proves it.
       client.write('{"type":"control","op":"pause"}\n');
-      await until(() => ops.length === 1, "the tcp control op to arrive");
+      await until(() => ops.length === 1, "the pipe control op to arrive");
       expect(ops).toEqual(["pause"]);
 
       client.end();
@@ -553,36 +543,33 @@ describe("startPanelServer tcp transport", () => {
     }
   });
 
-  it("does not create or remove any file for a tcp endpoint", async () => {
-    // The endpoint is not a path. Any file bookkeeping on it would be a bug:
-    // either a stray artifact next to the cwd, or an unlink of a path that was
-    // never a socket.
-    const port = await freeLoopbackPort();
-    const sentinel = join(tmpdir(), `squid-panel-tcp-${port}`);
+  it("creates no filesystem entry, and removes none on close", async () => {
+    // A pipe lives in the pipe namespace, not the filesystem. `clearBindPath`,
+    // the chmod, and the unlink-on-close are all gated off for it — if any of
+    // them ran, this is where the stray artifact or the wrong unlink shows up.
+    const pipeName = freePipeName();
+    expect(existsSync(pipeName)).toBe(false);
+
+    const server = await startPanelServer({ socketPath: pipeName, onControl: () => undefined });
     try {
-      const server = await startPanelServer({
-        socketPath: `tcp://127.0.0.1:${port}`,
-        onControl: () => undefined,
-      });
-      await server.close();
-      expect(existsSync(sentinel)).toBe(false);
+      expect(existsSync(pipeName)).toBe(false);
     } finally {
-      await rm(sentinel, { force: true });
+      await server.close();
     }
+    expect(existsSync(pipeName)).toBe(false);
   });
 
-  it("two servers cannot bind the same tcp endpoint", async () => {
-    // On Unix, the file mode and the refusal-to-clobber are the boundary; on
-    // TCP the equivalent guarantee is that a second bind at a live endpoint
-    // fails loudly rather than silently stealing the port.
-    const port = await freeLoopbackPort();
-    const first = await startPanelServer({
-      socketPath: `tcp://127.0.0.1:${port}`,
-      onControl: () => undefined,
-    });
+  it("refuses a second bind of the same pipe name", async () => {
+    // Bun surfaces this as a Node-shaped EADDRINUSE with syscall "listen"
+    // (asserted by Bun's own test/js/bun/net/named-pipe-listen-error.test.ts).
+    // Worth pinning here because the Unix socket does *not* refuse a duplicate
+    // bind, so the two transports differ and the difference should be recorded
+    // where someone reading the transport tests will find it.
+    const pipeName = freePipeName();
+    const first = await startPanelServer({ socketPath: pipeName, onControl: () => undefined });
     try {
       await expect(
-        startPanelServer({ socketPath: `tcp://127.0.0.1:${port}`, onControl: () => undefined }),
+        startPanelServer({ socketPath: pipeName, onControl: () => undefined }),
       ).rejects.toThrow();
     } finally {
       await first.close();

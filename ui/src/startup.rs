@@ -42,11 +42,11 @@ pub enum Startup {
 
 /// A working value for this platform, in the spelling its transport accepts.
 ///
-/// Windows connects over loopback TCP and Unix over a filesystem socket, so a
+/// Windows connects to a named pipe and Unix to a filesystem socket, so a
 /// single example would be wrong on one of them — and a wrong example in the
 /// message that exists to unblock someone is worse than no example.
 #[cfg(windows)]
-const ENDPOINT_EXAMPLE: &str = "tcp://127.0.0.1:7717";
+const ENDPOINT_EXAMPLE: &str = "\\\\.\\pipe\\squid-panel";
 #[cfg(not(windows))]
 const ENDPOINT_EXAMPLE: &str = "/tmp/squid-panel.sock";
 

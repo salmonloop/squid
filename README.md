@@ -362,9 +362,10 @@ The published assets are `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`
 each with a `sha256` beside it. The Linux binary needs `libfontconfig1`,
 `libfreetype6`, and `libxkbcommon0` at runtime — femtovg and winit link them, and
 the workflow installs the matching `-dev` packages to build. The Windows build
-needs no runtime packages; its panel transport is loopback TCP
-(`SQUID_PANEL_SOCKET=tcp://127.0.0.1:<port>`), where Unix uses a filesystem
-socket — the protocol document names the spelling each platform accepts.
+needs no runtime packages; its panel transport is a named pipe
+(`SQUID_PANEL_SOCKET=\\.\pipe\squid-panel`), where Unix uses a filesystem socket
+— the protocol document names the spelling each platform accepts, and why the
+pipe carries no access boundary the way the socket's file mode does.
 
 **The downloaded binary is a client, not an application to launch.** It connects
 to a watch session and renders what that session pushes it; with

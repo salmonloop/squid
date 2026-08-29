@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { parsePanelTcpEndpoint, resolvePanel } from "../src/resolve-panel.js";
+import { PANEL_PIPE_PREFIX, parsePanelPipeName, resolvePanel } from "../src/resolve-panel.js";
 
 describe("resolvePanel", () => {
   it("is off when SQUID_PANEL_SOCKET is unset", () => {
@@ -52,70 +52,111 @@ describe("resolvePanel", () => {
     }
   });
 
-  it("on Windows accepts only the loopback TCP spelling", () => {
-    // Windows has no std unix-socket transport, so a path spelling would
-    // produce a panel that could never connect. The endpoint, not the platform,
-    // names the transport — explicit is the only thing both ends can agree on.
+  it("on Windows accepts a named pipe and hands back the normalized spelling", () => {
+    // Windows has no std unix-socket transport, so a path spelling would produce
+    // a panel that could never connect. The endpoint, not the platform, names
+    // the transport — explicit is the only thing both ends can agree on.
     expect(
-      resolvePanel({ env: { SQUID_PANEL_SOCKET: "tcp://127.0.0.1:41950" }, platform: "win32" }),
-    ).toEqual({ enabled: true, socketPath: "tcp://127.0.0.1:41950" });
+      resolvePanel({
+        env: { SQUID_PANEL_SOCKET: "\\\\.\\pipe\\squid-panel" },
+        platform: "win32",
+      }),
+    ).toEqual({ enabled: true, socketPath: "\\\\.\\pipe\\squid-panel" });
 
+    // What the caller wrote is not necessarily what comes back: the resolution
+    // carries the normal form, so the bind, the panel's connect, and any
+    // diagnostic are all talking about one string.
     expect(
-      resolvePanel({ env: { SQUID_PANEL_SOCKET: "C:\\Users\\me\\panel.sock" }, platform: "win32" }),
-    ).toEqual({ configError: "On Windows SQUID_PANEL_SOCKET must be tcp://127.0.0.1:<port>." });
+      resolvePanel({
+        env: { SQUID_PANEL_SOCKET: "//./pipe/squid-panel" },
+        platform: "win32",
+      }),
+    ).toEqual({ enabled: true, socketPath: "\\\\.\\pipe\\squid-panel" });
   });
 
-  it("on Windows still refuses a wildcard or non-loopback host", () => {
-    // The parse rejects these already, but the platform gate must not loosen
-    // what the spelling gate tightened.
-    expect(
-      resolvePanel({ env: { SQUID_PANEL_SOCKET: "tcp://0.0.0.0:4000" }, platform: "win32" }),
-    ).toEqual({ configError: "On Windows SQUID_PANEL_SOCKET must be tcp://127.0.0.1:<port>." });
+  it("on Windows refuses a drive path and the loopback TCP spelling it replaced", () => {
+    // A drive path is the mistake a Unix habit produces; tcp:// is the one an
+    // older README produces. Both must fail at startup rather than bind
+    // something the panel will not find.
+    for (const value of ["C:\\Users\\me\\panel.sock", "tcp://127.0.0.1:41950"]) {
+      expect(resolvePanel({ env: { SQUID_PANEL_SOCKET: value }, platform: "win32" })).toEqual({
+        configError: "On Windows SQUID_PANEL_SOCKET must be a named pipe: \\\\.\\pipe\\<name>.",
+      });
+    }
   });
 
-  it("on non-Windows refuses the TCP spelling rather than guessing a platform", () => {
-    // A tcp:// value on Linux would silently bind a listener the bundled panel
-    // binary never connects to, because the Rust side picks its transport from
-    // the build target. Refusing keeps the two ends from disagreeing.
+  it("on non-Windows refuses the pipe spelling rather than guessing a platform", () => {
+    // A pipe value on Linux would bind a socket file whose name contains
+    // backslashes, in the cwd, that the bundled panel binary never looks for —
+    // the Rust side picks its transport from the build target. Refusing keeps
+    // the two ends from disagreeing.
     expect(
-      resolvePanel({ env: { SQUID_PANEL_SOCKET: "tcp://127.0.0.1:41950" }, platform: "linux" }),
+      resolvePanel({
+        env: { SQUID_PANEL_SOCKET: "\\\\.\\pipe\\squid-panel" },
+        platform: "linux",
+      }),
     ).toEqual({ configError: "SQUID_PANEL_SOCKET must be an absolute path." });
   });
 });
 
-describe("parsePanelTcpEndpoint", () => {
-  it("accepts the only endpoint the Windows panel is allowed to use", () => {
-    expect(parsePanelTcpEndpoint("tcp://127.0.0.1:41950")).toEqual({
-      hostname: "127.0.0.1",
-      port: 41950,
-    });
+describe("parsePanelPipeName", () => {
+  it("accepts every spelling Bun accepts, and normalizes them to one", () => {
+    // These four are the same pipe. Bun's own `normalize_pipe_name` rewrites
+    // the prefix and keeps the name, so this function must agree exactly: a
+    // value it accepts that Bun would not is a value that silently binds an
+    // AF_UNIX socket instead.
+    for (const spelling of [
+      "\\\\.\\pipe\\squid-panel",
+      "//./pipe/squid-panel",
+      "\\\\?\\pipe\\squid-panel",
+      "\\/.\\pipe/squid-panel",
+    ]) {
+      expect(parsePanelPipeName(spelling)).toBe("\\\\.\\pipe\\squid-panel");
+    }
+    expect(PANEL_PIPE_PREFIX).toBe("\\\\.\\pipe\\");
   });
 
-  it("refuses any host but loopback", () => {
-    // A general host would turn the unauthenticated control socket into a
-    // network service; loopback is the whole boundary on Windows.
-    expect(parsePanelTcpEndpoint("tcp://0.0.0.0:4000")).toBeNull();
-    expect(parsePanelTcpEndpoint("tcp://localhost:4000")).toBeNull();
-    expect(parsePanelTcpEndpoint("tcp://192.168.1.4:4000")).toBeNull();
-    expect(parsePanelTcpEndpoint("tcp://[::1]:4000")).toBeNull();
+  it("passes the name through untouched, including separators inside it", () => {
+    // The pipe namespace is flat but permits separators in a name. Normalizing
+    // them would connect to a pipe the caller did not ask for.
+    expect(parsePanelPipeName("\\\\.\\pipe\\squid\\panel-7")).toBe(
+      "\\\\.\\pipe\\squid\\panel-7",
+    );
+    expect(parsePanelPipeName("//./pipe/LOCAL/squid-panel")).toBe(
+      "\\\\.\\pipe\\LOCAL/squid-panel",
+    );
   });
 
-  it("refuses malformed ports", () => {
-    expect(parsePanelTcpEndpoint("tcp://127.0.0.1")).toBeNull();
-    expect(parsePanelTcpEndpoint("tcp://127.0.0.1:0")).toBeNull();
-    expect(parsePanelTcpEndpoint("tcp://127.0.0.1:65536")).toBeNull();
-    expect(parsePanelTcpEndpoint("tcp://127.0.0.1:notaport")).toBeNull();
+  it("refuses a prefix with no name behind it", () => {
+    // Length 9 exactly: a prefix and nothing else would bind a pipe called
+    // nothing, so the boundary is > 9 rather than >= 9.
+    expect(parsePanelPipeName("\\\\.\\pipe\\")).toBeNull();
+    expect(parsePanelPipeName("//./pipe/")).toBeNull();
+    // A separator where the name should start is the same emptiness one
+    // character later.
+    expect(parsePanelPipeName("\\\\.\\pipe\\\\name")).toBeNull();
   });
 
-  it("refuses extra URL structure", () => {
-    expect(parsePanelTcpEndpoint("tcp://user@127.0.0.1:4000")).toBeNull();
-    expect(parsePanelTcpEndpoint("tcp://127.0.0.1:4000/base")).toBeNull();
-    expect(parsePanelTcpEndpoint("tcp://127.0.0.1:4000?x=1")).toBeNull();
-    expect(parsePanelTcpEndpoint("tcp://127.0.0.1:4000#frag")).toBeNull();
+  it("refuses a malformed prefix rather than repairing it", () => {
+    expect(parsePanelPipeName("\\.\\pipe\\squid-panel")).toBeNull(); // one leading separator
+    expect(parsePanelPipeName("\\\\x\\pipe\\squid-panel")).toBeNull(); // device is not . or ?
+    expect(parsePanelPipeName("\\\\.\\pipes\\squid-panel")).toBeNull(); // pipes, not pipe
+    expect(parsePanelPipeName("\\\\.pipe\\squid-panel")).toBeNull(); // missing separator
   });
 
-  it("refuses the non-tcp spellings a Unix path could take", () => {
-    expect(parsePanelTcpEndpoint("/tmp/squid-panel.sock")).toBeNull();
-    expect(parsePanelTcpEndpoint("127.0.0.1:4000")).toBeNull();
+  it("refuses PIPE in the wrong case, because Bun does", () => {
+    // Not pedantry: Bun compares those four bytes exactly, so an uppercase
+    // spelling falls through to its AF_UNIX branch. Accepting it here is how
+    // the gate would pass a value that then binds the wrong kind of thing.
+    expect(parsePanelPipeName("\\\\.\\PIPE\\squid-panel")).toBeNull();
+    expect(parsePanelPipeName("\\\\.\\Pipe\\squid-panel")).toBeNull();
+  });
+
+  it("refuses the spellings the other platform and the old transport would use", () => {
+    expect(parsePanelPipeName("/tmp/squid-panel.sock")).toBeNull();
+    expect(parsePanelPipeName("C:\\Users\\me\\panel.sock")).toBeNull();
+    expect(parsePanelPipeName("tcp://127.0.0.1:41950")).toBeNull();
+    expect(parsePanelPipeName("squid-panel")).toBeNull();
+    expect(parsePanelPipeName("")).toBeNull();
   });
 });
