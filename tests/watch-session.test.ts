@@ -61,30 +61,49 @@ interface AgentLog {
 
 function fakeAgentFactory(
   log: AgentLog,
-  options: { readonly promptError?: Error; readonly reply?: string } = {},
+  options: {
+    readonly promptError?: Error;
+    readonly reply?: string;
+    /** A session whose turn never settles — the wedge the watchdog exists to break. */
+    readonly neverIdle?: boolean;
+  } = {},
 ): ResidentSessionFactory {
-  return async (): Promise<ResidentSession> => ({
-    async prompt(text: string): Promise<void> {
-      log.calls.push("prompt");
-      log.prompts.push(text);
-      if (options.promptError !== undefined) throw options.promptError;
-    },
-    async observe(customType: string, content: string): Promise<void> {
-      log.calls.push("observe");
-      log.observed.push(`${customType}:${content}`);
-    },
-    async waitForIdle(): Promise<void> {
-      log.calls.push("waitForIdle");
-    },
-    async abort(): Promise<void> {},
-    getLastAssistantText(): string | undefined {
-      return options.reply;
-    },
-    dispose(): void {
-      log.calls.push("dispose");
-      log.disposed += 1;
-    },
-  });
+  return async (): Promise<ResidentSession> => {
+    let idle: (() => void) | undefined;
+    return {
+      async prompt(text: string): Promise<void> {
+        log.calls.push("prompt");
+        log.prompts.push(text);
+        if (options.promptError !== undefined) throw options.promptError;
+      },
+      async observe(customType: string, content: string): Promise<void> {
+        log.calls.push("observe");
+        log.observed.push(`${customType}:${content}`);
+      },
+      async waitForIdle(): Promise<void> {
+        log.calls.push("waitForIdle");
+        if (options.neverIdle === true) {
+          // A wedged turn, faithfully: it settles only when aborted, which is
+          // how a real aborted session behaves — the watchdog's abort is what
+          // lets the turn end at all.
+          await new Promise<void>((resolve) => {
+            idle = resolve;
+          });
+        }
+      },
+      async abort(): Promise<void> {
+        log.calls.push("abort");
+        idle?.();
+      },
+      getLastAssistantText(): string | undefined {
+        return options.reply;
+      },
+      dispose(): void {
+        log.calls.push("dispose");
+        log.disposed += 1;
+      },
+    };
+  };
 }
 
 function emptyAgentLog(): AgentLog {
@@ -137,7 +156,11 @@ async function startSession(options: {
   readonly log?: (line: string) => void;
   readonly logError?: (line: string) => void;
   readonly agentLog?: AgentLog;
-  readonly agentOptions?: { readonly promptError?: Error; readonly reply?: string };
+  readonly agentOptions?: {
+    readonly promptError?: Error;
+    readonly reply?: string;
+    readonly neverIdle?: boolean;
+  };
 }) {
   const seenContexts: WatchSourceContext[] = [];
   const agentLog = options.agentLog ?? emptyAgentLog();
@@ -538,8 +561,44 @@ describe("the resident agent in the ingest loop", () => {
     expect(await result.session.runtime.store.all()).toHaveLength(2);
   });
 
-  it("drains in-flight turns before disposing the agent, then the store", async () => {
+  it("aborts a turn that never settles and keeps the loop alive", async () => {
     const lifecycle: string[] = [];
+    const errors: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result, agentLog } = await startSession({
+      sources: [source],
+      env: { SQUID_AGENT_TURN_TIMEOUT_MS: "50" },
+      logError: (line) => errors.push(line),
+      agentOptions: { neverIdle: true },
+    });
+    if ("configError" in result) throw new Error(result.configError);
+
+    await source.emit!(fileSaved("fs-1", "a.ts"));
+    // The watchdog fires 50ms in: without it this await never returns, because
+    // the serialized chain holds every later turn behind the wedged one.
+    await source.emit!(fileSaved("fs-2", "b.ts"));
+    await result.session.stop();
+
+    expect(agentLog.calls.filter((call) => call === "abort").length).toBeGreaterThanOrEqual(1);
+    expect(errors.some((line) => line.includes("agentTurnError") && line.includes("exceeded 50ms"))).toBe(true);
+    // The loop survived the wedge: the second event still reached the agent.
+    expect(agentLog.calls.filter((call) => call === "prompt")).toHaveLength(2);
+    expect(await result.session.runtime.store.all()).toHaveLength(2);
+  });
+
+  it("refuses a malformed SQUID_AGENT_TURN_TIMEOUT_MS before any source starts", async () => {
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result } = await startSession({
+      sources: [source],
+      env: { SQUID_AGENT_TURN_TIMEOUT_MS: "soon" },
+    });
+    if (!("configError" in result)) throw new Error("expected a config error");
+    expect(result.configError).toContain("SQUID_AGENT_TURN_TIMEOUT_MS");
+    expect(source.started).toBe(false);
+  });
+
+  it("drains in-flight turns before disposing the agent, then the store", async () => {    const lifecycle: string[] = [];
     const source = new ScriptedSource("alpha", lifecycle);
     const { result, agentLog } = await startSession({ sources: [source] });
     if ("configError" in result) throw new Error(result.configError);

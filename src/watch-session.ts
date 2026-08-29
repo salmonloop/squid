@@ -4,6 +4,7 @@ import { agentCustomTools } from "./agent-tools.js";
 import { describeErrorForAudit } from "./audit-text.js";
 import { CaptureGateActivitySource } from "./capture-gate-source.js";
 import { resolveCaptureGate } from "./resolve-capture-gate.js";
+import { resolveAgentTurnTimeout } from "./resolve-agent-turn-timeout.js";
 import { HOUR_MS, resolveRetention } from "./resolve-retention.js";
 import {
   createResidentAgent,
@@ -138,6 +139,12 @@ export async function startWatchSession(
   const panel = resolvePanel({ env });
   if ("configError" in panel) return { configError: panel.configError };
 
+  // The turn watchdog resolves with the other capability variables for the same
+  // reason: a malformed SQUID_AGENT_TURN_TIMEOUT_MS must fail startup rather
+  // than silently leave a run whose wedge protection was never applied.
+  const turnTimeout = resolveAgentTurnTimeout(env);
+  if ("configError" in turnTimeout) return { configError: turnTimeout.configError };
+
   const watch = createWatchRuntime({
     ...(options.databasePath === undefined ? {} : { databasePath: options.databasePath }),
     // Resolved inside createWatchRuntime, but the raw value passes through so
@@ -245,7 +252,7 @@ export async function startWatchSession(
   let turnTail: Promise<void> = Promise.resolve();
 
   const promptAgent = (): void => {
-    const turn = turnTail.then(async () => {
+    const runTurn = async (): Promise<void> => {
       await agent.prompt(AGENT_TURN_PROMPT);
       await agent.waitForIdle();
       const reply = agent.getLastAssistantText();
@@ -255,6 +262,29 @@ export async function startWatchSession(
       if (reply !== undefined && reply.trim().length > 0) {
         log(JSON.stringify({ agent: "replied", text: reply }));
         panelServer?.broadcast(panelAgentLine({ status: "replied", text: reply }));
+      }
+    };
+    const turn = turnTail.then(async () => {
+      const running = runTurn();
+      // A turn that fails after the watchdog fired must not surface as an
+      // unhandled rejection: the race below already reported the turn as lost.
+      running.catch(() => undefined);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          running,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              // The abort is what makes the timeout real. A turn that merely
+              // lost the race keeps running, and the next turn's waitForIdle
+              // would inherit the wedge this timeout exists to break.
+              void agent.abort().catch(() => undefined);
+              reject(new Error(`agent turn exceeded ${turnTimeout.timeoutMs}ms and was aborted`));
+            }, turnTimeout.timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
       }
     }).catch((error: unknown) => {
       // One failed turn must not end the ingest loop: the next observation gets
@@ -373,6 +403,7 @@ export async function startWatchSession(
       panel: panel.enabled ? panel.socketPath : "off",
       control: gate.enabled ? gate.readerKind : "off",
       retention: retention.enabled ? retention.hours : "off",
+      agentTurnTimeoutMs: turnTimeout.timeoutMs,
       ...(pruneSummary === undefined ? {} : { prunedEvents: pruneSummary.removedEvents }),
       restoredActions: restored.recentActions.length,
     },
