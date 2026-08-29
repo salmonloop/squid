@@ -16,7 +16,13 @@ import {
  */
 
 async function makeTempRoot(): Promise<string> {
-  return await mkdtemp(join(tmpdir(), "squid-containment-"));
+  // `realpath` because the subject canonicalizes its root, and every assertion
+  // below compares against a path this helper built. On Windows `tmpdir()`
+  // reports the 8.3 short name (`C:\\Users\\RUNNER~1\\...`), so without this the
+  // expected path carries the short form while `containPath` returns the long
+  // one and the two never match — and probe paths derived from the short root
+  // miss the files this helper just planted.
+  return await realpath(await mkdtemp(join(tmpdir(), "squid-containment-")));
 }
 
 async function plantProject(): Promise<{ root: string; cleanup: () => Promise<void> }> {

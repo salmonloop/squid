@@ -6,8 +6,16 @@ describe("resolvePanel", () => {
     expect(resolvePanel({ env: {} })).toEqual({ enabled: false });
   });
 
+  // Every case below is about the Unix spelling, so every one of them names its
+  // platform instead of inheriting the host's. Omitting it reads as "platform is
+  // irrelevant here", which is the opposite of true: the default is
+  // `process.platform`, so on a Windows runner these same assertions would be
+  // put to the win32 branch, where an absolute POSIX path is *correctly*
+  // refused — and the suite would fail for being right.
   it("enables the panel for an absolute socket path", () => {
-    expect(resolvePanel({ env: { SQUID_PANEL_SOCKET: "/tmp/squid-panel.sock" } })).toEqual({
+    expect(
+      resolvePanel({ env: { SQUID_PANEL_SOCKET: "/tmp/squid-panel.sock" }, platform: "linux" }),
+    ).toEqual({
       enabled: true,
       socketPath: "/tmp/squid-panel.sock",
     });
@@ -17,14 +25,24 @@ describe("resolvePanel", () => {
     // The socket file's mode is the only access boundary; a path that means a
     // different file depending on where the process launched would put that
     // boundary somewhere nobody chose.
-    const result = resolvePanel({ env: { SQUID_PANEL_SOCKET: "squid-panel.sock" } });
+    const result = resolvePanel({
+      env: { SQUID_PANEL_SOCKET: "squid-panel.sock" },
+      platform: "linux",
+    });
     expect(result).toEqual({ configError: "SQUID_PANEL_SOCKET must be an absolute path." });
     expect("enabled" in result).toBe(false);
   });
 
   it("refuses a dot-relative path too", () => {
-    const result = resolvePanel({ env: { SQUID_PANEL_SOCKET: "./run/panel.sock" } });
-    expect("configError" in result).toBe(true);
+    // Named for the same reason, and asserted on the message rather than merely
+    // on `"configError" in result`: the weaker form passes on Windows too, but
+    // for the pipe-spelling reason, so it would keep reporting success while
+    // testing something else entirely.
+    const result = resolvePanel({
+      env: { SQUID_PANEL_SOCKET: "./run/panel.sock" },
+      platform: "linux",
+    });
+    expect(result).toEqual({ configError: "SQUID_PANEL_SOCKET must be an absolute path." });
   });
 
   it("treats an empty value as a configuration error, not a second way to say off", () => {

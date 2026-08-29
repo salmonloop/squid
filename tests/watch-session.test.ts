@@ -663,22 +663,6 @@ describe("the resident agent in the ingest loop", () => {
  * Rust panel does, read framed lines, and send one back. A fake here would test
  * the wiring against itself.
  */
-
-/**
- * A real socket client against the panel server the session started.
- *
- * These tests do not read the server's internals — they connect the way the
- * Rust panel does, read framed lines, and send one back. A fake here would test
- * the wiring against itself.
- */
-
-/**
- * A real socket client against the panel server the session started.
- *
- * These tests do not read the server's internals — they connect the way the
- * Rust panel does, read framed lines, and send one back. A fake here would test
- * the wiring against itself.
- */
 class PanelTestClient {
   readonly lines: string[] = [];
   private buffer = "";
@@ -742,10 +726,32 @@ async function waitForLine(
  */
 const PLAIN_SELECTION = "SELECT invoice_total FROM ledger WHERE marker_zqxjkv = 1";
 
+/**
+ * A panel endpoint spelled the way this platform's transport requires.
+ *
+ * What the suites below actually test is the session's wiring: world state
+ * reaching a connected client, an agent turn being announced, a pause press
+ * reaching the capture-gate command path, a selection arriving as a length and
+ * never as text. None of that is transport-specific — but the endpoint
+ * *spelling* is. `resolvePanel` refuses a filesystem path on Windows, so a
+ * hardcoded `<tmp>/panel.sock` fails the session before a single source starts,
+ * and every assertion past that point reports a wiring bug that is really a
+ * spelling mismatch.
+ *
+ * Parameterizing the endpoint rather than skipping the suites keeps this
+ * platform-independent logic under test on both platforms. `node:net`'s
+ * `connect(path)` opens a named pipe on Windows and a Unix socket elsewhere, so
+ * `PanelTestClient` needs no branch of its own.
+ */
+const panelEndpoint = (dir: string): string =>
+  process.platform === "win32"
+    ? `\\\\.\\pipe\\squid-panel-test-${process.pid}-${Math.random().toString(36).slice(2)}`
+    : join(dir, "panel.sock");
+
 describe("the control panel on a watch session", () => {
   it("delivers world state to a connected panel over the real socket", async () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
-    const socketPath = join(dir, "panel.sock");
+    const socketPath = panelEndpoint(dir);
     const source = new ScriptedSource("alpha", []);
     const { result } = await startSession({
       sources: [source],
@@ -775,7 +781,7 @@ describe("the control panel on a watch session", () => {
 
   it("announces a replied agent turn on the panel", async () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
-    const socketPath = join(dir, "panel.sock");
+    const socketPath = panelEndpoint(dir);
     const source = new ScriptedSource("alpha", []);
     const { result } = await startSession({
       sources: [source],
@@ -805,7 +811,7 @@ describe("the control panel on a watch session", () => {
 
   it("announces a failed agent turn on the panel", async () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
-    const socketPath = join(dir, "panel.sock");
+    const socketPath = panelEndpoint(dir);
     const source = new ScriptedSource("alpha", []);
     const { result } = await startSession({
       sources: [source],
@@ -835,7 +841,7 @@ describe("the control panel on a watch session", () => {
 
   it("never puts the raw selection on the wire, only its length", async () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
-    const socketPath = join(dir, "panel.sock");
+    const socketPath = panelEndpoint(dir);
     const source = new ScriptedSource("screen", []);
     const { result } = await startSession({
       sources: [source],
@@ -884,7 +890,7 @@ describe("the control panel on a watch session", () => {
 
   it("routes a panel pause press into the capture-gate command path", async () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
-    const socketPath = join(dir, "panel.sock");
+    const socketPath = panelEndpoint(dir);
     const commandPath = join(dir, "gate.fifo");
     const source = new ScriptedSource("alpha", []);
     const { result } = await startSession({
@@ -935,13 +941,26 @@ describe("the control panel on a watch session", () => {
       sources: [source],
       env: { SQUID_PANEL_SOCKET: "relative/panel.sock" },
     });
-    expect("configError" in result && result.configError.includes("absolute")).toBe(true);
+    // Malformed on either platform, for a different stated reason: a relative
+    // path is not absolute, and it is not a named pipe either. The invariant is
+    // the refusal and its timing — before any source starts — so the message is
+    // matched per platform rather than pinning one platform's wording as though
+    // it were the contract.
+    const expected = process.platform === "win32" ? "named pipe" : "absolute";
+    expect("configError" in result && result.configError.includes(expected)).toBe(true);
     expect(lifecycle).toEqual([]);
   });
 
-  it("removes the socket file on stop", async () => {
+  /**
+   * The two below are about the socket *file*, so they stay off Windows. A named
+   * pipe has no directory entry to create or unlink, which is the whole subject
+   * here — and its disappearance after close is a handle lifetime rather than an
+   * unlink, with no ordering this test could rely on. The pipe's bind-and-close
+   * behaviour is asserted directly in `tests/panel-server.test.ts`.
+   */
+  it.skipIf(process.platform === "win32")("removes the socket file on stop", async () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
-    const socketPath = join(dir, "panel.sock");
+    const socketPath = panelEndpoint(dir);
     const source = new ScriptedSource("alpha", []);
     const { result } = await startSession({
       sources: [source],
@@ -957,9 +976,9 @@ describe("the control panel on a watch session", () => {
     }
   });
 
-  it("closes the panel even when a source fails to start", async () => {
+  it.skipIf(process.platform === "win32")("closes the panel even when a source fails to start", async () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
-    const socketPath = join(dir, "panel.sock");
+    const socketPath = panelEndpoint(dir);
     const broken = new ScriptedSource("broken", [], new Error("no display"));
     const { result } = await startSession({
       sources: [broken],
@@ -982,7 +1001,7 @@ describe("the control panel and the capture policy's redaction", () => {
    */
   it("reports the redacted placeholder's length, not the secret's", async () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
-    const socketPath = join(dir, "panel.sock");
+    const socketPath = panelEndpoint(dir);
     const source = new ScriptedSource("screen", []);
     const secret = "password = hunter2_marker_zqxjkv_and_a_long_tail_to_be_sure";
     const { result } = await startSession({
