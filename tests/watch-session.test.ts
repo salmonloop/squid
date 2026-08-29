@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { connect, type Socket } from "node:net";
+import type { Socket } from "bun";
 import { describe, expect, it } from "bun:test";
 import type {
   ActivityEventEmitter,
@@ -659,32 +659,45 @@ describe("the resident agent in the ingest loop", () => {
 /**
  * A real socket client against the panel server the session started.
  *
- * These tests do not read the server's internals — they connect the way the
- * Rust panel does, read framed lines, and send one back. A fake here would test
- * the wiring against itself.
+ * These tests do not read the server's internals — they connect over the real
+ * endpoint, read framed lines, and send one back. A fake here would test the
+ * wiring against itself.
+ *
+ * `Bun.connect`, not `node:net`'s `connect`, and the difference is measured
+ * rather than stylistic. On the Windows runner a `node:net` client against a
+ * named pipe connects and its writes arrive — the pause-press test proves the
+ * inbound direction — but nothing is ever delivered to its `data` handler, so
+ * every assertion that reads a broadcast times out. Swapped for `Bun.connect`
+ * against the identical server and pipe, both directions work; that is the API
+ * `tests/panel-server.test.ts` already uses, and its named-pipe round trip
+ * passes there. The gap is in Bun's `node:net` read path on Windows pipes, not
+ * in the panel transport, so the client moves to the API that carries both
+ * directions on both platforms rather than the suites being skipped.
  */
 class PanelTestClient {
   readonly lines: string[] = [];
-  private buffer = "";
-  private readonly socket: Socket;
+  private carry = "";
+  private socket: Socket<undefined> | null = null;
   private readonly opened: Promise<void>;
 
   public constructor(socketPath: string) {
-    this.socket = connect(socketPath);
-    this.socket.setEncoding("utf8");
-    this.opened = new Promise((resolve, reject) => {
-      this.socket.once("connect", resolve);
-      this.socket.once("error", reject);
-    });
-    this.socket.on("data", (chunk: string) => {
-      this.buffer += chunk;
-      for (;;) {
-        const index = this.buffer.indexOf("\n");
-        if (index === -1) break;
-        this.lines.push(this.buffer.slice(0, index));
-        this.buffer = this.buffer.slice(index + 1);
-      }
-    });
+    this.opened = (async () => {
+      this.socket = await Bun.connect<undefined>({
+        unix: socketPath,
+        socket: {
+          data: (_socket, chunk) => {
+            this.carry += chunk.toString("utf8");
+            const parts = this.carry.split("\n");
+            // The tail after the last newline is an incomplete line; it waits.
+            this.carry = parts.pop() ?? "";
+            for (const part of parts) this.lines.push(part);
+          },
+          open: () => undefined,
+          close: () => undefined,
+          error: () => undefined,
+        },
+      });
+    })();
   }
 
   public async ready(): Promise<void> {
@@ -692,11 +705,12 @@ class PanelTestClient {
   }
 
   public send(line: string): void {
-    this.socket.write(`${line}\n`);
+    this.socket?.write(`${line}\n`);
   }
 
-  public close(): Promise<void> {
-    return new Promise((resolve) => this.socket.end(resolve));
+  public async close(): Promise<void> {
+    await this.opened.catch(() => undefined);
+    this.socket?.end();
   }
 }
 
