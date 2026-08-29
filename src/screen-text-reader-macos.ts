@@ -1,4 +1,5 @@
 import { describeErrorForAudit } from "./audit-text.js";
+import { pollingScreenTextReaderFactory } from "./screen-text-reader-subprocess.js";
 import type {
   ScreenTextFocusRole,
   ScreenTextFrame,
@@ -100,78 +101,27 @@ export function createMacosScreenTextReader(
 
   const pollMs = options.pollMs ?? DEFAULT_POLL_MS;
 
-  return ({ onFrame, onError }) => {
-    let closed = false;
-    let sampling = false;
-    let activeProcess: { kill(): void } | null = null;
-    let lastErrorMessage: string | null = null;
-
-    /**
-     * osascript failures repeat once per poll — a revoked accessibility grant or
-     * an unresponsive app would otherwise emit an identical diagnostic every
-     * second, forever. Only report transitions, and never after close: a killed
-     * subprocess reports a broken pipe that says nothing about the host.
-     */
-    const reportError = (message: string): void => {
-      if (closed || message === lastErrorMessage) return;
-      lastErrorMessage = message;
-      onError(new Error(message));
-    };
-
-    const sample = async (): Promise<void> => {
-      // Polls must not overlap: osascript can block for longer than the interval
-      // when the frontmost app is busy, and a queued second query would only
-      // deepen the backlog.
-      if (closed || sampling) return;
-      sampling = true;
-      const occurredAt = new Date().toISOString();
-
-      try {
-        const child = Bun.spawn(["osascript", "-e", FOREGROUND_SCRIPT], {
-          stdout: "pipe",
-          stderr: "pipe",
-        });
-        activeProcess = child;
-        const [stdout, stderr, exitCode] = await Promise.all([
-          new Response(child.stdout).text(),
-          new Response(child.stderr).text(),
-          child.exited,
-        ]);
-        if (closed) return;
-
-        if (exitCode !== 0) {
-          reportError(`osascript exited ${exitCode}: ${stderr.trim() || "no stderr output"}`);
-          return;
-        }
-
-        const frame = parseFrame(stdout, occurredAt);
-        // A screen with no describable frontmost process — a lock screen, the
-        // login window — is a quiet observation, not a failure.
-        lastErrorMessage = null;
-        if (frame !== null) onFrame(frame);
-      } catch (error) {
-        reportError(describeErrorForAudit(error));
-      } finally {
-        activeProcess = null;
-        sampling = false;
-      }
-    };
-
-    // Sample once immediately so the first frame does not wait a whole interval.
-    void sample();
-    const timer = setInterval(() => void sample(), pollMs);
-
-    return {
-      close: () => {
-        closed = true;
-        clearInterval(timer);
-        // A poll can be mid-flight; killing it keeps osascript from outliving
-        // the reader that started it.
-        activeProcess?.kill();
-        activeProcess = null;
-      },
-    };
-  };
+  // The poll loop — sampling without overlap, transition-only error reporting,
+  // killing the in-flight query on close — is shared with the other platform
+  // backends; this file contributes only the query and the parser.
+  return pollingScreenTextReaderFactory({
+    program: "osascript",
+    pollMs,
+    parse: parseFrame,
+    run: async (onSpawned) => {
+      const child = Bun.spawn(["osascript", "-e", FOREGROUND_SCRIPT], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      onSpawned(child);
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ]);
+      return { stdout, stderr, exitCode };
+    },
+  });
 }
 
 /**

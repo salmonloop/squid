@@ -374,13 +374,17 @@ to its console, which is exactly the double-clicked case.
 
 ## What is not yet implemented
 
-- No supplementary tools ship. The agent works with Pi's built-ins; `ToolSummary` is the
-  shape a run would describe extras in, and the catalog renders a stated absence when
-  none arrive.
-- No evaluation corpus. The replay gate, the provider selector, and the belief layer were
-  the apparatus of a system that ranked its own candidates, and they went with it.
-- Linux and Windows screen/browser backends. Both accessibility readers are darwin-only;
-  the synthetic backends cover the paths anywhere.
+- No supplementary tools ship. The agent works with Pi's built-ins plus its own
+  `query_recent_events` sensory-history tool; `ToolSummary` is the shape a run would
+  describe extras in, and the catalog renders a stated absence when none arrive.
+- Browser page reading is darwin-only; the synthetic backend covers the path anywhere.
+  Screen text reads on all three platforms — the poll loop is shared
+  (`screen-text-reader-subprocess.ts`), with Linux on `xdotool` and Windows on
+  PowerShell/Win32 — but both report window identity only: focus roles and selection
+  text wait for an AT-SPI or full UIA backend.
+- The evaluation corpus (`eval/corpus.ts`) is a start, not an endpoint: five scenarios
+  with a deterministic CI consumer. Live-judgment evaluation — scoring what the agent
+  actually concludes — has no runner yet.
 
 ## Archived documents
 
