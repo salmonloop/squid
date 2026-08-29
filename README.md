@@ -362,6 +362,16 @@ needs no runtime packages; its panel transport is loopback TCP
 (`SQUID_PANEL_SOCKET=tcp://127.0.0.1:<port>`), where Unix uses a filesystem
 socket — the protocol document names the spelling each platform accepts.
 
+**The downloaded binary is a client, not an application to launch.** It connects
+to a watch session and renders what that session pushes it; with
+`SQUID_PANEL_SOCKET` unset there is nothing to connect to, so it prints why and
+exits `2` without opening a window. Double-clicking it on Windows therefore looks
+like a crash: the console that line was printed to belongs to the process and
+closes with it. Run it from a shell, or let the watch session start it. A window
+that cannot be created — no display, no OpenGL — exits `3`. On Windows both
+messages also appear in a dialog box when this process is the only one attached
+to its console, which is exactly the double-clicked case.
+
 ## What is not yet implemented
 
 - No supplementary tools ship. The agent works with Pi's built-ins; `ToolSummary` is the

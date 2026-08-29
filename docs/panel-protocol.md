@@ -53,6 +53,29 @@ one:
 - `stop()` alone leaves connected sockets writable and their handles alive, so the
   process will not exit while a panel is attached. Close with `stop(true)`.
 
+## Starting the panel
+
+Because the endpoint is off by default, the panel with no `SQUID_PANEL_SOCKET`
+has nothing to render and no session to control. It says so and exits `2` rather
+than opening a window: a panel that is up but attached to nothing looks like a
+watch session that has stopped reporting, and the shape rules below exist to keep
+this surface from telling that kind of lie.
+
+Two startup failures therefore end the process before the event loop, each with
+its own code so a launcher can tell them apart:
+
+| Code | Meaning |
+| --- | --- |
+| `2` | `SQUID_PANEL_SOCKET` is unset — no endpoint to connect to. |
+| `3` | The window could not be created — no display, or no OpenGL for femtovg. |
+
+Both print the reason to stderr. On Windows they also raise a message box, but
+only when `GetConsoleProcessList` reports this process alone in its console —
+that is the double-clicked case, where the console dies with the process and
+stderr dies with it. Launched from a shell the count is at least two and stderr
+is already readable; launched with no console at all it is zero, and a modal
+dialog no one can dismiss would hang the process instead of reporting anything.
+
 ## Message shape rules
 
 These are enforced by `ui/src/protocol.rs` and must not be relaxed. Each exists
