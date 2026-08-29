@@ -70,6 +70,7 @@ function fakeAgentFactory(
 ): ResidentSessionFactory {
   return async (): Promise<ResidentSession> => {
     let idle: (() => void) | undefined;
+    let aborted = false;
     return {
       async prompt(text: string): Promise<void> {
         log.calls.push("prompt");
@@ -82,10 +83,11 @@ function fakeAgentFactory(
       },
       async waitForIdle(): Promise<void> {
         log.calls.push("waitForIdle");
-        if (options.neverIdle === true) {
-          // A wedged turn, faithfully: it settles only when aborted, which is
-          // how a real aborted session behaves — the watchdog's abort is what
-          // lets the turn end at all.
+        // A wedged turn settles only when aborted — and once aborted, the
+        // session is idle for good: a real session falls back to idle the
+        // moment its abort lands, so any later waitForIdle (the watchdog's
+        // grace, say) resolves instead of outliving the abort.
+        if (options.neverIdle === true && !aborted) {
           await new Promise<void>((resolve) => {
             idle = resolve;
           });
@@ -93,6 +95,7 @@ function fakeAgentFactory(
       },
       async abort(): Promise<void> {
         log.calls.push("abort");
+        aborted = true;
         idle?.();
       },
       getLastAssistantText(): string | undefined {
@@ -583,6 +586,10 @@ describe("the resident agent in the ingest loop", () => {
     expect(errors.some((line) => line.includes("agentTurnError") && line.includes("exceeded 50ms"))).toBe(true);
     // The loop survived the wedge: the second event still reached the agent.
     expect(agentLog.calls.filter((call) => call === "prompt")).toHaveLength(2);
+    // And the second prompt was issued after the abort landed, not during the
+    // unwind — a prompt against a session still processing is refused outright.
+    const promptIndexes = agentLog.calls.flatMap((call, index) => (call === "prompt" ? [index] : []));
+    expect(agentLog.calls.indexOf("abort")).toBeLessThan(promptIndexes[1] ?? Number.POSITIVE_INFINITY);
     expect(await result.session.runtime.store.all()).toHaveLength(2);
   });
 
