@@ -663,24 +663,39 @@ describe("the resident agent in the ingest loop", () => {
  * endpoint, read framed lines, and send one back. A fake here would test the
  * wiring against itself.
  *
- * `Bun.connect`, not `node:net`'s `connect`, and the difference is measured
- * rather than stylistic. On the Windows runner a `node:net` client against a
- * named pipe connects and its writes arrive — the pause-press test proves the
- * inbound direction — but nothing is ever delivered to its `data` handler, so
- * every assertion that reads a broadcast times out. Swapped for `Bun.connect`
- * against the identical server and pipe, both directions work; that is the API
- * `tests/panel-server.test.ts` already uses, and its named-pipe round trip
- * passes there. The gap is in Bun's `node:net` read path on Windows pipes, not
- * in the panel transport, so the client moves to the API that carries both
- * directions on both platforms rather than the suites being skipped.
+ * `Bun.connect`, not `node:net`'s `connect`: both open a named pipe on Windows
+ * from the same endpoint spelling. Round three of this suite measured that
+ * swapping one for the other changed nothing, which retires the earlier claim
+ * written here — that the gap was Bun's `node:net` read path on Windows pipes.
+ * It was not.
+ *
+ * The real gap is a registration race. The server registers a client in its
+ * `open` handler, and `broadcast` is a one-shot pass over whoever is registered
+ * *at that moment* — nothing is re-delivered. On Unix the registration has
+ * landed by the time `Bun.connect` resolves, so "connected" already means
+ * "registered". On Windows it does not: a broadcast issued straight after a
+ * connect is received by nobody. `tests/panel-server.test.ts` bridges this by
+ * waiting for `clientCount === 1`, but the session owns its panel server and
+ * deliberately does not expose it — and it should not have to, for a test to
+ * work.
+ *
+ * So the handshake lives in the client. `ready()` sends one deliberately
+ * malformed probe line after connecting; the server refuses it with a
+ * diagnostic that can only be produced once the client is registered, because
+ * the `data` handler ignores unregistered sockets. The probe is side-effect
+ * free — it fails JSON parsing before any control op is even considered.
+ * Waiting for that diagnostic makes "ready" mean what the tests below need:
+ * from here on, every broadcast reaches this client.
  */
 class PanelTestClient {
   readonly lines: string[] = [];
   private carry = "";
   private socket: Socket<undefined> | null = null;
   private readonly opened: Promise<void>;
+  private readonly diagnostics: readonly string[];
 
-  public constructor(socketPath: string) {
+  public constructor(socketPath: string, diagnostics: readonly string[]) {
+    this.diagnostics = diagnostics;
     this.opened = (async () => {
       this.socket = await Bun.connect<undefined>({
         unix: socketPath,
@@ -702,6 +717,19 @@ class PanelTestClient {
 
   public async ready(): Promise<void> {
     await this.opened;
+    // One probe, then wait for its refusal. The diagnostic names no client, but
+    // the session's logError channel carries only this panel's diagnostics, and
+    // the only lines a freshly connected client can provoke are its own
+    // refusals — so a hit here is this client's handshake, not someone else's.
+    this.socket?.write("probe\n");
+    const deadline = Date.now() + 2000;
+    for (;;) {
+      if (this.diagnostics.some((line) => line.includes("Panel line refused"))) return;
+      if (Date.now() > deadline) {
+        throw new Error("timed out waiting for the panel server to register this client");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
   }
 
   public send(line: string): void {
@@ -753,9 +781,9 @@ const PLAIN_SELECTION = "SELECT invoice_total FROM ledger WHERE marker_zqxjkv = 
  * spelling mismatch.
  *
  * Parameterizing the endpoint rather than skipping the suites keeps this
- * platform-independent logic under test on both platforms. `node:net`'s
- * `connect(path)` opens a named pipe on Windows and a Unix socket elsewhere, so
- * `PanelTestClient` needs no branch of its own.
+ * platform-independent logic under test on both platforms. `Bun.connect` takes
+ * the same endpoint spelling and opens a named pipe on Windows, a Unix socket
+ * elsewhere, so `PanelTestClient` needs no branch of its own.
  */
 const panelEndpoint = (dir: string): string =>
   process.platform === "win32"
@@ -767,14 +795,16 @@ describe("the control panel on a watch session", () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
     const socketPath = panelEndpoint(dir);
     const source = new ScriptedSource("alpha", []);
+    const diagnostics: string[] = [];
     const { result } = await startSession({
       sources: [source],
       env: { SQUID_PANEL_SOCKET: socketPath },
+      logError: (line) => diagnostics.push(line),
     });
     if ("configError" in result) throw new Error(result.configError);
     try {
       expect(result.session.banner.panel).toBe(socketPath);
-      const client = new PanelTestClient(socketPath);
+      const client = new PanelTestClient(socketPath, diagnostics);
       await client.ready();
 
       await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
@@ -796,15 +826,17 @@ describe("the control panel on a watch session", () => {
   it("announces a replied agent turn on the panel", async () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
     const socketPath = panelEndpoint(dir);
+    const diagnostics: string[] = [];
     const source = new ScriptedSource("alpha", []);
     const { result } = await startSession({
       sources: [source],
       env: { SQUID_PANEL_SOCKET: socketPath },
       agentOptions: { reply: "ran the tests; they pass" },
+      logError: (line) => diagnostics.push(line),
     });
     if ("configError" in result) throw new Error(result.configError);
     try {
-      const client = new PanelTestClient(socketPath);
+      const client = new PanelTestClient(socketPath, diagnostics);
       await client.ready();
 
       await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
@@ -826,15 +858,17 @@ describe("the control panel on a watch session", () => {
   it("announces a failed agent turn on the panel", async () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
     const socketPath = panelEndpoint(dir);
+    const diagnostics: string[] = [];
     const source = new ScriptedSource("alpha", []);
     const { result } = await startSession({
       sources: [source],
       env: { SQUID_PANEL_SOCKET: socketPath },
       agentOptions: { promptError: new Error("the model refused") },
+      logError: (line) => diagnostics.push(line),
     });
     if ("configError" in result) throw new Error(result.configError);
     try {
-      const client = new PanelTestClient(socketPath);
+      const client = new PanelTestClient(socketPath, diagnostics);
       await client.ready();
 
       await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
@@ -856,14 +890,16 @@ describe("the control panel on a watch session", () => {
   it("never puts the raw selection on the wire, only its length", async () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
     const socketPath = panelEndpoint(dir);
+    const diagnostics: string[] = [];
     const source = new ScriptedSource("screen", []);
     const { result } = await startSession({
       sources: [source],
       env: { SQUID_PANEL_SOCKET: socketPath },
+      logError: (line) => diagnostics.push(line),
     });
     if ("configError" in result) throw new Error(result.configError);
     try {
-      const client = new PanelTestClient(socketPath);
+      const client = new PanelTestClient(socketPath, diagnostics);
       await client.ready();
 
       await source.emit!(applicationActivated("ev-1", "9"));
@@ -906,6 +942,7 @@ describe("the control panel on a watch session", () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
     const socketPath = panelEndpoint(dir);
     const commandPath = join(dir, "gate.fifo");
+    const diagnostics: string[] = [];
     const source = new ScriptedSource("alpha", []);
     const { result } = await startSession({
       sources: [source],
@@ -915,10 +952,11 @@ describe("the control panel on a watch session", () => {
         SQUID_CONTROL_FIFO: commandPath,
         SQUID_CONTROL_POLL_MS: "10",
       },
+      logError: (line) => diagnostics.push(line),
     });
     if ("configError" in result) throw new Error(result.configError);
     try {
-      const client = new PanelTestClient(socketPath);
+      const client = new PanelTestClient(socketPath, diagnostics);
       await client.ready();
 
       client.send(JSON.stringify({ type: "control", op: "pause" }));
@@ -1018,13 +1056,15 @@ describe("the control panel and the capture policy's redaction", () => {
     const socketPath = panelEndpoint(dir);
     const source = new ScriptedSource("screen", []);
     const secret = "password = hunter2_marker_zqxjkv_and_a_long_tail_to_be_sure";
+    const diagnostics: string[] = [];
     const { result } = await startSession({
       sources: [source],
       env: { SQUID_PANEL_SOCKET: socketPath },
+      logError: (line) => diagnostics.push(line),
     });
     if ("configError" in result) throw new Error(result.configError);
     try {
-      const client = new PanelTestClient(socketPath);
+      const client = new PanelTestClient(socketPath, diagnostics);
       await client.ready();
 
       await source.emit!(createActivityEvent({
