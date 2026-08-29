@@ -9,6 +9,11 @@
 # builds the binary it uploads. If the gate lived only on the pull request, the
 # release job could publish a binary built from code no test ever ran against —
 # the tag could point anywhere. The gate and the build see the same checkout.
+#
+# The tag is also the only ledger for the version number: it must be `v` plus
+# exactly what `package.json` and `ui/Cargo.toml` already say. Bump the manifests,
+# commit, tag that commit. The `version` job is the check; the tag remains the
+# decision.
 name: release
 
 on:
@@ -107,6 +112,63 @@ jobs:
 
       - run: cargo test --locked
 
+  # The tag and the manifests must tell the same version story.
+  #
+  # The tag is the release's name, but the two manifests each carry a `version`
+  # the shipped things read from: `package.json` for the TypeScript side,
+  # `ui/Cargo.toml` for the panel — and `env!("CARGO_PKG_VERSION")` puts that
+  # one inside the binary itself. Nothing else in this pipeline compares them,
+  # so without this job a tag naming 0.9.0 could publish binaries built from
+  # manifests still saying 0.1.0, and nothing anywhere would disagree. This job
+  # runs before the builds and fails in seconds, so a versioning slip costs a
+  # red mark instead of nineteen minutes of compiling on the way to the same
+  # red mark.
+  #
+  # Unconditional at the job level rather than skipped on `workflow_dispatch`:
+  # a job that a build `needs` and then skips skips the build with it, which
+  # would silently end the dry run. The step inside decides instead — a dry run
+  # has no tag, so there is nothing to reconcile.
+  version:
+    name: version (tag = manifests)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reconcile the tag against both manifests
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "no tag in play (${GITHUB_REF_TYPE} ${GITHUB_REF_NAME}); nothing to reconcile"
+            exit 0
+          fi
+
+          # Strip the `v`: the manifests hold the bare semver, the tag holds the
+          # one users type. String equality is the contract, not a semver range —
+          # "close enough" is how a mismatch survives.
+          expected="${tag#v}"
+
+          # The package version, read with the tool that parses JSON properly.
+          pkg="$(jq -r .version package.json)"
+          # The panel version: the one `^version` at column zero, which is the
+          # `[package]` entry — dependency lines carry their own versions but
+          # none of them start a line, so the anchor is the whole disambiguation.
+          ui="$(sed -n 's/^version = "\(.*\)"$/\1/p' ui/Cargo.toml | head -n 1)"
+
+          ok=yes
+          if [ "$pkg" != "$expected" ]; then
+            echo "::error::package.json says ${pkg:-<unreadable>}, but tag $tag names $expected" >&2
+            ok=no
+          fi
+          if [ "$ui" != "$expected" ]; then
+            echo "::error::ui/Cargo.toml says ${ui:-<unreadable>}, but tag $tag names $expected" >&2
+            ok=no
+          fi
+          [ "$ok" = yes ]
+          echo "tag $tag = package.json $pkg = ui/Cargo.toml $ui"
+
   # Builds the artifact the release will carry, from the same checkout the gate
   # ran on. Kept separate from `gate-ui` because a release build is a different
   # profile than the one the tests run under, and because this job's only output
@@ -118,7 +180,7 @@ jobs:
   # whose names say what they build.
   build-linux:
     name: build (x86_64-linux)
-    needs: [gate-bun, gate-ui]
+    needs: [version, gate-bun, gate-ui]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -170,7 +232,7 @@ jobs:
   # everything Slint/winit link against.
   build-windows:
     name: build (x86_64-windows)
-    needs: [gate-bun, gate-ui]
+    needs: [version, gate-bun, gate-ui]
     runs-on: windows-2025
     defaults:
       run:
