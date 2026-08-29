@@ -274,12 +274,15 @@ export async function createResidentAgent(
  * right response to a failing test is to read the error or to start editing. Stated
  * as guidance, it costs one prompt line; stated as a schema, it cost a model call.
  */
-const activityReadings = [
+export const activityReadings = [
   "debugging a failure",
   "drafting text",
   "researching a selection",
   "validating a change",
 ] as const;
+
+/** One entry of `activityReadings`. The eval corpus types its expectations with this. */
+export type ActivityReading = (typeof activityReadings)[number];
 
 /** The resident agent's system prompt: its identity, its posture, and how to read the world. */
 export function residentAgentSystemPrompt(): string {
