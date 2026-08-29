@@ -1,4 +1,4 @@
-import { isAbsolute } from "node:path";
+import { posix as posixPath } from "node:path";
 
 /**
  * Chooses whether this run exposes a control panel.
@@ -124,9 +124,17 @@ export function resolvePanel(options: ResolvePanelOptions = {}): PanelResolution
   }
   // A pipe spelling on Unix would bind a socket file with backslashes in its
   // name that the panel binary never looks for, because the Rust side picks its
-  // transport from the build target. `isAbsolute` already refuses it on POSIX;
+  // transport from the build target. POSIX `isAbsolute` already refuses it, and
   // it is named here so the reason is on the record.
-  if (!isAbsolute(path)) {
+  //
+  // `posix.isAbsolute`, not the platform-sensitive `isAbsolute`: this branch is
+  // the *non*-win32 one, so it must judge the path by POSIX rules no matter what
+  // host it runs on. The bare export follows `process.platform`, which would make
+  // `platform` a half-connected seam — it would pick the branch but not the
+  // path semantics inside it, and on a Windows host `\\.\pipe\x` reads as an
+  // absolute UNC path, so a caller asking about Linux would be told the pipe
+  // spelling is fine there.
+  if (!posixPath.isAbsolute(path)) {
     return { configError: "SQUID_PANEL_SOCKET must be an absolute path." };
   }
 
