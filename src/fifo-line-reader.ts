@@ -11,11 +11,19 @@ import { open, stat } from "node:fs/promises";
  *
  * A real named pipe answers neither question. `stat` on a pipe always reports
  * size 0, so the offset arithmetic can never see its bytes — an endpoint that
- * was genuinely a FIFO would read nothing forever. A pipe is drained instead:
- * open non-blocking (a blocking open would wedge the tick until a writer
- * arrives; ENOENT-quiet for missing files, EAGAIN for an empty pipe), then
- * read until the pipe runs dry. A writer that has already closed still leaves
- * its bytes in the buffer for the reader.
+ * was genuinely a FIFO would read nothing forever. A pipe is drained instead,
+ * and the read end is held open for the life of the reader rather than
+ * reopened per tick: a FIFO's buffer belongs to the pipe, and the pipe is
+ * destroyed the moment both ends close — bytes written while no reader held
+ * the read end are discarded by the kernel, not queued. A reader that opened
+ * and closed every tick would therefore lose exactly the writes that fell
+ * between its ticks. Holding the read end also serves the writer: a shell
+ * hook's `>> "$FIFO"` never blocks waiting for a reader to appear.
+ *
+ * The open is non-blocking (with no writer, a blocking open would wedge), and
+ * the fd is opened lazily per tick — the endpoint may not exist yet, and a
+ * missing file is the normal state before the first writer. Once held, each
+ * tick drains until the pipe runs dry (EAGAIN) and keeps the fd for the next.
  *
  * Callers hand in line handling; this module owns the reading, the poll loop,
  * and the partial-line carry. A half-written line is kept for the next tick —
@@ -43,6 +51,7 @@ export function startFifoLineReader(
   let offset = 0;
   let carry = "";
   let reading = false;
+  let pipeHandle: Awaited<ReturnType<typeof open>> | undefined;
 
   const readAvailable = async (): Promise<void> => {
     // One read at a time: a slow read must not interleave with the next tick
@@ -51,6 +60,7 @@ export function startFifoLineReader(
     reading = true;
     try {
       if (await isFifo(options.path)) {
+        await ensurePipeOpen();
         await drainPipe();
       } else {
         await readAppended();
@@ -106,21 +116,34 @@ export function startFifoLineReader(
     }
   };
 
-  /** The drain that works on real pipes, where `stat` reports nothing. */
+  /**
+   * Opens the pipe's read end once and holds it. Called per tick only while
+   * the fd is still missing; a failed open (the endpoint does not exist yet)
+   * propagates and is quieted upstream as the normal pre-writer state.
+   */
+  const ensurePipeOpen = async (): Promise<void> => {
+    if (pipeHandle !== undefined) return;
+    pipeHandle = await open(options.path, constants.O_RDONLY | constants.O_NONBLOCK);
+  };
+
+  /**
+   * Drains the held pipe until it runs dry. An empty pipe surfaces as EAGAIN
+   * (nothing to read) and a just-closed writer as 0 bytes — both are "nothing
+   * now", never a reason to drop the fd: the next writer's bytes must land in
+   * a buffer the reader still holds.
+   */
   const drainPipe = async (): Promise<void> => {
-    const handle = await open(options.path, constants.O_RDONLY | constants.O_NONBLOCK);
-    try {
-      const buffer = Buffer.alloc(PIPE_CHUNK);
-      for (;;) {
-        const { bytesRead } = await handle.read(buffer, 0, PIPE_CHUNK, null);
+    if (pipeHandle === undefined) return;
+    const buffer = Buffer.alloc(PIPE_CHUNK);
+    for (;;) {
+      try {
+        const { bytesRead } = await pipeHandle.read(buffer, 0, PIPE_CHUNK, null);
         if (bytesRead === 0) break;
         carry += buffer.subarray(0, bytesRead).toString("utf8");
+      } catch (error) {
+        if (!isAgain(error)) throw error;
+        break;
       }
-    } catch (error) {
-      // EAGAIN is the pipe running dry — the clean end of a drain.
-      if (!isAgain(error)) throw error;
-    } finally {
-      await handle.close();
     }
   };
 
@@ -133,6 +156,10 @@ export function startFifoLineReader(
     close: () => {
       closed = true;
       clearInterval(timer);
+      if (pipeHandle !== undefined) {
+        void pipeHandle.close().catch(() => undefined);
+        pipeHandle = undefined;
+      }
     },
   };
 }
