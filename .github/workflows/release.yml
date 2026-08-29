@@ -160,12 +160,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # The Windows build exists because the panel's Rust transport now carries a
-  # `#[cfg(windows)]` loopback-TCP branch (`ui/src/transport.rs`) matching the
-  # TypeScript side's `tcp://127.0.0.1:<port>` listen spelling. Without this job
-  # that branch compiles for nobody, and a Windows-only break would surface
-  # months later in someone's local build instead of here. No system headers are
-  # installed: MSVC runners ship everything Slint/winit link against.
+  # The Windows build exists because the panel's Rust transport carries a
+  # `#[cfg(windows)]` named-pipe branch (`ui/src/transport.rs`) matching the
+  # TypeScript side's `\\.\pipe\<name>` listen spelling. That branch is a
+  # different shape, not just a different type — the outgoing half parks a path
+  # and opens per line — so without this job it compiles for nobody and a
+  # Windows-only break would surface months later in someone's local build
+  # instead of here. No system headers are installed: MSVC runners ship
+  # everything Slint/winit link against.
   build-windows:
     name: build (x86_64-windows)
     needs: [gate-bun, gate-ui]

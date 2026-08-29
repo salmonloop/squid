@@ -24,14 +24,56 @@ use std::thread;
 use std::time::Duration;
 
 #[cfg(windows)]
-use std::net::TcpStream;
+use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
+/// The connected transport, chosen by the build target.
+///
+/// Unix is a domain socket. Windows is a named pipe, and a pipe client on
+/// Windows is opened as a *file*: `CreateFileW` on `\\.\pipe\<name>` is the
+/// documented way in, so `std::fs::File` is the std type that already wraps that
+/// handle. It implements `Read + Write` like the socket does, which is why the
+/// buffered framing and the backoff ladder below are written once for both.
+///
+/// Deliberately *not* a crate. `tokio` and `interprocess` both open pipes with
+/// `FILE_FLAG_OVERLAPPED`, and std's synchronous read/write path aborts the
+/// process on an overlapped handle; the async machinery is also the opposite of
+/// what a blocking reader thread wants. `File` is both the smaller dependency
+/// and the correct one.
 #[cfg(unix)]
 type PanelStream = UnixStream;
 #[cfg(windows)]
-type PanelStream = TcpStream;
+type PanelStream = File;
+
+/// What the UI thread holds in order to write, which is *not* the same shape on
+/// both platforms — and this is the one place the two transports genuinely part
+/// ways.
+///
+/// Unix parks a duplicated socket handle. Two descriptors on one socket read and
+/// write independently, so the reader can sit blocked in `read` while the UI
+/// thread writes past it.
+///
+/// Windows parks the pipe's **name** and opens a fresh connection per line,
+/// because the duplicate trick does not hold there. `try_clone` is
+/// `DuplicateHandle`, which yields two handles to one *file object*, and a handle
+/// opened without `FILE_FLAG_OVERLAPPED` is a synchronous file object whose I/O
+/// the I/O manager serializes on that object's lock. The reader parked in
+/// `ReadFile` awaiting the next push would hold it, and a pause click would
+/// block behind the reader until the server happened to send something — a panel
+/// that looks frozen for as long as the session is quiet, which is exactly the
+/// freeze the split exists to prevent.
+///
+/// A second *long-lived* connection would not do either: the server broadcasts
+/// to every client, so a connection nobody drains grows the server's per-client
+/// outbound buffer without bound. One connection per line is bounded by
+/// construction, costs a `CreateFileW` per click, and preserves the rule that a
+/// click with no server behind it is a click that did not happen — a refused open
+/// drops the line exactly as a failed write does.
+#[cfg(unix)]
+type OutgoingHandle = UnixStream;
+#[cfg(windows)]
+type OutgoingHandle = PathBuf;
 
 use crate::protocol::{parse_incoming, Incoming};
 
@@ -84,13 +126,13 @@ fn path_from(raw: Option<String>) -> Option<PathBuf> {
 /// write.
 #[derive(Clone)]
 pub struct Outgoing {
-    stream: Arc<Mutex<Option<PanelStream>>>,
+    handle: Arc<Mutex<Option<OutgoingHandle>>>,
 }
 
 impl Outgoing {
     pub fn new() -> Self {
         Self {
-            stream: Arc::new(Mutex::new(None)),
+            handle: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -109,32 +151,30 @@ impl Outgoing {
         // characterized, so appending to that stream could complete somebody
         // else's half-written line into a message nobody sent. Refusing to write
         // again is the only safe reading of that state.
-        let Ok(mut slot) = self.stream.lock() else {
+        let Ok(mut slot) = self.handle.lock() else {
             return;
         };
-        let Some(stream) = slot.as_mut() else {
+        let Some(handle) = slot.as_ref() else {
             return;
         };
-        // Flush explicitly. A socket wrapped in anything block-buffered turns an
-        // unflushed line into a lost click, which looks exactly like a panel
-        // that ignored the button.
-        if stream.write_all(line.as_bytes()).is_err() || stream.flush().is_err() {
-            // A failed write means the server is gone. That is the reader
-            // thread's loop to handle, not a reason to end the process: dropping
-            // the stream here is all this side needs to do, and the next
-            // connection will replace it.
+        // Clearing the slot is a Unix-only conclusion. There a failed write means
+        // this handle is dead, and dropping it is all this side needs to do — the
+        // reader loop replaces it. On Windows the handle is a name, not a
+        // connection: a refused open says nothing about whether the reader is
+        // still attached, so clearing here would silently mute every later click.
+        if write_line(handle, line).is_err() && cfg!(unix) {
             *slot = None;
         }
     }
 
-    fn adopt(&self, stream: PanelStream) {
-        if let Ok(mut slot) = self.stream.lock() {
-            *slot = Some(stream);
+    fn adopt(&self, handle: OutgoingHandle) {
+        if let Ok(mut slot) = self.handle.lock() {
+            *slot = Some(handle);
         }
     }
 
     fn release(&self) {
-        if let Ok(mut slot) = self.stream.lock() {
+        if let Ok(mut slot) = self.handle.lock() {
             *slot = None;
         }
     }
@@ -144,11 +184,38 @@ impl Outgoing {
     /// things the projection reports.
     #[cfg(test)]
     fn is_connected(&self) -> bool {
-        self.stream
+        self.handle
             .lock()
             .map(|slot| slot.is_some())
             .unwrap_or(false)
     }
+}
+
+/// Puts one framed line on the wire.
+///
+/// Unix writes through the parked socket handle. Windows opens the pipe, writes,
+/// and lets the connection close at the end of this call — see [`OutgoingHandle`]
+/// for why the write direction is its own connection there rather than a second
+/// handle on the reader's.
+#[cfg(unix)]
+fn write_line(stream: &UnixStream, line: &str) -> io::Result<()> {
+    // `&UnixStream` is itself `Write`, so the shared handle is borrowed rather
+    // than taken mutably; nothing here mutates the socket.
+    let mut stream = stream;
+    // Flush explicitly. A stream wrapped in anything block-buffered turns an
+    // unflushed line into a lost click, which looks exactly like a panel that
+    // ignored the button.
+    stream.write_all(line.as_bytes())?;
+    stream.flush()
+}
+
+#[cfg(windows)]
+fn write_line(pipe_name: &Path, line: &str) -> io::Result<()> {
+    // Write access only: this connection never reads, so asking for read access
+    // would claim a capability the call has no use for.
+    let mut pipe = OpenOptions::new().write(true).open(pipe_name)?;
+    pipe.write_all(line.as_bytes())?;
+    pipe.flush()
 }
 
 /// Connects, reads until the connection ends, and connects again. Never returns.
@@ -161,16 +228,16 @@ pub fn run(socket_path: &Path, outgoing: &Outgoing, mut deliver: impl FnMut(Inco
     let mut backoff = FIRST_BACKOFF;
     loop {
         if let Ok(stream) = connect(socket_path) {
-            // Two handles on one socket: one for this thread to read from, one
-            // parked in `outgoing` for the UI thread to write to. Sharing a
-            // single handle would mean the UI thread waiting on whatever the
-            // reader is blocked in.
-            if let Ok(reading) = stream.try_clone() {
+            // This thread reads from the connection it just made; the UI thread
+            // gets whatever it needs to write independently of that read. What
+            // "independently" costs differs per platform, which is the whole
+            // subject of [`OutgoingHandle`].
+            if let Ok(handle) = outgoing_handle(&stream, socket_path) {
                 // Reset only after a connection actually stands up. A ladder
                 // that reset on attempt rather than success would never climb.
                 backoff = FIRST_BACKOFF;
-                outgoing.adopt(stream);
-                read_messages(reading, &mut deliver);
+                outgoing.adopt(handle);
+                read_messages(stream, &mut deliver);
                 outgoing.release();
             }
         }
@@ -182,13 +249,22 @@ pub fn run(socket_path: &Path, outgoing: &Outgoing, mut deliver: impl FnMut(Inco
     }
 }
 
-/// Connects using the platform transport selected by the build target.
+/// Opens the reading half of the connection, using the transport the build
+/// target selects.
 ///
-/// Unix keeps the existing filesystem socket and its mode-600 boundary. Windows
-/// uses a loopback TCP endpoint because `std::os::unix::net::UnixStream` does not
-/// exist there; the TypeScript server binds the same `tcp://127.0.0.1:<port>`
-/// spelling. The endpoint is still explicit and local-only, so it does not widen
-/// the panel to the network.
+/// Unix keeps the filesystem socket and its mode-600 boundary. Windows opens the
+/// named pipe the server bound, `\\.\pipe\<name>`: a pipe client is opened as a
+/// file, and `OpenOptions::open` is `CreateFileW` with `OPEN_EXISTING`, so a
+/// missing pipe fails rather than creating a file named after it.
+///
+/// Read access only. This connection is the reader's, the write direction is its
+/// own (see [`OutgoingHandle`]), and a handle that cannot write is one that
+/// cannot interleave a stray byte into the server's inbound framing.
+///
+/// No `WaitNamedPipe` on the busy path. If every instance is taken the open
+/// fails with `ERROR_PIPE_BUSY` and the caller's backoff ladder retries, which is
+/// the same shape as the "server is not up yet" case and needs no second
+/// mechanism to express.
 fn connect(socket_path: &Path) -> io::Result<PanelStream> {
     #[cfg(unix)]
     {
@@ -197,15 +273,22 @@ fn connect(socket_path: &Path) -> io::Result<PanelStream> {
 
     #[cfg(windows)]
     {
-        let raw = socket_path.to_str().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "panel endpoint is not valid UTF-8",
-            )
-        })?;
-        let address = raw.strip_prefix("tcp://").unwrap_or(raw);
-        PanelStream::connect(address)
+        OpenOptions::new().read(true).open(socket_path)
     }
+}
+
+/// Derives the UI thread's write handle from a connection the reader just made.
+///
+/// Fallible on Unix, where it is a `dup`, and infallible on Windows, where it is
+/// the name that was passed in. Kept as one signature so `run` has one shape.
+#[cfg(unix)]
+fn outgoing_handle(stream: &UnixStream, _pipe_name: &Path) -> io::Result<OutgoingHandle> {
+    stream.try_clone()
+}
+
+#[cfg(windows)]
+fn outgoing_handle(_stream: &File, pipe_name: &Path) -> io::Result<OutgoingHandle> {
+    Ok(pipe_name.to_path_buf())
 }
 
 /// One rung up the retry ladder.

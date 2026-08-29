@@ -29,15 +29,46 @@ one:
     mode is the access boundary; there is no other authentication.
   - Socket paths are limited to roughly 108 bytes by `sun_path`; a longer one
     fails as an ordinary bind error.
-- **Windows: `tcp://127.0.0.1:<port>`, and nothing else.** `std::os::unix` does
-  not exist there, so the Rust panel builds a `TcpStream` against a loopback
-  endpoint and the TS side binds the same spelling. Loopback only is the
-  boundary: there is no file mode to chmod, and the control wire is
-  unauthenticated, so a general host would turn the panel into a network
-  service. `resolvePanel` refuses every other spelling on `win32`, and refuses
-  the `tcp://` spelling on every other platform — the two ends pick their
-  transport from the same string, so letting either guess would let them
-  disagree.
+- **Windows: a named pipe, `\\.\pipe\<name>`, and nothing else.** Both ends still
+  say `Bun.listen({ unix })` and both still read one env variable; what changes is
+  the spelling of the string and therefore the object the OS creates.
+  - **The accepted spelling is Bun's, copied exactly.** Two separators, then `.`
+    or `?`, a separator, the four bytes `pipe`, a separator, and at least one
+    character behind it. Either separator works and both are normalized to `\`,
+    so `//./pipe/squid-panel` and `\\.\pipe\squid-panel` name the same pipe — a
+    user should not have to count backslash escapes through a shell, JSON, and
+    PowerShell to be understood. `pipe` is matched byte-exactly: Bun's own
+    detector is case-sensitive, so `\\.\PIPE\x` would fall back to AF_UNIX and
+    bind a *file* by that name. Accepting a spelling Bun then interprets
+    differently is the one failure this gate exists to prevent.
+  - **The client is a `File`, not a socket.** `CreateFileW` on the pipe name is
+    the documented way for a client in, and `std::fs::File` is the std type that
+    wraps that handle. It is `Read + Write`, so the framing and the backoff
+    ladder are written once for both platforms.
+  - **The write direction is its own short-lived connection.** Unix parks a
+    duplicated socket handle and writes past the parked reader. That does not
+    hold here: `try_clone` is `DuplicateHandle`, yielding two handles to one
+    *file object*, and a handle opened without `FILE_FLAG_OVERLAPPED` is a
+    synchronous file object whose I/O the I/O manager serializes on that object's
+    lock. The reader parked in `ReadFile` would hold it and a pause click would
+    block behind it until the server next spoke — a panel frozen for exactly as
+    long as the session is quiet. So the outgoing half parks the pipe's *name*
+    and opens a connection per line. A refused open drops that line, the same as
+    a failed write does.
+  - **There is no access boundary here, and that is a known gap.** `uv_pipe_bind`
+    calls `CreateNamedPipeW` with a `NULL` security descriptor, and Bun offers no
+    way past it. The documented default DACL grants the creator and administrators
+    full control and **grants `Everyone` and anonymous logon read access**. So any
+    local user can read the world state this session pushes; only the write
+    direction is theirs alone, which is why a click cannot be forged but a
+    reading can be watched. This is weaker than the Unix `chmod 600` and is
+    accepted deliberately at this stage — the pipe is not a substitute for the
+    file mode, it is a transport that happens to leak reads.
+  - `resolvePanel` refuses every other spelling on `win32`, and refuses the pipe
+    spelling on every other platform — there a `\\.\pipe\x` string is just a
+    filename with backslashes in it, and binding it would produce a
+    group-readable socket in the working directory under a name that reads like a
+    pipe.
 - Both directions: **one JSON object per line**, `\n`-terminated, UTF-8.
 - **A writer must honour short writes.** Measured: `socket.write()` accepts about
   214 KB per call under backpressure and returns the count actually taken, or `-1`
@@ -48,8 +79,10 @@ one:
 - **Bun does not report `EADDRINUSE` for a live listener on the same path.** Two
   watch sessions pointed at one socket path both appear to bind and split
   connections unpredictably. Not enforced today; worth knowing before running two.
-  (TCP does refuse a second bind at the same loopback endpoint; the TCP tests
-  assert it.)
+  (Unverified for named pipes: `CreateNamedPipeW` refuses a second *first
+  instance* of the same name, but whether libuv surfaces that to `Bun.listen` is
+  untested — the Windows-only suite in `tests/panel-server.test.ts` is where that
+  answer belongs once a Windows runner exists.)
 - `stop()` alone leaves connected sockets writable and their handles alive, so the
   process will not exit while a panel is attached. Close with `stop(true)`.
 
