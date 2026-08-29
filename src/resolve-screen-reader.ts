@@ -1,7 +1,9 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describeErrorForAudit } from "./audit-text.js";
+import { createLinuxScreenTextReader } from "./screen-text-reader-linux.js";
 import { createMacosScreenTextReader } from "./screen-text-reader-macos.js";
+import { createWindowsScreenTextReader } from "./screen-text-reader-windows.js";
 import {
   createSyntheticScreenTextReader,
   demoScreenTextFrames,
@@ -12,21 +14,30 @@ import type { ScreenTextFrame, ScreenTextReaderFactory } from "./screen-text-sou
  * Chooses a screen-text backend from the environment.
  *
  * Lives outside `screen-text-source.ts` on purpose: the adapter must not import
- * a backend, or a future OCR or Windows reader stops being one new factory and
- * zero adapter changes. Lives outside the entry points because more than one
- * needs it, and a second copy of this validation is a second place for
+ * a backend, or a future OCR reader stops being one new factory and zero
+ * adapter changes. Lives outside the entry points because more than one needs
+ * it, and a second copy of this validation is a second place for
  * `SQUID_SCREEN_READER` to mean something slightly different.
  *
  * Every failure is a startup configuration error rather than a silent default:
  * a run that asked for the real accessibility reader and quietly replayed demo
  * frames instead looks identical to one that works.
  */
+export type ScreenReaderKind = "darwin" | "linux" | "windows" | "synthetic";
+
 export type ScreenReaderResolution =
   | {
-      readonly readerKind: "darwin" | "synthetic";
+      readonly readerKind: ScreenReaderKind;
       readonly readerFactory: ScreenTextReaderFactory;
     }
   | { readonly configError: string };
+
+/** The host platform each real backend requires, and the name a human reads. */
+const REQUIRED_PLATFORM: Partial<Record<ScreenReaderKind, { platform: NodeJS.Platform; label: string }>> = {
+  darwin: { platform: "darwin", label: "macOS" },
+  linux: { platform: "linux", label: "Linux" },
+  windows: { platform: "win32", label: "Windows" },
+};
 
 export interface ResolveScreenReaderOptions {
   /** Path to a scripted frame file; the built-in demo is used when absent. */
@@ -42,17 +53,22 @@ export async function resolveScreenReader(
   const platform = options.platform ?? process.platform;
 
   const readerKind = env.SQUID_SCREEN_READER ?? "synthetic";
-  if (readerKind !== "darwin" && readerKind !== "synthetic") {
-    return { configError: 'SQUID_SCREEN_READER must be "darwin" or "synthetic".' };
-  }
-  if (readerKind === "darwin" && platform !== "darwin") {
+  if (readerKind !== "darwin" && readerKind !== "linux" && readerKind !== "windows" && readerKind !== "synthetic") {
     return {
       configError:
-        `SQUID_SCREEN_READER=darwin requires macOS; this host reports ${platform}.`,
+        'SQUID_SCREEN_READER must be "darwin", "linux", "windows", or "synthetic".',
     };
   }
 
-  // One knob for both backends: how often the reader produces a frame.
+  const requirement = REQUIRED_PLATFORM[readerKind];
+  if (requirement !== undefined && platform !== requirement.platform) {
+    return {
+      configError:
+        `SQUID_SCREEN_READER=${readerKind} requires ${requirement.label}; this host reports ${platform}.`,
+    };
+  }
+
+  // One knob for every backend: how often the reader produces a frame.
   const rawPollMs = env.SQUID_SCREEN_POLL_MS;
   const pollMs = rawPollMs === undefined ? undefined : Number(rawPollMs);
   if (pollMs !== undefined && (!Number.isSafeInteger(pollMs) || pollMs <= 0)) {
@@ -65,6 +81,18 @@ export async function resolveScreenReader(
     return {
       readerKind,
       readerFactory: createMacosScreenTextReader(pollMs === undefined ? {} : { pollMs }),
+    };
+  }
+  if (readerKind === "linux") {
+    return {
+      readerKind,
+      readerFactory: createLinuxScreenTextReader(pollMs === undefined ? {} : { pollMs }),
+    };
+  }
+  if (readerKind === "windows") {
+    return {
+      readerKind,
+      readerFactory: createWindowsScreenTextReader(pollMs === undefined ? {} : { pollMs }),
     };
   }
 

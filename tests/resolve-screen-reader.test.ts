@@ -18,7 +18,7 @@ describe("resolveScreenReader", () => {
   });
 
   it("rejects an unrecognized reader instead of falling back", async () => {
-    for (const value of ["Darwin", "macos", "windows", ""]) {
+    for (const value of ["Darwin", "macos", "xdotool", ""]) {
       const resolved = await resolveScreenReader({
         env: { SQUID_SCREEN_READER: value },
         platform: "darwin",
@@ -27,12 +27,19 @@ describe("resolveScreenReader", () => {
     }
   });
 
-  it("refuses the darwin backend off macOS", async () => {
-    const resolved = await resolveScreenReader({
-      env: { SQUID_SCREEN_READER: "darwin" },
-      platform: "linux",
-    });
-    expect("configError" in resolved && resolved.configError).toContain("requires macOS");
+  it("refuses each real backend off its own platform", async () => {
+    const cases: ReadonlyArray<readonly [string, NodeJS.Platform, string]> = [
+      ["darwin", "linux", "requires macOS"],
+      ["linux", "win32", "requires Linux"],
+      ["windows", "linux", "requires Windows"],
+    ];
+    for (const [reader, host, expected] of cases) {
+      const resolved = await resolveScreenReader({
+        env: { SQUID_SCREEN_READER: reader },
+        platform: host,
+      });
+      expect("configError" in resolved && resolved.configError).toContain(expected);
+    }
   });
 
   /**
@@ -50,6 +57,15 @@ describe("resolveScreenReader", () => {
     });
     if ("configError" in resolved) throw new Error(resolved.configError);
     expect(resolved.readerKind).toBe("darwin");
+  });
+
+  it.skipIf(process.platform !== "linux")("accepts the linux backend on Linux", async () => {
+    const resolved = await resolveScreenReader({
+      env: { SQUID_SCREEN_READER: "linux" },
+      platform: "linux",
+    });
+    if ("configError" in resolved) throw new Error(resolved.configError);
+    expect(resolved.readerKind).toBe("linux");
   });
 
   it("rejects a poll interval that is not a positive integer", async () => {
