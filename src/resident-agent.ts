@@ -1,4 +1,8 @@
-import type { AgentSession, InlineExtension } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentSession,
+  InlineExtension,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import {
   createPiSession,
   resolveModel,
@@ -52,6 +56,8 @@ export type ResidentSessionFactory = (spec: {
   readonly systemPrompt: string;
   readonly cwd: string;
   readonly extensionFactories?: readonly InlineExtension[];
+  /** Custom Pi tools (e.g. the sensory-history queries) wired into the session. */
+  readonly customTools?: readonly ToolDefinition[];
   /** Where the conversation is kept. See `PiSessionSpec.history`. */
   readonly history?: "memory" | "persist" | "continue";
 }) => Promise<ResidentSession>;
@@ -76,6 +82,7 @@ export const createDefaultResidentSession: ResidentSessionFactory = async (spec)
     ...(spec.extensionFactories !== undefined
       ? { extensionFactories: spec.extensionFactories }
       : {}),
+    ...(spec.customTools !== undefined ? { customTools: spec.customTools } : {}),
   });
   return adaptHandle(handle);
 };
@@ -103,6 +110,11 @@ export interface CreateResidentAgentOptions {
   readonly cwd: string;
   /** Inline extensions (guards, senses, audit) wired at creation. Phase 0: empty. */
   readonly extensionFactories?: readonly InlineExtension[];
+  /**
+   * Custom Pi tools the agent may call (e.g. sensory-history queries). Executed
+   * by Pi's own runtime; the session history records each call.
+   */
+  readonly customTools?: readonly ToolDefinition[];
   /** The tool catalog the agent sees in every context injection. */
   readonly tools?: readonly ToolSummary[];
   /**
@@ -206,6 +218,7 @@ export async function createResidentAgent(
     systemPrompt: options.systemPrompt,
     cwd: options.cwd,
     extensionFactories: extensions,
+    ...(options.customTools !== undefined ? { customTools: options.customTools } : {}),
     ...(options.history !== undefined ? { history: options.history } : {}),
   });
 

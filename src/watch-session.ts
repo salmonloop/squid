@@ -1,5 +1,6 @@
 import { realpath } from "node:fs/promises";
 import { createWatchRuntime, type WatchRuntime } from "./create-watch-runtime.js";
+import { agentCustomTools } from "./agent-tools.js";
 import { describeErrorForAudit } from "./audit-text.js";
 import { CaptureGateActivitySource } from "./capture-gate-source.js";
 import { resolveCaptureGate } from "./resolve-capture-gate.js";
@@ -180,6 +181,10 @@ export async function startWatchSession(
       systemPrompt: residentAgentSystemPrompt(),
       cwd: options.workingDirectory,
       tools: options.tools ?? [],
+      // The agent queries its own sensory record through Pi's tool runtime:
+      // one custom tool per store-backed query, executed in Pi's sandbox and
+      // recorded in the session history like every other action.
+      customTools: agentCustomTools(watch.store),
       ...(options.createAgentSession !== undefined
         ? { createSession: options.createAgentSession }
         : {}),
