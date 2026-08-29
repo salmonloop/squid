@@ -56,12 +56,35 @@ type Pending = Arc<Mutex<Option<i64>>>;
 /// anyway is the one outcome worse than not answering.
 const POISONED: &str = "pending prompt lock poisoned; refusing to answer";
 
+/// The one line `--version` prints, and the only place the binary names itself.
+///
+/// `env!` is compile-time: the string is baked in from `ui/Cargo.toml` at the
+/// moment this binary was built — exactly the value the release pipeline's
+/// `version` job reconciled against the tag. A binary that reports a version
+/// can therefore only report the one it was actually built from; there is no
+/// runtime copy that could drift away from the release it shipped in.
+fn version_line() -> String {
+    format!("squid-ui {}", env!("CARGO_PKG_VERSION"))
+}
+
 /// Returns `()` rather than `Result`, because there is no failure here worth
 /// printing the way `Result` from `main` prints one: `Err` out of `main` reaches
 /// the user as a one-line `Debug` rendering on a stderr that a double-clicked
 /// console binary is about to close. Every exit path goes through
 /// `startup::abort`, which is the only thing that gets seen in that case.
 fn main() {
+    // Before anything else, including the socket check: a binary asked what it
+    // is must answer even with no environment to speak of. `--version` is also
+    // the only argument this process has ever read; the rest stay ignored, as
+    // they always were.
+    if std::env::args()
+        .skip(1)
+        .any(|argument| argument == "--version")
+    {
+        println!("{}", version_line());
+        return;
+    }
+
     // Refuse to start rather than opening a window that can never say anything.
     // The variable is off by default like every capability variable, so an unset
     // one is a run that was not meant to be observed — and a panel sitting there
@@ -285,4 +308,22 @@ fn clear_prompt(window: PanelWindow) {
     window.set_prompt_kind(SharedString::new());
     window.set_prompt_summary(SharedString::new());
     window.set_prompt_expires_at(SharedString::new());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_line;
+
+    /// The line is a name plus a version, from the crate's own compiled-in
+    /// constant — the same reasoning as the placeholder check in `startup.rs`:
+    /// a formatting slip here would ship a broken answer to the one question
+    /// this line exists to answer.
+    #[test]
+    fn the_version_line_names_the_binary_and_the_version_it_was_built_from() {
+        let line = version_line();
+        assert!(line.starts_with("squid-ui "), "{line}");
+        assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
+        assert!(!line.contains('{'), "{line}");
+        assert!(!line.contains('}'), "{line}");
+    }
 }
