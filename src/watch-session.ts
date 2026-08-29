@@ -270,19 +270,44 @@ export async function startWatchSession(
       // unhandled rejection: the race below already reported the turn as lost.
       running.catch(() => undefined);
       let timer: ReturnType<typeof setTimeout> | undefined;
+      // The budget question is answered the moment the timer fires, not at the
+      // end of the unwind: an abort that un-wedges the turn lets `running`
+      // settle and win the race below, and a race that reports the winner
+      // alone would record a turn that blew its budget as a success.
+      let timedOut = false;
+      const watchdog = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          void (async () => {
+            // The abort is what makes the timeout real. A turn that merely
+            // lost the race keeps running, and the next turn's waitForIdle
+            // would inherit the wedge this timeout exists to break. And the
+            // abort must land before the tail advances: a prompt issued
+            // while the session is still unwinding is refused outright, so
+            // the abort is awaited — under a grace bound, because a session
+            // that will not settle must not become a new way to wedge.
+            void agent.abort().catch(() => undefined);
+            let grace: ReturnType<typeof setTimeout> | undefined;
+            await Promise.race([
+              agent.waitForIdle().catch(() => undefined),
+              new Promise<void>((resolve) => {
+                grace = setTimeout(resolve, ABORT_GRACE_MS);
+              }),
+            ]).finally(() => {
+              if (grace !== undefined) clearTimeout(grace);
+            });
+            reject(new Error(`agent turn exceeded ${turnTimeout.timeoutMs}ms and was aborted`));
+          })();
+        }, turnTimeout.timeoutMs);
+      });
+      // The watchdog usually loses the race to the turn it aborted; its
+      // rejection still has to land somewhere.
+      watchdog.catch(() => undefined);
       try {
-        await Promise.race([
-          running,
-          new Promise<never>((_, reject) => {
-            timer = setTimeout(() => {
-              // The abort is what makes the timeout real. A turn that merely
-              // lost the race keeps running, and the next turn's waitForIdle
-              // would inherit the wedge this timeout exists to break.
-              void agent.abort().catch(() => undefined);
-              reject(new Error(`agent turn exceeded ${turnTimeout.timeoutMs}ms and was aborted`));
-            }, turnTimeout.timeoutMs);
-          }),
-        ]);
+        await Promise.race([running, watchdog]);
+        if (timedOut) {
+          throw new Error(`agent turn exceeded ${turnTimeout.timeoutMs}ms and was aborted`);
+        }
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }
@@ -445,6 +470,13 @@ export async function startWatchSession(
  */
 const AGENT_TURN_PROMPT =
   "New observations have arrived. Act only if something useful is clearly warranted; otherwise stop without acting.";
+
+/**
+ * How long an aborted session may take to settle before the turn tail advances
+ * anyway. Generous next to a model's TTFT, tiny next to the turn timeout — it
+ * bounds the wait on a clean abort, not the wedge the timeout exists to break.
+ */
+const ABORT_GRACE_MS = 5_000;
 
 /**
  * Paths a filesystem source must ignore because Squid's own sink lives there.
