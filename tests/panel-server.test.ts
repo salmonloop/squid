@@ -133,7 +133,20 @@ async function until(predicate: () => boolean, label: string): Promise<void> {
 /** A bounded pause, only for asserting that nothing arrives. */
 const settle = (): Promise<void> => Bun.sleep(60);
 
-describe("startPanelServer transport", () => {
+/**
+ * The Unix transport's *filesystem* contract: a mode, an unlink, a refusal to
+ * overwrite. Every assertion here is about the socket file, which is why the
+ * whole group is gated on Unix rather than each test guarding itself — on
+ * Windows there is no socket file to have a mode, and `withHarness` builds a
+ * path under `tmpdir()` that `Bun.listen` would bind as a pipe-less AF_UNIX
+ * name if it could. Measured on the Windows runner: `stat` of it fails EACCES,
+ * `existsSync` reports false for a bound one, and the chmod has nothing to act
+ * on. Skipping says that plainly; running them there produced four failures
+ * that named a platform mismatch rather than a defect.
+ *
+ * The named-pipe group at the bottom of this file is the Windows counterpart.
+ */
+describe.skipIf(process.platform === "win32")("startPanelServer transport", () => {
   it("restricts the socket file to mode 600 after binding", async () => {
     await withHarness(async (harness) => {
       await harness.start();
@@ -489,6 +502,46 @@ describe("startPanelServer incoming control", () => {
  * on the platform that has pipes and honest about being unmeasured elsewhere.
  */
 describe.skipIf(process.platform !== "win32")("startPanelServer named pipe", () => {
+  /**
+   * Whether this Bun would *panic* rather than throw on a failed named-pipe
+   * listen, which decides whether the duplicate-bind assertion below can run at
+   * all.
+   *
+   * Before oven-sh/bun#29422 the assignment is `this.listener = .{ .namedPipe =
+   * listen(...) catch return throw(...) }`, and Zig writes a tagged union's tag
+   * to the result location *before* evaluating the payload. So a failed listen
+   * leaves the tag at `.namedPipe` over garbage payload bytes, the registered
+   * `errdefer this.deinit()` fires, and `deinit` walks straight into
+   * `bun.assert(this.listener == .none)`. That is an abort, not an exception:
+   * `expect(...).rejects` never sees anything, and every later test in this file
+   * dies with the process.
+   *
+   * The fix landed 2026-04-18 and first shipped in Bun 1.3.13; this repo pins
+   * 1.3.11 (2026-03-18), a month older. Gating on the version rather than
+   * deleting the test keeps the assertion — and this reasoning — in the file,
+   * and hands it back the day the pin moves past 1.3.13.
+   */
+  const BUN_WITH_NAMED_PIPE_LISTEN_ERROR_FIX = "1.3.13";
+  const bunPanicsOnFailedPipeListen = ((): boolean => {
+    // `Bun.version` can carry a suffix ("1.3.11-canary.42"); `parseInt` stops at
+    // it, and a component that is not a number at all counts as 0, which errs
+    // toward skipping rather than toward crashing the run.
+    const components = (text: string): [number, number, number] => {
+      const [major = 0, minor = 0, patch = 0] = text
+        .split(".")
+        .map((part) => Number.parseInt(part, 10) || 0);
+      return [major, minor, patch];
+    };
+    const have = components(Bun.version);
+    const need = components(BUN_WITH_NAMED_PIPE_LISTEN_ERROR_FIX);
+    for (let index = 0; index < have.length; index += 1) {
+      const haveComponent = have[index] ?? 0;
+      const needComponent = need[index] ?? 0;
+      if (haveComponent !== needComponent) return haveComponent < needComponent;
+    }
+    return false;
+  })();
+
   /** A pipe name no other test or run can collide with. */
   const freePipeName = (): string =>
     `\\\\.\\pipe\\squid-panel-test-${process.pid}-${Math.random().toString(36).slice(2)}`;
@@ -543,23 +596,29 @@ describe.skipIf(process.platform !== "win32")("startPanelServer named pipe", () 
     }
   });
 
-  it("creates no filesystem entry, and removes none on close", async () => {
-    // A pipe lives in the pipe namespace, not the filesystem. `clearBindPath`,
-    // the chmod, and the unlink-on-close are all gated off for it — if any of
-    // them ran, this is where the stray artifact or the wrong unlink shows up.
+  it("touches the filesystem for neither the bind nor the close", async () => {
+    // A pipe lives in the pipe namespace, so `clearBindPath`, the chmod, and the
+    // unlink-on-close are all gated off for it. The assertion cannot be
+    // `existsSync(pipeName)`: measured on Windows, `stat` of a *live* pipe
+    // succeeds, so that would report `true` for a correctly-bound pipe and
+    // `false` only once it closed — the exact inverse of the intent. What is
+    // actually claimed is that no directory entry appears, so this watches the
+    // directory a `\\.\pipe\` path would land in if the name were ever
+    // treated as a filesystem path relative to the cwd.
     const pipeName = freePipeName();
-    expect(existsSync(pipeName)).toBe(false);
+    const strayPath = join(process.cwd(), pipeName.replace(/^\\\\[.?]\\pipe\\/, ""));
+    expect(existsSync(strayPath)).toBe(false);
 
     const server = await startPanelServer({ socketPath: pipeName, onControl: () => undefined });
     try {
-      expect(existsSync(pipeName)).toBe(false);
+      expect(existsSync(strayPath)).toBe(false);
     } finally {
       await server.close();
     }
-    expect(existsSync(pipeName)).toBe(false);
+    expect(existsSync(strayPath)).toBe(false);
   });
 
-  it("refuses a second bind of the same pipe name", async () => {
+  it.skipIf(bunPanicsOnFailedPipeListen)("refuses a second bind of the same pipe name", async () => {
     // Bun surfaces this as a Node-shaped EADDRINUSE with syscall "listen"
     // (asserted by Bun's own test/js/bun/net/named-pipe-listen-error.test.ts).
     // Worth pinning here because the Unix socket does *not* refuse a duplicate
