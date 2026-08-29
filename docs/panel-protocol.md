@@ -79,10 +79,17 @@ one:
 - **Bun does not report `EADDRINUSE` for a live listener on the same path.** Two
   watch sessions pointed at one socket path both appear to bind and split
   connections unpredictably. Not enforced today; worth knowing before running two.
-  (Unverified for named pipes: `CreateNamedPipeW` refuses a second *first
-  instance* of the same name, but whether libuv surfaces that to `Bun.listen` is
-  untested — the Windows-only suite in `tests/panel-server.test.ts` is where that
-  answer belongs once a Windows runner exists.)
+  (Still unverified for named pipes, but no longer for want of a runner. Bun's own
+  `test/js/bun/net/named-pipe-listen-error.test.ts` asserts a Node-shaped
+  `EADDRINUSE` with `syscall === "listen"`, so the intended behaviour is clear —
+  and `CreateNamedPipeW` does refuse a second *first instance* of a name. What
+  blocks the measurement is the pinned Bun: before oven-sh/bun#29422 a *failed*
+  named-pipe listen aborts the process instead of throwing, because the tagged
+  union's tag is written before the payload and the `errdefer` cleanup then trips
+  `bun.assert(this.listener == .none)`. The fix first shipped in Bun 1.3.13; this
+  repo pins 1.3.11. The assertion lives in the Windows-only suite in
+  `tests/panel-server.test.ts`, gated on that version, and runs itself the day the
+  pin moves.)
 - `stop()` alone leaves connected sockets writable and their handles alive, so the
   process will not exit while a panel is attached. Close with `stop(true)`.
 

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "bun:test";
@@ -22,8 +22,21 @@ afterEach(async () => {
   );
 });
 
+/**
+ * A scratch directory, handed out already canonical.
+ *
+ * The `realpath` is not decoration. On Windows `tmpdir()` reports the 8.3 short
+ * form of the user profile (`C:\\Users\\RUNNER~1\\...`), while
+ * `FilesystemActivitySource.start` canonicalizes its root before watching — so a
+ * fixture handing out the short form and then comparing against it is comparing
+ * two different spellings of one directory. Measured on the Windows runner: the
+ * root-canonicalization test failed on the mismatch, and a probe keyed by
+ * `absolutePath.slice(root.length + 1)` sliced at the wrong offset and starved
+ * its own `waitFor`. Both are the same fixture bug, and canonicalizing here fixes
+ * it once instead of at each call.
+ */
 async function temporaryRoot(): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), "squid-fs-source-"));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "squid-fs-source-")));
   temporaryDirectories.push(directory);
   return directory;
 }
