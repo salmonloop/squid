@@ -1,9 +1,9 @@
-import { open } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import type {
   TerminalCommandFrame,
   TerminalCommandReaderFactory,
 } from "./terminal-command-source.js";
+import { startFifoLineReader } from "./fifo-line-reader.js";
 
 /**
  * Reads command completions a shell hook writes, one JSON object per line.
@@ -46,78 +46,24 @@ export interface FifoTerminalCommandReaderOptions {
   readonly pollMs?: number;
 }
 
-const DEFAULT_POLL_MS = 250;
-
 export function createFifoTerminalCommandReader(
   options: FifoTerminalCommandReaderOptions,
 ): TerminalCommandReaderFactory {
   if (!isAbsolute(options.path)) {
     throw new Error("Terminal command FIFO path must be absolute.");
   }
-  const pollMs = options.pollMs ?? DEFAULT_POLL_MS;
 
-  return ({ onFrame, onError }) => {
-    let closed = false;
-    let offset = 0;
-    let carry = "";
-    let reading = false;
-
-    const readAvailable = async (): Promise<void> => {
-      // One read at a time: a slow read must not interleave with the next tick
-      // and reorder lines, since a shell's completions are inherently ordered.
-      if (reading || closed) return;
-      reading = true;
-      try {
-        const handle = await open(options.path, "r");
-        try {
-          const stats = await handle.stat();
-          if (stats.size < offset) {
-            // Truncated or replaced. Start over rather than reading from a stale
-            // offset, which would slice mid-line and produce garbage.
-            offset = 0;
-            carry = "";
-          }
-          if (stats.size > offset) {
-            const length = stats.size - offset;
-            const buffer = Buffer.alloc(length);
-            const { bytesRead } = await handle.read(buffer, 0, length, offset);
-            offset += bytesRead;
-            carry += buffer.subarray(0, bytesRead).toString("utf8");
-          }
-        } finally {
-          await handle.close();
-        }
-      } catch (error) {
-        // A missing file is the normal state before the first shell writes, so it
-        // is not worth reporting on every tick.
-        if (!isMissingFile(error)) {
-          onError(error instanceof Error ? error : new Error(String(error)));
-        }
-        reading = false;
-        return;
-      }
-
-      // Re-checked after the awaits above. `close()` can land while a read is in
-      // flight, and delivering a frame afterwards would push an event into a
-      // source that has already stopped — which then discards it on its own
-      // lifecycle guard, but only after the sequence and the offset have moved.
-      if (closed) {
-        reading = false;
-        return;
-      }
-
-      // Keep any trailing partial line for the next tick: a hook's write is not
-      // guaranteed atomic, so a half-written line must not be parsed.
-      const lines = carry.split("\n");
-      carry = lines.pop() ?? "";
-      for (const line of lines) {
-        if (line.trim().length === 0) continue;
+  return ({ onFrame, onError }) =>
+    startFifoLineReader({
+      path: options.path,
+      ...(options.pollMs !== undefined ? { pollMs: options.pollMs } : {}),
+      onLine: (line) => {
         let frame: TerminalCommandFrame;
         try {
           const parsed = JSON.parse(line) as unknown;
-          if (typeof parsed !== "object" || parsed === null) continue;
+          if (typeof parsed !== "object" || parsed === null) return;
           const record = parsed as { command?: unknown; exitCode?: unknown; occurredAt?: unknown };
-          if (typeof record.command !== "string") continue;
+          if (typeof record.command !== "string") return;
           frame = {
             command: record.command,
             exitCode: typeof record.exitCode === "number" ? record.exitCode : null,
@@ -128,27 +74,10 @@ export function createFifoTerminalCommandReader(
           // reading. The source records nothing here because the line never
           // became a frame — and its content is a raw command, so it must not
           // reach a diagnostic either.
-          continue;
+          return;
         }
         onFrame(frame);
-      }
-      reading = false;
-    };
-
-    const timer = setInterval(() => void readAvailable(), pollMs);
-    // Read once immediately so a completion written before start is not delayed
-    // by a whole poll interval.
-    void readAvailable();
-
-    return {
-      close: () => {
-        closed = true;
-        clearInterval(timer);
       },
-    };
-  };
-}
-
-function isMissingFile(error: unknown): boolean {
-  return error instanceof Error && "code" in error && error.code === "ENOENT";
+      onError,
+    });
 }
