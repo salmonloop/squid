@@ -10,10 +10,13 @@
 # release job could publish a binary built from code no test ever ran against —
 # the tag could point anywhere. The gate and the build see the same checkout.
 #
-# The tag is also the only ledger for the version number: it must be `v` plus
-# exactly what `package.json` and `ui/Cargo.toml` already say. Bump the manifests,
-# commit, tag that commit. The `version` job is the check; the tag remains the
-# decision.
+# The tag is also the only ledger for the version number: it must be `v` plus a
+# semver, and that is where the version comes from — nowhere else. The manifests
+# in the tree (`package.json`, `ui/Cargo.toml`) are not consulted and not
+# trusted; the `version` job stamps the tag's number into them before any build
+# runs, so the shipped panel cannot disagree with the tag that named it. The
+# manifests in git are a convenience for local development, never the release's
+# source of truth.
 name: release
 
 on:
@@ -112,62 +115,87 @@ jobs:
 
       - run: cargo test --locked
 
-  # The tag and the manifests must tell the same version story.
+  # The tag stamps the version into both manifests.
   #
   # The tag is the release's name, but the two manifests each carry a `version`
-  # the shipped things read from: `package.json` for the TypeScript side,
-  # `ui/Cargo.toml` for the panel — and `env!("CARGO_PKG_VERSION")` puts that
-  # one inside the binary itself. Nothing else in this pipeline compares them,
-  # so without this job a tag naming 0.9.0 could publish binaries built from
-  # manifests still saying 0.1.0, and nothing anywhere would disagree. This job
-  # runs before the builds and fails in seconds, so a versioning slip costs a
-  # red mark instead of nineteen minutes of compiling on the way to the same
-  # red mark.
+  # the shipped things read from: `ui/Cargo.toml` for the panel — and
+  # `env!("CARGO_PKG_VERSION")` puts that one inside the binary itself — and
+  # `package.json` for the TypeScript side. This job writes the tag's number
+  # into all three places (the two manifests plus the `squid-ui` entry in
+  # `Cargo.lock`, which `--locked` below requires to agree), so the binaries
+  # built downstream are literally built from the tag's version, not from
+  # whatever the developer's last commit happened to leave behind. No manual
+  # bump-and-tag dance: tag the commit that should ship, and the version
+  # follows the pointer.
+  #
+  # The stamped files travel to the build jobs as an artifact rather than being
+  # re-derived there: one stamping implementation, and the Linux and Windows
+  # builds provably see the same bytes. It is uploaded even on
+  # `workflow_dispatch` (where there is no tag, so the files go through
+  # unmodified) — a build job's download step would fail on a missing artifact
+  # and silently end the dry run.
   #
   # Unconditional at the job level rather than skipped on `workflow_dispatch`:
   # a job that a build `needs` and then skips skips the build with it, which
-  # would silently end the dry run. The step inside decides instead — a dry run
-  # has no tag, so there is nothing to reconcile.
+  # would silently end the dry run. The step inside decides instead.
   version:
-    name: version (tag = manifests)
+    name: version (the tag stamps the manifests)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Reconcile the tag against both manifests
+      - name: Stamp the tag's version into the manifests
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
-            echo "no tag in play (${GITHUB_REF_TYPE} ${GITHUB_REF_NAME}); nothing to reconcile"
+            echo "no tag in play (${GITHUB_REF_TYPE} ${GITHUB_REF_NAME}); leaving the manifests untouched"
             exit 0
           fi
 
-          # Strip the `v`: the manifests hold the bare semver, the tag holds the
-          # one users type. String equality is the contract, not a semver range —
-          # "close enough" is how a mismatch survives.
-          expected="${tag#v}"
+          # The manifests hold the bare semver, the tag holds the one users
+          # type. The shape is asserted rather than trusted: a tag that is not
+          # `v` + semver-with-prerelease would stamp a version no tool accepts.
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*-*) version="${tag#v}" ;;
+            *) echo "::error::$tag is not v<semver with a pre-release suffix>" >&2; exit 1 ;;
+          esac
 
-          # The package version, read with the tool that parses JSON properly.
-          pkg="$(jq -r .version package.json)"
-          # The panel version: the one `^version` at column zero, which is the
+          # The package version, written with the tool that parses JSON properly.
+          jq --arg v "$version" '.version = $v' package.json > package.json.tmp
+          mv package.json.tmp package.json
+
+          # The panel version: the `^version` at column zero, which is the
           # `[package]` entry — dependency lines carry their own versions but
           # none of them start a line, so the anchor is the whole disambiguation.
-          ui="$(sed -n 's/^version = "\(.*\)"$/\1/p' ui/Cargo.toml | head -n 1)"
+          sed -i "s/^version = \".*\"$/version = \"$version\"/" ui/Cargo.toml
 
-          ok=yes
-          if [ "$pkg" != "$expected" ]; then
-            echo "::error::package.json says ${pkg:-<unreadable>}, but tag $tag names $expected" >&2
-            ok=no
-          fi
-          if [ "$ui" != "$expected" ]; then
-            echo "::error::ui/Cargo.toml says ${ui:-<unreadable>}, but tag $tag names $expected" >&2
-            ok=no
-          fi
-          [ "$ok" = yes ]
-          echo "tag $tag = package.json $pkg = ui/Cargo.toml $ui"
+          # The lock must agree or `cargo build --locked` refuses to run. In the
+          # `squid-ui` block the `version` line directly follows the `name`
+          # line, so anchoring on the name and stepping one line down reaches
+          # exactly the entry that must move and nothing else.
+          sed -i "/^name = \"squid-ui\"$/{n;s/^version = \".*\"$/version = \"$version\"/}" ui/Cargo.lock
+
+          # Read back and assert. A stamp step that quietly did nothing would
+          # otherwise surface much later as a binary carrying the wrong version.
+          pkg="$(jq -r .version package.json)"
+          ui="$(sed -n 's/^version = "\(.*\)"$/\1/p' ui/Cargo.toml | head -n 1)"
+          lock="$(sed -n '/^name = "squid-ui"$/{n;s/^version = "\(.*\)"$/\1/p}' ui/Cargo.lock)"
+          [ "$pkg" = "$version" ] && [ "$ui" = "$version" ] && [ "$lock" = "$version" ]
+          echo "tag $tag stamped: package.json = ui/Cargo.toml = Cargo.lock = $version"
+
+      - name: Upload the stamped manifests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stamped-manifests
+          path: |
+            package.json
+            ui/Cargo.toml
+            ui/Cargo.lock
+          if-no-files-found: error
+          retention-days: 7
 
   # Builds everything a target ships, from the same checkout the gate ran on.
   # Kept separate from the gates because a release build is a different profile
@@ -191,6 +219,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # The version job stamped the tag's number into the manifests; this build
+      # compiles from those bytes, not from whatever the tree carries. Both
+      # halves of the zip and `Cargo.lock`'s consistency under `--locked` then
+      # read one story: the tag's.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stamped-manifests
+          path: stamped-manifests
+
+      - name: Apply the stamped manifests
+        run: |
+          cp stamped-manifests/package.json package.json
+          cp stamped-manifests/ui/Cargo.toml ui/Cargo.toml
+          cp stamped-manifests/ui/Cargo.lock ui/Cargo.lock
 
       - name: Install build dependencies
         run: |
@@ -261,6 +304,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Same stamped-manifests contract as the Linux job: the panel's version
+      # (`CARGO_PKG_VERSION`) comes from the tag, via one artifact both build
+      # jobs download. Paths are anchored to the workspace root because the
+      # job's `working-directory` is `ui` and this step reaches across it.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stamped-manifests
+          path: stamped-manifests
+
+      - name: Apply the stamped manifests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ws = $env:GITHUB_WORKSPACE
+          Copy-Item "$ws\stamped-manifests\package.json" "$ws\package.json"
+          Copy-Item "$ws\stamped-manifests\ui\Cargo.toml" "$ws\ui\Cargo.toml"
+          Copy-Item "$ws\stamped-manifests\ui\Cargo.lock" "$ws\ui\Cargo.lock"
 
       - name: Build the control panel
         run: cargo build --release --locked
