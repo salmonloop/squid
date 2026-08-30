@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   defaultPanelEndpoint,
   panelExecutablePath,
@@ -41,8 +41,13 @@ describe("resolveWatchRoot", () => {
 describe("panelExecutablePath", () => {
   it("follows the target, not the host", () => {
     // A Windows zip unpacked anywhere still names its panel `squid-ui.exe`.
-    expect(panelExecutablePath("windows", "/opt/squid/squid")).toBe("/opt/squid/squid-ui.exe");
-    expect(panelExecutablePath("other", "/opt/squid/squid")).toBe("/opt/squid/squid-ui");
+    // The separator spelling is the host's (`join` decides), so the assertion
+    // that carries the contract is the file name and the directory it sits in,
+    // neither of which a platform may rewrite.
+    const binary = process.platform === "win32" ? "C:\\opt\\squid\\squid" : "/opt/squid/squid";
+    expect(basename(panelExecutablePath("windows", binary))).toBe("squid-ui.exe");
+    expect(basename(panelExecutablePath("other", binary))).toBe("squid-ui");
+    expect(dirname(panelExecutablePath("windows", binary))).toBe(dirname(binary));
   });
 });
 
@@ -213,19 +218,18 @@ describe("spawnPanelProcess", () => {
 
   it("hands the child the same endpoint string the session listens on", () => {
     // The endpoint travels by env, the one variable every panel client reads.
-    expect(
-      childEndpointOf({
-        socketPath: "/tmp/squid-panel.sock",
-        env: { SQUID_DB: "/tmp/x.db", OTHER: undefined },
-        platform: "linux",
-        execPath: "/opt/squid/squid",
-        logError: () => undefined,
-        exists: () => true,
-      }),
-    ).toEqual({
-      exe: "/opt/squid/squid-ui",
-      env: { SQUID_DB: "/tmp/x.db", SQUID_PANEL_SOCKET: "/tmp/squid-panel.sock" },
+    // The exe's separator spelling is the host's, so its name is the part
+    // asserted here rather than the whole path.
+    const seen = childEndpointOf({
+      socketPath: "/tmp/squid-panel.sock",
+      env: { SQUID_DB: "/tmp/x.db", OTHER: undefined },
+      platform: "linux",
+      execPath: "/opt/squid/squid",
+      logError: () => undefined,
+      exists: () => true,
     });
+    expect(seen.env).toEqual({ SQUID_DB: "/tmp/x.db", SQUID_PANEL_SOCKET: "/tmp/squid-panel.sock" });
+    expect(basename(seen.exe)).toBe("squid-ui");
   });
 
   it("kills the panel on the shutdown signals, not on a Bun `exit` event", () => {
