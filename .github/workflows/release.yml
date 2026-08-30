@@ -169,15 +169,20 @@ jobs:
           [ "$ok" = yes ]
           echo "tag $tag = package.json $pkg = ui/Cargo.toml $ui"
 
-  # Builds the artifact the release will carry, from the same checkout the gate
-  # ran on. Kept separate from `gate-ui` because a release build is a different
-  # profile than the one the tests run under, and because this job's only output
-  # is the thing that gets uploaded.
+  # Builds everything a target ships, from the same checkout the gate ran on.
+  # Kept separate from the gates because a release build is a different profile
+  # than the one the tests run under, and because this job's only output is the
+  # thing that gets uploaded.
   #
-  # One job per target rather than a matrix: the two differ in more than the
-  # triplet — Linux needs the Slint/winit headers installed, Windows ships
-  # everything MSVC links against — so the honest shape is two explicit jobs
-  # whose names say what they build.
+  # One job per target rather than a matrix, and one *whole* artifact per job:
+  # the release asset is a zip holding the brain (`squid`, the compiled watch
+  # session) and the panel (`squid-ui`) side by side, because a double-clicked
+  # brain looks for its panel next to itself. Building the two halves in
+  # different jobs would split one asset's provenance across two runners for no
+  # gain — the Bun compile needs no Slint headers, so folding it in here is
+  # free. The two differ in more than the triplet — Linux needs the Slint/winit
+  # headers installed, Windows ships everything MSVC links against — so the
+  # honest shape is two explicit jobs whose names say what they build.
   build-linux:
     name: build (x86_64-linux)
     needs: [version, gate-bun, gate-ui]
@@ -201,23 +206,37 @@ jobs:
         working-directory: ui
         run: cargo build --release --locked
 
-      # A checksum computed on the runner that produced the binary, published
-      # next to it. It does not prove provenance on its own, but it lets someone
-      # who downloads the asset tell whether they got the bytes this job made.
+      # The brain: the watch session compiled into a standalone executable. The
+      # entry is the packaged one (`src/squid-app.ts`), not the CLI script —
+      # this is the binary a double-click runs, first-run conversation included.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.11
+
+      - run: bun install --frozen-lockfile
+
+      - name: Compile the double-click binary
+        run: bun build --compile src/squid-app.ts --target=bun-linux-x64 --outfile squid
+
+      # A checksum computed on the runner that produced the zip, published next
+      # to it. It does not prove provenance on its own, but it lets someone who
+      # downloads the asset tell whether they got the bytes this job made.
       - name: Stage the release asset
         run: |
           set -euo pipefail
-          mkdir -p artifacts
-          install -m 0755 ui/target/release/squid-ui \
-            "artifacts/squid-ui-x86_64-unknown-linux-gnu"
+          mkdir -p staging artifacts
+          install -m 0755 ui/target/release/squid-ui staging/squid-ui
+          install -m 0755 squid staging/squid
+          zip -j artifacts/squid-x86_64-unknown-linux-gnu.zip \
+            staging/squid staging/squid-ui
           cd artifacts
-          sha256sum squid-ui-x86_64-unknown-linux-gnu \
-            > squid-ui-x86_64-unknown-linux-gnu.sha256
-          cat squid-ui-x86_64-unknown-linux-gnu.sha256
+          sha256sum squid-x86_64-unknown-linux-gnu.zip \
+            > squid-x86_64-unknown-linux-gnu.zip.sha256
+          cat squid-x86_64-unknown-linux-gnu.zip.sha256
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: squid-ui-x86_64-unknown-linux-gnu
+          name: squid-x86_64-unknown-linux-gnu
           path: artifacts/
           if-no-files-found: error
           retention-days: 7
@@ -229,7 +248,8 @@ jobs:
   # and opens per line — so without this job it compiles for nobody and a
   # Windows-only break would surface months later in someone's local build
   # instead of here. No system headers are installed: MSVC runners ship
-  # everything Slint/winit link against.
+  # everything Slint/winit link against. Same whole-asset contract as the Linux
+  # job: one zip, brain and panel together.
   build-windows:
     name: build (x86_64-windows)
     needs: [version, gate-bun, gate-ui]
@@ -245,6 +265,21 @@ jobs:
       - name: Build the control panel
         run: cargo build --release --locked
 
+      # The brain, compiled natively on the same OS that ships it. The Bun steps
+      # opt back out of the `ui` working-directory: the compile entry lives at
+      # the repository root.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.11
+
+      - name: Install dependencies
+        working-directory: ${{ github.workspace }}
+        run: bun install --frozen-lockfile
+
+      - name: Compile the double-click binary
+        working-directory: ${{ github.workspace }}
+        run: bun build --compile src/squid-app.ts --target=bun-windows-x64 --outfile squid.exe
+
       # Same contract as the Linux staging step: the exact bytes this job made,
       # with a checksum published beside them. `sha256sum`'s `HASH  NAME` layout
       # is reproduced by hand so `sha256sum -c` works on either platform.
@@ -259,18 +294,20 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\artifacts" | Out-Null
-          Copy-Item target\release\squid-ui.exe `
-            "$env:GITHUB_WORKSPACE\artifacts\squid-ui-x86_64-pc-windows-msvc.exe"
-          $asset = "$env:GITHUB_WORKSPACE\artifacts\squid-ui-x86_64-pc-windows-msvc.exe"
-          $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
-          "$hash  squid-ui-x86_64-pc-windows-msvc.exe" |
-            Set-Content -NoNewline "$asset.sha256"
-          Get-Content "$asset.sha256"
+          New-Item -ItemType Directory -Force `
+            "$env:GITHUB_WORKSPACE\staging", "$env:GITHUB_WORKSPACE\artifacts" | Out-Null
+          Copy-Item target\release\squid-ui.exe "$env:GITHUB_WORKSPACE\staging\squid-ui.exe"
+          Copy-Item "$env:GITHUB_WORKSPACE\squid.exe" "$env:GITHUB_WORKSPACE\staging\squid.exe"
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE\staging\*" `
+            -DestinationPath "$env:GITHUB_WORKSPACE\artifacts\squid-x86_64-pc-windows-msvc.zip"
+          $zip = "$env:GITHUB_WORKSPACE\artifacts\squid-x86_64-pc-windows-msvc.zip"
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  squid-x86_64-pc-windows-msvc.zip" | Set-Content -NoNewline "$zip.sha256"
+          Get-Content "$zip.sha256"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: squid-ui-x86_64-pc-windows-msvc
+          name: squid-x86_64-pc-windows-msvc
           path: artifacts/
           if-no-files-found: error
           retention-days: 7
@@ -346,7 +383,7 @@ jobs:
         run: |
           set -euo pipefail
           # Downloaded artifacts land one directory per job; the glob gathers
-          # both targets' binaries and checksums in one call.
+          # both targets' zips and their checksums in one call.
           gh release upload "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber \
