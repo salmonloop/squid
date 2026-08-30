@@ -443,9 +443,13 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # Downloaded artifacts land one directory per job; the glob gathers
-          # both targets' zips and their checksums in one call.
+          # `download-artifact` with no `name` lands every artifact of the run,
+          # `stamped-manifests` included. That artifact is build input, not a
+          # release asset — and it contains `ui/` as a directory, which
+          # `gh release upload` refuses to touch (`is a directory`, exit 1).
+          # The glob is keyed to the build jobs' artifact names, so only the
+          # two targets' zips and their checksums are handed to the release.
           gh release upload "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber \
-            artifacts/*/*
+            artifacts/squid-*/*
