@@ -101,6 +101,13 @@ than opening a window: a panel that is up but attached to nothing looks like a
 watch session that has stopped reporting, and the shape rules below exist to keep
 this surface from telling that kind of lie.
 
+In the packaged release this never comes up: the `squid` binary shipped beside
+the panel starts the watch session and then launches the panel itself, passing
+the endpoint through `SQUID_PANEL_SOCKET` in the child's environment. Because
+the transport reconnects on its own, the spawn order does not matter — a panel
+that starts before the socket exists simply retries. Hand-launching is what the
+exit codes below are for: pointing a panel at a session someone else started.
+
 Two startup failures therefore end the process before the event loop, each with
 its own code so a launcher can tell them apart:
 

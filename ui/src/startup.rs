@@ -94,7 +94,10 @@ impl Startup {
                  which is why it stops here instead of opening a window that would report \
                  an idle machine forever.\n\
                  \n\
-                 It is normally started by that session. To start it by hand, point it at \
+                 It is normally started by that session, and the release zip puts that \
+                 session next to this binary: run the `squid` executable in the same \
+                 folder and it starts the watch session and launches this panel itself. \
+                 To start this panel by hand instead, point it at \
                  the endpoint the session listens on ({ENDPOINT_EXAMPLE} on this \
                  platform):\n\
                  \n\
@@ -244,14 +247,19 @@ mod tests {
 
     /// The unconfigured message exists to answer "why did the window flash and
     /// disappear", so each part of that answer is checked: the variable to set,
-    /// the fact that something else drives this process, and a command for this
-    /// platform. A message that dropped any one of them would still read fine.
+    /// the fact that something else drives this process, the sibling binary a
+    /// release zip pairs it with, and a command for this platform. A message
+    /// that dropped any one of them would still read fine.
     #[test]
     fn the_unconfigured_message_names_the_variable_the_cause_and_the_fix() {
         let message = Startup::Unconfigured.message();
         assert!(message.contains(SOCKET_ENV), "{message}");
         assert!(message.contains("client"), "{message}");
         assert!(message.contains("watch session"), "{message}");
+        assert!(
+            message.contains("`squid` executable in the same"),
+            "{message}"
+        );
         assert!(message.contains(ENDPOINT_EXAMPLE), "{message}");
         assert!(message.contains(&export_example()), "{message}");
     }
