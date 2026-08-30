@@ -227,6 +227,47 @@ describe("spawnPanelProcess", () => {
       env: { SQUID_DB: "/tmp/x.db", SQUID_PANEL_SOCKET: "/tmp/squid-panel.sock" },
     });
   });
+
+  it("kills the panel on the shutdown signals, not on a Bun `exit` event", () => {
+    // Bun never runs `exit` handlers — measured with a spawned sleeper that
+    // outlived its parent on a natural exit. The cleanup has to ride the
+    // signals the watch session treats as shutdown, and this asserts the
+    // registered handler actually kills, invoked directly so no other suite's
+    // SIGINT listeners fire with it.
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+      const before = process.listeners(signal);
+      let killed = false;
+      const original = Bun.spawn;
+      (Bun as { spawn: typeof Bun.spawn }).spawn = (() => ({
+        kill: () => {
+          killed = true;
+        },
+      })) as unknown as typeof Bun.spawn;
+      try {
+        spawnPanelProcess({
+          socketPath: "/tmp/squid-panel.sock",
+          env: {},
+          platform: "linux",
+          execPath: "/opt/squid/squid",
+          logError: () => undefined,
+          exists: () => true,
+        });
+        const added = process.listeners(signal).filter((l) => !before.includes(l));
+        expect(added).toHaveLength(1);
+        added[0]!(signal);
+        expect(killed).toBe(true);
+      } finally {
+        for (const listener of process.listeners(signal)) {
+          if (before.includes(listener)) continue;
+          // The union-typed signal defeats removeListener's overloads, so the
+          // branch spells each name the overloads recognize.
+          if (signal === "SIGINT") process.removeListener("SIGINT", listener);
+          else process.removeListener("SIGTERM", listener);
+        }
+        (Bun as { spawn: typeof Bun.spawn }).spawn = original;
+      }
+    }
+  });
 });
 
 /**
