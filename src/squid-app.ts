@@ -147,15 +147,21 @@ export function spawnPanelProcess(options: {
     stderr: "inherit",
   });
   // A session that exits leaves an orphan window reconnecting forever unless
-  // the child dies with it. `exit` fires on normal exit and on the graceful
-  // shutdown the signal handlers perform.
-  process.on("exit", () => {
+  // the child dies with it. The cleanup rides the signals the watch session
+  // treats as shutdown rather than the `exit` event, because Bun never runs
+  // `exit` handlers — measured, not guessed: a natural exit skips them the
+  // same way a signal exit does. Every registered SIGINT/SIGTERM handler runs,
+  // so this does not compete with the session's own graceful shutdown; it
+  // only makes sure the panel does not outlive its parent.
+  const killPanel = (): void => {
     try {
       child.kill();
     } catch {
       // Already gone is the good case.
     }
-  });
+  };
+  process.on("SIGINT", killPanel);
+  process.on("SIGTERM", killPanel);
 }
 
 /** The real first-run conversation: the double-clicked console. */
