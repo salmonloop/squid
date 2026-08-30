@@ -366,8 +366,10 @@ the runner instead of delegating that token to a third-party action. Every actio
 is third-party is pinned by commit SHA. This is the argument `ui/Cargo.toml` makes about
 the panel's own dependencies, applied to the pipeline that signs its releases.
 
-The published assets are `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`,
-each with a `sha256` beside it. The Linux binary needs `libfontconfig1`,
+The published assets are one zip per platform — `x86_64-unknown-linux-gnu` and
+`x86_64-pc-windows-msvc`, each with a `sha256` beside it. The zip holds two
+binaries side by side: `squid`, the watch session compiled to a standalone
+executable, and `squid-ui`, the panel. The Linux panel needs `libfontconfig1`,
 `libfreetype6`, and `libxkbcommon0` at runtime — femtovg and winit link them, and
 the workflow installs the matching `-dev` packages to build. The Windows build
 needs no runtime packages; its panel transport is a named pipe
@@ -375,15 +377,25 @@ needs no runtime packages; its panel transport is a named pipe
 — the protocol document names the spelling each platform accepts, and why the
 pipe carries no access boundary the way the socket's file mode does.
 
-**The downloaded binary is a client, not an application to launch.** It connects
-to a watch session and renders what that session pushes it; with
+**Unpack the zip and run the `squid` binary; that is the whole download.** It
+needs no arguments. With no model configured it asks for one in the console it
+was opened from — an OpenAI-compatible endpoint URL, a model id, and an API key —
+and stores the answers in Pi's own config (`models.json` and `auth.json`), so
+the question appears exactly once. It then watches the user's home directory by
+default (`SQUID_WATCH_ROOT` overrides it) and launches the `squid-ui` sitting
+next to itself, handing it the panel endpoint through the environment. The panel
+is an observer and dispensable: if its binary is missing the session reports
+that and keeps watching.
+
+The panel can still be run by hand — it is a client of a session, and with
 `SQUID_PANEL_SOCKET` unset there is nothing to connect to, so it prints why and
 exits `2` without opening a window. Double-clicking it on Windows therefore looks
 like a crash: the console that line was printed to belongs to the process and
-closes with it. Run it from a shell, or let the watch session start it. A window
-that cannot be created — no display, no OpenGL — exits `3`. On Windows both
-messages also appear in a dialog box when this process is the only one attached
-to its console, which is exactly the double-clicked case.
+closes with it. Point it at the endpoint the session listens on, or just run
+`squid` and let it launch the panel. A window that cannot be created — no
+display, no OpenGL — exits `3`. On Windows both messages also appear in a dialog
+box when this process is the only one attached to its console, which is exactly
+the double-clicked case.
 
 ## What is not yet implemented
 
