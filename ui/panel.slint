@@ -91,7 +91,7 @@ component Divider inherits Rectangle {
 
 // One editable settings row: label, editor, markers, Save.
 //
-// Factored out because the rules below have to hold for every one of the ~21
+// Factored out because the rules below have to hold for every one of the 18
 // rows and a rule re-implemented per row is a rule that will be got wrong once.
 //
 // The editor is never authoritative. It shows the value the last dump reported
@@ -287,7 +287,7 @@ export component PanelWindow inherits Window {
     // Sized for its content: a two-column field list at a readable 12px, plus
     // room for a couple of wrapped lines of agent text.
     preferred-width: 520px;
-    // Taller than the read-only panel was: the settings form is 21 rows behind
+    // Taller than the read-only panel was: the settings form is 18 rows behind
     // a scroll view, and a window that opens with the form clipped invites the
     // reading that the form is not there.
     preferred-height: 760px;
@@ -661,7 +661,7 @@ export component PanelWindow inherits Window {
             wrap: no-wrap;
         }
 
-        // Scrolled rather than allowed to grow: the dump is ~21 rows, and a
+        // Scrolled rather than allowed to grow: the dump is 18 rows, and a
         // window that resizes itself to whatever the brain declares would be a
         // window whose size the brain controls. Fixed height so the sections
         // above and the confirmation area below keep their places.
