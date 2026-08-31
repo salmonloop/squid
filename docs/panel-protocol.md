@@ -185,6 +185,27 @@ Pushed when the agent finishes a turn.
 | `status` | `"replied"` \| `"failed"` | yes | |
 | `text` | string | no | **sanitized** assistant text or error |
 
+### `service`
+
+The brain's own standing state, announced to each panel **as it connects** — not
+broadcast once at startup. A broadcast reaches only whoever is registered at that
+instant, and a panel connects after the session starts, every time; so standing
+facts are replayed per client rather than shouted once into an empty room. The
+Rust panel silently ignores this message until the panel-rendering phase wires
+a UI for it.
+
+```jsonc
+{"type":"service","agentState":"needs_config"}
+```
+
+| field | type | required | notes |
+|---|---|---|---|
+| `type` | `"service"` | yes | |
+| `agentState` | `"ready"` \| `"needs_config"` | yes | `needs_config` means no resident-agent model is configured; the settings form is the way out |
+
+No user-derived text rides this line, so it carries no sanitization — the only
+fields are fixed-vocabulary strings.
+
 ### `prompt` / `cancel`
 
 The confirmation area. No caller produces these today — tool-layer safety is Pi's
@@ -257,7 +278,11 @@ export interface PanelAgentLine {
   readonly status: "replied" | "failed";
   readonly text?: string;
 }
-export type PanelMessage = PanelWorldState | PanelAgentLine;
+export type PanelMessage = PanelWorldState | PanelAgentLine | PanelServiceLine;
+export interface PanelServiceLine {
+  readonly type: "service";
+  readonly agentState: "ready" | "needs_config";
+}
 /** Absent fields are omitted from the object, never set to null/undefined keys. */
 export function panelWorldState(state: WorldState): PanelWorldState | null;
 export function panelAgentLine(input: {
@@ -265,6 +290,10 @@ export function panelAgentLine(input: {
   readonly text?: string;
   readonly at?: string;
 }): PanelAgentLine;
+/** The brain's standing state, replayed to each panel on connect. */
+export function panelServiceLine(input: {
+  readonly agentState: "ready" | "needs_config";
+}): PanelServiceLine;
 /** One line, newline-terminated. The only sanctioned way to frame a message. */
 export function panelLine(message: PanelMessage): string;
 
@@ -289,6 +318,8 @@ export function startPanelServer(options: {
   readonly onControl: (op: "pause" | "resume") => void;
   readonly onAnswer?: (promptId: number, answer: "approved" | "declined") => void;
   readonly onDiagnostic?: (line: string) => void;
+  /** Runs once per newly registered client, after it can receive broadcasts. */
+  readonly onConnect?: (clientCount: number) => void;
 }): Promise<PanelServer>;
 
 // src/panel-control.ts

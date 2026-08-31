@@ -3,6 +3,7 @@ import type {
   InlineExtension,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   createPiSession,
   resolveModel,
@@ -11,6 +12,7 @@ import {
   type ModelRuntime,
   type PiSessionHandle,
 } from "./pi-session-factory.js";
+import { modelConfigurationStatus } from "./app-model.js";
 import { sensePromptLines } from "./agent-senses.js";
 import type { ToolSummary } from "./tool-catalog.js";
 import type { WorldState } from "./protocol.js";
@@ -89,6 +91,21 @@ export const createDefaultResidentSession: ResidentSessionFactory = async (spec)
   });
   return adaptHandle(handle);
 };
+
+/**
+ * Cheap pre-flight for the default factory: whether the configured model would
+ * open. Reads the same agent directory and the same model verdict
+ * `createDefaultResidentSession` reads — it predicts the factory's outcome
+ * without starting anything.
+ *
+ * Only the default Pi-backed factory needs this probe. An injected session
+ * factory is by definition usable (tests must not depend on the developer
+ * machine's Pi configuration), so callers that inject one pass `true`.
+ */
+export function residentAgentConfigured(): boolean {
+  const status = modelConfigurationStatus(getAgentDir(), resolvePiModel({}).provider);
+  return status.kind === "ready";
+}
 
 /** Adapts a `PiSessionHandle` to the narrowed `ResidentSession` surface. */
 function adaptHandle(handle: PiSessionHandle): ResidentSession {

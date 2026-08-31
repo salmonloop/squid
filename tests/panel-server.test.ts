@@ -29,6 +29,10 @@ interface Harness {
   readonly socketPath: string;
   /** Connects a client and collects whole lines it receives. */
   connect(): Promise<TestClient>;
+  /** The wire the onConnect tests announce standing state through. */
+  announce: PanelServer["broadcast"];
+  /** Replaceable so a test can supply its own onConnect hook. */
+  onConnect?: (clientCount: number) => void;
   start(options?: {
     readonly onControl?: (op: "pause" | "resume") => void;
     readonly onAnswer?: (promptId: number, answer: "approved" | "declined") => void;
@@ -59,14 +63,18 @@ async function withHarness(body: (harness: Harness) => Promise<void>): Promise<v
 
   const harness: Harness = {
     socketPath,
+    announce: () => undefined,
     start: async (options = {}) => {
       const server = await startPanelServer({
         socketPath: options.socketPath ?? socketPath,
         onControl: options.onControl ?? (() => undefined),
         ...(options.onAnswer === undefined ? {} : { onAnswer: options.onAnswer }),
         ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
+        ...(harness.onConnect === undefined ? {} : { onConnect: harness.onConnect }),
       });
       servers.push(server);
+      // Late-bound so a test can set `harness.onConnect` between start calls.
+      harness.announce = server.broadcast;
       return server;
     },
     connect: async () => {
@@ -633,5 +641,48 @@ describe.skipIf(process.platform !== "win32")("startPanelServer named pipe", () 
     } finally {
       await first.close();
     }
+  });
+});
+
+describe("startPanelServer onConnect", () => {
+  it("delivers standing state to a client that connects after the server started", async () => {
+    // The reason the hook exists: broadcast is a one-shot pass over whoever is
+    // registered at that instant, and a panel attaches after the server starts,
+    // every time. The replay inside onConnect is what the late client hears.
+    await withHarness(async (harness) => {
+      harness.onConnect = () => harness.announce(WORLD_LINE);
+      await harness.start();
+
+      const client = await harness.connect();
+      await client.waitFor(1);
+      expect(JSON.parse(client.lines[0] ?? "")).toEqual(WORLD_LINE);
+      client.close();
+    });
+  });
+
+  it("runs once per connect, and only after that client is registered", async () => {
+    await withHarness(async (harness) => {
+      const connects: number[] = [];
+      harness.onConnect = (count) => {
+        // `count` proves registration happened first: the hook runs with the
+        // new client already in the set, so a broadcast inside it reaches it.
+        connects.push(count);
+        harness.announce(WORLD_LINE);
+      };
+      const server = await harness.start();
+
+      const first = await harness.connect();
+      await first.waitFor(1);
+      const second = await harness.connect();
+      await second.waitFor(1);
+
+      expect(connects).toEqual([1, 2]);
+      expect(JSON.parse(first.lines[0] ?? "")).toEqual(WORLD_LINE);
+      // Each client's first line is the replay it triggered itself; the second
+      // client never sees the first client's replay.
+      expect(JSON.parse(second.lines[0] ?? "")).toEqual(WORLD_LINE);
+      first.close();
+      second.close();
+    });
   });
 });

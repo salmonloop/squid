@@ -76,6 +76,14 @@ export interface PanelServerOptions {
   readonly onControl: (op: "pause" | "resume") => void;
   readonly onAnswer?: (promptId: number, answer: "approved" | "declined") => void;
   readonly onDiagnostic?: (line: string) => void;
+  /**
+   * Runs once per newly registered client, after it can receive broadcasts.
+   * Standing state the panel must know from its first second — the `service`
+   * line — is replayed here, not broadcast once at startup: broadcast reaches
+   * only whoever is registered at that instant, and a panel connects after the
+   * server starts, every time.
+   */
+  readonly onConnect?: (clientCount: number) => void;
 }
 
 /**
@@ -96,7 +104,7 @@ interface Client {
 }
 
 export async function startPanelServer(options: PanelServerOptions): Promise<PanelServer> {
-  const { socketPath, onControl, onAnswer, onDiagnostic } = options;
+  const { socketPath, onControl, onAnswer, onDiagnostic, onConnect } = options;
   const diagnostic = (line: string): void => {
     onDiagnostic?.(line);
   };
@@ -198,6 +206,10 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
       const client: Client = { socket, buffer: "", outbound: "", dropped: false };
       clients.add(client);
       clientOf.set(socket, client);
+      // Registered first, then announced: the hook exists so standing state can
+      // be replayed to the one client that just arrived, and a broadcast inside
+      // it must reach that client.
+      onConnect?.(clients.size);
     },
     data: (socket: Socket<undefined>, chunk: Uint8Array) => {
       const client = clientOf.get(socket);

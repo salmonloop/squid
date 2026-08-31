@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { panelAgentLine, panelLine, panelWorldState } from "../src/panel-view.js";
+import { panelAgentLine, panelLine, panelServiceLine, panelWorldState } from "../src/panel-view.js";
 import { emptyWorldState } from "../src/protocol.js";
 import type { SemanticAction, WorldState } from "../src/protocol.js";
 
@@ -334,5 +334,24 @@ describe("panelLine", () => {
   it("frames a world_state with its type discriminator", () => {
     const state: WorldState = { ...emptyWorldState(), updatedAt: "2026-08-27T10:00:00.000Z" };
     expect(JSON.parse(panelLine(panelWorldState(state)!)).type).toBe("world_state");
+  });
+});
+
+describe("panelServiceLine", () => {
+  it("carries the agent state as a flat object with nothing else", () => {
+    expect(panelServiceLine({ agentState: "needs_config" })).toEqual({
+      type: "service",
+      agentState: "needs_config",
+    });
+    expect(panelServiceLine({ agentState: "ready" })).toEqual({
+      type: "service",
+      agentState: "ready",
+    });
+  });
+
+  it("frames as one newline-terminated line, like every message", () => {
+    const line = panelLine(panelServiceLine({ agentState: "needs_config" }));
+    expect(line.endsWith("\n")).toBe(true);
+    expect(JSON.parse(line).type).toBe("service");
   });
 });

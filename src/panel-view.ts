@@ -38,7 +38,12 @@ export interface PanelAgentLine {
   readonly text?: string;
 }
 
-export type PanelMessage = PanelWorldState | PanelAgentLine;
+export interface PanelServiceLine {
+  readonly type: "service";
+  readonly agentState: "ready" | "needs_config";
+}
+
+export type PanelMessage = PanelWorldState | PanelAgentLine | PanelServiceLine;
 
 /**
  * Projects the world state into the panel's view of it.
@@ -122,8 +127,24 @@ export function panelAgentLine(input: {
 }
 
 /**
- * Frames one message for the wire: a single JSON object, newline-terminated.
+ * The brain's own state line, announced to every panel as it connects.
  *
+ * This is not an event — it is a standing fact, and the wire treats it like one:
+ * the session re-sends it on each connect rather than broadcasting it once at
+ * startup, because broadcast is a one-shot pass over whoever is registered at
+ * that moment and the panel connects after the session, not before. A panel that
+ * never hears this line infers nothing; `agentState: "needs_config"` is the
+ * signal that the session is running headless-配置-less and the settings form is
+ * the way out.
+ */
+export function panelServiceLine(input: {
+  readonly agentState: "ready" | "needs_config";
+}): PanelServiceLine {
+  return { type: "service", agentState: input.agentState };
+}
+
+/**
+ * Frames one message for the wire: a single JSON object, newline-terminated.
  * The only sanctioned framing. `JSON.stringify` drops `undefined`-valued keys,
  * but the builders above never create them in the first place — the omission is
  * intentional and tested, not a side effect of the serializer we happen to use.

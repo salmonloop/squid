@@ -8,6 +8,7 @@ import { resolveAgentTurnTimeout } from "./resolve-agent-turn-timeout.js";
 import { HOUR_MS, resolveRetention } from "./resolve-retention.js";
 import {
   createResidentAgent,
+  residentAgentConfigured,
   residentAgentSystemPrompt,
   type ResidentAgent,
   type ResidentSessionFactory,
@@ -20,7 +21,7 @@ import { sqliteWatchExclusions } from "./sqlite-event-store.js";
 import type { ToolSummary } from "./tool-catalog.js";
 import { resolvePanel } from "./resolve-panel.js";
 import { startPanelServer, type PanelServer } from "./panel-server.js";
-import { panelAgentLine, panelWorldState } from "./panel-view.js";
+import { panelAgentLine, panelServiceLine, panelWorldState } from "./panel-view.js";
 import { appendGateCommand } from "./panel-control.js";
 
 /**
@@ -94,14 +95,26 @@ export interface WatchSessionOptions {
    * it and gets the Pi-backed session.
    */
   readonly createAgentSession?: ResidentSessionFactory;
+  /**
+   * The pre-checked model verdict, computed by the caller before launching.
+   * Default: an injected session factory counts as configured (a test must not
+   * depend on the developer machine's Pi configuration); the default factory's
+   * verdict comes from `residentAgentConfigured`, consulted only when a panel is
+   * actually mounted.
+   */
+  readonly agentConfigured?: boolean;
 }
 
 export interface WatchSession {
   /** Startup summary, already merged with the caller's fields. */
   readonly banner: Record<string, string | number | boolean | null>;
   readonly runtime: WatchRuntime;
-  /** The live agent. Held so a caller can prompt or inspect it directly. */
-  readonly agent: ResidentAgent;
+  /**
+   * The live agent, when one is running. Absent (`undefined`) in headless
+   * mode: the model is not configured and a panel is mounted, so the session
+   * captures and projects without thinking — the settings form is the way out.
+   */
+  readonly agent: ResidentAgent | undefined;
   /** Every source that started, in start order. */
   readonly sourceIds: readonly string[];
   /** Drains sources, settles the agent, then closes sinks. Idempotent. */
@@ -176,29 +189,51 @@ export async function startWatchSession(
   /**
    * The agent is created after the store is open and before any source starts.
    *
-   * Eagerly, so a missing model configuration fails startup rather than on the
-   * first observation — by which point sources are running and events are being
-   * captured into a session no agent will ever read. A failure here disposes the
-   * store it already opened; a half-created database is exactly what the
-   * pre-sink resolution order exists to prevent.
+   * Three states, not two:
+   *
+   *   ready        — the model is configured; the agent starts eagerly, so a
+   *                  broken setup fails here rather than on the first
+   *                  observation, after sources are already capturing.
+   *   needs_config — the model is not configured **and a panel is mounted** to
+   *                  be told: the session starts with no agent at all and says
+   *                  so on the `service` wire message below. Capture, the
+   *                  projection, and the panel run exactly as always; only the
+   *                  thinking waits. A headless run cannot take this state —
+   *                  there would be nothing to repair the configuration with,
+   *                  so the honest answer stays a startup failure.
+   *   failed       — the creation itself threw: the error is the configError
+   *                  and everything built above is disposed. Unchanged.
+   *
+   * The probe is consulted only behind `panel.enabled`: without a window there
+   * is no needs_config to enter, so there is no reason to read Pi's files. A
+   * caller that injected its own session factory has answered the question by
+   * that fact — the factory is the authority on whether a session can open —
+   * so the probe guards only the default Pi-backed one.
    */
-  let agent: ResidentAgent;
-  try {
-    agent = await createResidentAgent({
-      systemPrompt: residentAgentSystemPrompt(),
-      cwd: options.workingDirectory,
-      tools: options.tools ?? [],
-      // The agent queries its own sensory record through Pi's tool runtime:
-      // one custom tool per store-backed query, executed in Pi's sandbox and
-      // recorded in the session history like every other action.
-      customTools: agentCustomTools(watch.store),
-      ...(options.createAgentSession !== undefined
-        ? { createSession: options.createAgentSession }
-        : {}),
-    });
-  } catch (error) {
-    await watch.dispose();
-    return { configError: `The resident agent could not start: ${describeErrorForAudit(error)}` };
+  const agentConfigured = (): boolean =>
+    options.agentConfigured
+    ?? (options.createAgentSession !== undefined || residentAgentConfigured());
+  const needsConfig = panel.enabled && !agentConfigured();
+
+  let agent: ResidentAgent | undefined;
+  if (!needsConfig) {
+    try {
+      agent = await createResidentAgent({
+        systemPrompt: residentAgentSystemPrompt(),
+        cwd: options.workingDirectory,
+        tools: options.tools ?? [],
+        // The agent queries its own sensory record through Pi's tool runtime:
+        // one custom tool per store-backed query, executed in Pi's sandbox and
+        // recorded in the session history like every other action.
+        customTools: agentCustomTools(watch.store),
+        ...(options.createAgentSession !== undefined
+          ? { createSession: options.createAgentSession }
+          : {}),
+      });
+    } catch (error) {
+      await watch.dispose();
+      return { configError: `The resident agent could not start: ${describeErrorForAudit(error)}` };
+    }
   }
 
   /**
@@ -229,9 +264,19 @@ export async function startWatchSession(
           });
         },
         onDiagnostic: (line) => logError(line),
+        onConnect: () => {
+          // Standing state, replayed per client rather than broadcast once:
+          // broadcast reaches only whoever is registered at that instant, and
+          // a panel attaches after the session — often seconds after, and in
+          // the panel-first flow always after. Every connect gets the current
+          // truth, so the panel never infers readiness from silence.
+          panelServer?.broadcast(
+            panelServiceLine({ agentState: agent === undefined ? "needs_config" : "ready" }),
+          );
+        },
       });
     } catch (error) {
-      agent.dispose();
+      agent?.dispose();
       await watch.dispose();
       return { configError: `The panel could not start: ${describeErrorForAudit(error)}` };
     }
@@ -252,10 +297,14 @@ export async function startWatchSession(
   let turnTail: Promise<void> = Promise.resolve();
 
   const promptAgent = (): void => {
+    // A captured `let` does not narrow inside the closures below, so the guard
+    // lands once here and `live` carries the certainty down into the turn.
+    if (agent === undefined) return;
+    const live = agent;
     const runTurn = async (): Promise<void> => {
-      await agent.prompt(AGENT_TURN_PROMPT);
-      await agent.waitForIdle();
-      const reply = agent.getLastAssistantText();
+      await live.prompt(AGENT_TURN_PROMPT);
+      await live.waitForIdle();
+      const reply = live.getLastAssistantText();
       // Reported, not interpreted. Whether the agent acted, and how, is in its
       // session history; this line is the operator's window into a loop that is
       // otherwise silent.
@@ -286,10 +335,10 @@ export async function startWatchSession(
             // while the session is still unwinding is refused outright, so
             // the abort is awaited — under a grace bound, because a session
             // that will not settle must not become a new way to wedge.
-            void agent.abort().catch(() => undefined);
+            void live.abort().catch(() => undefined);
             let grace: ReturnType<typeof setTimeout> | undefined;
             await Promise.race([
-              agent.waitForIdle().catch(() => undefined),
+              live.waitForIdle().catch(() => undefined),
               new Promise<void>((resolve) => {
                 grace = setTimeout(resolve, ABORT_GRACE_MS);
               }),
@@ -355,7 +404,7 @@ export async function startWatchSession(
   if (sources.length === 0) {
     if (panelServer !== undefined) await panelServer.close();
     await drainAgentTurns();
-    agent.dispose();
+    agent?.dispose();
     await watch.dispose();
     return { configError: "A watch session needs at least one activity source." };
   }
@@ -385,7 +434,10 @@ export async function startWatchSession(
     // A duplicate changed nothing about the world, so there is nothing new for
     // the agent to see and no reason to spend a turn on it.
     if (ingested.ingest.disposition === "duplicate") return;
-    await agent.observe(ingested.ingest.state);
+    // Headless mode has no agent tail: nothing to observe into, nothing to
+    // prompt. The projection below still runs — the world keeps being seen;
+    // only the thinking about it waits.
+    if (agent !== undefined) await agent.observe(ingested.ingest.state);
     // The panel reads the same projection the senses do — one view of the world,
     // two windows onto it. `panelWorldState` returns null when there is nothing
     // to report, and a null is skipped rather than sent: the wire format has no
@@ -413,7 +465,7 @@ export async function startWatchSession(
     // in flight on this path rather than only in theory.
     if (panelServer !== undefined) await panelServer.close();
     await drainAgentTurns();
-    agent.dispose();
+    agent?.dispose();
     await watch.dispose();
     return { configError: `A source failed to start: ${describeErrorForAudit(error)}` };
   }
@@ -424,7 +476,7 @@ export async function startWatchSession(
       ...(options.banner ?? {}),
       sources: sources.map((source) => source.id).join(","),
       store: watch.databasePath ?? "memory",
-      agent: "resident",
+      agent: agent === undefined ? "needs_config" : "resident",
       panel: panel.enabled ? panel.socketPath : "off",
       control: gate.enabled ? gate.readerKind : "off",
       retention: retention.enabled ? retention.hours : "off",
@@ -451,7 +503,7 @@ export async function startWatchSession(
       // somewhere to land.
       await drainAgentTurns();
       if (panelServer !== undefined) await panelServer.close();
-      agent.dispose();
+      agent?.dispose();
       await watch.dispose();
     },
   };
