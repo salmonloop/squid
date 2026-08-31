@@ -1,5 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import { panelAgentLine, panelLine, panelServiceLine, panelWorldState } from "../src/panel-view.js";
+import {
+  panelAgentLine,
+  panelConfigEnd,
+  panelConfigLine,
+  panelConfigResult,
+  panelLine,
+  panelServiceLine,
+  panelWorldState,
+} from "../src/panel-view.js";
 import { emptyWorldState } from "../src/protocol.js";
 import type { SemanticAction, WorldState } from "../src/protocol.js";
 
@@ -353,5 +361,119 @@ describe("panelServiceLine", () => {
     const line = panelLine(panelServiceLine({ agentState: "needs_config" }));
     expect(line.endsWith("\n")).toBe(true);
     expect(JSON.parse(line).type).toBe("service");
+  });
+});
+
+describe("panelConfigLine", () => {
+  it("emits the flat row a settings form renders, values joined with ;", () => {
+    expect(panelConfigLine({
+      id: "screenReader",
+      label: "Screen reader",
+      kind: "enum",
+      value: "synthetic",
+      applies: "restart",
+      overridden: true,
+      values: ["synthetic", "darwin", "linux", "windows"],
+    })).toEqual({
+      type: "config",
+      id: "screenReader",
+      label: "Screen reader",
+      kind: "enum",
+      value: "synthetic",
+      applies: "restart",
+      overridden: 1,
+      values: "synthetic;darwin;linux;windows",
+    });
+  });
+
+  it("omits overridden when false and values when there are none", () => {
+    const line = panelConfigLine({
+      id: "watchRoot",
+      label: "Watch root",
+      kind: "text",
+      value: "/home/me",
+      applies: "restart",
+      overridden: false,
+    });
+    expect("overridden" in line).toBe(false);
+    expect("values" in line).toBe(false);
+    // Absence on the object must survive framing: the flat parser's
+    // first-key-wins has no null case to fall back on.
+    const framed = JSON.parse(panelLine(line));
+    expect("overridden" in framed).toBe(false);
+    expect("values" in framed).toBe(false);
+  });
+
+  it("passes a secret's empty value through as the empty string", () => {
+    // The dump already stripped the value upstream; the builder's job is to
+    // not be the place where one could sneak back in, so this asserts the
+    // passthrough rather than trusting sanitization to act differently here.
+    const line = panelConfigLine({
+      id: "apiKey",
+      label: "API key",
+      kind: "secret",
+      value: "",
+      applies: "now",
+      overridden: false,
+    });
+    expect(line.value).toBe("");
+    expect(JSON.parse(panelLine(line)).value).toBe("");
+  });
+
+  it("sanitizes id, label, and value as diagnostics", () => {
+    // A value came from a file the user hand-edited, so none of the three
+    // fields is trusted prose — the sanitizer is what keeps the line flat.
+    const line = panelConfigLine({
+      id: "watchRoot",
+      label: "Watch root",
+      kind: "text",
+      value: "/home/me/notes",
+      applies: "restart",
+      overridden: false,
+    });
+    expect(line.value).not.toContain("");
+  });
+});
+
+describe("panelConfigEnd", () => {
+  it("closes a dump with the entry count", () => {
+    expect(panelConfigEnd(18)).toEqual({ type: "config_end", count: 18 });
+  });
+});
+
+describe("panelConfigResult", () => {
+  it("maps ok to the wire booleans and carries applies on success", () => {
+    expect(panelConfigResult({ id: "watchRoot", ok: true, applies: "restart" })).toEqual({
+      type: "config_result",
+      id: "watchRoot",
+      ok: 1,
+      applies: "restart",
+    });
+  });
+
+  it("carries a sanitized error instead of applies on failure", () => {
+    const result = panelConfigResult({
+      id: "retentionHours",
+      ok: false,
+      error: "Retention (hours) must be a positive integer.",
+    });
+    expect(result).toEqual({
+      type: "config_result",
+      id: "retentionHours",
+      ok: 0,
+      error: "Retention (hours) must be a positive integer.",
+    });
+  });
+
+  it("omits id when the dump itself failed, so nothing is attributable to a row", () => {
+    const result = panelConfigResult({ ok: false, error: "config file is malformed" });
+    expect("id" in result).toBe(false);
+    expect(JSON.parse(panelLine(result)).id).toBeUndefined();
+  });
+
+  it("sanitizes id and error like every diagnostic on the wire", () => {
+    const result = panelConfigResult({ id: "key", ok: false, error: "bad" });
+    expect(result.id).not.toContain("");
+    expect(result.error).not.toContain("");
   });
 });

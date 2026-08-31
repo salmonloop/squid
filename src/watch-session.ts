@@ -6,6 +6,15 @@ import { CaptureGateActivitySource } from "./capture-gate-source.js";
 import { resolveCaptureGate } from "./resolve-capture-gate.js";
 import { resolveAgentTurnTimeout } from "./resolve-agent-turn-timeout.js";
 import { HOUR_MS, resolveRetention } from "./resolve-retention.js";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { resolvePiModel } from "./pi-session-factory.js";
+import {
+  DEFAULT_BASE_URL,
+  applyConfigSet,
+  configDumpEntries,
+  isModelConfigKey,
+  type ConfigServiceOptions,
+} from "./config-service.js";
 import {
   createResidentAgent,
   residentAgentConfigured,
@@ -14,14 +23,21 @@ import {
   type ResidentSessionFactory,
 } from "./resident-agent.js";
 import type { ActivitySource, ActivitySourceDiagnostic } from "./activity-source.js";
-import type { ActivityEvent } from "./protocol.js";
+import type { ActivityEvent, WorldState } from "./protocol.js";
 import type { PredictionRuntimeIngestResult } from "./prediction-runtime.js";
 import { runRetentionPrune, type RetentionPruneResult } from "./retention-prune.js";
 import { sqliteWatchExclusions } from "./sqlite-event-store.js";
 import type { ToolSummary } from "./tool-catalog.js";
 import { resolvePanel } from "./resolve-panel.js";
 import { startPanelServer, type PanelServer } from "./panel-server.js";
-import { panelAgentLine, panelServiceLine, panelWorldState } from "./panel-view.js";
+import {
+  panelAgentLine,
+  panelConfigEnd,
+  panelConfigLine,
+  panelConfigResult,
+  panelServiceLine,
+  panelWorldState,
+} from "./panel-view.js";
 import { appendGateCommand } from "./panel-control.js";
 
 /**
@@ -103,6 +119,26 @@ export interface WatchSessionOptions {
    * actually mounted.
    */
   readonly agentConfigured?: boolean;
+  /**
+   * Where the Squid config file lives. Settings sets and dumps go through it;
+   * undefined means a run with no config file, where file-backed sets refuse.
+   */
+  readonly configPath?: string;
+  /**
+   * Pi's agent directory and the model fallbacks, injected in tests so no suite
+   * reads the developer machine's Pi files. Production omits all three and gets
+   * Pi's own defaults.
+   */
+  readonly agentDir?: string;
+  readonly modelProvider?: string;
+  readonly defaultModelId?: string;
+  readonly defaultBaseUrl?: string;
+  /**
+   * What a requested restart does once the session has stopped. Production
+   * exits 3 — the supervisor's signal to respawn with the new configuration —
+   * and tests inject a spy instead of ending the process.
+   */
+  readonly restartExit?: () => void;
 }
 
 export interface WatchSession {
@@ -131,6 +167,10 @@ export async function startWatchSession(
   const env = options.env ?? process.env;
   const log = options.log ?? ((line: string) => console.log(line));
   const logError = options.logError ?? ((line: string) => console.error(line));
+  // Exit 3 is the supervisor's contract: "I stopped cleanly because you asked;
+  // bring me back with the configuration as it now stands." Exit 2 stays the
+  // terminal code for a config error, so a launcher can tell the two apart.
+  const restartExit = options.restartExit ?? (() => process.exit(3));
 
   // The capture gate resolves with the other capabilities, before any sink
   // opens: a typo in SQUID_CONTROL must fail startup rather than silently
@@ -215,26 +255,86 @@ export async function startWatchSession(
     ?? (options.createAgentSession !== undefined || residentAgentConfigured());
   const needsConfig = panel.enabled && !agentConfigured();
 
+  /**
+   * The settings service the panel talks to. Built once, after the env is
+   * resolved and before the panel server wires its hooks; every read and write
+   * funnels through it so the two stores (Squid file, Pi's own files) stay
+   * this layer's private detail.
+   */
+  const configService: ConfigServiceOptions = {
+    configPath: options.configPath,
+    env,
+    agentDir: options.agentDir ?? getAgentDir(),
+    provider: options.modelProvider ?? resolvePiModel({}).provider,
+    defaultModelId: options.defaultModelId ?? resolvePiModel({}).modelId,
+    defaultBaseUrl: options.defaultBaseUrl ?? DEFAULT_BASE_URL,
+    agentLive: () => agent !== undefined,
+  };
+
+  /**
+   * Builds the agent. Extracted from the eager path so the same recipe serves
+   * needs_config recovery: a panel set saving the missing model configuration
+   * starts the agent in-session rather than demanding a process restart.
+   */
+  const buildAgent = async (): Promise<ResidentAgent> =>
+    createResidentAgent({
+      systemPrompt: residentAgentSystemPrompt(),
+      cwd: options.workingDirectory,
+      tools: options.tools ?? [],
+      // The agent queries its own sensory record through Pi's tool runtime:
+      // one custom tool per store-backed query, executed in Pi's sandbox and
+      // recorded in the session history like every other action.
+      customTools: agentCustomTools(watch.store),
+      ...(options.createAgentSession !== undefined
+        ? { createSession: options.createAgentSession }
+        : {}),
+    });
+
   let agent: ResidentAgent | undefined;
   if (!needsConfig) {
     try {
-      agent = await createResidentAgent({
-        systemPrompt: residentAgentSystemPrompt(),
-        cwd: options.workingDirectory,
-        tools: options.tools ?? [],
-        // The agent queries its own sensory record through Pi's tool runtime:
-        // one custom tool per store-backed query, executed in Pi's sandbox and
-        // recorded in the session history like every other action.
-        customTools: agentCustomTools(watch.store),
-        ...(options.createAgentSession !== undefined
-          ? { createSession: options.createAgentSession }
-          : {}),
-      });
+      agent = await buildAgent();
     } catch (error) {
       await watch.dispose();
       return { configError: `The resident agent could not start: ${describeErrorForAudit(error)}` };
     }
   }
+
+  /**
+   * Starts the agent after a settings set un-blocked it. Guarded so two rapid
+   * sets — or a set racing the startup path — cannot build two agents on one
+   * store.
+   *
+   * Failure here is reported, not fatal: the session already runs, its sources
+   * already capture, and the store already holds history. The agent line says
+   * the start failed and the service line keeps saying needs_config; the panel
+   * stays mounted and the user can fix the value and try again. This is the
+   * honest counterpart to the startup path, where an agent that cannot start
+   * still refuses the whole session because nothing else exists yet.
+   */
+  let agentStarting = false;
+  let lastState: WorldState | null = null;
+  const tryStartAgent = (): void => {
+    if (agent !== undefined || agentStarting) return;
+    agentStarting = true;
+    void (async () => {
+      try {
+        const created = await buildAgent();
+        agent = created;
+        // The world did not pause while the agent was being built: the newest
+        // projection is replayed so its first thought is about now, not about
+        // the moment the session started.
+        if (lastState !== null) await created.observe(lastState);
+        panelServer?.broadcast(panelServiceLine({ agentState: "ready" }));
+        log(JSON.stringify({ agent: "resident", recovered: "config_set" }));
+      } catch (error) {
+        logError(JSON.stringify({ agentStartError: describeErrorForAudit(error) }));
+        panelServer?.broadcast(panelAgentLine({ status: "failed", text: describeErrorForAudit(error) }));
+      } finally {
+        agentStarting = false;
+      }
+    })();
+  };
 
   /**
    * The panel starts after the agent and before any source, so an observation
@@ -248,6 +348,13 @@ export async function startWatchSession(
    * event like every other gate change. With the gate off there is nothing to
    * append to and the press is answered with a diagnostic, not silence.
    */
+  /**
+   * Held in a mutable ref because the hooks below are wired before the session
+   * object exists — a restart arriving in that window must find "no session
+   * yet", not a stale closure over undefined.
+   */
+  const sessionRef: { session: WatchSession | undefined } = { session: undefined };
+
   let panelServer: PanelServer | undefined;
   if (panel.enabled) {
     const commandPath = env.SQUID_CONTROL_FIFO;
@@ -264,6 +371,61 @@ export async function startWatchSession(
           });
         },
         onDiagnostic: (line) => logError(line),
+        onConfigGet: () => {
+          // The dump is re-read every time, so what the panel shows reflects
+          // sets that landed after this process started — there is no cache to
+          // go stale.
+          const dump = configDumpEntries(configService);
+          if (!dump.ok) {
+            panelServer?.broadcast(panelConfigResult({ ok: false, error: dump.error }));
+            return;
+          }
+          for (const entry of dump.entries) {
+            panelServer?.broadcast(panelConfigLine(entry));
+          }
+          panelServer?.broadcast(panelConfigEnd(dump.entries.length));
+        },
+        onConfigSet: (id, value) => {
+          const outcome = applyConfigSet(configService, id, value);
+          panelServer?.broadcast(
+            panelConfigResult({
+              id,
+              ok: outcome.ok,
+              ...(outcome.ok ? { applies: outcome.applies } : { error: outcome.error }),
+            }),
+          );
+          // Saving the missing model configuration is the way out of
+          // needs_config: the agent starts in-session, immediately, on the
+          // files just written. The result above already told the panel the
+          // set landed; this is what makes its "applies: now" true.
+          if (outcome.ok && isModelConfigKey(id) && agent === undefined) {
+            tryStartAgent();
+          }
+        },
+        onServiceControl: (op) => {
+          // Only a supervised run may restart: the supervisor is what respawns
+          // the process, and an unsupervised exit would look like a crash to
+          // whoever started it by hand. Refused with a diagnostic, not silence.
+          if (env.SQUID_SUPERVISED !== "1") {
+            logError(JSON.stringify({ panelControl: op, error: "Restart requires a supervised run (SQUID_SUPERVISED=1)." }));
+            return;
+          }
+          if (sessionRef.session === undefined) {
+            logError(JSON.stringify({ panelControl: op, error: "The session is still starting." }));
+            return;
+          }
+          // Stop in the ordinary order — sources, turns, panel, agent, store —
+          // then exit with the code the supervisor reads as "respawn me". The
+          // exit code, not a callback, is the handoff: this process cannot
+          // start its own replacement.
+          void sessionRef.session.stop().then(
+            () => restartExit(),
+            (error: unknown) => {
+              logError(JSON.stringify({ restartStopError: describeErrorForAudit(error) }));
+              restartExit();
+            },
+          );
+        },
         onConnect: () => {
           // Standing state, replayed per client rather than broadcast once:
           // broadcast reaches only whoever is registered at that instant, and
@@ -431,6 +593,9 @@ export async function startWatchSession(
       readonly ingest: NonNullable<PredictionRuntimeIngestResult["ingest"]>;
     };
     log(JSON.stringify(options.describeEvent(event, ingested)));
+    // The newest projection, kept for needs_config recovery: an agent started
+    // later observes this instead of waking up blind to the world it missed.
+    lastState = ingested.ingest.state;
     // A duplicate changed nothing about the world, so there is nothing new for
     // the agent to see and no reason to spend a turn on it.
     if (ingested.ingest.disposition === "duplicate") return;
@@ -507,6 +672,9 @@ export async function startWatchSession(
       await watch.dispose();
     },
   };
+  // The restart hook reads this: the session now exists, so a restart that
+  // lands from here on stops the real thing instead of being told "starting".
+  sessionRef.session = session;
   return { session };
 }
 

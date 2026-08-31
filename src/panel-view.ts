@@ -43,7 +43,55 @@ export interface PanelServiceLine {
   readonly agentState: "ready" | "needs_config";
 }
 
-export type PanelMessage = PanelWorldState | PanelAgentLine | PanelServiceLine;
+/** The kinds a settings form can render; `secret` renders masked and never echoes. */
+export type PanelConfigKind = "text" | "int" | "enum" | "secret";
+
+/**
+ * One settings entry as the form needs it, structurally what `config-service`
+ * dumps. Declared here rather than imported so this module keeps its two
+ * dependencies (sanitizer, projection type) and stays pure.
+ */
+export interface PanelConfigEntryInput {
+  readonly id: string;
+  readonly label: string;
+  readonly kind: PanelConfigKind;
+  readonly value: string;
+  readonly applies: "now" | "restart";
+  readonly overridden: boolean;
+  readonly values?: readonly string[];
+}
+
+export interface PanelConfigLine {
+  readonly type: "config";
+  readonly id: string;
+  readonly label: string;
+  readonly kind: PanelConfigKind;
+  readonly value: string;
+  readonly applies: "now" | "restart";
+  readonly overridden?: 0 | 1;
+  readonly values?: string;
+}
+
+export interface PanelConfigEnd {
+  readonly type: "config_end";
+  readonly count: number;
+}
+
+export interface PanelConfigResult {
+  readonly type: "config_result";
+  readonly id?: string;
+  readonly ok: 0 | 1;
+  readonly applies?: "now" | "restart";
+  readonly error?: string;
+}
+
+export type PanelMessage =
+  | PanelWorldState
+  | PanelAgentLine
+  | PanelServiceLine
+  | PanelConfigLine
+  | PanelConfigEnd
+  | PanelConfigResult;
 
 /**
  * Projects the world state into the panel's view of it.
@@ -141,6 +189,55 @@ export function panelServiceLine(input: {
   readonly agentState: "ready" | "needs_config";
 }): PanelServiceLine {
   return { type: "service", agentState: input.agentState };
+}
+
+/**
+ * One settings row for the form. Sanitizes id, label, and value as diagnostics,
+ * which is what makes this line wire-legal even when the value came from a file
+ * the user hand-edited. The secret's value is already empty upstream — the dump
+ * structurally never carries one — so sanitizing it is a no-op kept for
+ * uniformity: one rule for every value that rides the wire.
+ *
+ * `overridden` is the env-wins disclosure, sent only when true so the flat line
+ * stays minimal. `values` (enum choices) joins with `;` like every list here.
+ */
+export function panelConfigLine(entry: PanelConfigEntryInput): PanelConfigLine {
+  return {
+    type: "config",
+    id: sanitizeAuditText(entry.id, "diagnostic").text,
+    label: sanitizeAuditText(entry.label, "diagnostic").text,
+    kind: entry.kind,
+    value: sanitizeAuditText(entry.value, "diagnostic").text,
+    applies: entry.applies,
+    ...(entry.overridden ? { overridden: 1 } : {}),
+    ...(entry.values === undefined ? {} : { values: entry.values.join(";") }),
+  };
+}
+
+/** Closes a dump: the count lets the panel size its list before rendering. */
+export function panelConfigEnd(count: number): PanelConfigEnd {
+  return { type: "config_end", count };
+}
+
+/**
+ * The verdict on one set — or on the dump itself when `id` is omitted. `error`
+ * is prose for the panel's status area, sanitized here like every other
+ * diagnostic, so a filesystem refusal quoting a path cannot smuggle control
+ * characters or a credential onto the wire.
+ */
+export function panelConfigResult(result: {
+  readonly id?: string;
+  readonly ok: boolean;
+  readonly applies?: "now" | "restart";
+  readonly error?: string;
+}): PanelConfigResult {
+  return {
+    type: "config_result",
+    ...(result.id === undefined ? {} : { id: sanitizeAuditText(result.id, "diagnostic").text }),
+    ok: result.ok ? 1 : 0,
+    ...(result.applies === undefined ? {} : { applies: result.applies }),
+    ...(result.error === undefined ? {} : { error: sanitizeAuditText(result.error, "diagnostic").text }),
+  };
 }
 
 /**

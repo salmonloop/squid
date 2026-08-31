@@ -206,6 +206,64 @@ a UI for it.
 No user-derived text rides this line, so it carries no sanitization — the only
 fields are fixed-vocabulary strings.
 
+### `config`
+
+One settings row per message, sent as the reply to `config_get` (a dump).
+The schema rides the wire — `label`/`kind`/`values` come from the TS side's
+one settings table — so the panel hardcodes no key and stays a dumb client
+across settings changes.
+
+```jsonc
+{"type":"config","id":"watchRoot","label":"Watch root","kind":"text","value":"/home/me","applies":"restart","overridden":1}
+{"type":"config","id":"screenReader","label":"Screen reader","kind":"enum","value":"linux","applies":"restart","values":"synthetic;linux;windows"}
+{"type":"config","id":"apiKey","label":"API key","kind":"secret","value":"","applies":"restart"}
+{"type":"config_end","count":18}
+```
+
+| field | type | required | notes |
+|---|---|---|---|
+| `type` | `"config"` | yes | |
+| `id` | string | yes | the key a `config_set` echoes back |
+| `label` | string | yes | what the form shows, **sanitized** |
+| `kind` | `"text"` \| `"int"` \| `"enum"` \| `"secret"` | yes | |
+| `value` | string | yes | the file's value; `""` means unset. **A `secret` kind is always `""`.** |
+| `applies` | `"now"` \| `"restart"` | yes | when a saved value takes effect |
+| `overridden` | `0` \| `1` | no | present only when an env var is governing this run, so the file value shown is not the live one |
+| `values` | string | no | `;`-joined enum choices, `enum` kind only |
+
+The dump shows the **file** value even when overridden: the form edits the
+file, and `overridden: 1` is the disclosure that the live run disagrees.
+
+**The secret rule is structural, not a convention.** A credential never rides
+the wire in either direction more than once: the dump reports a secret's value
+as the empty string, and the only message that ever carries a real key is the
+panel's `config_set` for it — which is never echoed back, never logged, and
+never quoted in a diagnostic, on either side. There is no "show me the stored
+key" operation at all.
+
+### `config_result`
+
+The verdict on one `config_set` — or, with `id` omitted, on a failed dump.
+
+```jsonc
+{"type":"config_result","id":"watchRoot","ok":1,"applies":"restart"}
+{"type":"config_result","id":"retentionHours","ok":0,"error":"Retention (hours): must be a positive integer."}
+{"type":"config_result","ok":0,"error":"The config file at … is not valid JSON: …"}
+```
+
+| field | type | required | notes |
+|---|---|---|---|
+| `type` | `"config_result"` | yes | |
+| `id` | string | no | the key the set named; omitted for a dump-level failure |
+| `ok` | `0` \| `1` | yes | |
+| `applies` | `"now"` \| `"restart"` | no | present when `ok` is `1` |
+| `error` | string | no | present when `ok` is `0`, **sanitized** — a filesystem refusal quoting a path must not smuggle anything onto the wire |
+
+`applies: "now"` is possible only for a model setting saved while no agent is
+running (the session starts the agent on the spot); a model setting saved while
+the agent is live says `"restart"`, because Pi's session already holds the old
+endpoint, and claiming otherwise would be a lie the panel renders as fact.
+
 ### `prompt` / `cancel`
 
 The confirmation area. No caller produces these today — tool-layer safety is Pi's
@@ -225,11 +283,14 @@ selection must not be able to reach this process at all.
 ```jsonc
 {"type":"control","op":"pause"}
 {"type":"control","op":"resume"}
+{"type":"control","op":"restart"}
+{"type":"config_get"}
+{"type":"config_set","id":"watchRoot","value":"/home/me"}
 {"type":"answer","promptId":1,"answer":"approved"}
 ```
 
-`op` is exactly `pause` or `resume`. `answer` is exactly `approved` or `declined`.
-An unrecognized value is dropped, not guessed at.
+`op` is exactly `pause`, `resume`, or `restart`. `answer` is exactly `approved`
+or `declined`. An unrecognized value is dropped, not guessed at.
 
 **Pause and resume do not change capture state directly.** They append the
 corresponding line to the existing capture-gate command path
@@ -238,6 +299,44 @@ keeps one control path rather than two, and it means a pause still produces a
 `capture_gate_changed` event in the timeline — the trace that distinguishes a
 deliberate gap from an idle machine. A panel that mutated state directly would
 lose that distinction.
+
+**`config_get`** asks for a full settings dump: one `config` line per key, then
+`config_end` with the count. The dump re-reads the config file on every call —
+a set that landed mid-run is visible to the next get.
+
+**`config_set`** writes one key's value. `id` is a non-empty string with no
+control characters; `value` is a string with none either. The transport
+validates only that shape — diagnostics name the key and never quote the
+value, because the one `config_set` that carries a real API key must not be
+able to echo it back through an error line. Everything semantic (which store,
+which rules, what applies when) lives in the TS settings service.
+
+The server's reply is exactly one `config_result` per set. A form with five
+edits sends five messages and sees five verdicts, so every refusal is
+attributable to the field being edited.
+
+## Restart and the process contract
+
+A `control` op of `restart` asks the brain to stop cleanly and be respawned
+with the configuration as it now stands. It is **refused unless the run is
+supervised** (`SQUID_SUPERVISED=1`): the supervisor is what respawns, and an
+unsupervised exit would just be a crash to whoever started the process by
+hand. The refusal is a diagnostic, not silence — and the panel learns nothing
+from the silence either way, which is why the diagnostic is logged on the
+brain's own error stream in this phase.
+
+Exit codes a launcher can tell apart:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | clean shutdown (signal handler) |
+| `1` | shutdown error |
+| `2` | startup refused — a config error, terminal, not worth respawning |
+| `3` | stopped cleanly at a supervisor's request — respawn with the new configuration |
+
+The split matters: a supervisor that respawned a config error would crash-loop
+on a typo, and one that did not respawn a restart would strand the user's
+panel on a dead endpoint.
 
 ## Privacy boundary
 
@@ -278,10 +377,37 @@ export interface PanelAgentLine {
   readonly status: "replied" | "failed";
   readonly text?: string;
 }
-export type PanelMessage = PanelWorldState | PanelAgentLine | PanelServiceLine;
+export type PanelMessage =
+  | PanelWorldState
+  | PanelAgentLine
+  | PanelServiceLine
+  | PanelConfigLine
+  | PanelConfigEnd
+  | PanelConfigResult;
 export interface PanelServiceLine {
   readonly type: "service";
   readonly agentState: "ready" | "needs_config";
+}
+export interface PanelConfigLine {
+  readonly type: "config";
+  readonly id: string;
+  readonly label: string;
+  readonly kind: "text" | "int" | "enum" | "secret";
+  readonly value: string;          // secret kind is always ""
+  readonly applies: "now" | "restart";
+  readonly overridden?: 0 | 1;     // present only when true
+  readonly values?: string;        // ";"-joined, enum only
+}
+export interface PanelConfigEnd {
+  readonly type: "config_end";
+  readonly count: number;
+}
+export interface PanelConfigResult {
+  readonly type: "config_result";
+  readonly id?: string;
+  readonly ok: 0 | 1;
+  readonly applies?: "now" | "restart";
+  readonly error?: string;
 }
 /** Absent fields are omitted from the object, never set to null/undefined keys. */
 export function panelWorldState(state: WorldState): PanelWorldState | null;
@@ -294,6 +420,24 @@ export function panelAgentLine(input: {
 export function panelServiceLine(input: {
   readonly agentState: "ready" | "needs_config";
 }): PanelServiceLine;
+/** One settings row; sanitizes id/label/value, omits overridden when false. */
+export function panelConfigLine(entry: {
+  readonly id: string;
+  readonly label: string;
+  readonly kind: "text" | "int" | "enum" | "secret";
+  readonly value: string;
+  readonly applies: "now" | "restart";
+  readonly overridden: boolean;
+  readonly values?: readonly string[];
+}): PanelConfigLine;
+export function panelConfigEnd(count: number): PanelConfigEnd;
+/** One set's verdict; id omitted means the dump itself failed. */
+export function panelConfigResult(result: {
+  readonly id?: string;
+  readonly ok: boolean;
+  readonly applies?: "now" | "restart";
+  readonly error?: string;
+}): PanelConfigResult;
 /** One line, newline-terminated. The only sanctioned way to frame a message. */
 export function panelLine(message: PanelMessage): string;
 
@@ -316,11 +460,39 @@ export interface PanelServer {
 export function startPanelServer(options: {
   readonly socketPath: string;
   readonly onControl: (op: "pause" | "resume") => void;
+  readonly onServiceControl?: (op: "restart") => void;
   readonly onAnswer?: (promptId: number, answer: "approved" | "declined") => void;
+  readonly onConfigGet?: () => void;
+  readonly onConfigSet?: (id: string, value: string) => void;
   readonly onDiagnostic?: (line: string) => void;
   /** Runs once per newly registered client, after it can receive broadcasts. */
   readonly onConnect?: (clientCount: number) => void;
 }): Promise<PanelServer>;
+
+// src/config-service.ts — the semantics between the panel and the stores.
+// File-backed keys go to the Squid config file; the three model keys go to
+// Pi's own models.json/auth.json. The secret's value never leaves a set.
+export interface ConfigServiceOptions {
+  readonly configPath: string | undefined;
+  readonly env: Record<string, string | undefined>;
+  readonly agentDir: string;
+  readonly provider: string;
+  readonly defaultModelId: string;
+  readonly defaultBaseUrl: string;
+  readonly agentLive: () => boolean;
+}
+export const MODEL_CONFIG_KEYS: readonly {
+  readonly id: "modelBaseUrl" | "modelId" | "apiKey";
+  readonly label: string;
+  readonly kind: "text" | "secret";
+}[];
+export function isModelConfigKey(id: string): boolean;
+export function configDumpEntries(options: ConfigServiceOptions):
+  | { readonly ok: true; readonly entries: readonly ConfigDumpEntry[] }
+  | { readonly ok: false; readonly error: string };
+export function applyConfigSet(options: ConfigServiceOptions, id: string, value: string):
+  | { readonly ok: true; readonly applies: "now" | "restart" }
+  | { readonly ok: false; readonly error: string };
 
 // src/panel-control.ts
 /** Appends one gate command line to the capture-gate command path. */

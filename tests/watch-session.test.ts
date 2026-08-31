@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -174,6 +174,25 @@ async function startSession(options: {
   };
   /** Overrides the model-configuration probe, for the headless-needs-config tests. */
   readonly agentConfigured?: boolean;
+  /**
+   * Overrides the default fake factory, for tests that must count or vary the
+   * builds themselves — the needs_config recovery, say, where the interesting
+   * fact is how many times the factory was ever called.
+   */
+  readonly createAgentSession?: ResidentSessionFactory;
+  /**
+   * Settings-store wiring for the panel's config tests. Every suite that mounts
+   * the panel forwards all of them: without an injected `agentDir` the config
+   * service falls back to Pi's own defaults and the test would read — or, on a
+   * model set, *write* — the developer machine's Pi files.
+   */
+  readonly configPath?: string;
+  readonly agentDir?: string;
+  readonly modelProvider?: string;
+  readonly defaultModelId?: string;
+  readonly defaultBaseUrl?: string;
+  /** The restart handoff; tests inject a spy instead of ending the process. */
+  readonly restartExit?: () => void;
 }) {
   const seenContexts: WatchSourceContext[] = [];
   const agentLog = options.agentLog ?? emptyAgentLog();
@@ -182,8 +201,14 @@ async function startSession(options: {
     env: options.env ?? OFFLINE_ENV,
     log: options.log ?? (() => {}),
     logError: options.logError ?? (() => {}),
-    createAgentSession: fakeAgentFactory(agentLog, options.agentOptions ?? {}),
+    createAgentSession: options.createAgentSession ?? fakeAgentFactory(agentLog, options.agentOptions ?? {}),
     ...(options.agentConfigured === undefined ? {} : { agentConfigured: options.agentConfigured }),
+    ...(options.configPath === undefined ? {} : { configPath: options.configPath }),
+    ...(options.agentDir === undefined ? {} : { agentDir: options.agentDir }),
+    ...(options.modelProvider === undefined ? {} : { modelProvider: options.modelProvider }),
+    ...(options.defaultModelId === undefined ? {} : { defaultModelId: options.defaultModelId }),
+    ...(options.defaultBaseUrl === undefined ? {} : { defaultBaseUrl: options.defaultBaseUrl }),
+    ...(options.restartExit === undefined ? {} : { restartExit: options.restartExit }),
     createSources: async (context) => {
       seenContexts.push(context);
       return options.sources;
@@ -1138,6 +1163,285 @@ describe("the control panel on a watch session", () => {
     expect("configError" in result).toBe(true);
     expect(existsSync(socketPath)).toBe(false);
     await rm(dir, { recursive: true, force: true });
+  });
+
+  /**
+   * The panel-first settings story, end to end on one socket: the panel asks
+   * for the form's contents, sets a value, and the answer names the store it
+   * actually wrote. Both stores live in a temp dir — the Squid config file and
+   * Pi's models.json/auth.json — because only the files on disk prove which
+   * store a set landed in; asserting on return values alone would let a
+   * credential written to the wrong store pass unnoticed.
+   */
+  describe("the panel and the settings stores", () => {
+    const API_KEY = "sk-test-1234567890";
+
+    interface SettingsHarness {
+      readonly dir: string;
+      readonly configPath: string;
+      readonly agentDir: string;
+      readonly diagnostics: string[];
+      readonly restartCalls: number[];
+      readonly session: { stop(): Promise<void> };
+      readonly client: PanelTestClient;
+      readonly close: () => Promise<void>;
+    }
+
+    /**
+     * One session, one panel client, both stores under one temp dir.
+     * `supervised` decides the restart contract; the factory is healthy so a
+     * model set can actually start an agent through it.
+     */
+    const startSettingsSession = async (supervised: boolean): Promise<SettingsHarness> => {
+      const dir = await mkdtemp(join(tmpdir(), "squid-settings-"));
+      const socketPath = panelEndpoint(dir);
+      const diagnostics: string[] = [];
+      const restartCalls: number[] = [];
+      const source = new ScriptedSource("alpha", []);
+      const { result } = await startSession({
+        sources: [source],
+        env: {
+          SQUID_PANEL_SOCKET: socketPath,
+          ...(supervised ? { SQUID_SUPERVISED: "1" } : {}),
+        },
+        configPath: join(dir, "config.json"),
+        agentDir: join(dir, "agent"),
+        modelProvider: "bifrost",
+        defaultModelId: "deepseek-v4-flash",
+        defaultBaseUrl: "https://default.example/v1",
+        restartExit: () => {
+          restartCalls.push(1);
+        },
+        logError: (line) => diagnostics.push(line),
+      });
+      if ("configError" in result) throw new Error(result.configError);
+      const client = new PanelTestClient(socketPath, diagnostics);
+      await client.ready();
+      return {
+        dir,
+        configPath: join(dir, "config.json"),
+        agentDir: join(dir, "agent"),
+        diagnostics,
+        restartCalls,
+        session: result.session,
+        client,
+        close: async () => {
+          await client.close();
+          await result.session.stop();
+          await rm(dir, { recursive: true, force: true });
+        },
+      };
+    };
+
+    /** Waits for the dump to finish and returns the config rows in wire order. */
+    const awaitConfigEnd = async (client: PanelTestClient): Promise<Record<string, unknown>[]> => {
+      const deadline = Date.now() + 2000;
+      for (;;) {
+        const parsed = client.lines.map(parsePanelLine);
+        if (parsed.some((p) => p.type === "config_end")) {
+          return parsed.filter((p) => p.type === "config");
+        }
+        if (Date.now() > deadline) throw new Error("config_get never completed");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    };
+
+    /** Waits for one config_result naming a given id. */
+    const awaitConfigResult = async (
+      client: PanelTestClient,
+      id: string,
+    ): Promise<Record<string, unknown>> => {
+      const deadline = Date.now() + 2000;
+      for (;;) {
+        const found = client.lines
+          .map(parsePanelLine)
+          .find((p) => p.type === "config_result" && p.id === id);
+        if (found !== undefined) return found;
+        if (Date.now() > deadline) throw new Error(`no config_result for ${id}`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    };
+
+    it("answers config_get with the whole form, model rows first, and counts it", async () => {
+      const h = await startSettingsSession(false);
+      try {
+        h.client.send(JSON.stringify({ type: "config_get" }));
+        const configs = await awaitConfigEnd(h.client);
+        // Three model rows lead, then every file-backed row in schema order —
+        // the form IS the dump, so the panel never hardcodes a key name.
+        expect(configs).toHaveLength(18);
+        const baseUrlRow = configs[0];
+        if (baseUrlRow === undefined) throw new Error("the dump is missing the modelBaseUrl row");
+        const apiKeyRow = configs[2];
+        if (apiKeyRow === undefined) throw new Error("the dump is missing the apiKey row");
+        const lastRow = configs[17];
+        if (lastRow === undefined) throw new Error("the dump is missing the 18th row");
+        expect(baseUrlRow.id).toBe("modelBaseUrl");
+        expect(baseUrlRow.kind).toBe("text");
+        // The dump shows what the FILE holds — empty on a fresh agentDir. The
+        // default base URL is a write-time fallback, never a display value.
+        expect(baseUrlRow.value).toBe("");
+        expect(apiKeyRow.id).toBe("apiKey");
+        expect(apiKeyRow.kind).toBe("secret");
+        // The stored value is nothing the panel may hold; the dump strips it.
+        expect(apiKeyRow.value).toBe("");
+        expect(lastRow.id).toBe("excludeApplications");
+        const end = h.client.lines.map(parsePanelLine).find((p) => p.type === "config_end");
+        expect(end?.count).toBe(18);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("writes a file-backed set to the Squid config file and says restart", async () => {
+      const h = await startSettingsSession(false);
+      try {
+        h.client.send(JSON.stringify({ type: "config_set", id: "retentionHours", value: "72" }));
+        const result = await awaitConfigResult(h.client, "retentionHours");
+        expect(result.ok).toBe(1);
+        // File-backed settings are read once at startup; only a restart lands
+        // them, and the result says which.
+        expect(result.applies).toBe("restart");
+        const onDisk = JSON.parse(readFileSync(h.configPath, "utf8")) as Record<string, string>;
+        expect(onDisk.retentionHours).toBe("72");
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("refuses an invalid file-backed set with the schema's message", async () => {
+      const h = await startSettingsSession(false);
+      try {
+        h.client.send(JSON.stringify({ type: "config_set", id: "retentionHours", value: "1e3" }));
+        const result = await awaitConfigResult(h.client, "retentionHours");
+        expect(result.ok).toBe(0);
+        expect(String(result.error)).toContain("Retention (hours)");
+        expect(existsSync(h.configPath)).toBe(false);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("starts the agent in-session when a model set unblocks needs_config", async () => {
+      // The factory counts its builds: needs_config startup must NOT call it
+      // (building the agent is exactly what needs_config skips), and the
+      // recovery must call it exactly once — proving the agent started
+      // in-session rather than the process having quietly restarted.
+      const dir = await mkdtemp(join(tmpdir(), "squid-settings-"));
+      const socketPath = panelEndpoint(dir);
+      const diagnostics: string[] = [];
+      let builds = 0;
+      // The recovered agent delegates to the ordinary fake so it behaves
+      // exactly like a started-from-scratch one.
+      const working = fakeAgentFactory(emptyAgentLog(), {});
+      const factory: ResidentSessionFactory = async (spec) => {
+        builds += 1;
+        return working(spec);
+      };
+      const source = new ScriptedSource("alpha", []);
+      const { result } = await startSession({
+        sources: [source],
+        env: { SQUID_PANEL_SOCKET: socketPath },
+        agentConfigured: false,
+        createAgentSession: factory,
+        configPath: join(dir, "config.json"),
+        agentDir: join(dir, "agent"),
+        modelProvider: "bifrost",
+        defaultModelId: "deepseek-v4-flash",
+        defaultBaseUrl: "https://default.example/v1",
+        logError: (line) => diagnostics.push(line),
+      });
+      if ("configError" in result) throw new Error(result.configError);
+      const client = new PanelTestClient(socketPath, diagnostics);
+      try {
+        expect(result.session.banner.agent).toBe("needs_config");
+        await client.ready();
+        const serviceBefore = await waitForLine(() =>
+          client.lines.map(parsePanelLine).find((p) => p.type === "service"),
+        );
+        expect(serviceBefore.agentState).toBe("needs_config");
+
+        client.send(JSON.stringify({ type: "config_set", id: "apiKey", value: API_KEY }));
+        const setResult = await awaitConfigResult(client, "apiKey");
+        expect(setResult.ok).toBe(1);
+        const serviceAfter = await waitForLine(() => {
+          const services = client.lines.map(parsePanelLine).filter((p) => p.type === "service");
+          return services.length > 1 ? services[1] : undefined;
+        });
+        expect(serviceAfter.agentState).toBe("ready");
+        // Exactly one build, and it happened during recovery, not startup: the
+        // process never restarted, the agent just came up in-session.
+        expect(builds).toBe(1);
+        expect(result.session.banner.agent).toBe("needs_config");
+      } finally {
+        await client.close();
+        await result.session.stop();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses a restart from an unsupervised run and keeps the session alive", async () => {
+      const h = await startSettingsSession(false);
+      try {
+        h.client.send(JSON.stringify({ type: "control", op: "restart" }));
+        const deadline = Date.now() + 2000;
+        for (;;) {
+          if (h.diagnostics.some((line) => line.includes("SQUID_SUPERVISED"))) break;
+          if (Date.now() > deadline) throw new Error("restart was not refused");
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        // Refusal, not shutdown: the run keeps serving its panel. The proof is
+        // a follow-up round-trip, not the temp dir merely existing.
+        expect(h.restartCalls).toEqual([]);
+        h.client.send(JSON.stringify({ type: "config_get" }));
+        await awaitConfigEnd(h.client);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("hands the process to the supervisor with a supervised restart", async () => {
+      const h = await startSettingsSession(true);
+      try {
+        h.client.send(JSON.stringify({ type: "control", op: "restart" }));
+        const deadline = Date.now() + 2000;
+        for (;;) {
+          if (h.restartCalls.length > 0) break;
+          if (Date.now() > deadline) throw new Error("restart never reached the exit hook");
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        // The stop runs in the ordinary order BEFORE the handoff: the sources'
+        // teardown is observable in the same lifecycle the start tests use.
+        expect(h.restartCalls).toEqual([1]);
+      } finally {
+        // stop() is idempotent (the session guards with `stopped`), so an
+        // already-restarted session settles quietly here.
+        await h.close();
+      }
+    });
+
+    it("never puts the API key on the wire, even after setting it", async () => {
+      const h = await startSettingsSession(false);
+      try {
+        h.client.send(JSON.stringify({ type: "config_set", id: "apiKey", value: API_KEY }));
+        const setResult = await awaitConfigResult(h.client, "apiKey");
+        expect(setResult.ok).toBe(1);
+        // The credential landed in Pi's own store...
+        const auth = JSON.parse(readFileSync(join(h.agentDir, "auth.json"), "utf8")) as {
+          bifrost: { key: string };
+        };
+        expect(auth.bifrost.key).toBe(API_KEY);
+        // ...and a fresh dump afterwards carries no trace of it: the secret's
+        // value is structurally absent from every line the session can send.
+        h.client.send(JSON.stringify({ type: "config_get" }));
+        await awaitConfigEnd(h.client);
+        for (const raw of h.client.lines) {
+          expect(raw).not.toContain(API_KEY);
+        }
+      } finally {
+        await h.close();
+      }
+    });
   });
 });
 

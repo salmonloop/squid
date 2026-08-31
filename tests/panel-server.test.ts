@@ -35,7 +35,10 @@ interface Harness {
   onConnect?: (clientCount: number) => void;
   start(options?: {
     readonly onControl?: (op: "pause" | "resume") => void;
+    readonly onServiceControl?: (op: "restart") => void;
     readonly onAnswer?: (promptId: number, answer: "approved" | "declined") => void;
+    readonly onConfigGet?: () => void;
+    readonly onConfigSet?: (id: string, value: string) => void;
     readonly onDiagnostic?: (line: string) => void;
     /** Bind at a path other than the harness default. */
     readonly socketPath?: string;
@@ -68,7 +71,10 @@ async function withHarness(body: (harness: Harness) => Promise<void>): Promise<v
       const server = await startPanelServer({
         socketPath: options.socketPath ?? socketPath,
         onControl: options.onControl ?? (() => undefined),
+        ...(options.onServiceControl === undefined ? {} : { onServiceControl: options.onServiceControl }),
         ...(options.onAnswer === undefined ? {} : { onAnswer: options.onAnswer }),
+        ...(options.onConfigGet === undefined ? {} : { onConfigGet: options.onConfigGet }),
+        ...(options.onConfigSet === undefined ? {} : { onConfigSet: options.onConfigSet }),
         ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
         ...(harness.onConnect === undefined ? {} : { onConnect: harness.onConnect }),
       });
@@ -456,6 +462,106 @@ describe("startPanelServer incoming control", () => {
       await until(() => diagnostics.length >= 1, "the refusal diagnostic");
 
       expect(diagnostics.some((line) => line.includes("confirmation handler"))).toBe(true);
+    });
+  });
+
+  it("invokes onServiceControl with restart", async () => {
+    await withHarness(async (harness) => {
+      const ops: string[] = [];
+      const server = await harness.start({ onServiceControl: (op) => ops.push(op) });
+      const client = await harness.connect();
+      await until(() => server.clientCount === 1, "the client to register");
+
+      client.socket.write('{"type":"control","op":"restart"}\n');
+      await until(() => ops.length === 1, "the restart op to arrive");
+
+      // Restart rides the control type but must land in its own handler: the
+      // capture gate's pause/resume and a process exit are not the same decision.
+      expect(ops).toEqual(["restart"]);
+    });
+  });
+
+  it("refuses restart when no service-control handler is wired", async () => {
+    await withHarness(async (harness) => {
+      const diagnostics: string[] = [];
+      const server = await harness.start({ onDiagnostic: (line) => diagnostics.push(line) });
+      const client = await harness.connect();
+      await until(() => server.clientCount === 1, "the client to register");
+
+      client.socket.write('{"type":"control","op":"restart"}\n');
+      await until(() => diagnostics.length >= 1, "the refusal diagnostic");
+
+      expect(diagnostics.some((line) => line.includes("service-control handler"))).toBe(true);
+    });
+  });
+
+  it("invokes onConfigGet and onConfigSet with the parsed pair", async () => {
+    await withHarness(async (harness) => {
+      let gotDump = 0;
+      const sets: (readonly [string, string])[] = [];
+      const server = await harness.start({
+        onConfigGet: () => {
+          gotDump += 1;
+        },
+        onConfigSet: (id, value) => sets.push([id, value]),
+      });
+      const client = await harness.connect();
+      await until(() => server.clientCount === 1, "the client to register");
+
+      client.socket.write('{"type":"config_get"}\n');
+      client.socket.write('{"type":"config_set","id":"watchRoot","value":"/new"}\n');
+      await until(() => gotDump === 1 && sets.length === 1, "both config calls to arrive");
+
+      expect(gotDump).toBe(1);
+      expect(sets).toEqual([["watchRoot", "/new"]]);
+    });
+  });
+
+  it("refuses config_set shapes that the flat wire forbids, and never quotes the value", async () => {
+    await withHarness(async (harness) => {
+      const sets: [string, string][] = [];
+      const diagnostics: string[] = [];
+      const server = await harness.start({
+        onConfigSet: (id, value) => sets.push([id, value]),
+        onDiagnostic: (line) => diagnostics.push(line),
+      });
+      const client = await harness.connect();
+      await until(() => server.clientCount === 1, "the client to register");
+
+      client.socket.write('{"type":"config_set"}\n');
+      client.socket.write('{"type":"config_set","id":""}\n');
+      client.socket.write('{"type":"config_set","id":7,"value":"/x"}\n');
+      client.socket.write('{"type":"config_set","id":"watchRoot","value":42}\n');
+      // Escaped spellings on purpose: a raw control byte in this source would
+      // make git call the file binary and grep silently miss it.
+      client.socket.write('{"type":"config_set","id":"watch\\u0001root","value":"/x"}\n');
+      client.socket.write('{"type":"config_set","id":"watchRoot","value":"/x\\u007f"}\n');
+      // Then a good one, proving the connection survived the refusals.
+      client.socket.write('{"type":"config_set","id":"watchRoot","value":"/good"}\n');
+      await until(() => sets.length === 1, "the trailing valid set to arrive");
+      await settle();
+
+      expect(sets).toEqual([["watchRoot", "/good"]]);
+      // Each refusal is visible, and the diagnostics name the key — the value
+      // that could be a real API key never echoes through an error line.
+      expect(diagnostics.length).toBeGreaterThanOrEqual(6);
+      const quoted = diagnostics.filter((line) => line.includes("/x") || line.includes("/new"));
+      expect(quoted).toEqual([]);
+    });
+  });
+
+  it("refuses config calls when no config handler is wired", async () => {
+    await withHarness(async (harness) => {
+      const diagnostics: string[] = [];
+      const server = await harness.start({ onDiagnostic: (line) => diagnostics.push(line) });
+      const client = await harness.connect();
+      await until(() => server.clientCount === 1, "the client to register");
+
+      client.socket.write('{"type":"config_get"}\n');
+      client.socket.write('{"type":"config_set","id":"watchRoot","value":"/x"}\n');
+      await until(() => diagnostics.length >= 2, "both refusal diagnostics");
+
+      expect(diagnostics.filter((line) => line.includes("no config handler")).length).toBe(2);
     });
   });
 
