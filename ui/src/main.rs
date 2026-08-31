@@ -35,9 +35,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use protocol::{
-    answer_line, control_line, AgentLine, Answer, Control, Incoming, Prompt, WorldState,
+    answer_line, config_get_line, config_set_line, control_line, source_get_line,
+    source_toggle_line, AgentLine, Answer, ConfigLine, ConfigResultLine, Control, Incoming, Prompt,
+    SourceLine, SourceResultLine, WorldState,
 };
-use slint::{ComponentHandle, SharedString};
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use startup::Startup;
 use transport::Outgoing;
 
@@ -55,6 +57,22 @@ type Pending = Arc<Mutex<Option<i64>>>;
 /// pending id can no longer be trusted to name the plan on screen. Answering
 /// anyway is the one outcome worse than not answering.
 const POISONED: &str = "pending prompt lock poisoned; refusing to answer";
+
+/// Rows collected between a dump's first line and its terminator.
+///
+/// Lives on the reader thread and holds *protocol* types, not Slint ones: the
+/// buffer crosses to the UI thread inside a posted closure, and building the
+/// window's own row structs happens there, where the event loop owns them.
+///
+/// A dump is swapped in whole. Patching rows in place would mean this window
+/// keeping its own copy of the catalog and the settings — a second projection to
+/// drift out of step with the brain's, which is the one thing the panel has
+/// never done.
+#[derive(Default)]
+struct Dumps {
+    settings: Vec<ConfigLine>,
+    sources: Vec<SourceLine>,
+}
 
 /// The one line `--version` prints, and the only place the binary names itself.
 ///
@@ -115,6 +133,36 @@ fn main() {
         window.on_resume(move || outgoing.send(&control_line(Control::Resume)));
     }
     {
+        let outgoing = outgoing.clone();
+        // The typed value goes out as it was typed. Whether it is legal is the
+        // brain's answer, and it comes back as a `config_result`; validating here
+        // would be a second rule set to disagree with the one that writes the
+        // file. The API key's single trip across this wire is this line.
+        window.on_save_setting(move |id, value| outgoing.send(&config_set_line(&id, &value)));
+    }
+    {
+        let outgoing = outgoing.clone();
+        // Asks; does not assume. The row's checkbox has already moved because
+        // that is what a checkbox does, but nothing here records a new state —
+        // the verdict triggers a fresh dump, and the dump decides.
+        window.on_toggle_source(move |id, on| outgoing.send(&source_toggle_line(&id, on)));
+    }
+    {
+        let outgoing = outgoing.clone();
+        window.on_refresh(move || {
+            outgoing.send(&config_get_line());
+            outgoing.send(&source_get_line());
+        });
+    }
+    {
+        let outgoing = outgoing.clone();
+        // Only reachable while `supervised` is set, which today is never: the
+        // panel is not yet the process that spawns the brain. The line is wired
+        // now so the button has somewhere to go the moment it is, and the brain
+        // refuses it unsupervised in any case.
+        window.on_restart_service(move || outgoing.send(&control_line(Control::Restart)));
+    }
+    {
         let pending = Arc::clone(&pending);
         let outgoing = outgoing.clone();
         let handle = window.as_weak();
@@ -153,8 +201,14 @@ fn main() {
         // honest thing to keep showing. Blanking the fields on disconnect would
         // make a lost connection look like a quiet machine.
         thread::spawn(move || {
+            // The buffers live in this closure: one connection's dumps, torn down
+            // with the closure if this thread ever ends. `transport::run` calls
+            // this for every message on this thread, so no lock is needed to
+            // accumulate — and nothing Slint-owned is touched until a terminator
+            // posts a finished dump to the event loop.
+            let mut dumps = Dumps::default();
             transport::run(&socket_path, &outgoing, |message| {
-                apply(&handle, &pending, message)
+                apply(&handle, &pending, &outgoing, &mut dumps, message)
             })
         });
     }
@@ -178,7 +232,13 @@ fn main() {
 /// closure. A failure to post means the event loop is gone, which means the
 /// process is already on its way out — there is nothing left to show and nothing
 /// to report it to.
-fn apply(window: &slint::Weak<PanelWindow>, pending: &Pending, message: Incoming) {
+fn apply(
+    window: &slint::Weak<PanelWindow>,
+    pending: &Pending,
+    outgoing: &Outgoing,
+    dumps: &mut Dumps,
+    message: Incoming,
+) {
     match message {
         Incoming::WorldState(state) => {
             let _ = window.upgrade_in_event_loop(move |window| show_world(&window, state));
@@ -188,7 +248,154 @@ fn apply(window: &slint::Weak<PanelWindow>, pending: &Pending, message: Incoming
         }
         Incoming::Prompt(prompt) => show_prompt(window, pending, prompt),
         Incoming::Cancel { prompt_id } => cancel(window, pending, prompt_id),
+        Incoming::Service { agent_state } => {
+            let _ = window.upgrade_in_event_loop(move |window| {
+                window.set_agent_state(agent_state.into());
+            });
+            // This line *is* the connect signal. The brain replays it to every
+            // client as it attaches — that is the whole reason it exists as a
+            // standing fact rather than a one-off broadcast — so the panel asks
+            // for its two dumps here instead of the transport growing an
+            // on-connect hook that would mean the same thing twice.
+            //
+            // It also arrives when the brain leaves `needs_config` mid-session,
+            // where re-pulling is exactly right: the model keys just changed.
+            outgoing.send(&config_get_line());
+            outgoing.send(&source_get_line());
+        }
+        Incoming::Config(row) => dumps.settings.push(row),
+        Incoming::ConfigEnd { count } => {
+            // Taken, not cloned: the next dump starts empty, so a refresh cannot
+            // append to the last one and show every setting twice.
+            let rows = std::mem::take(&mut dumps.settings);
+            let _ = window.upgrade_in_event_loop(move |window| show_settings(&window, rows, count));
+        }
+        Incoming::ConfigResult(result) => {
+            let refresh = result.id.is_some();
+            let _ = window.upgrade_in_event_loop(move |window| {
+                window.set_status(config_verdict(&result).into());
+            });
+            // Re-read after a per-key verdict: a save can change `value` and can
+            // clear or set `overridden`, and the honest way to show that is the
+            // brain's own dump rather than this side patching the row it just
+            // sent.
+            //
+            // Only when the verdict named a key. A dump-level refusal carries no
+            // id, and asking again in response to it would answer itself forever.
+            if refresh {
+                outgoing.send(&config_get_line());
+            }
+        }
+        Incoming::Source(row) => dumps.sources.push(row),
+        Incoming::SourceEnd { count } => {
+            let rows = std::mem::take(&mut dumps.sources);
+            let _ = window.upgrade_in_event_loop(move |window| show_sources(&window, rows, count));
+        }
+        Incoming::SourceResult(result) => {
+            let refresh = result.id.is_some();
+            let _ = window.upgrade_in_event_loop(move |window| {
+                window.set_status(source_verdict(&result).into());
+            });
+            // The verdict says whether the toggle landed, never what the catalog
+            // now looks like — so the state on screen comes from a fresh dump. A
+            // refused stop (the last observer) rebuilds the row still running,
+            // which is the truth the checkbox owes the user.
+            if refresh {
+                outgoing.send(&source_get_line());
+            }
+        }
     }
+}
+
+/// Replaces the settings form with a dump.
+///
+/// The count is read, not ignored: `parse_incoming` drops a row it cannot parse,
+/// so a dump can arrive one row short with nothing else to show it. A user who
+/// reads a missing key as "not a setting" would be misled by silence, so the
+/// shortfall is stated in the status line.
+fn show_settings(window: &PanelWindow, rows: Vec<ConfigLine>, count: i64) {
+    let note = dump_note("settings", rows.len(), count);
+    let form: Vec<SettingRow> = rows
+        .into_iter()
+        .map(|row| SettingRow {
+            id: row.id.into(),
+            label: row.label.into(),
+            kind: row.kind.into(),
+            value: row.value.into(),
+            applies: row.applies.into(),
+            // Anything but an explicit 1 reads as not overridden: this is a
+            // disclosure, and claiming one on a malformed field would be worse
+            // than leaving it off.
+            overridden: row.overridden == Some(1),
+            values: row.values.unwrap_or_default().into(),
+        })
+        .collect();
+    window.set_settings(ModelRc::new(VecModel::from(form)));
+    if let Some(note) = note {
+        window.set_status(note.into());
+    }
+}
+
+/// Replaces the source list with a dump. Same swap-whole discipline as
+/// [`show_settings`], and the same reason for reading the count.
+fn show_sources(window: &PanelWindow, rows: Vec<SourceLine>, count: i64) {
+    let note = dump_note("sources", rows.len(), count);
+    let list: Vec<SourceRow> = rows
+        .into_iter()
+        .map(|row| SourceRow {
+            id: row.id.into(),
+            label: row.label.into(),
+            state: row.state.into(),
+        })
+        .collect();
+    window.set_sources(ModelRc::new(VecModel::from(list)));
+    if let Some(note) = note {
+        window.set_status(note.into());
+    }
+}
+
+/// Complains when a dump's rows and its own count disagree, and says nothing
+/// when they match — the ordinary case must not produce a status line.
+fn dump_note(kind: &str, arrived: usize, count: i64) -> Option<String> {
+    if i64::try_from(arrived).ok() == Some(count) {
+        return None;
+    }
+    Some(format!(
+        "Showing {arrived} {kind} rows, but the session counted {count}; this list is incomplete."
+    ))
+}
+
+/// The status line for one settings verdict, in the brain's words.
+///
+/// The error text is already sanitized upstream and names the key and the reason,
+/// so it is reported verbatim. The `ok` cases are this side's only sentences, and
+/// they exist because "saved" and "saved, but not in effect yet" are different
+/// facts that a user acting on the value needs told apart.
+fn config_verdict(result: &ConfigResultLine) -> String {
+    let subject = result.id.clone().unwrap_or_else(|| "settings".to_owned());
+    if result.ok != 1 {
+        return match &result.error {
+            Some(error) => error.clone(),
+            None => format!("{subject} was refused."),
+        };
+    }
+    match result.applies.as_deref() {
+        Some("restart") => format!("Saved {subject}. It takes effect when the session restarts."),
+        _ => format!("Saved {subject}."),
+    }
+}
+
+/// The status line for one toggle verdict, same discipline as
+/// [`config_verdict`]: refusals are quoted, successes are stated plainly.
+fn source_verdict(result: &SourceResultLine) -> String {
+    let subject = result.id.clone().unwrap_or_else(|| "sources".to_owned());
+    if result.ok != 1 {
+        return match &result.error {
+            Some(error) => error.clone(),
+            None => format!("{subject} was refused."),
+        };
+    }
+    format!("{subject} updated.")
 }
 
 /// Applies a `world_state` line. One property per wire field, nothing derived.
@@ -312,7 +519,8 @@ fn clear_prompt(window: PanelWindow) {
 
 #[cfg(test)]
 mod tests {
-    use super::version_line;
+    use super::{config_verdict, dump_note, source_verdict, version_line};
+    use crate::protocol::{ConfigResultLine, SourceResultLine};
 
     /// The line is a name plus a version, from the crate's own compiled-in
     /// constant — the same reasoning as the placeholder check in `startup.rs`:
@@ -325,5 +533,113 @@ mod tests {
         assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
         assert!(!line.contains('{'), "{line}");
         assert!(!line.contains('}'), "{line}");
+    }
+
+    /// A refusal is reported in the brain's words, because those words name the
+    /// key and the reason. Paraphrasing here would be this window inventing a
+    /// diagnosis for a file it never read.
+    #[test]
+    fn a_refusal_is_quoted_rather_than_paraphrased() {
+        let refused = ConfigResultLine {
+            id: Some("retentionHours".to_owned()),
+            ok: 0,
+            applies: None,
+            error: Some("Retention (hours) must be a whole number.".to_owned()),
+        };
+        assert_eq!(
+            config_verdict(&refused),
+            "Retention (hours) must be a whole number."
+        );
+        let toggle = SourceResultLine {
+            id: Some("browser-page-host".to_owned()),
+            ok: 0,
+            error: Some("Source \"browser-page-host\" is the only observer; a watch session needs at least one.".to_owned()),
+        };
+        assert_eq!(
+            source_verdict(&toggle),
+            "Source \"browser-page-host\" is the only observer; a watch session needs at least one."
+        );
+    }
+
+    /// A refusal with no words still has to read as a refusal. Falling through to
+    /// the success sentence is the one wrong outcome: the user would act on a
+    /// value the brain never saved.
+    #[test]
+    fn a_refusal_without_words_still_reads_as_one() {
+        let bare = ConfigResultLine {
+            id: Some("watchRoot".to_owned()),
+            ok: 0,
+            applies: None,
+            error: None,
+        };
+        assert_eq!(config_verdict(&bare), "watchRoot was refused.");
+        let dump_level = ConfigResultLine {
+            id: None,
+            ok: 0,
+            applies: None,
+            error: None,
+        };
+        assert_eq!(config_verdict(&dump_level), "settings was refused.");
+        let source = SourceResultLine {
+            id: None,
+            ok: 0,
+            error: None,
+        };
+        assert_eq!(source_verdict(&source), "sources was refused.");
+    }
+
+    /// "Saved" and "saved but not yet in effect" are different facts. A user who
+    /// reads the first when the second is true will look for a behavior change
+    /// that cannot happen until the session restarts.
+    #[test]
+    fn a_save_that_needs_a_restart_says_so() {
+        let now = ConfigResultLine {
+            id: Some("apiKey".to_owned()),
+            ok: 1,
+            applies: Some("now".to_owned()),
+            error: None,
+        };
+        assert_eq!(config_verdict(&now), "Saved apiKey.");
+        let later = ConfigResultLine {
+            id: Some("watchRoot".to_owned()),
+            ok: 1,
+            applies: Some("restart".to_owned()),
+            error: None,
+        };
+        assert_eq!(
+            config_verdict(&later),
+            "Saved watchRoot. It takes effect when the session restarts."
+        );
+        // No `applies` at all reads as the weaker claim — plain "saved" — rather
+        // than promising a restart the brain did not ask for.
+        let unstated = ConfigResultLine {
+            id: Some("watchRoot".to_owned()),
+            ok: 1,
+            applies: None,
+            error: None,
+        };
+        assert_eq!(config_verdict(&unstated), "Saved watchRoot.");
+        assert_eq!(
+            source_verdict(&SourceResultLine {
+                id: Some("filesystem-local".to_owned()),
+                ok: 1,
+                error: None,
+            }),
+            "filesystem-local updated."
+        );
+    }
+
+    /// A dump that arrives short is stated, not hidden. The parser drops a row it
+    /// cannot read, so without this the missing setting would look like a setting
+    /// that does not exist — silence reading as an answer, which is the failure
+    /// the whole protocol doc warns about.
+    #[test]
+    fn a_short_dump_is_reported_and_a_complete_one_is_silent() {
+        assert_eq!(dump_note("settings", 21, 21), None);
+        assert_eq!(dump_note("sources", 0, 0), None);
+        let note = dump_note("settings", 20, 21).expect("a shortfall is worth saying");
+        assert!(note.contains("20"), "{note}");
+        assert!(note.contains("21"), "{note}");
+        assert!(note.contains("incomplete"), "{note}");
     }
 }

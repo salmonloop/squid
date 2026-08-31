@@ -610,6 +610,13 @@ pub enum Incoming {
     Agent(AgentLine),
     Prompt(Prompt),
     Cancel { prompt_id: i64 },
+    Service { agent_state: String },
+    Config(ConfigLine),
+    ConfigEnd { count: i64 },
+    ConfigResult(ConfigResultLine),
+    Source(SourceLine),
+    SourceEnd { count: i64 },
+    SourceResult(SourceResultLine),
 }
 pub struct WorldState {
     pub updated_at: String,
@@ -626,9 +633,64 @@ pub struct AgentLine {
     pub status: String,
     pub text: Option<String>,
 }
+pub struct ConfigLine {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    pub value: String,
+    pub applies: String,
+    pub overridden: Option<i64>,
+    pub values: Option<String>,
+}
+pub struct ConfigResultLine {
+    pub id: Option<String>,
+    pub ok: i64,
+    pub applies: Option<String>,
+    pub error: Option<String>,
+}
+pub struct SourceLine {
+    pub id: String,
+    pub label: String,
+    pub state: String,
+}
+pub struct SourceResultLine {
+    pub id: Option<String>,
+    pub ok: i64,
+    pub error: Option<String>,
+}
 pub fn parse_incoming(line: &str) -> Option<Incoming>;
 pub fn control_line(op: Control) -> String;   // {"type":"control","op":"pause"}
 pub fn answer_line(prompt_id: i64, answer: Answer) -> String;
-pub enum Control { Pause, Resume }
+pub fn config_get_line() -> String;           // {"type":"config_get"}
+pub fn config_set_line(id: &str, value: &str) -> String;
+pub fn source_get_line() -> String;           // {"type":"source_get"}
+pub fn source_toggle_line(id: &str, on: bool) -> String;
+pub enum Control { Pause, Resume, Restart }
 pub enum Answer { Approved, Declined }
 ```
+
+Three rules the Rust half holds to that are not visible in the signatures:
+
+* **`ok` is read strictly, display fields leniently.** `flag_field` accepts only
+  `1` or `0` for `ok`, and a line carrying anything else is dropped — there is no
+  third verdict to map a stray number onto, and mapping it would make the panel
+  state an outcome the session never claimed. `overridden`, by contrast, is a
+  disclosure: a malformed value reads as "not overridden" rather than costing the
+  user the whole row.
+* **Outgoing values are escaped, never filtered.** `config_set_line` is the first
+  line the panel writes that carries text a person typed, so it escapes quotes,
+  backslashes, and control characters per JSON. It does not *reject* anything: the
+  session re-validates every value, and a panel-side refusal would be a second
+  validator to drift from the one that writes the file. A control character
+  therefore arrives as `\u0001` and comes back as a refusal naming the key, which
+  the user can see — better than a silent cleanup that changes what was saved.
+* **Dumps are pulled, and pulled again.** The session replays `service` to every
+  client on connect but does not push the two lists, so the panel asks for both on
+  hearing it. Every verdict that names an `id` triggers a fresh `config_get` or
+  `source_get`: a `config_set` can change `overridden`, and a toggle's verdict says
+  only whether it landed, never what the catalog now looks like. A dump-level
+  refusal carries no `id` and so does not re-ask — otherwise it would answer itself
+  forever. Rows are buffered until the `*_end` line and swapped in whole, and the
+  `count` is compared against what arrived: the parser drops a row it cannot read,
+  and a missing setting that looked like a setting which does not exist would be
+  silence reading as an answer.

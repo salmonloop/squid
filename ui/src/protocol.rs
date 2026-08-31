@@ -11,6 +11,13 @@
 //! {"type":"agent","at":"...","status":"replied","text":"ran the tests; they pass"}
 //! {"type":"prompt","promptId":1,"candidateId":"...","kind":"run_tests","summary":"...","expiresAt":"..."}
 //! {"type":"cancel","promptId":1}
+//! {"type":"service","agentState":"ready"}
+//! {"type":"config","id":"watchRoot","label":"Watch root","kind":"text","value":"/","applies":"restart"}
+//! {"type":"config_end","count":21}
+//! {"type":"config_result","id":"watchRoot","ok":1,"applies":"restart"}
+//! {"type":"source","id":"filesystem-local","label":"Filesystem","state":"running"}
+//! {"type":"source_end","count":5}
+//! {"type":"source_result","id":"filesystem-local","ok":1}
 //! ```
 //!
 //! Outgoing, one per line:
@@ -18,6 +25,10 @@
 //! ```jsonc
 //! {"type":"control","op":"pause"}
 //! {"type":"answer","promptId":1,"answer":"approved"}
+//! {"type":"config_get"}
+//! {"type":"config_set","id":"watchRoot","value":"/home/me"}
+//! {"type":"source_get"}
+//! {"type":"source_toggle","id":"filesystem-local","on":0}
 //! ```
 //!
 //! Hand-written rather than `serde_json` because this process is the one that
@@ -47,6 +58,36 @@ pub enum Incoming {
     Cancel {
         prompt_id: i64,
     },
+    /// The brain's own state, replayed on every connect. Not an event — a
+    /// standing fact, and the one signal the settings form is the way out of.
+    Service {
+        agent_state: String,
+    },
+    /// One settings row. The schema rides on the wire (`kind`, `label`,
+    /// `applies`, enum `values`), so this side holds no key names and renders
+    /// every row the same generic way — a key hardcoded here would be a second
+    /// schema to keep in sync with the brain's.
+    Config(ConfigLine),
+    /// Closes a settings dump. `count` is the sizing contract, like the dump
+    /// lists in the protocol doc.
+    ConfigEnd {
+        count: i64,
+    },
+    /// The verdict on one `config_set` — or on the dump itself when `id` is
+    /// absent. This is the only place a save's outcome is stated; the form
+    /// reports what this line said, never what the click hoped for.
+    ConfigResult(ConfigResultLine),
+    /// One row of the source catalog — running, stopped, or unsupported, all
+    /// three shown so an un-toggleable capability is visible, not hidden.
+    Source(SourceLine),
+    /// Closes a source dump, mirroring [`Incoming::ConfigEnd`].
+    SourceEnd {
+        count: i64,
+    },
+    /// The verdict on one toggle. The brain does not broadcast the new state
+    /// with it, so this is the trigger to pull a fresh dump rather than to
+    /// flip the row locally — optimism here would drift from the catalog.
+    SourceResult(SourceResultLine),
 }
 
 /// The projection as the panel is allowed to see it.
@@ -103,6 +144,50 @@ pub struct Prompt {
     pub expires_at: String,
 }
 
+/// One settings row, exactly the fields the TS dump sends.
+///
+/// `value` is always a string on the wire, even for an int setting — the panel
+/// renders it and sends it back verbatim, and any casting here would be a second
+/// validator to disagree with the brain's. `values` arrives as the `;`-joined
+/// string the flat wire mandates and stays joined: splitting it would be string
+/// surgery in a place with no tests, and a joined list reads fine.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ConfigLine {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    pub value: String,
+    pub applies: String,
+    pub overridden: Option<i64>,
+    pub values: Option<String>,
+}
+
+/// The verdict on one set. `id` is absent on a dump-level refusal, which is why
+/// this is not part of [`ConfigLine`].
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ConfigResultLine {
+    pub id: Option<String>,
+    pub ok: i64,
+    pub applies: Option<String>,
+    pub error: Option<String>,
+}
+
+/// One row of the source catalog.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct SourceLine {
+    pub id: String,
+    pub label: String,
+    pub state: String,
+}
+
+/// The verdict on one toggle.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct SourceResultLine {
+    pub id: Option<String>,
+    pub ok: i64,
+    pub error: Option<String>,
+}
+
 /// One field value. The protocol only uses strings and integers; `Other` exists
 /// so an unrecognized value type in some future field is skipped rather than
 /// poisoning the whole line.
@@ -152,27 +237,73 @@ pub fn parse_incoming(line: &str) -> Option<Incoming> {
         "cancel" => Some(Incoming::Cancel {
             prompt_id: int_field(&fields, "promptId")?,
         }),
+        "service" => Some(Incoming::Service {
+            agent_state: text_field(&fields, "agentState")?,
+        }),
+        "config" => Some(Incoming::Config(ConfigLine {
+            id: text_field(&fields, "id")?,
+            label: text_field(&fields, "label")?,
+            kind: text_field(&fields, "kind")?,
+            // Required even for a secret, whose value is the empty string: the
+            // dump structurally never carries a credential, and an *absent*
+            // value would be a different claim than "there is nothing to show".
+            value: text_field(&fields, "value")?,
+            applies: text_field(&fields, "applies")?,
+            overridden: optional_int_field(&fields, "overridden"),
+            values: optional_text_field(&fields, "values"),
+        })),
+        "config_end" => Some(Incoming::ConfigEnd {
+            count: int_field(&fields, "count")?,
+        }),
+        "config_result" => Some(Incoming::ConfigResult(ConfigResultLine {
+            // Absent when the refusal is about the dump rather than one key.
+            id: optional_text_field(&fields, "id"),
+            ok: flag_field(&fields, "ok")?,
+            applies: optional_text_field(&fields, "applies"),
+            error: optional_text_field(&fields, "error"),
+        })),
+        "source" => Some(Incoming::Source(SourceLine {
+            id: text_field(&fields, "id")?,
+            label: text_field(&fields, "label")?,
+            state: text_field(&fields, "state")?,
+        })),
+        "source_end" => Some(Incoming::SourceEnd {
+            count: int_field(&fields, "count")?,
+        }),
+        "source_result" => Some(Incoming::SourceResult(SourceResultLine {
+            id: optional_text_field(&fields, "id"),
+            ok: flag_field(&fields, "ok")?,
+            error: optional_text_field(&fields, "error"),
+        })),
         _ => None,
     }
 }
 
 /// Serializes a control line, newline included.
 ///
-/// Pause and resume are the whole vocabulary, so a [`Control`] cannot name a
-/// third operation the TS side would drop.
+/// The enum is the whole vocabulary, so a [`Control`] cannot name an operation
+/// the TS side would drop.
 pub fn control_line(op: Control) -> String {
     format!("{{\"type\":\"control\",\"op\":\"{}\"}}\n", op.as_wire())
 }
 
-/// The only two control operations that exist.
+/// The control operations that exist.
 ///
-/// Neither one changes capture state here. They are appended to the existing
-/// capture-gate command path, so a pause still produces a `capture_gate_changed`
-/// event — the trace that tells a deliberate gap apart from an idle machine.
+/// None of them changes capture state here. Pause and resume are appended to the
+/// existing capture-gate command path, so a pause still produces a
+/// `capture_gate_changed` event — the trace that tells a deliberate gap apart
+/// from an idle machine.
+///
+/// `Restart` is the odd one and deliberately still just a line: this process
+/// asks, and the brain decides. The brain refuses it outright unless it is a
+/// supervised run, because a brain that exited with no supervisor to respawn it
+/// would look like a crash to whoever started it by hand — so a panel that is not
+/// the supervisor can send this and correctly get nothing back.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Control {
     Pause,
     Resume,
+    Restart,
 }
 
 impl Control {
@@ -180,6 +311,7 @@ impl Control {
         match self {
             Control::Pause => "pause",
             Control::Resume => "resume",
+            Control::Restart => "restart",
         }
     }
 }
@@ -217,6 +349,86 @@ impl Answer {
     }
 }
 
+/// Serializes a `config_get`, newline included. No fields: the request is the
+/// whole message, and the dump comes back as its own lines.
+pub fn config_get_line() -> String {
+    "{\"type\":\"config_get\"}\n".to_owned()
+}
+
+/// Serializes one `config_set`.
+///
+/// This is the first line this process writes that carries text a person typed,
+/// which is why [`escape_json_string`] exists at all: every other outgoing field
+/// is an enum spelling or an integer, and a `format!` over those cannot produce
+/// an illegal object. A `value` holding a quote would, and the API key's one trip
+/// across this wire is a `config_set`.
+///
+/// The brain re-validates everything anyway (kind rules, enum spellings, the
+/// control-character ban), so this does not filter — it only makes sure what
+/// arrives is the string the user typed rather than a broken object. Refusing
+/// locally would be a second validator to disagree with the brain's.
+pub fn config_set_line(id: &str, value: &str) -> String {
+    format!(
+        "{{\"type\":\"config_set\",\"id\":\"{}\",\"value\":\"{}\"}}\n",
+        escape_json_string(id),
+        escape_json_string(value)
+    )
+}
+
+/// Serializes a `source_get`. Fieldless like [`config_get_line`].
+pub fn source_get_line() -> String {
+    "{\"type\":\"source_get\"}\n".to_owned()
+}
+
+/// Serializes one `source_toggle`.
+///
+/// `on` is a `bool` here and `1`/`0` on the wire: the flat protocol has no JSON
+/// booleans, and the brain refuses anything that is not exactly one of those two
+/// integers. Taking a `bool` means this side cannot emit the third value.
+///
+/// The id is escaped for the same reason as [`config_set_line`]'s, even though it
+/// comes from a dump rather than a keyboard: it is a string this process did not
+/// author, and the rule "escape what you did not write" is cheaper to keep than
+/// to reason about per call site.
+pub fn source_toggle_line(id: &str, on: bool) -> String {
+    format!(
+        "{{\"type\":\"source_toggle\",\"id\":\"{}\",\"on\":{}}}\n",
+        escape_json_string(id),
+        i32::from(on)
+    )
+}
+
+/// Escapes a string for a JSON string body.
+///
+/// Handles exactly what JSON requires — quote, backslash, and every C0 control
+/// character — and nothing more. Control characters become `\uXXXX` rather than
+/// being dropped: the brain bans them and will refuse the line, and a *refusal*
+/// naming the key is a better outcome than a silently-cleaned value the user
+/// never sees was changed. Non-ASCII passes through as UTF-8, which the
+/// TypeScript side's `JSON.parse` reads directly.
+fn escape_json_string(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for character in raw.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("\\f"),
+            // The rest of C0, plus DEL, which JSON permits raw but the brain's
+            // own ban covers — spelled as an escape either way so the line stays
+            // one line and stays parseable.
+            control if control < '\u{0020}' || control == '\u{007F}' => {
+                out.push_str(&format!("\\u{:04x}", control as u32));
+            }
+            ordinary => out.push(ordinary),
+        }
+    }
+    out
+}
+
 fn field<'a>(fields: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
     // First occurrence wins. A duplicate key later in the object cannot override
     // an earlier one, so a crafted line cannot append a second `"kind"` to
@@ -237,6 +449,21 @@ fn text_field(fields: &[(String, Value)], name: &str) -> Option<String> {
 fn int_field(fields: &[(String, Value)], name: &str) -> Option<i64> {
     match field(fields, name)? {
         Value::Int(number) => Some(*number),
+        _ => None,
+    }
+}
+
+/// Reads a wire boolean, which the flat protocol spells `1` or `0`.
+///
+/// Strict where [`optional_int_field`] is lenient, and the split is the point:
+/// `ok` decides whether the panel reports a save as landed or refused, so a `7`
+/// arriving is not a verdict to be mapped onto one of the two answers — it is a
+/// line to drop, the same posture `answer` takes with its two exact spellings.
+/// Display-only fields stay lenient, because losing a whole reading over a
+/// cosmetic field would cost the user more than the field is worth.
+fn flag_field(fields: &[(String, Value)], name: &str) -> Option<i64> {
+    match int_field(fields, name)? {
+        value @ (0 | 1) => Some(value),
         _ => None,
     }
 }
@@ -807,6 +1034,310 @@ mod tests {
         ] {
             assert_eq!(parse_incoming(line), None, "should reject: {line}");
         }
+    }
+
+    #[test]
+    fn parses_a_service_line() {
+        assert_eq!(
+            parse_incoming("{\"type\":\"service\",\"agentState\":\"needs_config\"}"),
+            Some(Incoming::Service {
+                agent_state: "needs_config".to_owned(),
+            })
+        );
+        // The state is carried as the string the brain sent, not mapped onto a
+        // local enum: a spelling this build has not met must reach the window as
+        // itself rather than being flattened into whichever variant is nearest.
+        assert_eq!(
+            parse_incoming("{\"type\":\"service\",\"agentState\":\"draining\"}"),
+            Some(Incoming::Service {
+                agent_state: "draining".to_owned(),
+            })
+        );
+        // A service line with no state says nothing; there is no default that
+        // would be honest here.
+        assert_eq!(parse_incoming("{\"type\":\"service\"}"), None);
+    }
+
+    #[test]
+    fn parses_a_config_row_with_and_without_its_optional_fields() {
+        let line = "{\"type\":\"config\",\"id\":\"screenReader\",\"label\":\"Screen reader\",\"kind\":\"enum\",\"value\":\"linux\",\"applies\":\"restart\",\"overridden\":1,\"values\":\"synthetic;darwin;linux;windows\"}";
+        assert_eq!(
+            parse_incoming(line),
+            Some(Incoming::Config(ConfigLine {
+                id: "screenReader".to_owned(),
+                label: "Screen reader".to_owned(),
+                kind: "enum".to_owned(),
+                value: "linux".to_owned(),
+                applies: "restart".to_owned(),
+                overridden: Some(1),
+                // Stays joined. Splitting here would be string surgery the flat
+                // wire exists to avoid.
+                values: Some("synthetic;darwin;linux;windows".to_owned()),
+            }))
+        );
+        // A secret's value is the empty string, which is a real value and not an
+        // absent one: the dump structurally never carries a credential.
+        assert_eq!(
+            parse_incoming(
+                "{\"type\":\"config\",\"id\":\"apiKey\",\"label\":\"API key\",\"kind\":\"secret\",\"value\":\"\",\"applies\":\"now\"}"
+            ),
+            Some(Incoming::Config(ConfigLine {
+                id: "apiKey".to_owned(),
+                label: "API key".to_owned(),
+                kind: "secret".to_owned(),
+                value: String::new(),
+                applies: "now".to_owned(),
+                overridden: None,
+                values: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn a_config_row_missing_a_required_field_is_not_a_row() {
+        // Five required fields, each dropped in turn. A row rendered with a
+        // guessed kind would offer the wrong editor for the value.
+        for line in [
+            "{\"type\":\"config\",\"label\":\"L\",\"kind\":\"text\",\"value\":\"v\",\"applies\":\"now\"}",
+            "{\"type\":\"config\",\"id\":\"i\",\"kind\":\"text\",\"value\":\"v\",\"applies\":\"now\"}",
+            "{\"type\":\"config\",\"id\":\"i\",\"label\":\"L\",\"value\":\"v\",\"applies\":\"now\"}",
+            "{\"type\":\"config\",\"id\":\"i\",\"label\":\"L\",\"kind\":\"text\",\"applies\":\"now\"}",
+            "{\"type\":\"config\",\"id\":\"i\",\"label\":\"L\",\"kind\":\"text\",\"value\":\"v\"}",
+        ] {
+            assert_eq!(parse_incoming(line), None, "should reject: {line}");
+        }
+    }
+
+    #[test]
+    fn parses_both_dump_terminators() {
+        assert_eq!(
+            parse_incoming("{\"type\":\"config_end\",\"count\":21}"),
+            Some(Incoming::ConfigEnd { count: 21 })
+        );
+        assert_eq!(
+            parse_incoming("{\"type\":\"source_end\",\"count\":5}"),
+            Some(Incoming::SourceEnd { count: 5 })
+        );
+        // The count is the sizing contract; a terminator without one closes a
+        // dump of unknown length, which is not something to render.
+        assert_eq!(parse_incoming("{\"type\":\"config_end\"}"), None);
+        assert_eq!(
+            parse_incoming("{\"type\":\"source_end\",\"count\":\"5\"}"),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_both_verdicts_in_both_directions() {
+        assert_eq!(
+            parse_incoming("{\"type\":\"config_result\",\"id\":\"watchRoot\",\"ok\":1,\"applies\":\"restart\"}"),
+            Some(Incoming::ConfigResult(ConfigResultLine {
+                id: Some("watchRoot".to_owned()),
+                ok: 1,
+                applies: Some("restart".to_owned()),
+                error: None,
+            }))
+        );
+        assert_eq!(
+            parse_incoming(
+                "{\"type\":\"config_result\",\"id\":\"retentionHours\",\"ok\":0,\"error\":\"Retention (hours) must be a whole number.\"}"
+            ),
+            Some(Incoming::ConfigResult(ConfigResultLine {
+                id: Some("retentionHours".to_owned()),
+                ok: 0,
+                applies: None,
+                error: Some("Retention (hours) must be a whole number.".to_owned()),
+            }))
+        );
+        // No id: the refusal is about the dump itself, not one key.
+        assert_eq!(
+            parse_incoming("{\"type\":\"config_result\",\"ok\":0,\"error\":\"The config file is unreadable.\"}"),
+            Some(Incoming::ConfigResult(ConfigResultLine {
+                id: None,
+                ok: 0,
+                applies: None,
+                error: Some("The config file is unreadable.".to_owned()),
+            }))
+        );
+        assert_eq!(
+            parse_incoming("{\"type\":\"source_result\",\"id\":\"browser-page-host\",\"ok\":0,\"error\":\"Source \\\"browser-page-host\\\" is the only observer; a watch session needs at least one.\"}"),
+            Some(Incoming::SourceResult(SourceResultLine {
+                id: Some("browser-page-host".to_owned()),
+                ok: 0,
+                error: Some(
+                    "Source \"browser-page-host\" is the only observer; a watch session needs at least one."
+                        .to_owned()
+                ),
+            }))
+        );
+    }
+
+    #[test]
+    fn a_verdict_needs_a_flag_that_is_exactly_zero_or_one() {
+        // `ok` is the field that decides whether the form says "saved" or
+        // "refused", so it is read strictly. There is no third answer to map a
+        // stray number onto, and mapping it would make the panel state an
+        // outcome the brain never claimed.
+        for line in [
+            "{\"type\":\"config_result\",\"id\":\"i\"}",
+            "{\"type\":\"config_result\",\"id\":\"i\",\"ok\":7}",
+            "{\"type\":\"config_result\",\"id\":\"i\",\"ok\":-1}",
+            "{\"type\":\"config_result\",\"id\":\"i\",\"ok\":true}",
+            "{\"type\":\"config_result\",\"id\":\"i\",\"ok\":\"1\"}",
+            "{\"type\":\"source_result\",\"id\":\"i\",\"ok\":2}",
+            "{\"type\":\"source_result\",\"id\":\"i\"}",
+        ] {
+            assert_eq!(parse_incoming(line), None, "should reject: {line}");
+        }
+    }
+
+    #[test]
+    fn parses_all_three_source_states() {
+        // Every declared entry is rendered, including the one this run cannot
+        // start: an un-toggleable capability must be visible rather than hidden.
+        for state in ["running", "stopped", "unsupported"] {
+            let line = format!(
+                "{{\"type\":\"source\",\"id\":\"filesystem-local\",\"label\":\"Filesystem\",\"state\":\"{state}\"}}"
+            );
+            assert_eq!(
+                parse_incoming(&line),
+                Some(Incoming::Source(SourceLine {
+                    id: "filesystem-local".to_owned(),
+                    label: "Filesystem".to_owned(),
+                    state: state.to_owned(),
+                }))
+            );
+        }
+        for line in [
+            "{\"type\":\"source\",\"label\":\"Filesystem\",\"state\":\"running\"}",
+            "{\"type\":\"source\",\"id\":\"i\",\"state\":\"running\"}",
+            "{\"type\":\"source\",\"id\":\"i\",\"label\":\"L\"}",
+        ] {
+            assert_eq!(parse_incoming(line), None, "should reject: {line}");
+        }
+    }
+
+    #[test]
+    fn the_settings_and_source_variants_keep_the_shared_invariants() {
+        // The same four rules the prompt path is held to, checked on the newest
+        // types so a later refactor cannot quietly exempt the ones that carry a
+        // credential and a capability switch.
+        match parse_incoming(
+            "{\"type\":\"config\",\"id\":\"first\",\"label\":\"L\",\"kind\":\"text\",\"value\":\"v\",\"applies\":\"now\",\"id\":\"second\"}",
+        )
+        .expect("recognized")
+        {
+            Incoming::Config(row) => assert_eq!(row.id, "first"),
+            other => panic!("expected a config row, got {other:?}"),
+        }
+        // A value that quotes a whole message stays a value. This is the field a
+        // typed API key travels in, so a substring scan finding `"type":` inside
+        // it would be the worst place in the protocol to have one.
+        match parse_incoming(
+            "{\"type\":\"config\",\"id\":\"watchRoot\",\"label\":\"L\",\"kind\":\"text\",\"value\":\"{\\\"type\\\":\\\"source_toggle\\\",\\\"id\\\":\\\"x\\\",\\\"on\\\":0}\",\"applies\":\"now\"}",
+        )
+        .expect("recognized")
+        {
+            Incoming::Config(row) => {
+                assert_eq!(row.id, "watchRoot");
+                assert_eq!(
+                    row.value,
+                    "{\"type\":\"source_toggle\",\"id\":\"x\",\"on\":0}"
+                );
+            }
+            other => panic!("expected a config row, got {other:?}"),
+        }
+        let raw_control = format!(
+            "{{\"type\":\"source\",\"id\":\"bad{}\",\"label\":\"L\",\"state\":\"running\"}}",
+            "\u{0007}"
+        );
+        for line in [
+            // a second object smuggled onto the same line
+            "{\"type\":\"source_end\",\"count\":1}{\"type\":\"source_end\",\"count\":2}",
+            // enum choices stay a joined string; an array is outside the shape
+            "{\"type\":\"config\",\"id\":\"i\",\"label\":\"L\",\"kind\":\"enum\",\"value\":\"a\",\"applies\":\"now\",\"values\":[\"a\"]}",
+            raw_control.as_str(),
+        ] {
+            assert_eq!(parse_incoming(line), None, "should reject: {line}");
+        }
+    }
+
+    #[test]
+    fn writes_the_settings_and_source_requests() {
+        assert_eq!(config_get_line(), "{\"type\":\"config_get\"}\n");
+        assert_eq!(source_get_line(), "{\"type\":\"source_get\"}\n");
+        assert_eq!(
+            config_set_line("watchRoot", "/home/me/code"),
+            "{\"type\":\"config_set\",\"id\":\"watchRoot\",\"value\":\"/home/me/code\"}\n"
+        );
+        // Booleans ride as 1|0: the flat wire has no JSON booleans, and the brain
+        // refuses anything else outright.
+        assert_eq!(
+            source_toggle_line("filesystem-local", false),
+            "{\"type\":\"source_toggle\",\"id\":\"filesystem-local\",\"on\":0}\n"
+        );
+        assert_eq!(
+            source_toggle_line("filesystem-local", true),
+            "{\"type\":\"source_toggle\",\"id\":\"filesystem-local\",\"on\":1}\n"
+        );
+        assert_eq!(
+            control_line(Control::Restart),
+            "{\"type\":\"control\",\"op\":\"restart\"}\n"
+        );
+    }
+
+    #[test]
+    fn a_typed_value_cannot_break_out_of_its_own_field() {
+        // The reason `escape_json_string` exists. A path with a quote in it is an
+        // ordinary thing to type, and unescaped it would end the value early and
+        // leave the rest of the characters reading as object syntax.
+        let line = config_set_line("watchRoot", "/tmp/\"; rm -rf /");
+        assert_eq!(
+            line,
+            "{\"type\":\"config_set\",\"id\":\"watchRoot\",\"value\":\"/tmp/\\\"; rm -rf /\"}\n"
+        );
+        // Round-trips through this module's own parser, which refuses trailing
+        // content and unterminated strings — so a line that parses back to the
+        // typed value is a line the brain's `JSON.parse` reads the same way.
+        let echoed = line.trim_end();
+        let fields = parse_object(echoed).expect("still one legal object");
+        assert_eq!(
+            text_field(&fields, "value"),
+            Some("/tmp/\"; rm -rf /".to_owned())
+        );
+    }
+
+    #[test]
+    fn control_characters_and_backslashes_are_escaped_rather_than_dropped() {
+        // A newline would end the line and turn the tail into a second message;
+        // a backslash left alone would eat the closing quote. Both are spelled as
+        // escapes rather than stripped: the brain bans control characters and
+        // will refuse this key by name, which the user can see, whereas a quiet
+        // cleanup changes the saved value without saying so.
+        let line = config_set_line("watchRoot", "a\nb\\c\td\u{0001}e");
+        assert_eq!(
+            line,
+            "{\"type\":\"config_set\",\"id\":\"watchRoot\",\"value\":\"a\\nb\\\\c\\td\\u0001e\"}\n"
+        );
+        let fields = parse_object(line.trim_end()).expect("one legal object");
+        assert_eq!(
+            text_field(&fields, "value"),
+            Some("a\nb\\c\td\u{0001}e".to_owned())
+        );
+    }
+
+    #[test]
+    fn non_ascii_rides_through_as_utf8() {
+        // No `\u` expansion for ordinary text: the wire is UTF-8 and both parsers
+        // read it directly, so escaping it would only make the line longer and
+        // the tests harder to read.
+        let line = config_set_line("watchRoot", "/home/我的项目");
+        assert!(line.contains("/home/我的项目"), "{line}");
+        let fields = parse_object(line.trim_end()).expect("one legal object");
+        assert_eq!(
+            text_field(&fields, "value"),
+            Some("/home/我的项目".to_owned())
+        );
     }
 
     #[test]

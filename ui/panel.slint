@@ -1,4 +1,46 @@
-import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
+import { Button, CheckBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
+
+// One source-catalog row as the wire delivers it. `state` stays the string the
+// brain sent — "running" | "stopped" | "unsupported" — rather than a bool, so a
+// capability this run cannot start is a third answer instead of an unchecked box
+// that looks like a choice the user made.
+export struct SourceRow {
+    id: string,
+    label: string,
+    state: string,
+}
+
+// One settings row, schema included. Every field here arrives on the wire: the
+// panel holds no list of setting names, no idea which key is an int, and no
+// notion of which ones need a restart. That is what keeps this a form renderer
+// rather than a second copy of the brain's schema — see docs/panel-protocol.md.
+export struct SettingRow {
+    id: string,
+    label: string,
+    // "text" | "int" | "enum" | "secret". Only `secret` changes the editor, and
+    // only into a masked one; the brain validates every kind either way.
+    kind: string,
+    value: string,
+    // "now" | "restart", shown as a badge so a value that will not take effect
+    // until the brain restarts does not look like it already has.
+    applies: string,
+    // An environment variable is shadowing the file. Disclosed rather than
+    // hidden: without it, a saved value that visibly does not apply looks like a
+    // bug in the save.
+    overridden: bool,
+    // ";"-joined enum choices, rendered as a hint. Kept joined on purpose: the
+    // wire is flat, and splitting it here would be parser work in a file with no
+    // tests.
+    values: string,
+}
+
+// A small trailing marker beside a settings row.
+component Badge inherits Text {
+    font-size: 10px;
+    color: #8a5a00;
+    vertical-alignment: center;
+    wrap: no-wrap;
+}
 
 // One label/value row. Factored out because the placeholder rule below has to
 // hold for *every* field, and a rule re-implemented eight times is a rule that
@@ -45,6 +87,85 @@ component Divider inherits Rectangle {
     // Rectangle to fill whatever space is going.
     height: 1px;
     background: #e0e0e0;
+}
+
+// One editable settings row: label, editor, markers, Save.
+//
+// Factored out because the rules below have to hold for every one of the ~21
+// rows and a rule re-implemented per row is a rule that will be got wrong once.
+//
+// The editor is never authoritative. It shows the value the last dump reported
+// and sends what the user typed; whether that value is legal is the brain's
+// answer, and it comes back as a `config_result` the status line reports. There
+// is no local validation here on purpose — a second validator would eventually
+// disagree with the one that actually writes the file.
+component SettingEditor inherits VerticalLayout {
+    in property <SettingRow> setting;
+    // Emitted with the row's own id, so the id that travels is the one the dump
+    // named rather than anything reconstructed from the label on screen.
+    callback save(string, string);
+
+    spacing: 2px;
+
+    HorizontalLayout {
+        spacing: 8px;
+
+        Text {
+            text: root.setting.label;
+            // Same fixed label column as `Field`: the panel is scanned, and a
+            // ragged left edge defeats scanning.
+            width: 122px;
+            font-size: 12px;
+            color: #8a8a8a;
+            vertical-alignment: center;
+            wrap: no-wrap;
+        }
+
+        editor := LineEdit {
+            // A binding, so a fresh dump replaces what is shown. Typing breaks
+            // the binding until the next dump rebuilds this row — which is
+            // exactly the wanted behavior: a draft survives while the user works
+            // on it, and the brain's truth wins the moment it speaks.
+            text: root.setting.value;
+            // The secret's value is empty on the wire by construction — the API
+            // key lives in Pi's own store and the dump structurally cannot carry
+            // it — so the placeholder says that rather than implying "unset".
+            placeholder-text: root.setting.kind == "secret" ? "write-only" : "";
+            // Masked echo for a credential. This is display only: what leaves
+            // this process is the same string either way, and the wire's privacy
+            // rule is that the key travels once, on a set, and never comes back.
+            input-type: root.setting.kind == "secret" ? InputType.password : InputType.text;
+            horizontal-stretch: 1;
+            accepted(value) => {
+                root.save(root.setting.id, value);
+            }
+        }
+
+        if root.setting.overridden: Badge {
+            text: "env";
+        }
+
+        if root.setting.applies == "restart": Badge {
+            text: "restart";
+        }
+
+        Button {
+            text: "Save";
+            clicked => {
+                root.save(root.setting.id, editor.text);
+            }
+        }
+    }
+
+    // The enum choices, verbatim from the wire. A hint rather than a dropdown:
+    // building a dropdown would mean splitting the joined list here, and the
+    // brain already refuses an unlisted spelling by name.
+    if root.setting.values != "": Text {
+        text: "one of: " + root.setting.values;
+        font-size: 10px;
+        color: #999999;
+        wrap: word-wrap;
+    }
 }
 
 // The resident control panel: what the sensors observed, what the agent last
@@ -107,7 +228,40 @@ export component PanelWindow inherits Window {
     callback pause();
     callback resume();
 
-    // --- D. Confirmation area --------------------------------------------
+    // --- D. The brain's own state ----------------------------------------
+    // "ready" | "needs_config" | "" — empty until a `service` line has been
+    // heard, which is also this panel's connect signal. `needs_config` is a
+    // running session with no model configured: the sensors observe, nothing
+    // thinks, and the settings section below is the way out.
+    in property <string> agent-state;
+    // True only when this panel spawned the brain itself. The brain refuses a
+    // restart it is not supervised for, so offering the button without this
+    // would be selling a switch that does nothing — the restart surface appears
+    // exactly where it can work.
+    in property <bool> supervised;
+    callback restart-service();
+
+    // --- E. Sources -------------------------------------------------------
+    // The whole declared catalog, three states, rendered generically. The
+    // capture gate is deliberately not in here: it is the pause switch above,
+    // not an observer, and the brain never declares it as one.
+    in property <[SourceRow]> sources;
+    callback toggle-source(string, bool);
+
+    // --- F. Settings ------------------------------------------------------
+    // The dump, schema and all. Re-pulled on every connect and after every
+    // verdict rather than patched in place, so what is on screen is a reading
+    // of the brain's files and never this window's memory of a click.
+    in property <[SettingRow]> settings;
+    callback save-setting(string, string);
+    // Re-asks for both dumps. Exists because a panel that can only refresh by
+    // reconnecting is a panel that hides staleness behind a restart.
+    callback refresh();
+    // The last verdict, or a complaint about a dump that arrived short. One
+    // line, always the brain's words — this window has no opinions to add.
+    in property <string> status;
+
+    // --- G. Confirmation area --------------------------------------------
     // Retained by explicit request even though no caller produces prompts
     // today (tool-layer safety is Pi's sandbox), so an external confirmation
     // can be wired in later without redesigning this surface.
@@ -125,9 +279,12 @@ export component PanelWindow inherits Window {
     always-on-top: false;
     // Sized for its content: a two-column field list at a readable 12px, plus
     // room for a couple of wrapped lines of agent text.
-    preferred-width: 480px;
-    preferred-height: 520px;
-    min-width: 380px;
+    preferred-width: 520px;
+    // Taller than the read-only panel was: the settings form is 21 rows behind
+    // a scroll view, and a window that opens with the form clipped invites the
+    // reading that the form is not there.
+    preferred-height: 760px;
+    min-width: 420px;
 
     VerticalBox {
         padding: 16px;
@@ -326,7 +483,169 @@ export component PanelWindow inherits Window {
             }
         }
 
-        // --- D. Confirmation area ---
+        Divider { }
+
+        // --- D. Service ---
+        SectionHeader { text: "SERVICE"; }
+
+        HorizontalLayout {
+            spacing: 8px;
+
+            Text {
+                text: "Agent";
+                width: 122px;
+                font-size: 12px;
+                color: #8a8a8a;
+                wrap: no-wrap;
+            }
+
+            Text {
+                // Three readings, three words. The unknown case is its own
+                // sentence rather than an optimistic "ready": a panel that has
+                // heard nothing yet must not claim the brain is thinking.
+                text: root.agent-state == ""
+                    ? "not reported yet"
+                    : (root.agent-state == "needs_config" ? "needs configuration" : root.agent-state);
+                font-size: 12px;
+                color: root.agent-state == "needs_config"
+                    ? #8a5a00
+                    : (root.agent-state == "ready" ? #1b6b2f : #8a8a8a);
+                font-weight: root.agent-state == "" ? 400 : 700;
+                wrap: no-wrap;
+                horizontal-stretch: 1;
+            }
+
+            // Only where it can work: an unsupervised brain refuses a restart,
+            // because exiting with nobody to respawn it would read as a crash to
+            // whoever started it by hand.
+            if root.supervised: Button {
+                text: "Restart brain";
+                clicked => {
+                    root.restart-service();
+                }
+            }
+        }
+
+        if root.agent-state == "needs_config": Text {
+            // The one piece of guidance this window offers, and it points at the
+            // form below rather than explaining the model layer: the session is
+            // already observing, so the only thing missing is three settings.
+            text: "The session is observing but not thinking. Set the model base URL, model id, and API key below.";
+            font-size: 11px;
+            color: #8a5a00;
+            wrap: word-wrap;
+        }
+
+        Divider { }
+
+        // --- E. Sources ---
+        HorizontalLayout {
+            spacing: 8px;
+
+            SectionHeader {
+                text: "SOURCES";
+                horizontal-stretch: 1;
+            }
+
+            // Re-pulls both dumps. Small and unobtrusive: the panel already
+            // refreshes itself on every connect and after every verdict, so this
+            // is for the case where the user wants to be sure rather than the
+            // normal path.
+            Text {
+                text: "refresh";
+                font-size: 11px;
+                color: #3a6ea5;
+                wrap: no-wrap;
+                TouchArea {
+                    clicked => {
+                        root.refresh();
+                    }
+                }
+            }
+        }
+
+        if root.sources.length == 0: Text {
+            text: "no catalog reported yet";
+            font-size: 12px;
+            color: #8a8a8a;
+            wrap: no-wrap;
+        }
+
+        for entry in root.sources: HorizontalLayout {
+            spacing: 8px;
+
+            CheckBox {
+                text: entry.label;
+                // A binding on the reported state, not a local flag. The click
+                // moves the box, but the next dump is what decides where it
+                // stays: a refused stop — the last observer, say — comes back as
+                // an error and a rebuilt row that shows the source still
+                // running. The panel never asserts a state the brain did not.
+                checked: entry.state == "running";
+                // A capability this run cannot start is shown and not offered.
+                // Hiding it would make a missing sensor look like a sensor that
+                // was never declared.
+                enabled: entry.state != "unsupported";
+                horizontal-stretch: 1;
+                toggled => {
+                    root.toggle-source(entry.id, self.checked);
+                }
+            }
+
+            Text {
+                text: entry.state == "unsupported" ? "not available in this run" : entry.state;
+                font-size: 11px;
+                color: entry.state == "running" ? #1b6b2f : #8a8a8a;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                wrap: no-wrap;
+            }
+        }
+
+        Divider { }
+
+        // --- F. Settings ---
+        SectionHeader { text: "SETTINGS"; }
+
+        if root.settings.length == 0: Text {
+            text: "no settings reported yet";
+            font-size: 12px;
+            color: #8a8a8a;
+            wrap: no-wrap;
+        }
+
+        // Scrolled rather than allowed to grow: the dump is ~21 rows, and a
+        // window that resizes itself to whatever the brain declares would be a
+        // window whose size the brain controls. Fixed height so the sections
+        // above and the confirmation area below keep their places.
+        if root.settings.length > 0: ScrollView {
+            height: 240px;
+
+            VerticalLayout {
+                spacing: 4px;
+                alignment: start;
+
+                for entry in root.settings: SettingEditor {
+                    setting: entry;
+                    save(id, value) => {
+                        root.save-setting(id, value);
+                    }
+                }
+            }
+        }
+
+        // The last thing the brain said about a save or a toggle, verbatim. Its
+        // words rather than a local paraphrase: the refusal text names the key
+        // and the reason, and re-writing it here would be this window inventing
+        // a diagnosis.
+        if root.status != "": Text {
+            text: root.status;
+            font-size: 11px;
+            color: #555555;
+            wrap: word-wrap;
+        }
+
+        // --- G. Confirmation area ---
         // Conditional rather than merely transparent: when nothing is pending
         // there are no buttons on screen to be clicked by a stray keystroke,
         // and no stale summary left sitting under them.
