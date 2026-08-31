@@ -543,6 +543,65 @@ mod tests {
     }
 
     #[test]
+    fn delivers_the_settings_and_source_variants_too() {
+        // The read path has to forward every type the parser knows, not just the
+        // four it was written for. A dump whose rows parse but never reach
+        // `deliver` would show as an empty form with no error anywhere.
+        let lines = [
+            "{\"type\":\"service\",\"agentState\":\"needs_config\"}",
+            "{\"type\":\"config\",\"id\":\"watchRoot\",\"label\":\"Watch root\",\"kind\":\"text\",\"value\":\"/\",\"applies\":\"restart\"}",
+            "{\"type\":\"config_end\",\"count\":1}",
+            "{\"type\":\"config_result\",\"id\":\"watchRoot\",\"ok\":1,\"applies\":\"restart\"}",
+            "{\"type\":\"source\",\"id\":\"filesystem-local\",\"label\":\"Filesystem\",\"state\":\"running\"}",
+            "{\"type\":\"source_end\",\"count\":1}",
+            "{\"type\":\"source_result\",\"id\":\"filesystem-local\",\"ok\":0,\"error\":\"refused\"}",
+        ];
+        let bytes = format!("{}\n", lines.join("\n"));
+        let seen = messages(bytes.as_bytes());
+        assert_eq!(seen.len(), 7);
+        assert_eq!(
+            seen[0],
+            Incoming::Service {
+                agent_state: "needs_config".to_owned(),
+            }
+        );
+        assert!(matches!(seen[1], Incoming::Config(_)));
+        assert_eq!(seen[2], Incoming::ConfigEnd { count: 1 });
+        assert!(matches!(seen[3], Incoming::ConfigResult(_)));
+        assert!(matches!(seen[4], Incoming::Source(_)));
+        assert_eq!(seen[5], Incoming::SourceEnd { count: 1 });
+        assert!(matches!(seen[6], Incoming::SourceResult(_)));
+    }
+
+    #[test]
+    fn what_the_settings_form_writes_arrives_as_whole_lines() {
+        // The outgoing half for the new surfaces, framed the way the server's
+        // reader is entitled to expect — including a value with a quote in it,
+        // which is the case that would break the framing if it went out raw.
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let outgoing = Outgoing::new();
+        outgoing.adopt(ours);
+        outgoing.send(&crate::protocol::config_get_line());
+        outgoing.send(&crate::protocol::config_set_line("watchRoot", "/tmp/a\"b"));
+        outgoing.send(&crate::protocol::source_toggle_line(
+            "filesystem-local",
+            false,
+        ));
+        drop(outgoing);
+        let mut received = String::new();
+        BufReader::new(theirs)
+            .read_to_string(&mut received)
+            .expect("read back");
+        assert_eq!(
+            received,
+            "{\"type\":\"config_get\"}\n{\"type\":\"config_set\",\"id\":\"watchRoot\",\"value\":\"/tmp/a\\\"b\"}\n{\"type\":\"source_toggle\",\"id\":\"filesystem-local\",\"on\":0}\n"
+        );
+        // Three lines out, three lines back: the escaped value did not end its
+        // own object early and turn the tail into messages of its own.
+        assert_eq!(received.lines().count(), 3);
+    }
+
+    #[test]
     fn backoff_doubles_and_stops_at_the_cap() {
         let mut delay = FIRST_BACKOFF;
         assert_eq!(next_backoff(delay), FIRST_BACKOFF * 2);
