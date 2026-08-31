@@ -66,9 +66,16 @@ function fakeAgentFactory(
     readonly reply?: string;
     /** A session whose turn never settles — the wedge the watchdog exists to break. */
     readonly neverIdle?: boolean;
+    /**
+     * A factory that cannot open a session at all — the shape an unconfigured
+     * model produces. A session that starts anyway proves creation was skipped,
+     * not that this factory is special.
+     */
+    readonly factoryError?: Error;
   } = {},
 ): ResidentSessionFactory {
   return async (): Promise<ResidentSession> => {
+    if (options.factoryError !== undefined) throw options.factoryError;
     let idle: (() => void) | undefined;
     let aborted = false;
     return {
@@ -163,7 +170,10 @@ async function startSession(options: {
     readonly promptError?: Error;
     readonly reply?: string;
     readonly neverIdle?: boolean;
+    readonly factoryError?: Error;
   };
+  /** Overrides the model-configuration probe, for the headless-needs-config tests. */
+  readonly agentConfigured?: boolean;
 }) {
   const seenContexts: WatchSourceContext[] = [];
   const agentLog = options.agentLog ?? emptyAgentLog();
@@ -173,6 +183,7 @@ async function startSession(options: {
     log: options.log ?? (() => {}),
     logError: options.logError ?? (() => {}),
     createAgentSession: fakeAgentFactory(agentLog, options.agentOptions ?? {}),
+    ...(options.agentConfigured === undefined ? {} : { agentConfigured: options.agentConfigured }),
     createSources: async (context) => {
       seenContexts.push(context);
       return options.sources;
@@ -807,6 +818,15 @@ describe("the control panel on a watch session", () => {
       const client = new PanelTestClient(socketPath, diagnostics);
       await client.ready();
 
+      // Every attach opens with the service state — a normal session says
+      // `ready`, so a panel never has to infer readiness from silence.
+      const service = await waitForLine(() =>
+        client.lines
+          .map(parsePanelLine)
+          .find((parsed) => parsed.type === "service"),
+      );
+      expect(service.agentState).toBe("ready");
+
       await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
       const line = await waitForLine(() =>
         client.lines
@@ -1026,6 +1046,85 @@ describe("the control panel on a watch session", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  /**
+   * The headless state: model unconfigured, panel mounted. The session starts
+   * anyway and says so on the wire — capture and the panel run, no turn ever
+   * does. This is what the panel-first flow sits on: the settings form has to
+   * be reachable to repair the configuration, so startup cannot die first.
+   */
+  it("starts agentless with a panel when the model is unconfigured, and says so on the wire", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+    const socketPath = panelEndpoint(dir);
+    const diagnostics: string[] = [];
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result, agentLog } = await startSession({
+      sources: [source],
+      env: { SQUID_PANEL_SOCKET: socketPath },
+      // A factory that would fail if anyone tried: the session starting at all
+      // proves creation was skipped, not that this factory is special.
+      agentOptions: { factoryError: new Error("No resident-agent model is configured") },
+      agentConfigured: false,
+      logError: (line) => diagnostics.push(line),
+    });
+    if ("configError" in result) throw new Error(result.configError);
+    try {
+      expect(result.session.banner.agent).toBe("needs_config");
+      expect(result.session.agent).toBeUndefined();
+      // Sources run exactly as always; the agent was never created.
+      expect(lifecycle).toEqual(["start:alpha"]);
+      expect(agentLog.disposed).toBe(0);
+
+      const client = new PanelTestClient(socketPath, diagnostics);
+      await client.ready();
+
+      // The client attached after the announcement, so hearing the service
+      // line here is the replay doing its job, not a startup broadcast.
+      const service = await waitForLine(() =>
+        client.lines.map(parsePanelLine).find((parsed) => parsed.type === "service"),
+      );
+      expect(service.agentState).toBe("needs_config");
+
+      // The session is otherwise ordinary: events still land on the wire...
+      await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
+      const world = await waitForLine(() =>
+        client.lines.map(parsePanelLine).find((parsed) => parsed.type === "world_state"),
+      );
+      expect(world.lastEvent).toBe("file_saved");
+      // ...and no agent line can exist, because no turn was ever started.
+      expect(agentLog.calls).toEqual([]);
+
+      await client.close();
+    } finally {
+      await result.session.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The no-panel branch is unchanged on purpose: without a window there is no
+   * repair path, so an unconfigured model stays a startup failure with the
+   * everything-built-above disposed.
+   */
+  it("still fails startup when the model is unconfigured and no panel can be told", async () => {
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    const { result, agentLog } = await startSession({
+      sources: [source],
+      agentConfigured: false,
+      agentOptions: { factoryError: new Error("No resident-agent model is configured") },
+    });
+    expect("configError" in result).toBe(true);
+    if ("configError" in result) {
+      expect(result.configError).toContain("The resident agent could not start");
+      expect(result.configError).toContain("No resident-agent model is configured");
+    }
+    // The agent is created before any source starts, so a failed creation must
+    // leave the sources unstarted rather than half-started.
+    expect(lifecycle).toEqual([]);
+    expect(agentLog.disposed).toBe(0);
   });
 
   it.skipIf(process.platform === "win32")("closes the panel even when a source fails to start", async () => {
