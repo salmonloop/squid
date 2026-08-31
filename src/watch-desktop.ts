@@ -123,6 +123,9 @@ export async function startDesktopWatch(
       ? {}
       : { createAgentSession: options.createAgentSession }),
     ...(databasePath === undefined ? {} : { databasePath }),
+    // Settings sets write back to the same file step zero read, so a form edit
+    // and the next startup agree about what "saved" means.
+    configPath: loaded.configPath,
     // Commands run in the watched root, matching `watch:files`. The screen source
     // contributes no paths, so it has no claim on the working directory.
     workingDirectory: canonicalRoot,

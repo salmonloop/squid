@@ -74,7 +74,10 @@ export interface PanelServer {
 export interface PanelServerOptions {
   readonly socketPath: string;
   readonly onControl: (op: "pause" | "resume") => void;
+  readonly onServiceControl?: (op: "restart") => void;
   readonly onAnswer?: (promptId: number, answer: "approved" | "declined") => void;
+  readonly onConfigGet?: () => void;
+  readonly onConfigSet?: (id: string, value: string) => void;
   readonly onDiagnostic?: (line: string) => void;
   /**
    * Runs once per newly registered client, after it can receive broadcasts.
@@ -85,6 +88,9 @@ export interface PanelServerOptions {
    */
   readonly onConnect?: (clientCount: number) => void;
 }
+
+/** Wire-illegal characters in a config_set field; the panel never sends them. */
+const HAS_CONTROL_CHAR = /[\u0000-\u001F\u007F]/;
 
 /**
  * Per-connection line-buffer ceiling. A panel's largest legal message is a
@@ -104,7 +110,7 @@ interface Client {
 }
 
 export async function startPanelServer(options: PanelServerOptions): Promise<PanelServer> {
-  const { socketPath, onControl, onAnswer, onDiagnostic, onConnect } = options;
+  const { socketPath, onControl, onServiceControl, onAnswer, onConfigGet, onConfigSet, onDiagnostic, onConnect } = options;
   const diagnostic = (line: string): void => {
     onDiagnostic?.(line);
   };
@@ -172,11 +178,51 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
     const record = parsed as Record<string, unknown>;
     if (record.type === "control") {
       const op = record.op;
+      if (op === "restart") {
+        if (onServiceControl === undefined) {
+          diagnostic("Panel control refused: no service-control handler is wired.");
+          return;
+        }
+        onServiceControl(op);
+        return;
+      }
       if (op !== "pause" && op !== "resume") {
-        diagnostic("Panel control refused: op must be exactly pause or resume.");
+        diagnostic("Panel control refused: op must be exactly pause, resume, or restart.");
         return;
       }
       onControl(op);
+      return;
+    }
+    if (record.type === "config_get") {
+      if (onConfigGet === undefined) {
+        diagnostic("Panel config_get refused: no config handler is wired.");
+        return;
+      }
+      onConfigGet();
+      return;
+    }
+    if (record.type === "config_set") {
+      const { id, value } = record;
+      if (typeof id !== "string" || id.length === 0) {
+        diagnostic("Panel config_set refused: id must be a non-empty string.");
+        return;
+      }
+      if (typeof value !== "string") {
+        diagnostic(`Panel config_set refused: value for "${id}" must be a string.`);
+        return;
+      }
+      // The wire bans raw control characters outright; refusing here keeps the
+      // handler's job semantic-only. Diagnostics name the key, never the value —
+      // that value could be the API key's one trip across this socket.
+      if (HAS_CONTROL_CHAR.test(id) || HAS_CONTROL_CHAR.test(value)) {
+        diagnostic(`Panel config_set refused: value for "${id}" holds a control character.`);
+        return;
+      }
+      if (onConfigSet === undefined) {
+        diagnostic("Panel config_set refused: no config handler is wired.");
+        return;
+      }
+      onConfigSet(id, value);
       return;
     }
     if (record.type === "answer") {

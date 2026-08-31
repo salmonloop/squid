@@ -79,6 +79,45 @@ export function modelConfigurationStatus(
   return { kind: "ready" };
 }
 
+export interface ModelEntryValues {
+  readonly baseUrl: string | undefined;
+  readonly modelId: string | undefined;
+}
+
+/**
+ * Reads one provider's current entry for *display*: what a settings form would
+ * start from. Values are undefined when the entry does not name them, and the
+ * whole result is undefined when there is no readable entry — a malformed file
+ * reads as unconfigured here, because the dump's job is to show the form, not
+ * to adjudicate the file; the next startup's status check is what refuses a
+ * malformed one loudly.
+ */
+export function readModelEntry(agentDir: string, provider: string): ModelEntryValues | undefined {
+  const catalog = readProviders(agentDir);
+  if (catalog.kind !== "present") return undefined;
+  const record = catalog.providers[provider];
+  if (typeof record !== "object" || record === null) return undefined;
+  const entry = record as { baseUrl?: unknown; models?: unknown };
+  const baseUrl = typeof entry.baseUrl === "string" ? entry.baseUrl : undefined;
+  const first = Array.isArray(entry.models) ? entry.models[0] : undefined;
+  const modelId = typeof first === "object" && first !== null && typeof (first as { id?: unknown }).id === "string"
+    ? (first as { id: string }).id
+    : undefined;
+  if (baseUrl === undefined && modelId === undefined) return undefined;
+  return { baseUrl, modelId };
+}
+
+/**
+ * Whether a credential exists for the provider, without ever exposing its
+ * value: the key's content stays inside Pi's auth file and this module. Callers
+ * that need the value to restate it (an endpoint rewrite that also rewrote
+ * auth.json) are the reason `writeModelEndpoint` exists instead — an endpoint
+ * edit must not need the key at all.
+ */
+export function hasStoredCredential(agentDir: string, provider: string): boolean {
+  return readStoredCredential(provider, join(agentDir, "auth.json")) !== undefined;
+}
+
 export interface FirstRunAnswers {
   readonly baseUrl: string;
   readonly modelId: string;
@@ -126,13 +165,19 @@ export async function askFirstRunAnswers(
  * it is what a reader of this file needs to know.
  */
 
-export function writeModelConfiguration(
+/**
+ * The endpoint half of the configuration, shared by the first-run write and
+ * `writeModelEndpoint`: one provider's models.json entry, rewritten while every
+ * other provider the user has configured is preserved. Clobbering a user's
+ * other logins to add ours is not a default anyone consented to.
+ */
+function writeProviderEntry(
   agentDir: string,
   provider: string,
-  answers: FirstRunAnswers,
+  baseUrl: string,
+  modelId: string,
 ): void {
   mkdirSync(agentDir, { recursive: true });
-
   const modelsPath = join(agentDir, "models.json");
   const models: Record<string, unknown> = existsSync(modelsPath)
     ? (JSON.parse(readFileSync(modelsPath, "utf8")) as Record<string, unknown>)
@@ -143,12 +188,12 @@ export function writeModelConfiguration(
       : {}
   ) as Record<string, unknown>;
   providers[provider] = {
-    baseUrl: answers.baseUrl,
+    baseUrl,
     api: "openai-completions",
     models: [
       {
-        id: answers.modelId,
-        name: answers.modelId,
+        id: modelId,
+        name: modelId,
         reasoning: true,
         input: ["text"],
         contextWindow: DEFAULT_CONTEXT_WINDOW,
@@ -161,6 +206,14 @@ export function writeModelConfiguration(
   };
   models.providers = providers;
   writeJsonAtomic(modelsPath, models);
+}
+
+export function writeModelConfiguration(
+  agentDir: string,
+  provider: string,
+  answers: FirstRunAnswers,
+): void {
+  writeProviderEntry(agentDir, provider, answers.baseUrl, answers.modelId);
 
   const authPath = join(agentDir, "auth.json");
   const auth: Record<string, unknown> = existsSync(authPath)
@@ -168,4 +221,20 @@ export function writeModelConfiguration(
     : {};
   auth[provider] = { type: "api_key", key: answers.apiKey };
   writeJsonAtomic(authPath, auth);
+}
+
+/**
+ * Rewrites the endpoint half (models.json) and leaves the credential half
+ * (auth.json) exactly as it stands. A user moving where the model is reached
+ * must not have to re-enter their key — and since this module deliberately
+ * cannot read the key's value back out, a flow that required restating it could
+ * not even be built correctly. Settings-panel edits of base URL and model id
+ * go through here for exactly that reason.
+ */
+export function writeModelEndpoint(
+  agentDir: string,
+  provider: string,
+  endpoint: { readonly baseUrl: string; readonly modelId: string },
+): void {
+  writeProviderEntry(agentDir, provider, endpoint.baseUrl, endpoint.modelId);
 }
