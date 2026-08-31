@@ -22,7 +22,8 @@ import {
   type ResidentAgent,
   type ResidentSessionFactory,
 } from "./resident-agent.js";
-import type { ActivitySource, ActivitySourceDiagnostic } from "./activity-source.js";
+import type { ActivitySourceDiagnostic, SourceEntry } from "./activity-source.js";
+import { SourceManager } from "./source-manager.js";
 import type { ActivityEvent, WorldState } from "./protocol.js";
 import type { PredictionRuntimeIngestResult } from "./prediction-runtime.js";
 import { runRetentionPrune, type RetentionPruneResult } from "./retention-prune.js";
@@ -36,6 +37,9 @@ import {
   panelConfigLine,
   panelConfigResult,
   panelServiceLine,
+  panelSourceEnd,
+  panelSourceLine,
+  panelSourceResult,
   panelWorldState,
 } from "./panel-view.js";
 import { appendGateCommand } from "./panel-control.js";
@@ -78,11 +82,14 @@ export interface WatchSessionOptions {
   /** Absolute directory the agent works in. */
   readonly workingDirectory: string;
   /**
-   * Builds the sources once the runtime exists. Filesystem exclusions depend on
-   * the database path, which is derived during construction, so sources cannot
-   * be passed in ready-made.
+   * Declares the source catalog once the runtime exists. Filesystem exclusions
+   * depend on the database path, which is derived during construction, so the
+   * catalog cannot be passed in ready-made. Entries are recipes, not instances:
+   * the session's source manager builds each one it starts, and an entry whose
+   * `create` is omitted shows as `unsupported` and refuses toggles rather than
+   * disappearing from the panel's dump.
    */
-  readonly createSources: (context: WatchSourceContext) => Promise<readonly ActivitySource[]>;
+  readonly createSources: (context: WatchSourceContext) => Promise<readonly SourceEntry[]>;
   /**
    * One stdout line per ingested event. Read the projection (`result.ingest.state`)
    * rather than `event.payload`: the projection is built from the *captured*
@@ -355,6 +362,13 @@ export async function startWatchSession(
    */
   const sessionRef: { session: WatchSession | undefined } = { session: undefined };
 
+  /**
+   * Held in a ref for the same reason as `sessionRef`: the hooks below are
+   * wired before the catalog is built, and a toggle arriving in that window
+   * must be refused outright, not answered by a closure over `undefined`.
+   */
+  const sourceManagerRef: { manager: SourceManager | undefined } = { manager: undefined };
+
   let panelServer: PanelServer | undefined;
   if (panel.enabled) {
     const commandPath = env.SQUID_CONTROL_FIFO;
@@ -401,6 +415,35 @@ export async function startWatchSession(
           if (outcome.ok && isModelConfigKey(id) && agent === undefined) {
             tryStartAgent();
           }
+        },
+        onSourceGet: () => {
+          const manager = sourceManagerRef.manager;
+          if (manager === undefined) {
+            // The window between the panel server listening and the catalog
+            // being built. A refusal, not silence: a panel waiting on a dump
+            // that never ends is a worse lie than an honest "not yet".
+            panelServer?.broadcast(panelSourceResult({ ok: false, error: "The source catalog is still starting." }));
+            return;
+          }
+          const snapshot = manager.snapshot();
+          for (const entry of snapshot) {
+            panelServer?.broadcast(panelSourceLine(entry));
+          }
+          panelServer?.broadcast(panelSourceEnd(snapshot.length));
+        },
+        onSourceToggle: (id, on) => {
+          const manager = sourceManagerRef.manager;
+          if (manager === undefined) {
+            panelServer?.broadcast(panelSourceResult({ id, ok: false, error: "The source catalog is still starting." }));
+            return;
+          }
+          // The manager returns a result instead of throwing — including for
+          // unknown ids and refusals — so the panel learns the verdict either way.
+          void (on ? manager.start(id) : manager.stop(id)).then((result) => {
+            panelServer?.broadcast(
+              panelSourceResult(result.ok ? { id, ok: true } : { id, ok: false, error: result.error }),
+            );
+          });
         },
         onServiceControl: (op) => {
           // Only a supervised run may restart: the supervisor is what respawns
@@ -546,24 +589,34 @@ export async function startWatchSession(
     }
   };
 
-  const sources = [...await options.createSources({
+  const entries = [...await options.createSources({
     databasePath: watch.databasePath,
     onDiagnostic: (diagnostic) => {
       logError(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
     },
   })];
+  // Outside the catalog on purpose: the gate is the pause switch, not an
+  // observer, so the panel cannot stop it and the manager never counts it.
+  let gateSource: CaptureGateActivitySource | undefined;
   if (gate.enabled) {
     // Last, after every observer: a pause command must land in the timeline
     // with the foreground already projected, and resume must arrive before any
-    // event the resumed capture produces.
-    sources.push(new CaptureGateActivitySource({
+    // event the resumed capture produces. The gate is deliberately not a
+    // catalog entry — it is not an observer the panel toggles, and removing it
+    // from the session's stop order would corrupt the timeline ordering.
+    gateSource = new CaptureGateActivitySource({
       readerFactory: gate.readerFactory,
       onDiagnostic: (diagnostic) => {
         logError(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
       },
-    }));
+    });
   }
-  if (sources.length === 0) {
+  // The same invariant startup has always enforced, one level up: `sources`
+  // used to count observers plus gate, so a catalog with no startable entries
+  // (and no gate) refused here too. A gate counts — it is the one source a
+  // session can run with, paused, while the panel offers the rest.
+  const startableCount = entries.filter((entry) => entry.create !== undefined).length;
+  if (startableCount + (gate.enabled ? 1 : 0) === 0) {
     if (panelServer !== undefined) await panelServer.close();
     await drainAgentTurns();
     agent?.dispose();
@@ -614,20 +667,25 @@ export async function startWatchSession(
     promptAgent();
   };
 
-  // Started one at a time rather than with Promise.all: a source that rejects
-  // must not leave a sibling half-started with no handle to stop it.
-  const started: ActivitySource[] = [];
+  const sourceManager = new SourceManager({
+    entries,
+    emit: ingest,
+    log,
+    logError,
+  });
+  sourceManagerRef.manager = sourceManager;
+
+  // Started one at a time (the manager's startAll) rather than with
+  // Promise.all: a source that rejects must not leave a sibling half-started
+  // with no handle to stop it. The gate starts after every observer, per the
+  // ordering rule its construction comment states.
   try {
-    for (const source of sources) {
-      await source.start(ingest);
-      started.push(source);
-    }
+    await sourceManager.startAll();
+    if (gateSource !== undefined) await gateSource.start(ingest);
   } catch (error) {
-    for (const source of started.reverse()) {
-      await source.stop().catch(() => {});
-    }
-    // A source that failed mid-start may already have emitted, so a turn can be
-    // in flight on this path rather than only in theory.
+    // A source that failed mid-start may already have emitted, so a turn can
+    // be in flight on this path rather than only in theory.
+    await sourceManager.stopAll();
     if (panelServer !== undefined) await panelServer.close();
     await drainAgentTurns();
     agent?.dispose();
@@ -635,11 +693,21 @@ export async function startWatchSession(
     return { configError: `A source failed to start: ${describeErrorForAudit(error)}` };
   }
 
+  // What actually started: every startable entry (startAll just proved it) in
+  // declaration order, then the gate. The banner and the id list tell the truth
+  // about the run — an unsupported entry never appears as if it were observing.
+  const startedSourceIds = [
+    ...sourceManager.snapshot()
+      .filter((entry) => entry.state === "running")
+      .map((entry) => entry.id),
+    ...(gateSource === undefined ? [] : [gateSource.id]),
+  ];
+
   let stopped = false;
   const session: WatchSession = {
     banner: {
       ...(options.banner ?? {}),
-      sources: sources.map((source) => source.id).join(","),
+      sources: startedSourceIds.join(","),
       store: watch.databasePath ?? "memory",
       agent: agent === undefined ? "needs_config" : "resident",
       panel: panel.enabled ? panel.socketPath : "off",
@@ -651,15 +719,16 @@ export async function startWatchSession(
     },
     runtime: watch,
     agent,
-    sourceIds: sources.map((source) => source.id),
+    sourceIds: startedSourceIds,
     stop: async () => {
       if (stopped) return;
       stopped = true;
       // Sources first, in reverse start order, so a later source never emits
-      // into one already torn down.
-      for (const source of [...sources].reverse()) {
-        await source.stop();
-      }
+      // into one already torn down. The gate started last, so it stops first;
+      // the manager's stopAll then walks the observers in reverse declaration
+      // order. Hot-toggled sources are simply wherever `running` left them.
+      if (gateSource !== undefined) await gateSource.stop();
+      await sourceManager.stopAll();
       // Then the agent's turns, while its session is still open: a turn cut off
       // mid-flight loses whatever the agent was doing, and its session history is
       // the only record that it happened. The panel closes after that drain, so

@@ -264,6 +264,55 @@ running (the session starts the agent on the spot); a model setting saved while
 the agent is live says `"restart"`, because Pi's session already holds the old
 endpoint, and claiming otherwise would be a lie the panel renders as fact.
 
+### `source`
+
+One source row per message, sent as the reply to `source_get` (a dump). The
+dump lists the whole catalog in declaration order — including capabilities this
+run did not configure — so the panel shows the whole truth instead of hiding a
+toggle the schema knows about.
+
+```jsonc
+{"type":"source","id":"filesystem-local","label":"Files","state":"running"}
+{"type":"source","id":"browser-page-host","label":"Browser","state":"unsupported"}
+{"type":"source_end","count":5}
+```
+
+| field | type | required | notes |
+|---|---|---|---|
+| `type` | `"source"` | yes | |
+| `id` | string | yes | the id a `source_toggle` echoes back |
+| `label` | string | yes | what the form shows, **sanitized** |
+| `state` | `"running"` \| `"stopped"` \| `"unsupported"` | yes | `unsupported` = the capability exists but this run cannot start it; toggles are refused |
+
+`count` on `source_end` tells the panel how many rows to expect — the same
+sizing contract as `config_end`.
+
+**The capture gate is not a source.** It is the pause switch, not an observer,
+so it never appears in this dump and cannot be stopped by a panel. The last
+running observer cannot be stopped either: a watch session with zero sources
+is the exact state startup refuses, so the manager refuses it at runtime too.
+
+### `source_result`
+
+The verdict on one `source_toggle`.
+
+```jsonc
+{"type":"source_result","id":"browser-page-host","ok":1}
+{"type":"source_result","id":"browser-page-host","ok":0,"error":"Source \"browser-page-host\" is not available in this run."}
+```
+
+| field | type | required | notes |
+|---|---|---|---|
+| `type` | `"source_result"` | yes | |
+| `id` | string | no | the id the toggle named; omitted for a dump-level failure |
+| `ok` | `0` \| `1` | yes | |
+| `error` | string | no | present when `ok` is `0`, **sanitized** |
+
+A toggle is a recipe rebuild, not a resurrection: starting a stopped source
+builds a fresh instance from the catalog's `create`, because a source cannot
+restart itself. Events emitted while a source drains during its stop are
+delivered before the stop resolves, so nothing observed is lost.
+
 ### `prompt` / `cancel`
 
 The confirmation area. No caller produces these today — tool-layer safety is Pi's
@@ -286,6 +335,8 @@ selection must not be able to reach this process at all.
 {"type":"control","op":"restart"}
 {"type":"config_get"}
 {"type":"config_set","id":"watchRoot","value":"/home/me"}
+{"type":"source_get"}
+{"type":"source_toggle","id":"browser-page-host","on":0}
 {"type":"answer","promptId":1,"answer":"approved"}
 ```
 
@@ -314,6 +365,18 @@ which rules, what applies when) lives in the TS settings service.
 The server's reply is exactly one `config_result` per set. A form with five
 edits sends five messages and sees five verdicts, so every refusal is
 attributable to the field being edited.
+
+**`source_get`** asks for the source catalog dump: one `source` line per entry,
+then `source_end` with the count.
+
+**`source_toggle`** starts (`on: 1`) or stops (`on: 0`) one source. `id` is a
+non-empty string with no control characters and `on` is exactly `0` or `1` —
+a string `"1"` or a truthy cast is refused, because a malformed line must not
+flip a source the panel never meant to flip. The server replies with exactly
+one `source_result` per toggle. Toggles on one source are serialized in arrival
+order, so a start and a stop cannot interleave; distinct sources are
+independent. Starting an already-running source and stopping one that is not
+running are honest refusals, not silent no-ops.
 
 ## Restart and the process contract
 
@@ -383,7 +446,10 @@ export type PanelMessage =
   | PanelServiceLine
   | PanelConfigLine
   | PanelConfigEnd
-  | PanelConfigResult;
+  | PanelConfigResult
+  | PanelSourceLine
+  | PanelSourceEnd
+  | PanelSourceResult;
 export interface PanelServiceLine {
   readonly type: "service";
   readonly agentState: "ready" | "needs_config";
@@ -407,6 +473,22 @@ export interface PanelConfigResult {
   readonly id?: string;
   readonly ok: 0 | 1;
   readonly applies?: "now" | "restart";
+  readonly error?: string;
+}
+export interface PanelSourceLine {
+  readonly type: "source";
+  readonly id: string;
+  readonly label: string;
+  readonly state: "running" | "stopped" | "unsupported";
+}
+export interface PanelSourceEnd {
+  readonly type: "source_end";
+  readonly count: number;
+}
+export interface PanelSourceResult {
+  readonly type: "source_result";
+  readonly id?: string;
+  readonly ok: 0 | 1;
   readonly error?: string;
 }
 /** Absent fields are omitted from the object, never set to null/undefined keys. */
@@ -438,6 +520,19 @@ export function panelConfigResult(result: {
   readonly applies?: "now" | "restart";
   readonly error?: string;
 }): PanelConfigResult;
+/** One catalog row; sanitizes id and label like every wire string. */
+export function panelSourceLine(entry: {
+  readonly id: string;
+  readonly label: string;
+  readonly state: "running" | "stopped" | "unsupported";
+}): PanelSourceLine;
+export function panelSourceEnd(count: number): PanelSourceEnd;
+/** One toggle's verdict; id omitted means the dump itself failed. */
+export function panelSourceResult(result: {
+  readonly id?: string;
+  readonly ok: boolean;
+  readonly error?: string;
+}): PanelSourceResult;
 /** One line, newline-terminated. The only sanctioned way to frame a message. */
 export function panelLine(message: PanelMessage): string;
 

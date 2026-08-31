@@ -24,10 +24,14 @@ const started = await startWatchSession({
   ...(databasePath === undefined ? {} : { databasePath }),
   workingDirectory: process.cwd(),
   banner: { watching: "foreground-window-text", reader: reader.readerKind },
-  createSources: async (context) => [new ScreenTextActivitySource({
-    readerFactory: reader.readerFactory,
-    onDiagnostic: context.onDiagnostic,
-  })],
+  createSources: async (context) => [{
+    id: "screen-text-host",
+    label: "Screen",
+    create: () => new ScreenTextActivitySource({
+      readerFactory: reader.readerFactory,
+      onDiagnostic: context.onDiagnostic,
+    }),
+  }],
   // Read window and application from the projection rather than from `event`.
   // The projection is built from the *captured* event, so anything the capture
   // policy redacted stays redacted here; logging `event.payload` would print the

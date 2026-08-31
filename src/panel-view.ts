@@ -85,13 +85,35 @@ export interface PanelConfigResult {
   readonly error?: string;
 }
 
+export interface PanelSourceLine {
+  readonly type: "source";
+  readonly id: string;
+  readonly label: string;
+  readonly state: "running" | "stopped" | "unsupported";
+}
+
+export interface PanelSourceEnd {
+  readonly type: "source_end";
+  readonly count: number;
+}
+
+export interface PanelSourceResult {
+  readonly type: "source_result";
+  readonly id?: string;
+  readonly ok: 0 | 1;
+  readonly error?: string;
+}
+
 export type PanelMessage =
   | PanelWorldState
   | PanelAgentLine
   | PanelServiceLine
   | PanelConfigLine
   | PanelConfigEnd
-  | PanelConfigResult;
+  | PanelConfigResult
+  | PanelSourceLine
+  | PanelSourceEnd
+  | PanelSourceResult;
 
 /**
  * Projects the world state into the panel's view of it.
@@ -236,6 +258,47 @@ export function panelConfigResult(result: {
     ...(result.id === undefined ? {} : { id: sanitizeAuditText(result.id, "diagnostic").text }),
     ok: result.ok ? 1 : 0,
     ...(result.applies === undefined ? {} : { applies: result.applies }),
+    ...(result.error === undefined ? {} : { error: sanitizeAuditText(result.error, "diagnostic").text }),
+  };
+}
+
+/**
+ * One row of the source dump. The panel gets every declared entry — running,
+ * stopped, or unsupported — so the form shows the whole truth about this run;
+ * a capability this process cannot start must be visible as un-toggleable, not
+ * hidden. Id and label sanitize as diagnostics like every wire string.
+ */
+export function panelSourceLine(input: {
+  readonly id: string;
+  readonly label: string;
+  readonly state: "running" | "stopped" | "unsupported";
+}): PanelSourceLine {
+  return {
+    type: "source",
+    id: sanitizeAuditText(input.id, "diagnostic").text,
+    label: sanitizeAuditText(input.label, "diagnostic").text,
+    state: input.state,
+  };
+}
+
+/** Closes a source dump, mirroring `config_end`'s count-for-sizing contract. */
+export function panelSourceEnd(count: number): PanelSourceEnd {
+  return { type: "source_end", count };
+}
+
+/**
+ * The verdict on one toggle. Same shape discipline as `config_result`: id and
+ * error sanitize as diagnostics, ok is 0|1, omission where nothing to say.
+ */
+export function panelSourceResult(result: {
+  readonly id?: string;
+  readonly ok: boolean;
+  readonly error?: string;
+}): PanelSourceResult {
+  return {
+    type: "source_result",
+    ...(result.id === undefined ? {} : { id: sanitizeAuditText(result.id, "diagnostic").text }),
+    ok: result.ok ? 1 : 0,
     ...(result.error === undefined ? {} : { error: sanitizeAuditText(result.error, "diagnostic").text }),
   };
 }

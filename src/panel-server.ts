@@ -78,6 +78,8 @@ export interface PanelServerOptions {
   readonly onAnswer?: (promptId: number, answer: "approved" | "declined") => void;
   readonly onConfigGet?: () => void;
   readonly onConfigSet?: (id: string, value: string) => void;
+  readonly onSourceGet?: () => void;
+  readonly onSourceToggle?: (id: string, on: boolean) => void;
   readonly onDiagnostic?: (line: string) => void;
   /**
    * Runs once per newly registered client, after it can receive broadcasts.
@@ -110,7 +112,7 @@ interface Client {
 }
 
 export async function startPanelServer(options: PanelServerOptions): Promise<PanelServer> {
-  const { socketPath, onControl, onServiceControl, onAnswer, onConfigGet, onConfigSet, onDiagnostic, onConnect } = options;
+  const { socketPath, onControl, onServiceControl, onAnswer, onConfigGet, onConfigSet, onSourceGet, onSourceToggle, onDiagnostic, onConnect } = options;
   const diagnostic = (line: string): void => {
     onDiagnostic?.(line);
   };
@@ -223,6 +225,41 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
         return;
       }
       onConfigSet(id, value);
+      return;
+    }
+    if (record.type === "source_get") {
+      if (onSourceGet === undefined) {
+        diagnostic("Panel source_get refused: no source handler is wired.");
+        return;
+      }
+      onSourceGet();
+      return;
+    }
+    if (record.type === "source_toggle") {
+      const { id, on } = record;
+      if (typeof id !== "string" || id.length === 0) {
+        diagnostic("Panel source_toggle refused: id must be a non-empty string.");
+        return;
+      }
+      // Booleans ride as 1|0 per the flat-wire rule; a string "1" or a truthy
+      // cast would let a malformed line flip a source the panel never meant to.
+      if (on !== 0 && on !== 1) {
+        diagnostic(`Panel source_toggle refused: on for "${id}" must be 0 or 1.`);
+        return;
+      }
+      // The same control-character ban config_set enforces: a dirty id never
+      // reaches a handler, let alone a log line.
+      if (HAS_CONTROL_CHAR.test(id)) {
+        // The id is not quoted here: it holds the control byte, and a
+        // diagnostic that echoes it would smuggle the byte into the log.
+        diagnostic("Panel source_toggle refused: id holds a control character.");
+        return;
+      }
+      if (onSourceToggle === undefined) {
+        diagnostic("Panel source_toggle refused: no source handler is wired.");
+        return;
+      }
+      onSourceToggle(id, on === 1);
       return;
     }
     if (record.type === "answer") {

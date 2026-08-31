@@ -21,3 +21,26 @@ export interface ActivitySource {
   /** Stops observation, drains buffered events, and resolves once quiet. Idempotent. */
   stop(): Promise<void>;
 }
+
+/**
+ * One toggleable source as the catalog declares it: an identity plus a recipe.
+ *
+ * `create` is a recipe, not an instance, because `ActivitySource.start` refuses
+ * to run on a stopped instance — a hot restart means a fresh instance built by
+ * the same recipe, never a resurrection of the old one. The entry's `id` is the
+ * single declaration: every instance built from `create` must report the same
+ * id, and the source manager refuses to start one that does not, so the catalog
+ * key and the event metadata cannot drift apart.
+ *
+ * `create` is omitted for a capability this run did not configure — a browser
+ * reader that was off at startup, say. The entry still appears in the panel's
+ * dump (state `unsupported`) and refuses toggles, so the form shows the whole
+ * truth about the run instead of hiding a capability that exists in the schema
+ * but not in this process.
+ */
+export interface SourceEntry {
+  readonly id: string;
+  /** Human-readable name the panel renders; sanitized like every wire string. */
+  readonly label: string;
+  readonly create?: () => ActivitySource;
+}
