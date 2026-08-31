@@ -1,0 +1,310 @@
+import { describe, expect, it } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CONFIG_KEYS, configKeyByEnv, configKeyById } from "../src/config-schema.js";
+import { resolveConfigPath, type ConfigPathResolution } from "../src/config-paths.js";
+import { readConfigFile, updateConfigFile, type ConfigFileRead } from "../src/config-file.js";
+import {
+  loadConfiguredEnvironment,
+  withConfigFile,
+} from "../src/effective-env.js";
+
+/** Unwraps a resolution for an assertion, failing loudly if it was an error. */
+function pathOf(result: ConfigPathResolution): string {
+  if ("configError" in result) throw new Error(result.configError);
+  return result.path;
+}
+
+/** Unwraps a read for an `toEqual`, failing loudly if it was an error. */
+function readOf(result: ConfigFileRead): { kind: string; values: Record<string, string> } {
+  if ("configError" in result) throw new Error(result.configError);
+  if (result.kind !== "read") throw new Error(`expected a read, got kind ${result.kind}`);
+  return { kind: result.kind, values: { ...result.values } };
+}
+
+function tempDir(): string {
+  return mkdtempSync(join(tmpdir(), "squid-config-"));
+}
+
+function writeConfig(path: string, body: string): void {
+  writeFileSync(path, body, "utf8");
+}
+
+describe("config schema", () => {
+  it("maps every id to the env name a resolver already reads", () => {
+    // The schema introduces no new configuration language: each row is a
+    // rename of an existing variable, so a wrong env spelling here would
+    // silently strand a setting the panel offers but nothing reads.
+    expect(configKeyById("watchRoot")?.env).toBe("SQUID_WATCH_ROOT");
+    expect(configKeyById("databasePath")?.env).toBe("SQUID_DB");
+    expect(configKeyByEnv("SQUID_SCREEN_POLL_MS")?.id).toBe("screenPollMs");
+    expect(configKeyByEnv("SQUID_PANEL_SOCKET")).toBeUndefined();
+  });
+
+  it("accepts the values each kind means and refuses the near-misses", () => {
+    const retention = configKeyById("retentionHours")!;
+    expect(retention.validate("72")).toEqual({ ok: true });
+    // `Number()` would take all three; a lax parser here would store values
+    // the resolver then refuses, moving the error to a place with no form.
+    expect(retention.validate("1e3").ok).toBe(false);
+    expect(retention.validate(" 24").ok).toBe(false);
+    expect(retention.validate("0").ok).toBe(false);
+    expect(retention.validate("-1").ok).toBe(false);
+
+    const reader = configKeyById("screenReader")!;
+    expect(reader.validate("synthetic")).toEqual({ ok: true });
+    expect(reader.validate("Synthetic").ok).toBe(false);
+    expect(reader.validate("vision").ok).toBe(false);
+
+    const root = configKeyById("watchRoot")!;
+    expect(root.validate("/home/me")).toEqual({ ok: true });
+    // A pasted trailing newline is a different directory; the file layer's
+    // one whitespace rule is refuse, not trim.
+    expect(root.validate("/home/me ").ok).toBe(false);
+  });
+
+  it("reads the empty string as unset for every key", () => {
+    // An empty settings field means "not set", and unset already means the
+    // right thing everywhere — home default, capture off, no exclusions.
+    for (const key of CONFIG_KEYS) {
+      expect(key.validate("")).toEqual({ ok: true });
+    }
+  });
+
+  it("refuses the empty entry an exclusion list would turn into a typo", () => {
+    const exclude = configKeyById("excludeApplications")!;
+    expect(exclude.validate("code,terminal")).toEqual({ ok: true });
+    expect(exclude.validate("code,,terminal").ok).toBe(false);
+    // Whitespace *around* an entry is what the resolver trims, so the file
+    // layer accepts it too — refusing here would make a value work by env and
+    // fail by file, an asymmetry with no defender.
+    expect(exclude.validate("code, terminal").ok).toBe(true);
+  });
+
+  it("carries every label and kind the panel will render", () => {
+    // The wire config message hands these over verbatim so Rust never
+    // hardcodes a key; a row missing its label would ship a form with a hole.
+    for (const key of CONFIG_KEYS) {
+      expect(key.label.length).toBeGreaterThan(0);
+      if (key.kind === "enum") expect(key.values?.length ?? 0).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("resolveConfigPath", () => {
+  it("names each platform's own config home", () => {
+    const home = "/home/me";
+    expect(pathOf(resolveConfigPath({ env: {}, platform: "darwin", home })))
+      .toBe(join(home, "Library", "Application Support", "Squid", "config.json"));
+    expect(pathOf(resolveConfigPath({ env: {}, platform: "linux", home })))
+      .toBe("/home/me/.config/squid/config.json");
+    expect(pathOf(resolveConfigPath({ env: {}, platform: "win32", home })))
+      .toBe(join(home, "AppData", "Roaming", "Squid", "config.json"));
+  });
+
+  it("honors an absolute XDG_CONFIG_HOME and refuses a relative one", () => {
+    const home = "/home/me";
+    expect(pathOf(resolveConfigPath({ env: { XDG_CONFIG_HOME: "/etc/me" }, platform: "linux", home })))
+      .toBe("/etc/me/squid/config.json");
+    // A relative XDG dir would make the file's location depend on the launch
+    // directory — the same reason the override below is absolute-only.
+    expect(pathOf(resolveConfigPath({ env: { XDG_CONFIG_HOME: "etc/me" }, platform: "linux", home })))
+      .toBe("/home/me/.config/squid/config.json");
+  });
+
+  it("takes SQUID_CONFIG as the whole file, and only when absolute", () => {
+    expect(pathOf(resolveConfigPath({ env: { SQUID_CONFIG: "/tmp/x/config.json" }, platform: "linux" })))
+      .toBe("/tmp/x/config.json");
+    expect(resolveConfigPath({ env: { SQUID_CONFIG: "x/config.json" }, platform: "linux" }))
+      .toEqual({ configError: "SQUID_CONFIG must be an absolute path." });
+    expect(pathOf(resolveConfigPath({ env: { SQUID_CONFIG: "C:\\x\\config.json" }, platform: "win32" })))
+      .toBe("C:\\x\\config.json");
+  });
+});
+
+describe("readConfigFile", () => {
+  it("reports absence instead of inventing an error", () => {
+    const read = readConfigFile(join(tempDir(), "config.json"));
+    expect("configError" in read).toBe(false);
+    if ("configError" in read) return;
+    expect(read.kind).toBe("absent");
+  });
+
+  it("reads known keys after validating them", () => {
+    const dir = tempDir();
+    const path = join(dir, "config.json");
+    writeConfig(path, JSON.stringify({ watchRoot: "/home/me", retentionHours: "72" }));
+    expect(readOf(readConfigFile(path))).toEqual({
+      kind: "read",
+      values: { watchRoot: "/home/me", retentionHours: "72" },
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("fails on malformed JSON rather than starting without it", () => {
+    // A file the user hand-edited that no longer parses is not ours to ignore:
+    // starting anyway would run with settings that are not the ones on disk.
+    const dir = tempDir();
+    const path = join(dir, "config.json");
+    writeConfig(path, "{not json");
+    const read = readConfigFile(path);
+    expect("configError" in read).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("refuses anything but a flat object of strings", () => {
+    const dir = tempDir();
+    for (const body of [
+      JSON.stringify(["watchRoot"]),
+      JSON.stringify({ retentionHours: 72 }),
+      JSON.stringify({ nested: { watchRoot: "/x" } }),
+    ]) {
+      const path = join(dir, "config.json");
+      writeConfig(path, body);
+      expect("configError" in readConfigFile(path)).toBe(true);
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("carries unknown keys through honestly, validating only its own", () => {
+    // A key from a newer build must survive a downgrade round-trip, and it
+    // must not be enforced by a build that cannot name it. What the session
+    // sees is filtered later, at the env boundary — not here.
+    const dir = tempDir();
+    const path = join(dir, "config.json");
+    writeConfig(path, JSON.stringify({ futureSetting: "whatever", watchRoot: "/home/me" }));
+    expect(readOf(readConfigFile(path))).toEqual({
+      kind: "read",
+      values: { futureSetting: "whatever", watchRoot: "/home/me" },
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("updateConfigFile", () => {
+  it("merges updates and preserves keys it cannot name", () => {
+    const dir = tempDir();
+    const path = join(dir, "config.json");
+    writeConfig(path, JSON.stringify({ futureSetting: "kept", watchRoot: "/old" }));
+
+    const written = updateConfigFile(path, { watchRoot: "/new" });
+    // The read-back includes the unknown key: a write that swallowed it would
+    // be the merge eating an entry it cannot name.
+    expect(written).toEqual({
+      kind: "read",
+      values: { futureSetting: "kept", watchRoot: "/new" },
+    });
+
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as Record<string, string>;
+    expect(onDisk.futureSetting).toBe("kept");
+    expect(onDisk.watchRoot).toBe("/new");
+    // No temp litter: the atomic write's scratch file is gone once renamed.
+    expect(existsSync(`${path}.squid.tmp`)).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("writes unset as absence, never as an empty string", () => {
+    const dir = tempDir();
+    const path = join(dir, "config.json");
+    writeConfig(path, JSON.stringify({ watchRoot: "/old", retentionHours: "72" }));
+
+    updateConfigFile(path, { watchRoot: "" });
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as Record<string, string>;
+    expect(onDisk.watchRoot).toBeUndefined();
+    expect(onDisk.retentionHours).toBe("72");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("creates the directory and the file on first write", () => {
+    const dir = tempDir();
+    const path = join(dir, "nested", "squid", "config.json");
+    const written = updateConfigFile(path, { watchRoot: "/new" });
+    expect(written).toEqual({ kind: "read", values: { watchRoot: "/new" } });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("refuses to write an unknown or invalid key", () => {
+    const dir = tempDir();
+    const path = join(dir, "config.json");
+    expect("configError" in updateConfigFile(path, { futureSetting: "x" })).toBe(true);
+    expect("configError" in updateConfigFile(path, { retentionHours: "0" })).toBe(true);
+    expect(existsSync(path)).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("withConfigFile", () => {
+  it("lets the env win per key and the file fill the gaps", () => {
+    // Per key, not per file: one exported variable beats the file for exactly
+    // that variable, while every other setting still comes from the file.
+    const env = { SQUID_WATCH_ROOT: "/from/env", SQUID_RETENTION_HOURS: "24" };
+    const file = { watchRoot: "/from/file", retentionHours: "72", screenPollMs: "500" };
+    const merged = withConfigFile(env, file);
+    expect(merged.SQUID_WATCH_ROOT).toBe("/from/env");
+    expect(merged.SQUID_RETENTION_HOURS).toBe("24");
+    expect(merged.SQUID_SCREEN_POLL_MS).toBe("500");
+  });
+
+  it("maps file ids to env names through the schema, and nothing else", () => {
+    // An id that is not in the table must not leak into the env under any
+    // spelling — the endpoints are env-only by design.
+    const merged = withConfigFile({}, { unknownKey: "value" });
+    expect(merged).toEqual({});
+  });
+
+  it("treats a file empty string as unset and an env empty string as the env's", () => {
+    // The file layer never has "" semantics — absence is absence. The env
+    // layer keeps its own contract: SQUID_DB="" travels verbatim and the
+    // resolver refuses it, exactly as it would without a config file.
+    const merged = withConfigFile(
+      { SQUID_DB: "" },
+      { watchRoot: "", databasePath: "", retentionHours: "72" },
+    );
+    expect(merged.SQUID_DB).toBe("");
+    expect(merged.SQUID_WATCH_ROOT).toBeUndefined();
+    expect(merged.SQUID_RETENTION_HOURS).toBe("72");
+  });
+});
+
+describe("loadConfiguredEnvironment", () => {
+  it("composes path, file, and precedence in one step-0", () => {
+    const dir = tempDir();
+    const path = join(dir, "config.json");
+    writeConfig(path, JSON.stringify({ retentionHours: "72" }));
+
+    const loaded = loadConfiguredEnvironment(
+      { SQUID_CONFIG: path, SQUID_RETENTION_HOURS: "24" },
+      { platform: "linux" },
+    );
+    expect("env" in loaded).toBe(true);
+    if ("env" in loaded) {
+      expect(loaded.env.SQUID_RETENTION_HOURS).toBe("24");
+      expect(loaded.configPath).toBe(path);
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reports a broken file and a broken path with the same configError shape", () => {
+    const brokenFile = join(tempDir(), "config.json");
+    writeConfig(brokenFile, "{not json");
+    expect("configError" in loadConfiguredEnvironment(
+      { SQUID_CONFIG: brokenFile },
+      { platform: "linux" },
+    )).toBe(true);
+
+    expect("configError" in loadConfiguredEnvironment(
+      { SQUID_CONFIG: "relative.json" },
+      { platform: "linux" },
+    )).toBe(true);
+  });
+
+  it("produces the raw env unchanged when no file exists", () => {
+    const loaded = loadConfiguredEnvironment(
+      { SQUID_CONFIG: join(tempDir(), "absent.json"), SQUID_WATCH_ROOT: "/tmp/demo" },
+      { platform: "linux" },
+    );
+    expect("env" in loaded).toBe(true);
+    if ("env" in loaded) expect(loaded.env.SQUID_WATCH_ROOT).toBe("/tmp/demo");
+  });
+});

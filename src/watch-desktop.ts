@@ -1,6 +1,7 @@
 import { realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { sanitizeAuditText } from "./audit-text.js";
+import { loadConfiguredEnvironment } from "./effective-env.js";
 import { BrowserPageActivitySource } from "./browser-page-source.js";
 import { EditorSaveActivitySource } from "./editor-save-source.js";
 import { FilesystemActivitySource } from "./filesystem-source.js";
@@ -66,9 +67,19 @@ export interface StartDesktopWatchOptions {
 export async function startDesktopWatch(
   options: StartDesktopWatchOptions,
 ): Promise<WatchSessionResult> {
-  const env = options.env ?? process.env;
   const log = options.log ?? ((line: string) => console.log(line));
   const logError = options.logError ?? ((line: string) => console.error(line));
+
+  // Step 0: the config file pre-fills the same variables the env carries, and
+  // a problem with it fails before the fail-fast chain below even starts.
+  // Tests point it at a temp file through SQUID_CONFIG in the injected env —
+  // the one override the resolver already defines, so there is no second way
+  // to relocate the file.
+  const loaded = loadConfiguredEnvironment(options.env ?? process.env);
+  if ("configError" in loaded) {
+    return { configError: loaded.configError };
+  }
+  const env = loaded.env;
 
   const databasePath = options.databasePath ?? env.SQUID_DB;
   if (databasePath !== undefined && !isAbsolute(databasePath)) {

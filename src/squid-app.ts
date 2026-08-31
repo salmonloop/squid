@@ -12,6 +12,7 @@ import {
   writeModelConfiguration,
   type FirstRunIO,
 } from "./app-model.js";
+import { loadConfiguredEnvironment } from "./effective-env.js";
 import { resolvePiModel } from "./pi-session-factory.js";
 import { startDesktopWatch } from "./watch-desktop.js";
 import { installWatchSignalHandlers } from "./watch-session.js";
@@ -68,6 +69,18 @@ export function prepareLaunch(options: {
   readonly agentDir: string;
   readonly provider: string;
 }): PrepareLaunchResult {
+  // Step 0: the config file pre-fills the variables everything below reads,
+  // so a broken file fails before the model check — the same fail-fast spine
+  // `startDesktopWatch` runs, one link further up. The merged env is what the
+  // rest of this function sees, so `resolveWatchRoot` and the watch session
+  // itself get the file's values through the variables they already read;
+  // this layer adds no second reading of them.
+  const loaded = loadConfiguredEnvironment(options.env, { platform: options.platform });
+  if ("configError" in loaded) {
+    return { configError: loaded.configError };
+  }
+  const mergedEnv = loaded.env;
+
   const status = modelConfigurationStatus(options.agentDir, options.provider);
   if (status.kind !== "ready") {
     if (status.kind === "malformed-models") {
@@ -79,20 +92,22 @@ export function prepareLaunch(options: {
     return { needsFirstRun: true };
   }
 
-  const root = resolveWatchRoot(options.env, options.platform);
+  const root = resolveWatchRoot(mergedEnv, options.platform);
   if (!isAbsoluteRoot(root, options.platform)) {
     return { configError: "SQUID_WATCH_ROOT must be an absolute path." };
   }
 
-  const panel = resolveAppPanel(options.env, options.platform);
+  const panel = resolveAppPanel(mergedEnv, options.platform);
   if ("configError" in panel) {
     return { configError: panel.configError };
   }
 
   // The endpoint the session will listen on is exactly what the child gets —
-  // including the resolver's normalized pipe spelling on Windows.
+  // including the resolver's normalized pipe spelling on Windows. The env is
+  // the merged one, so file-configured settings travel to the session and the
+  // spawned panel through the variables they already read.
   const env: Record<string, string | undefined> = {
-    ...options.env,
+    ...mergedEnv,
     SQUID_PANEL_SOCKET: panel.enabled ? panel.socketPath : undefined,
   };
   return {

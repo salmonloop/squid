@@ -158,27 +158,90 @@ describe("askFirstRunAnswers", () => {
 
 describe("prepareLaunch", () => {
   // A configured agent directory: without it every case below answers
-  // needsFirstRun before any other resolution gets a turn.
+  // needsFirstRun before any other resolution gets a turn. The config path is
+  // pointed at a file that does not exist so the suite never reads whatever a
+  // developer machine happens to keep at the platform default.
   const base = {
     platform: "linux" as const,
     agentDir: readyAgentDir(),
     provider: "bifrost",
+    configPath: absentConfigPath(),
   };
 
   it("wires the default endpoint through the same resolver an explicit value takes", () => {
     // The assertion is not that a default exists — it is that the packaged run
     // and a CLI run agree on what the endpoint means for a platform.
     const ready = expectReady(
-      prepareLaunch({ ...base, env: { SQUID_WATCH_ROOT: "/tmp/demo" } }),
+      prepareLaunch({ ...base, env: withConfig(base.configPath, { SQUID_WATCH_ROOT: "/tmp/demo" }) }),
     );
     expect(ready.panelSocket).toBe("/tmp/squid-panel.sock");
   });
 
   it("rejects a relative watch root before any sink opens", () => {
-    const result = prepareLaunch({ ...base, env: { SQUID_WATCH_ROOT: "relative" } });
+    const result = prepareLaunch({
+      ...base,
+      env: withConfig(base.configPath, { SQUID_WATCH_ROOT: "relative" }),
+    });
     expect("configError" in result).toBe(true);
   });
+
+  it("pre-fills settings from the config file the env does not set", () => {
+    // The file names a relative watch root; the env names none. The failure to
+    // start is the observable: it proves the file's string reached the same
+    // variable the env would have carried, through the resolver prepareLaunch
+    // actually checks — watch root, the one SQUID_ setting it validates itself.
+    const dir = mkdtempSync(join(tmpdir(), "squid-config-"));
+    try {
+      const path = join(dir, "config.json");
+      writeFileSync(path, JSON.stringify({ watchRoot: "relative" }));
+      const result = prepareLaunch({
+        ...base,
+        env: withConfig(path, {}),
+      });
+      expect("configError" in result).toBe(true);
+      if ("configError" in result) {
+        expect(result.configError).toBe("SQUID_WATCH_ROOT must be an absolute path.");
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails on a broken config file before the model check runs", () => {
+    // Order is the contract: a file the session cannot read is a cheaper
+    // answer than first-run, and reporting it first keeps the diagnosis on
+    // the thing that is actually wrong.
+    const dir = mkdtempSync(join(tmpdir(), "squid-config-"));
+    try {
+      const path = join(dir, "config.json");
+      writeFileSync(path, "{not json");
+      const result = prepareLaunch({
+        ...base,
+        // An unconfigured agent dir would otherwise answer needsFirstRun.
+        agentDir: join(dir, "absent-agent"),
+        env: withConfig(path, {}),
+      });
+      expect("configError" in result).toBe(true);
+      if ("configError" in result) {
+        expect(result.configError).toContain("not valid JSON");
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
+
+function withConfig(
+  path: string,
+  env: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  return { ...env, SQUID_CONFIG: path };
+}
+
+/** A path in a fresh temp dir that nothing writes: the hermetic "no file". */
+function absentConfigPath(): string {
+  return join(mkdtempSync(join(tmpdir(), "squid-config-")), "config.json");
+}
 
 function readyAgentDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "squid-ready-"));
