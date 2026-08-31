@@ -29,8 +29,10 @@
 
 mod protocol;
 mod startup;
+mod supervisor;
 mod transport;
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -85,7 +87,88 @@ fn version_line() -> String {
     format!("squid-ui {}", env!("CARGO_PKG_VERSION"))
 }
 
-/// Returns `()` rather than `Result`, because there is no failure here worth
+/// How this run got its endpoint, which decides whether the panel supervises.
+///
+/// Two shapes rather than a bool plus a path, so a caller cannot ask for the
+/// brain's executable in attached mode: there is no brain to name there, because
+/// this process did not start the session and has no business claiming a state
+/// for it.
+enum Launch {
+    /// `SQUID_PANEL_SOCKET` named an endpoint; a session owns it.
+    Attached(PathBuf),
+    /// This panel is the entry point. It computed the endpoint and either found a
+    /// session already there (`brain: None`) or is about to start one.
+    Supervising {
+        endpoint: PathBuf,
+        /// `None` when the probe found a live session: the panel attaches to it
+        /// and supervises nothing, because a brain somebody else started is not
+        /// this process's to restart or to report a state for.
+        brain: Option<PathBuf>,
+    },
+}
+
+impl Launch {
+    fn endpoint(&self) -> &Path {
+        match self {
+            Self::Attached(endpoint) => endpoint,
+            Self::Supervising { endpoint, .. } => endpoint,
+        }
+    }
+
+    /// The brain this run is responsible for, if any. Drives the window's
+    /// `supervised` flag, which is what puts the Restart button on screen — the
+    /// brain refuses a restart it is not supervised for, so the button appears
+    /// exactly where it can work.
+    fn brain(&self) -> Option<&Path> {
+        match self {
+            Self::Attached(_) => None,
+            Self::Supervising { brain, .. } => brain.as_deref(),
+        }
+    }
+}
+
+/// Works out how a double-clicked panel should proceed.
+///
+/// Order matters and is the double-start guard: probe first, spawn second. A
+/// session already listening — started by hand, by a previous panel, or by the
+/// packaged `squid` — is attached to rather than duplicated, because
+/// `Bun.listen({ unix })` does not reliably report `EADDRINUSE` and two brains on
+/// one endpoint split connections unpredictably.
+///
+/// The error case is a missing sibling binary, which is the one failure a user
+/// can act on: it means the zip was unpacked incompletely or the panel was
+/// copied out of it alone.
+fn supervising_launch() -> Result<Launch, String> {
+    let endpoint = supervisor::default_endpoint(std::env::var("XDG_RUNTIME_DIR").ok().as_deref());
+    let endpoint = PathBuf::from(endpoint);
+
+    // Probe before looking for the binary: if a session is already up, a missing
+    // `squid` beside this panel is not a problem worth reporting — there is
+    // nothing to start.
+    if supervisor::session_is_listening(&endpoint) {
+        return Ok(Launch::Supervising {
+            endpoint,
+            brain: None,
+        });
+    }
+
+    let panel_exe = std::env::current_exe()
+        .map_err(|error| format!("could not locate this binary: {error}"))?;
+    let brain = supervisor::brain_executable_path(&panel_exe);
+    if !brain.is_file() {
+        return Err(format!(
+            "no session is running, and the `squid` binary is not next to this one \
+             (looked for {}). The release zip ships them side by side; unpack both.",
+            brain.display()
+        ));
+    }
+    Ok(Launch::Supervising {
+        endpoint,
+        brain: Some(brain),
+    })
+}
+
+/// Returns `()` rather than `Result`, because there is no failure here worth/// Returns `()` rather than `Result`, because there is no failure here worth
 /// printing the way `Result` from `main` prints one: `Err` out of `main` reaches
 /// the user as a one-line `Debug` rendering on a stderr that a double-clicked
 /// console binary is about to close. Every exit path goes through
@@ -103,14 +186,28 @@ fn main() {
         return;
     }
 
-    // Refuse to start rather than opening a window that can never say anything.
-    // The variable is off by default like every capability variable, so an unset
-    // one is a run that was not meant to be observed — and a panel sitting there
-    // reporting "no observations yet" forever would be indistinguishable from a
-    // quiet machine, which is the same class of lie the protocol warns about.
-    let Some(socket_path) = transport::socket_path() else {
-        startup::abort(Startup::Unconfigured);
+    // The startup fork, and the inversion issue #23 asked for.
+    //
+    // `SQUID_PANEL_SOCKET` set is the shape the panel has always had: a session
+    // exists and this is its second display. Unset used to be a refusal — the
+    // panel exited 2 and explained it was a client. Now it means "the user
+    // double-clicked me", which is the ordinary way in: compute the endpoint the
+    // brain would listen on, and take over starting it.
+    let launch = match transport::endpoint_setting() {
+        transport::EndpointSetting::Named(path) => Launch::Attached(path),
+        // Set but empty: a launcher that lost the value. Refused rather than
+        // treated as a double-click, because guessing which was meant is how a
+        // broken script comes to look like an intentional entry point.
+        transport::EndpointSetting::Empty => startup::abort(Startup::Unconfigured),
+        transport::EndpointSetting::Unset => match supervising_launch() {
+            Ok(launch) => launch,
+            Err(reason) => startup::abort(Startup::NoBrain(reason)),
+        },
     };
+    let socket_path = launch.endpoint().to_path_buf();
+    // The endpoint as the brain's environment will spell it, taken before the
+    // reader thread takes ownership of the path itself.
+    let endpoint_text = socket_path.to_string_lossy().into_owned();
 
     // Not `?`: a window that cannot be created is the other startup failure a
     // user meets as a vanishing black box, and it is the one whose cause —
@@ -123,6 +220,11 @@ fn main() {
     // One outgoing half, shared. The reader thread hands it a socket on connect
     // and takes it back on disconnect; the callbacks below only ever write.
     let outgoing = Outgoing::new();
+
+    // Only a run that started its own brain offers to restart it. The brain
+    // refuses `op:"restart"` unless it is supervised, so showing the button in
+    // attached mode would be selling a switch that does nothing.
+    window.set_supervised(launch.brain().is_some());
 
     {
         let outgoing = outgoing.clone();
@@ -210,6 +312,34 @@ fn main() {
             transport::run(&socket_path, &outgoing, |message| {
                 apply(&handle, &pending, &outgoing, &mut dumps, message)
             })
+        });
+    }
+
+    // The supervision thread, when this run owns a brain. Its own thread because
+    // `wait()` blocks, and the state changes hop to the UI thread the same way
+    // the reader's messages do — nothing here touches a Slint property directly.
+    //
+    // The thread outliving its usefulness is fine: `supervise` returns when the
+    // brain should not be restarted again, having reported why, and the panel
+    // stays up showing that. A window that vanished with its child would be the
+    // failure supervising mode exists to prevent.
+    if let Some(brain) = launch.brain() {
+        let brain = brain.to_path_buf();
+        let endpoint = endpoint_text.clone();
+        let handle = window.as_weak();
+        // Idle until the first spawn reports: the window opens before the child
+        // exists, and "running" written optimistically here would be a claim about
+        // a process that has not been created yet.
+        window.set_service_state(supervisor::ServiceState::Idle.label().into());
+        thread::spawn(move || {
+            supervisor::supervise(&brain, &endpoint, |state| {
+                let label = state.label().to_owned();
+                let detail = state.detail();
+                let _ = handle.upgrade_in_event_loop(move |window| {
+                    window.set_service_state(label.into());
+                    window.set_service_detail(detail.into());
+                });
+            });
         });
     }
 

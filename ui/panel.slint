@@ -239,6 +239,13 @@ export component PanelWindow inherits Window {
     // would be selling a switch that does nothing — the restart surface appears
     // exactly where it can work.
     in property <bool> supervised;
+    // The supervised process's own state — "idle" | "running" | "restarting" |
+    // "failed" — and the sentence behind it. Deliberately separate from
+    // `agent-state`: a brain whose process is running but whose agent is
+    // unconfigured is two facts, and blending them into one word would hide
+    // whichever is worse.
+    in property <string> service-state;
+    in property <string> service-detail;
     callback restart-service();
 
     // --- E. Sources -------------------------------------------------------
@@ -524,6 +531,46 @@ export component PanelWindow inherits Window {
                     root.restart-service();
                 }
             }
+        }
+
+        // The process, beside the agent and never merged with it. A brain that is
+        // running but unconfigured is two facts; one word for both would hide
+        // whichever is worse. Only shown when this panel started the brain —
+        // claiming a state for somebody else's session would be a guess.
+        if root.supervised: HorizontalLayout {
+            spacing: 8px;
+
+            Text {
+                text: "Process";
+                width: 122px;
+                font-size: 12px;
+                color: #8a8a8a;
+                wrap: no-wrap;
+            }
+
+            Text {
+                text: root.service-state == "" ? "—" : root.service-state;
+                font-size: 12px;
+                color: root.service-state == "failed"
+                    ? #b3261e
+                    : (root.service-state == "restarting"
+                        ? #8a5a00
+                        : (root.service-state == "running" ? #1b6b2f : #8a8a8a));
+                font-weight: root.service-state == "" ? 400 : 700;
+                wrap: no-wrap;
+                horizontal-stretch: 1;
+            }
+        }
+
+        // The supervisor's own words about why it is restarting or has stopped
+        // trying. Verbatim: it names the exit code and the count, and a paraphrase
+        // here would be this window inventing a diagnosis for a process it only
+        // watched.
+        if root.service-detail != "": Text {
+            text: root.service-detail;
+            font-size: 11px;
+            color: root.service-state == "failed" ? #b3261e : #8a5a00;
+            wrap: word-wrap;
         }
 
         if root.agent-state == "needs_config": Text {

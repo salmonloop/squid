@@ -295,6 +295,36 @@ describe("spawnPanelProcess", () => {
     expect(basename(seen.exe)).toBe("squid-ui");
   });
 
+  it("does not spawn a panel when a panel is already supervising this run", () => {
+    // The panel started this brain, so it is attached already. A second window
+    // would share the endpoint, and this process would kill it on shutdown while
+    // the supervisor's own panel stayed up waiting to respawn us — ownership has
+    // to run one way, and this is the check that keeps it there.
+    const diagnostics: string[] = [];
+    const original = Bun.spawn;
+    let spawned = 0;
+    (Bun as { spawn: typeof Bun.spawn }).spawn = (() => {
+      spawned += 1;
+      return { kill: () => undefined } as unknown as ReturnType<typeof Bun.spawn>;
+    }) as typeof Bun.spawn;
+    try {
+      spawnPanelProcess({
+        socketPath: "/tmp/squid-panel.sock",
+        env: { SQUID_SUPERVISED: "1" },
+        platform: "linux",
+        execPath: "/opt/squid/squid",
+        logError: (line) => diagnostics.push(line),
+        exists: () => true,
+      });
+    } finally {
+      (Bun as { spawn: typeof Bun.spawn }).spawn = original;
+    }
+    expect(spawned).toBe(0);
+    // Silent, not a diagnostic: nothing went wrong. The panel is exactly where
+    // it should be, so a warning would train the user to ignore warnings.
+    expect(diagnostics).toEqual([]);
+  });
+
   it("kills the panel on the shutdown signals, not on a Bun `exit` event", () => {
     // Bun never runs `exit` handlers — measured with a spawned sleeper that
     // outlived its parent on a natural exit. The cleanup has to ride the

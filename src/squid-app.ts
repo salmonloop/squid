@@ -136,6 +136,13 @@ export function spawnPanelProcess(options: {
   readonly exists?: (path: string) => boolean;
 }): void {
   if (options.socketPath.length === 0) return;
+  // A supervised run was started *by* a panel, which is already attached and
+  // already watching this process. Spawning one here would put a second window
+  // on the same endpoint — and worse, one this process kills on shutdown while
+  // the supervisor's own panel stays up expecting to respawn us. The supervisor
+  // owns the panel's lifetime in that direction; this branch is what keeps the
+  // ownership one-way.
+  if (options.env.SQUID_SUPERVISED === "1") return;
   const exe = panelExecutablePath(
     options.platform === "win32" ? "windows" : "other",
     options.execPath,
