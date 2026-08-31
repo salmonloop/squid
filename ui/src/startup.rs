@@ -33,7 +33,18 @@ use crate::transport::SOCKET_ENV;
 /// to decide whether a startup failure is worth continuing past.
 pub enum Startup {
     /// `SQUID_PANEL_SOCKET` is unset or empty, so there is no endpoint to reach.
+    ///
+    /// No longer produced by the ordinary path: an unset variable now means "the
+    /// user double-clicked me", and the panel computes the endpoint and starts a
+    /// brain itself. The variant stays because the exit code is published in
+    /// `docs/panel-protocol.md` and a launcher may still read it, and because
+    /// "unset" and "set to empty" are different mistakes — the second is a shell
+    /// that lost the value on the way.
     Unconfigured,
+    /// Nothing is listening and there is no `squid` binary beside this one to
+    /// start. Carries the path that was looked for, because the fix is to unpack
+    /// the other half of the zip and the user needs to know where it goes.
+    NoBrain(String),
     /// Slint could not create the window or run its event loop. Carries the
     /// platform's own text, because the useful part (no display, no OpenGL, a
     /// missing library) is in there and this file cannot improve on it.
@@ -73,7 +84,7 @@ impl Startup {
     /// window" from the generic failure of everything else.
     pub fn code(&self) -> i32 {
         match self {
-            Self::Unconfigured => 2,
+            Self::Unconfigured | Self::NoBrain(_) => 2,
             Self::Platform(_) => 3,
         }
     }
@@ -87,24 +98,34 @@ impl Startup {
     pub fn message(&self) -> String {
         match self {
             Self::Unconfigured => format!(
-                "squid-ui: {SOCKET_ENV} is not set, so there is nothing to connect to.\n\
+                "squid-ui: {SOCKET_ENV} is set but empty, so there is no endpoint to \
+                 connect to.\n\
                  \n\
-                 This panel is a client. A running Squid watch session pushes it what to \
-                 show, and on its own it has nothing to display and no way to get any — \
-                 which is why it stops here instead of opening a window that would report \
-                 an idle machine forever.\n\
+                 An *unset* variable is fine — the panel then computes the default \
+                 endpoint for this platform ({ENDPOINT_EXAMPLE}) and starts the \
+                 session itself. An empty one is different: it reads as a value that \
+                 was lost on the way, so it stops here rather than guessing which was \
+                 meant.\n\
                  \n\
-                 It is normally started by that session, and the release zip puts that \
-                 session next to this binary: run the `squid` executable in the same \
-                 folder and it starts the watch session and launches this panel itself. \
-                 To start this panel by hand instead, point it at \
-                 the endpoint the session listens on ({ENDPOINT_EXAMPLE} on this \
-                 platform):\n\
+                 Either unset it, or point it at the endpoint a running session \
+                 listens on:\n\
                  \n\
                  \x20   {command}\n\
                  \n\
                  See docs/panel-protocol.md for the endpoint spelling each platform accepts.",
                 command = export_example()
+            ),
+            Self::NoBrain(detail) => format!(
+                "squid-ui: no Squid session is running, and this panel could not find \
+                 one to start.\n\
+                 \n\
+                 {detail}\n\
+                 \n\
+                 The release zip ships the panel and the session (`squid`) side by \
+                 side, and double-clicking the panel is meant to start both — so a \
+                 panel on its own has a window to draw and nothing to draw in it. \
+                 Unpack the whole zip and run this again, or start `squid` yourself \
+                 and the panel will attach to it."
             ),
             Self::Platform(detail) => format!(
                 "squid-ui: this machine could not open the panel window.\n\
@@ -235,33 +256,51 @@ mod tests {
     #[test]
     fn each_failure_has_its_own_exit_code() {
         assert_eq!(Startup::Unconfigured.code(), 2);
+        // A missing sibling binary shares 2 with the endpoint refusal, and that is
+        // deliberate: both are "this launch was not set up right", which is what a
+        // launcher scripts against. 3 stays the machine-cannot-draw code, because
+        // that is the one a retry on the same box will not fix either but for an
+        // entirely different reason.
+        assert_eq!(Startup::NoBrain("looked in /opt".to_owned()).code(), 2);
         assert_eq!(Startup::Platform("no display".to_owned()).code(), 3);
         assert_ne!(
             Startup::Unconfigured.code(),
             Startup::Platform(String::new()).code()
         );
-        // Neither is the code a panic or an uncaught error would produce.
+        // None of them is the code a panic or an uncaught error would produce.
         assert_ne!(Startup::Unconfigured.code(), 1);
+        assert_ne!(Startup::NoBrain(String::new()).code(), 1);
         assert_ne!(Startup::Platform(String::new()).code(), 1);
     }
 
-    /// The unconfigured message exists to answer "why did the window flash and
-    /// disappear", so each part of that answer is checked: the variable to set,
-    /// the fact that something else drives this process, the sibling binary a
-    /// release zip pairs it with, and a command for this platform. A message
-    /// that dropped any one of them would still read fine.
+    /// The empty-endpoint message has to say why *empty* is a refusal when
+    /// *unset* is not, since that asymmetry is the surprising part now that the
+    /// panel is an entry point. It names the variable, both outcomes, and the
+    /// command for this platform.
     #[test]
-    fn the_unconfigured_message_names_the_variable_the_cause_and_the_fix() {
+    fn the_unconfigured_message_distinguishes_empty_from_unset() {
         let message = Startup::Unconfigured.message();
         assert!(message.contains(SOCKET_ENV), "{message}");
-        assert!(message.contains("client"), "{message}");
-        assert!(message.contains("watch session"), "{message}");
-        assert!(
-            message.contains("`squid` executable in the same"),
-            "{message}"
-        );
+        // The distinction itself, in the user's words rather than ours.
+        assert!(message.contains("empty"), "{message}");
+        assert!(message.contains("unset"), "{message}");
         assert!(message.contains(ENDPOINT_EXAMPLE), "{message}");
         assert!(message.contains(&export_example()), "{message}");
+        // And no longer claims the panel is only ever a client: a double-clicked
+        // panel starts the session itself, and a message saying otherwise would
+        // send the user looking for a CLI they do not need.
+        assert!(!message.contains("This panel is a client"), "{message}");
+    }
+
+    /// The no-brain message is the one a user actually meets when they copy the
+    /// panel out of the zip alone, so it has to carry the path that was searched
+    /// and the fix — unpack both halves — rather than just reporting absence.
+    #[test]
+    fn the_no_brain_message_names_where_it_looked_and_what_to_do() {
+        let message = Startup::NoBrain("looked for /opt/squid/squid".to_owned()).message();
+        assert!(message.contains("/opt/squid/squid"), "{message}");
+        assert!(message.contains("side by"), "{message}");
+        assert!(message.contains("squid"), "{message}");
     }
 
     /// The platform's own text is the useful part of a render failure, so it is

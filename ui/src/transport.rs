@@ -100,20 +100,47 @@ const FIRST_BACKOFF: Duration = Duration::from_millis(125);
 /// busy-loop that an uncapped-but-tiny delay would be.
 const MAX_BACKOFF: Duration = Duration::from_secs(4);
 
-/// Reads the socket path, or `None` when the panel was not asked to connect.
-pub fn socket_path() -> Option<PathBuf> {
-    path_from(std::env::var(SOCKET_ENV).ok())
+/// How the endpoint variable was set, which the startup fork reads.
+///
+/// Three answers rather than an `Option`, because *unset* and *set to empty* are
+/// now different outcomes: unset means "the user double-clicked me" and the panel
+/// computes a default, while empty reads as a value a shell lost on the way and
+/// is refused. Collapsing them would make a broken launcher script look like an
+/// intentional double-click.
+pub enum EndpointSetting {
+    /// Not set at all — the supervising path.
+    Unset,
+    /// Set to the empty string, which is a mistake rather than a mode.
+    Empty,
+    Named(PathBuf),
 }
 
-/// An empty value reads as unset rather than as the empty path: exporting the
-/// variable with nothing in it is how a shell says "not configured", and
-/// `connect("")` would only fail on every attempt forever.
-fn path_from(raw: Option<String>) -> Option<PathBuf> {
-    let value = raw?;
-    if value.is_empty() {
-        return None;
+impl EndpointSetting {
+    /// A word for a diagnostic or a test failure. Not `Debug`, so a variant
+    /// rename cannot quietly change what gets printed.
+    #[cfg(test)]
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Unset => "unset",
+            Self::Empty => "empty",
+            Self::Named(_) => "named",
+        }
     }
-    Some(PathBuf::from(value))
+}
+
+/// Reads how the endpoint variable was set.
+pub fn endpoint_setting() -> EndpointSetting {
+    classify_endpoint(std::env::var(SOCKET_ENV).ok())
+}
+
+/// The decision itself, separated from reading the environment so it is testable
+/// without mutating a variable every other test in this binary shares.
+fn classify_endpoint(raw: Option<String>) -> EndpointSetting {
+    match raw {
+        None => EndpointSetting::Unset,
+        Some(value) if value.is_empty() => EndpointSetting::Empty,
+        Some(value) => EndpointSetting::Named(PathBuf::from(value)),
+    }
 }
 
 /// The outgoing half of the connection, shared between the UI thread and the
@@ -218,7 +245,19 @@ fn write_line(pipe_name: &Path, line: &str) -> io::Result<()> {
     pipe.flush()
 }
 
-/// Connects, reads until the connection ends, and connects again. Never returns.
+/// Whether anything is accepting connections on this endpoint right now.
+///
+/// The supervisor's double-start guard, expressed through the one call this
+/// module already owns: a connect that succeeds means a session is there, and the
+/// connection is dropped immediately because the question was only ever "is
+/// somebody home". It is deliberately *not* a read — a session that has bound but
+/// has not yet pushed a line is still a session, and waiting for a first message
+/// would spawn a second brain next to a perfectly live one.
+pub fn probe(endpoint: &Path) -> bool {
+    connect(endpoint).is_ok()
+}
+
+/// Connects, reads until the connection ends, and connects again. Never returns./// Connects, reads until the connection ends, and connects again. Never returns.
 ///
 /// Runs on the reader thread: `connect`, `read`, and `sleep` all block, and
 /// blocking Slint's event loop would freeze the window. `deliver` is called on
@@ -618,16 +657,24 @@ mod tests {
     }
 
     #[test]
-    fn an_unset_or_empty_socket_path_reads_as_not_configured() {
-        // Off by default, like every capability variable. An exported-but-empty
-        // value is a shell saying "not configured", not a request to connect to
-        // the empty path forever.
-        assert_eq!(path_from(None), None);
-        assert_eq!(path_from(Some(String::new())), None);
-        assert_eq!(
-            path_from(Some("/tmp/squid.sock".to_owned())),
-            Some(PathBuf::from("/tmp/squid.sock"))
-        );
+    fn the_endpoint_setting_tells_unset_from_empty() {
+        // Three answers, not two, and the distinction is load-bearing since the
+        // panel became an entry point: unset is a double-click and gets a computed
+        // default, empty is a launcher that lost the value and gets refused.
+        // Collapsing them would make a broken script look like an intended launch.
+        //
+        // Asserted through the parse of a value rather than by mutating the
+        // process environment, which is shared with every other test in this
+        // binary.
+        assert!(matches!(classify_endpoint(None), EndpointSetting::Unset));
+        assert!(matches!(
+            classify_endpoint(Some(String::new())),
+            EndpointSetting::Empty
+        ));
+        match classify_endpoint(Some("/tmp/squid.sock".to_owned())) {
+            EndpointSetting::Named(path) => assert_eq!(path, PathBuf::from("/tmp/squid.sock")),
+            other => panic!("expected a named endpoint, got {:?}", other.label()),
+        }
     }
 
     #[test]
