@@ -12,6 +12,7 @@ import {
   writeModelConfiguration,
   type FirstRunIO,
 } from "./app-model.js";
+import { ensureDefaultConfigFile } from "./config-file.js";
 import { loadConfiguredEnvironment } from "./effective-env.js";
 import { resolvePiModel } from "./pi-session-factory.js";
 import { startDesktopWatch } from "./watch-desktop.js";
@@ -47,6 +48,8 @@ export interface LaunchPreparation {
   readonly env: Record<string, string | undefined>;
   readonly root: string;
   readonly panelSocket: string;
+  /** The one resolved location the panel-first path may initialize when absent. */
+  readonly configPath: string;
 }
 
 export type PrepareLaunchResult =
@@ -68,6 +71,13 @@ export function prepareLaunch(options: {
   readonly platform: NodeJS.Platform;
   readonly agentDir: string;
   readonly provider: string;
+  /**
+   * The panel-supervised child has no interactive stdin: an absent model is not
+   * a console-first-run question there, it is the `needs_config` state the panel
+   * was built to render. Other packaged launches preserve the console first-run
+   * flow, so a command-line `squid` still asks exactly once.
+   */
+  readonly allowNeedsConfig?: boolean;
 }): PrepareLaunchResult {
   // Step 0: the config file pre-fills the variables everything below reads,
   // so a broken file fails before the model check — the same fail-fast spine
@@ -89,7 +99,12 @@ export function prepareLaunch(options: {
           "The Pi models.json is not valid JSON; fix or remove it — first-run will not overwrite a file it cannot read.",
       };
     }
-    return { needsFirstRun: true };
+    // The supervising panel is the first-run UI. Its child inherits no stdin, so
+    // sending it into readline would be a blocked console prompt behind a window
+    // that says nothing. Let the watch session start headless instead; it sees its
+    // panel endpoint and reports `needs_config`, then this same process starts the
+    // agent once the form writes the missing model files.
+    if (options.allowNeedsConfig !== true) return { needsFirstRun: true };
   }
 
   const root = resolveWatchRoot(mergedEnv, options.platform);
@@ -115,8 +130,26 @@ export function prepareLaunch(options: {
       env,
       root,
       panelSocket: panel.enabled ? panel.socketPath : "",
+      configPath: loaded.configPath,
     },
   };
+}
+
+/**
+ * Makes the settings file tangible for the panel-first run, and only that run.
+ *
+ * The supervisor is the source of `SQUID_SUPERVISED=1`; no other entry gets to
+ * write a default file merely by launching. The config resolver stays the sole
+ * authority for its path and its validity — this helper only creates `{}` when
+ * the resolved file is absent, never repairs or overwrites an existing file.
+ */
+export function ensureSupervisedConfig(options: {
+  readonly env: Record<string, string | undefined>;
+  readonly configPath: string;
+}): { readonly ok: true } | { readonly configError: string } {
+  if (options.env.SQUID_SUPERVISED !== "1") return { ok: true };
+  const created = ensureDefaultConfigFile(options.configPath);
+  return "configError" in created ? { configError: created.configError } : { ok: true };
 }
 
 function isAbsoluteRoot(root: string, platform: NodeJS.Platform): boolean {
@@ -208,7 +241,14 @@ if (import.meta.main) {
   const agentDir = getAgentDir();
   const model = resolvePiModel({});
 
-  let prepared = prepareLaunch({ env, platform, agentDir, provider: model.provider });
+  const supervised = env.SQUID_SUPERVISED === "1";
+  let prepared = prepareLaunch({
+    env,
+    platform,
+    agentDir,
+    provider: model.provider,
+    ...(supervised ? { allowNeedsConfig: true } : {}),
+  });
   if ("needsFirstRun" in prepared) {
     const answers = await askFirstRunAnswers(consoleFirstRunIO(), {
       modelId: model.modelId,
@@ -225,6 +265,19 @@ if (import.meta.main) {
   }
   if ("configError" in prepared) {
     console.error(prepared.configError);
+    process.exit(2);
+  }
+
+  // Only the panel's supervised child gets a tangible empty settings file. The
+  // file was already resolved and read above, so this cannot overwrite malformed
+  // hand-written content; it only turns absence into the `{}` the settings form
+  // can later update atomically.
+  const config = ensureSupervisedConfig({
+    env: prepared.ready.env,
+    configPath: prepared.ready.configPath,
+  });
+  if ("configError" in config) {
+    console.error(config.configError);
     process.exit(2);
   }
 

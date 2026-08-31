@@ -377,25 +377,31 @@ needs no runtime packages; its panel transport is a named pipe
 — the protocol document names the spelling each platform accepts, and why the
 pipe carries no access boundary the way the socket's file mode does.
 
-**Unpack the zip and run the `squid` binary; that is the whole download.** It
-needs no arguments. With no model configured it asks for one in the console it
-was opened from — an OpenAI-compatible endpoint URL, a model id, and an API key —
-and stores the answers in Pi's own config (`models.json` and `auth.json`), so
-the question appears exactly once. It then watches the user's home directory by
-default (`SQUID_WATCH_ROOT` overrides it) and launches the `squid-ui` sitting
-next to itself, handing it the panel endpoint through the environment. The panel
-is an observer and dispensable: if its binary is missing the session reports
-that and keeps watching.
+**Unpack the zip and open `squid-ui`; that is the whole download.** It needs
+no arguments and is the recommended way in. With `SQUID_PANEL_SOCKET` unset the
+panel computes the platform endpoint, makes a short probe to avoid a double
+start, then starts the sibling `squid` beside it. The supervised brain watches
+the user's home directory by default, writes an empty Squid settings file only
+when none exists yet, and leaves every business setting to that file — no parent
+environment silently wins over what the form saves.
 
-The panel can still be run by hand — it is a client of a session, and with
-`SQUID_PANEL_SOCKET` unset there is nothing to connect to, so it prints why and
-exits `2` without opening a window. Double-clicking it on Windows therefore looks
-like a crash: the console that line was printed to belongs to the process and
-closes with it. Point it at the endpoint the session listens on, or just run
-`squid` and let it launch the panel. A window that cannot be created — no
-display, no OpenGL — exits `3`. On Windows both messages also appear in a dialog
-box when this process is the only one attached to its console, which is exactly
-the double-clicked case.
+With no model configured, the panel starts the sensors in `needs configuration`
+mode. Fill the model base URL, model id, and API key in **SETTINGS**; the key goes
+only to Pi's `models.json`/`auth.json` and is never displayed back. Everything
+else lives in Squid's own config file. A saved setting that says `restart` takes
+effect when you click **Restart brain**; the brain drains in its ordinary order
+and the panel starts its replacement. The **SOURCES** list independently starts
+and stops observers, except the last running observer (the session needs one)
+and the capture gate (which is a pause switch, not a source).
+
+You can still run `squid` by hand. Its panel child attaches normally. You can
+also start `squid-ui` with a non-empty `SQUID_PANEL_SOCKET` to attach to a session
+someone else started. An endpoint set to an empty string is refused rather than
+guessed at, because that is a launcher losing a value, not a panel-first request.
+If neither a live session nor the sibling `squid` binary exists, the panel names
+what it looked for and exits 2. A window that cannot be created — no display, no
+OpenGL — exits 3. On Windows these failures also appear in a dialog when the
+panel owns its short-lived double-click console.
 
 ## What is not yet implemented
 

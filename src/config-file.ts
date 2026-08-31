@@ -30,6 +30,29 @@ export type ConfigFileRead =
   | { readonly kind: "read"; readonly values: Readonly<Record<string, string>> }
   | { readonly configError: string };
 
+/**
+ * Creates the empty default config file when it does not exist yet.
+ *
+ * Only the panel-supervised packaged path calls this. A CLI run deliberately
+ * leaves the file absent: absence already means all resolver defaults, and a
+ * command-line tool that starts creating user configuration merely because it
+ * was run would turn an observation into a side effect. The supervising panel,
+ * on the other hand, is the product's first-run surface and needs a concrete
+ * settings home before its form promises a value can be saved.
+ *
+ * An existing file is never touched here. `readConfigFile` remains its judge:
+ * malformed input is a startup refusal, not something a default writer repairs
+ * over the top of what the user wrote.
+ */
+export function ensureDefaultConfigFile(path: string): ConfigFileRead {
+  const current = readConfigFile(path);
+  if ("configError" in current || current.kind === "read") return current;
+
+  mkdirSync(dirname(path), { recursive: true });
+  writeJsonAtomic(path, {});
+  return { kind: "read", values: {} };
+}
+
 export function readConfigFile(path: string): ConfigFileRead {
   if (!existsSync(path)) return { kind: "absent" };
 

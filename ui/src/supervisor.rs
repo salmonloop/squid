@@ -326,19 +326,54 @@ pub fn session_is_listening(endpoint: &Path) -> bool {
 
 /// Spawns the brain, marked supervised.
 ///
-/// The child's environment is inherited **plus** two variables: the endpoint it
-/// should listen on and the supervised flag. Nothing else is injected, and that
-/// is a decision rather than laziness — the config file is the authority for
-/// every setting, and a panel that passed `SQUID_WATCH_ROOT` and friends would be
-/// a second configuration path whose values silently outrank the file the
-/// settings form writes. The one thing the panel knows and the file cannot is
-/// where this panel is listening.
+/// The child does **not** inherit the panel's whole environment. That is the
+/// point of the config file: a stray `SQUID_WATCH_ROOT` or `SQUID_BROWSER` in the
+/// parent must not silently outrank the values the settings form writes. The
+/// child receives only the operating-system variables needed to find a home,
+/// runtime directory, temporary files, and system libraries — plus `SQUID_CONFIG`
+/// when a person deliberately chose a non-default *location* for the config file.
+/// The location is not a business setting; it is the pointer to the one authority
+/// for them. Every other `SQUID_*` value is deliberately absent.
+///
+/// The two variables the panel itself owns are then added: the endpoint it should
+/// listen on and the supervised flag. Nothing else is injected.
 ///
 /// stdout and stderr are inherited so the brain's diagnostics land wherever the
 /// panel's own do — a supervised run's log is the panel's console, and swallowing
 /// it would make a failing session unexplainable.
 pub fn spawn_brain(brain: &Path, endpoint: &str) -> io::Result<Child> {
-    Command::new(brain)
+    let mut command = Command::new(brain);
+    command.env_clear();
+    // All are location/runtime variables, not Squid behavior. Windows needs
+    // SYSTEMROOT/WINDIR to create normal child processes; Unix needs HOME for
+    // Pi's own config location; the XDG pair names the same locations the TS
+    // config resolver uses. Missing values stay missing — inventing one here
+    // would be a new default separate from the brain's.
+    for name in [
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "XDG_CONFIG_HOME",
+        "XDG_RUNTIME_DIR",
+        "PATH",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    // The config-file *locator* is the one Squid variable that travels. It
+    // points to the file rather than selecting a behavior, and leaving it behind
+    // would make a panel opened with SQUID_CONFIG edit one file while the brain
+    // starts from another.
+    if let Some(value) = std::env::var_os("SQUID_CONFIG") {
+        command.env("SQUID_CONFIG", value);
+    }
+    command
         .env(crate::transport::SOCKET_ENV, endpoint)
         .env(SUPERVISED_ENV, "1")
         .stdin(Stdio::null())
