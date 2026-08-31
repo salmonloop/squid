@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { readStoredCredential } from "@earendil-works/pi-coding-agent";
+import { writeJsonAtomic } from "./json-atomic.js";
 
 /**
  * Whether the resident agent's model is usable, and first-run setup when it is
@@ -119,12 +120,11 @@ export async function askFirstRunAnswers(
  * previous file intact rather than a truncated one. Both files may hold other
  * providers' entries — the read-modify-write preserves them, because clobbering
  * a user's other logins to add ours is not a default anyone consented to.
+ *
+ * The mechanics live in `json-atomic.ts`, shared with the Squid config file;
+ * only the comment survives here because the read-modify-write contract above
+ * it is what a reader of this file needs to know.
  */
-function writeJsonAtomic(path: string, value: unknown): void {
-  const temp = `${path}.squid-first-run.tmp`;
-  writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  renameSync(temp, path);
-}
 
 export function writeModelConfiguration(
   agentDir: string,
