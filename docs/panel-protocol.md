@@ -95,25 +95,67 @@ one:
 
 ## Starting the panel
 
-Because the endpoint is off by default, the panel with no `SQUID_PANEL_SOCKET`
-has nothing to render and no session to control. It says so and exits `2` rather
-than opening a window: a panel that is up but attached to nothing looks like a
-watch session that has stopped reporting, and the shape rules below exist to keep
-this surface from telling that kind of lie.
+**The panel is the recommended entry point.** Unpack the release zip and
+open `squid-ui`. When `SQUID_PANEL_SOCKET` is **unset**, that is not a missing
+configuration: it means this is a panel-first run. The panel computes the
+platform default endpoint, probes it for at most 1.5 seconds, and then does one
+of two things:
 
-In the packaged release this never comes up: the `squid` binary shipped beside
-the panel starts the watch session and then launches the panel itself, passing
-the endpoint through `SQUID_PANEL_SOCKET` in the child's environment. Because
-the transport reconnects on its own, the spawn order does not matter — a panel
-that starts before the socket exists simply retries. Hand-launching is what the
-exit codes below are for: pointing a panel at a session someone else started.
+1. **A session already answers the probe:** attach to it. The panel does not
+   start a second `squid`, and it does not claim to supervise a process it did
+   not start.
+2. **Nothing answers:** start the sibling `squid` binary from the same directory,
+   with `SQUID_PANEL_SOCKET=<computed endpoint>` and `SQUID_SUPERVISED=1`.
+   The release zip deliberately puts the two binaries side by side so a
+   double-click never needs a `PATH` search.
 
-Two startup failures therefore end the process before the event loop, each with
-its own code so a launcher can tell them apart:
+The probe is the double-start guard. It is deliberately a *connect*, rather than
+trusting a bind failure: Bun's `listen({ unix })` does not reliably surface
+`EADDRINUSE`, and two watch sessions pointed at one endpoint can both appear to
+bind, then split panel connections unpredictably. A stale Unix socket file is
+not a false positive — nothing accepts on it, so the probe fails; the brain's
+own server startup clears the stale file before binding.
+
+A supervisor starts its child with a deliberately narrow environment. It carries
+only OS location/runtime variables, the optional `SQUID_CONFIG` **file locator**,
+and the two supervision variables above. It does **not** carry `SQUID_WATCH_ROOT`,
+`SQUID_BROWSER`, or any other business `SQUID_*` value: the config file is the
+single authority for those values, and passing a parent environment through would
+silently outrank the settings form. If that config file is absent, the supervised
+brain writes an empty `{}` at the resolved location; CLI/manual brain launches do
+not create it merely for being run. Existing files are always read first and are
+never overwritten by this initialization — malformed JSON remains a startup
+refusal.
+
+A panel opened with `SQUID_PANEL_SOCKET` **set to a non-empty endpoint** is the
+attached shape: it connects and renders, exactly as prior releases did. This is
+how a person attaches to a session somebody else started. A value that is **set
+but empty** is different from unset and is refused with exit code 2: it means a
+launcher lost a value, and treating that failure as a panel-first request would
+make a broken script look intentional.
+
+The supervising panel owns only the brain it started. The brain sees
+`SQUID_SUPERVISED=1`, accepts `{"type":"control","op":"restart"}`, runs its
+ordinary ordered teardown, and exits **3**. The panel never signals it; exit 3
+means start a replacement immediately. Exit 0 means a deliberate stop and is not
+respawned. Exit 2 is a startup/configuration refusal and is terminal on the first
+try. Other non-zero exits (including a signal death) retry after 250ms, doubling
+to 8 seconds; three within 60 seconds stop the loop and leave the panel visible
+with the reason. A restart requested by the user is not a crash and clears the
+crash history.
+
+The panel's SERVICE area shows two separate facts when it supervises: the process
+state (`idle`, `running`, `restarting`, or `failed`) and the brain's own `service`
+line (`ready` or `needs_config`). A process that is alive but has no configured
+agent is not called healthy by implication. Attached panels show only the brain's
+own state; they never guess the lifecycle of a process they did not create.
+
+Two startup failures end the process before the event loop, each with its own code
+so a launcher can tell them apart:
 
 | Code | Meaning |
 | --- | --- |
-| `2` | `SQUID_PANEL_SOCKET` is unset — no endpoint to connect to. |
+| `2` | `SQUID_PANEL_SOCKET` was set empty, or no live session and no sibling `squid` binary were found. |
 | `3` | The window could not be created — no display, or no OpenGL for femtovg. |
 
 Both print the reason to stderr. On Windows they also raise a message box, but

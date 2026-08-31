@@ -272,6 +272,13 @@ jobs:
           install -m 0755 squid staging/squid
           zip -j artifacts/squid-x86_64-unknown-linux-gnu.zip \
             staging/squid staging/squid-ui
+          # The panel-first flow only works when both siblings travel together.
+          # `zip` succeeding proves it made an archive, not that a glob or a
+          # staging rename did not quietly leave one half out; inspect the exact
+          # member names before publishing the checksum for these bytes.
+          members="$(unzip -Z1 artifacts/squid-x86_64-unknown-linux-gnu.zip | sort)"
+          expected="$(printf '%s\n' squid squid-ui)"
+          test "$members" = "$expected"
           cd artifacts
           sha256sum squid-x86_64-unknown-linux-gnu.zip \
             > squid-x86_64-unknown-linux-gnu.zip.sha256
@@ -361,7 +368,17 @@ jobs:
           Copy-Item "$env:GITHUB_WORKSPACE\squid.exe" "$env:GITHUB_WORKSPACE\staging\squid.exe"
           Compress-Archive -Path "$env:GITHUB_WORKSPACE\staging\*" `
             -DestinationPath "$env:GITHUB_WORKSPACE\artifacts\squid-x86_64-pc-windows-msvc.zip"
+          # Same assertion as Linux, in PowerShell's archive API. A successful
+          # archive that contains only one sibling would publish a panel that
+          # cannot start a brain (or a brain with no UI), so member names are a
+          # release contract, not an incidental build detail.
           $zip = "$env:GITHUB_WORKSPACE\artifacts\squid-x86_64-pc-windows-msvc.zip"
+          $members = [System.IO.Compression.ZipFile]::OpenRead($zip).Entries |
+            ForEach-Object { $_.FullName } | Sort-Object
+          $expected = @("squid-ui.exe", "squid.exe") | Sort-Object
+          if (Compare-Object $members $expected) {
+            throw "release zip must contain squid.exe and squid-ui.exe, exactly once each"
+          }
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           "$hash  squid-x86_64-pc-windows-msvc.zip" | Set-Content -NoNewline "$zip.sha256"
           Get-Content "$zip.sha256"

@@ -13,7 +13,7 @@ import {
   writeModelConfiguration,
   type FirstRunIO,
 } from "../src/app-model.js";
-import { prepareLaunch, spawnPanelProcess } from "../src/squid-app.js";
+import { ensureSupervisedConfig, prepareLaunch, spawnPanelProcess } from "../src/squid-app.js";
 
 describe("defaultPanelEndpoint", () => {
   it("names the platform's transport: a pipe on Windows, a socket path elsewhere", () => {
@@ -168,6 +168,37 @@ describe("prepareLaunch", () => {
     configPath: absentConfigPath(),
   };
 
+  it("lets the panel-supervised child reach needs_config instead of opening readline", () => {
+    // The panel child has stdin set to null. The old console-first-run branch
+    // would therefore turn a missing model into an invisible blocked question;
+    // Phase 2 made the watch session able to run sensors headless and tell the
+    // panel `needs_config`, so this preparation path must reach `ready` there.
+    const prepared = prepareLaunch({
+      ...base,
+      env: withConfig(base.configPath, {
+        SQUID_WATCH_ROOT: "/tmp/demo",
+        SQUID_SUPERVISED: "1",
+      }),
+      agentDir: join(mkdtempSync(join(tmpdir(), "squid-empty-agent-")), "agent"),
+      allowNeedsConfig: true,
+    });
+    const ready = expectReady(prepared);
+    expect(ready.root).toBe("/tmp/demo");
+    expect(ready.env.SQUID_SUPERVISED).toBe("1");
+  });
+
+  it("keeps the ordinary packaged launch in console first-run mode", () => {
+    // The escape hatch belongs only to the panel child. A direct `squid` launch
+    // still owns an interactive console and should ask once, not silently start
+    // a session with no model.
+    const prepared = prepareLaunch({
+      ...base,
+      env: withConfig(base.configPath, { SQUID_WATCH_ROOT: "/tmp/demo" }),
+      agentDir: join(mkdtempSync(join(tmpdir(), "squid-empty-agent-")), "agent"),
+    });
+    expect(prepared).toEqual({ needsFirstRun: true });
+  });
+
   it("wires the default endpoint through the same resolver an explicit value takes", () => {
     // The assertion is not that a default exists — it is that the packaged run
     // and a CLI run agree on what the endpoint means for a platform.
@@ -260,9 +291,61 @@ function expectReady(result: ReturnType<typeof prepareLaunch>): {
   env: Record<string, string | undefined>;
   root: string;
   panelSocket: string;
+  configPath: string;
 } {
   if (!("ready" in result)) throw new Error(`expected ready, got ${JSON.stringify(result)}`);
   return result.ready;
+}
+
+describe("ensureSupervisedConfig", () => {
+  it("creates an empty settings file only for the panel-supervised child", () => {
+    // CLI shape: no write. Absence already means resolver defaults, and a command
+    // line tool that leaves files merely for having run would turn observation
+    // into a side effect.
+    const dir = mkdtempSync(join(tmpdir(), "squid-config-"));
+    try {
+      const path = join(dir, "nested", "config.json");
+      expect(ensureSupervisedConfig({ env: {}, configPath: path })).toEqual({ ok: true });
+      expect(exists(path)).toBe(false);
+
+      expect(ensureSupervisedConfig({
+        env: { SQUID_SUPERVISED: "1" },
+        configPath: path,
+      })).toEqual({ ok: true });
+      expect(JSON.parse(readText(path))).toEqual({});
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never overwrites a malformed file while trying to make a default", () => {
+    // An existing hand-written file is read first. A default writer that repaired
+    // it into {} would erase the evidence and start the session under settings
+    // the user never chose.
+    const dir = mkdtempSync(join(tmpdir(), "squid-config-"));
+    try {
+      const path = join(dir, "config.json");
+      writeFileSync(path, "{broken", "utf8");
+      const result = ensureSupervisedConfig({
+        env: { SQUID_SUPERVISED: "1" },
+        configPath: path,
+      });
+      expect("configError" in result).toBe(true);
+      expect(readText(path)).toBe("{broken");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// `existsSync` by another name keeps the assertion's purpose readable: it asks
+// whether supervised first-run created the file, not whether some value resolved.
+function exists(path: string): boolean {
+  try {
+    return readFileSync(path), true;
+  } catch {
+    return false;
+  }
 }
 
 describe("spawnPanelProcess", () => {
