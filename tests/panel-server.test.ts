@@ -39,6 +39,8 @@ interface Harness {
     readonly onAnswer?: (promptId: number, answer: "approved" | "declined") => void;
     readonly onConfigGet?: () => void;
     readonly onConfigSet?: (id: string, value: string) => void;
+    readonly onSourceGet?: () => void;
+    readonly onSourceToggle?: (id: string, on: boolean) => void;
     readonly onDiagnostic?: (line: string) => void;
     /** Bind at a path other than the harness default. */
     readonly socketPath?: string;
@@ -75,6 +77,8 @@ async function withHarness(body: (harness: Harness) => Promise<void>): Promise<v
         ...(options.onAnswer === undefined ? {} : { onAnswer: options.onAnswer }),
         ...(options.onConfigGet === undefined ? {} : { onConfigGet: options.onConfigGet }),
         ...(options.onConfigSet === undefined ? {} : { onConfigSet: options.onConfigSet }),
+        ...(options.onSourceGet === undefined ? {} : { onSourceGet: options.onSourceGet }),
+        ...(options.onSourceToggle === undefined ? {} : { onSourceToggle: options.onSourceToggle }),
         ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
         ...(harness.onConnect === undefined ? {} : { onConnect: harness.onConnect }),
       });
@@ -562,6 +566,76 @@ describe("startPanelServer incoming control", () => {
       await until(() => diagnostics.length >= 2, "both refusal diagnostics");
 
       expect(diagnostics.filter((line) => line.includes("no config handler")).length).toBe(2);
+    });
+  });
+
+  it("invokes onSourceGet and onSourceToggle with the parsed pair", async () => {
+    await withHarness(async (harness) => {
+      let gotDump = 0;
+      const toggles: (readonly [string, boolean])[] = [];
+      const server = await harness.start({
+        onSourceGet: () => {
+          gotDump += 1;
+        },
+        onSourceToggle: (id, on) => toggles.push([id, on]),
+      });
+      const client = await harness.connect();
+      await until(() => server.clientCount === 1, "the client to register");
+
+      client.socket.write('{"type":"source_get"}\n');
+      client.socket.write('{"type":"source_toggle","id":"browser-page-host","on":0}\n');
+      client.socket.write('{"type":"source_toggle","id":"browser-page-host","on":1}\n');
+      await until(() => gotDump === 1 && toggles.length === 2, "all three source calls to arrive");
+
+      expect(gotDump).toBe(1);
+      // 0 and 1 decode to false and true — the panel never sends a bare truthy.
+      expect(toggles).toEqual([
+        ["browser-page-host", false],
+        ["browser-page-host", true],
+      ]);
+    });
+  });
+
+  it("refuses source_toggle shapes that the flat wire forbids", async () => {
+    await withHarness(async (harness) => {
+      const toggles: [string, boolean][] = [];
+      const diagnostics: string[] = [];
+      const server = await harness.start({
+        onSourceToggle: (id, on) => toggles.push([id, on]),
+        onDiagnostic: (line) => diagnostics.push(line),
+      });
+      const client = await harness.connect();
+      await until(() => server.clientCount === 1, "the client to register");
+
+      client.socket.write('{"type":"source_toggle"}\n');
+      client.socket.write('{"type":"source_toggle","id":""}\n');
+      // A string "1" or a truthy cast would let a malformed line flip a source
+      // the panel never meant to, so the boolean must be exactly 0 or 1.
+      client.socket.write('{"type":"source_toggle","id":"browser-page-host","on":"1"}\n');
+      client.socket.write('{"type":"source_toggle","id":"browser-page-host","on":2}\n');
+      client.socket.write('{"type":"source_toggle","id":"browser\\u0001page","on":1}\n');
+      // Then a good one, proving the connection survived the refusals.
+      client.socket.write('{"type":"source_toggle","id":"browser-page-host","on":0}\n');
+      await until(() => toggles.length === 1, "the trailing valid toggle to arrive");
+      await settle();
+
+      expect(toggles).toEqual([["browser-page-host", false]]);
+      expect(diagnostics.length).toBeGreaterThanOrEqual(5);
+    });
+  });
+
+  it("refuses source calls when no source handler is wired", async () => {
+    await withHarness(async (harness) => {
+      const diagnostics: string[] = [];
+      const server = await harness.start({ onDiagnostic: (line) => diagnostics.push(line) });
+      const client = await harness.connect();
+      await until(() => server.clientCount === 1, "the client to register");
+
+      client.socket.write('{"type":"source_get"}\n');
+      client.socket.write('{"type":"source_toggle","id":"browser-page-host","on":1}\n');
+      await until(() => diagnostics.length >= 2, "both refusal diagnostics");
+
+      expect(diagnostics.filter((line) => line.includes("no source handler")).length).toBe(2);
     });
   });
 

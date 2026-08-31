@@ -8,6 +8,7 @@ import type {
   ActivityEventEmitter,
   ActivitySource,
   ActivitySourceDiagnostic,
+  SourceEntry,
 } from "../src/activity-source.js";
 import { createActivityEvent, type ActivityEvent } from "../src/protocol.js";
 import { startWatchSession, type WatchSourceContext } from "../src/watch-session.js";
@@ -161,7 +162,15 @@ function applicationActivated(eventId: string, applicationId: string): ActivityE
 const OFFLINE_ENV: Record<string, string | undefined> = {};
 
 async function startSession(options: {
-  readonly sources: readonly ActivitySource[];
+  /**
+   * The classic shape: live instances the test still holds handles to, wrapped
+   * here into one-entry recipes keyed by each instance's own id. For catalogs
+   * the manager must build itself (hot-restart tests), pass `sourceEntries`
+   * instead and leave this unset.
+   */
+  readonly sources?: readonly ActivitySource[];
+  /** Direct catalog entries, for tests exercising recipes rather than instances. */
+  readonly sourceEntries?: readonly SourceEntry[];
   readonly env?: Record<string, string | undefined>;
   readonly log?: (line: string) => void;
   readonly logError?: (line: string) => void;
@@ -211,7 +220,10 @@ async function startSession(options: {
     ...(options.restartExit === undefined ? {} : { restartExit: options.restartExit }),
     createSources: async (context) => {
       seenContexts.push(context);
-      return options.sources;
+      if (options.sourceEntries !== undefined) return options.sourceEntries;
+      const sources = options.sources;
+      if (sources === undefined) throw new Error("startSession needs sources or sourceEntries");
+      return sources.map((source) => ({ id: source.id, label: source.id, create: () => source }));
     },
     describeEvent: (event, ingested) => ({
       kind: event.kind,
@@ -396,7 +408,11 @@ describe("startWatchSession", () => {
       log: () => {},
       logError: () => {},
       createAgentSession: fakeAgentFactory(emptyAgentLog()),
-      createSources: async () => [source],
+      createSources: async () => [{
+        id: source.id,
+        label: source.id,
+        create: () => source,
+      }],
       describeEvent: () => ({}),
     });
 
@@ -436,7 +452,11 @@ describe("startWatchSession", () => {
         log: () => {},
         logError: () => {},
         createAgentSession: fakeAgentFactory(emptyAgentLog()),
-        createSources: async () => [source],
+        createSources: async () => [{
+        id: source.id,
+        label: source.id,
+        create: () => source,
+      }],
         describeEvent: () => ({}),
       });
       if ("configError" in result) throw new Error(result.configError);
@@ -876,8 +896,8 @@ describe("the control panel on a watch session", () => {
     const { result } = await startSession({
       sources: [source],
       env: { SQUID_PANEL_SOCKET: socketPath },
-      agentOptions: { reply: "ran the tests; they pass" },
       logError: (line) => diagnostics.push(line),
+      agentOptions: { reply: "ran the tests; they pass" },
     });
     if ("configError" in result) throw new Error(result.configError);
     try {
@@ -908,8 +928,8 @@ describe("the control panel on a watch session", () => {
     const { result } = await startSession({
       sources: [source],
       env: { SQUID_PANEL_SOCKET: socketPath },
-      agentOptions: { promptError: new Error("the model refused") },
       logError: (line) => diagnostics.push(line),
+      agentOptions: { promptError: new Error("the model refused") },
     });
     if ("configError" in result) throw new Error(result.configError);
     try {
@@ -1088,11 +1108,11 @@ describe("the control panel on a watch session", () => {
     const { result, agentLog } = await startSession({
       sources: [source],
       env: { SQUID_PANEL_SOCKET: socketPath },
+      logError: (line) => diagnostics.push(line),
       // A factory that would fail if anyone tried: the session starting at all
       // proves creation was skipped, not that this factory is special.
       agentOptions: { factoryError: new Error("No resident-agent model is configured") },
       agentConfigured: false,
-      logError: (line) => diagnostics.push(line),
     });
     if ("configError" in result) throw new Error(result.configError);
     try {
@@ -1163,6 +1183,277 @@ describe("the control panel on a watch session", () => {
     expect("configError" in result).toBe(true);
     expect(existsSync(socketPath)).toBe(false);
     await rm(dir, { recursive: true, force: true });
+  });
+
+  /**
+   * The hot-toggle story, end to end on one socket: the panel asks for the
+   * source catalog, flips one off and on, and the brain answers with verdicts.
+   * Recipes (`sourceEntries`) matter here — a hot restart must build a FRESH
+   * instance, because `ActivitySource.start` refuses a stopped one, and only a
+   * `create` recipe can prove that happened.
+   */
+  describe("the panel and the source catalog", () => {
+    /** Waits for the dump to finish and returns the source rows in wire order. */
+    const awaitSourceEnd = async (client: PanelTestClient): Promise<Record<string, unknown>[]> => {
+      const deadline = Date.now() + 2000;
+      for (;;) {
+        const parsed = client.lines.map(parsePanelLine);
+        if (parsed.some((p) => p.type === "source_end")) {
+          return parsed.filter((p) => p.type === "source");
+        }
+        if (Date.now() > deadline) throw new Error("source_get never completed");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    };
+
+    /**
+     * Waits for one source_result naming a given id, starting the scan at
+     * `cursor.from` and returning the new cursor. The cursor is the point: a
+     * second toggle for the same id must not re-read the FIRST verdict.
+     */
+    const awaitSourceResult = async (
+      client: PanelTestClient,
+      id: string,
+      cursor: { from: number } = { from: 0 },
+    ): Promise<Record<string, unknown>> => {
+      const deadline = Date.now() + 2000;
+      for (;;) {
+        const parsed = client.lines.map(parsePanelLine);
+        const index = parsed.findIndex(
+          (p, i) =>
+            i >= cursor.from &&
+            p.type === "source_result" &&
+            p.id === id,
+        );
+        if (index >= 0) {
+          cursor.from = index + 1;
+          return parsed[index] as Record<string, unknown>;
+        }
+        if (Date.now() > deadline) throw new Error(`no source_result for ${id}`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    };
+
+    it("answers source_get with the whole catalog, gate excluded, and counts it", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+      const socketPath = panelEndpoint(dir);
+      const diagnostics: string[] = [];
+      const { result } = await startSession({
+        sourceEntries: [
+          { id: "alpha", label: "Alpha", create: () => new ScriptedSource("alpha", []) },
+          // Declared but unconfigured: the dump shows it, state unsupported.
+          { id: "ghost", label: "Ghost" },
+        ],
+        env: { SQUID_PANEL_SOCKET: socketPath },
+        logError: (line) => diagnostics.push(line),
+      });
+      if ("configError" in result) throw new Error(result.configError);
+      try {
+        const client = new PanelTestClient(socketPath, diagnostics);
+        await client.ready();
+        client.send(JSON.stringify({ type: "source_get" }));
+        const rows = await awaitSourceEnd(client);
+        expect(rows).toEqual([
+          { type: "source", id: "alpha", label: "Alpha", state: "running" },
+          { type: "source", id: "ghost", label: "Ghost", state: "unsupported" },
+        ]);
+        // The gate is not a catalog entry: it is the pause switch, so it must
+        // never appear as something the panel could stop.
+        expect(rows.some((row) => row.id === "capture-gate")).toBe(false);
+        const end = client.lines.map(parsePanelLine).find((p) => p.type === "source_end");
+        expect(end?.count).toBe(2);
+        await client.close();
+      } finally {
+        await result.session.stop();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("toggles a source off and on, building a fresh instance for the restart", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+      const socketPath = panelEndpoint(dir);
+      const builds: ScriptedSource[] = [];
+      const diagnostics: string[] = [];
+      const { result } = await startSession({
+        sourceEntries: [
+          { id: "alpha", label: "Alpha", create: () => new ScriptedSource("alpha", []) },
+          {
+            id: "beta",
+            label: "Beta",
+            create: () => {
+              const built = new ScriptedSource("beta", []);
+              builds.push(built);
+              return built;
+            },
+          },
+        ],
+        env: { SQUID_PANEL_SOCKET: socketPath },
+        logError: (line) => diagnostics.push(line),
+      });
+      if ("configError" in result) throw new Error(result.configError);
+      try {
+        expect(builds).toHaveLength(1); // startup built beta once
+        const client = new PanelTestClient(socketPath, diagnostics);
+        await client.ready();
+
+        const cursor = { from: 0 };
+        client.send(JSON.stringify({ type: "source_toggle", id: "beta", on: 0 }));
+        const offResult = await awaitSourceResult(client, "beta", cursor);
+        expect(offResult.ok).toBe(1);
+        expect(builds[0]?.stopped).toBe(true);
+
+        client.send(JSON.stringify({ type: "source_toggle", id: "beta", on: 1 }));
+        const onResult = await awaitSourceResult(client, "beta", cursor);
+        expect(onResult.ok).toBe(1);
+        // The restart built a SECOND instance. Resurrection is not a thing a
+        // source can do; only a fresh recipe can bring it back.
+        expect(builds).toHaveLength(2);
+        expect(builds[1]?.started).toBe(true);
+
+        await client.close();
+      } finally {
+        await result.session.stop();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses to stop the last running source over the wire", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+      const socketPath = panelEndpoint(dir);
+      const diagnostics: string[] = [];
+      const { result } = await startSession({
+        sourceEntries: [{ id: "alpha", label: "Alpha", create: () => new ScriptedSource("alpha", []) }],
+        env: { SQUID_PANEL_SOCKET: socketPath },
+        logError: (line) => diagnostics.push(line),
+      });
+      if ("configError" in result) throw new Error(result.configError);
+      try {
+        const client = new PanelTestClient(socketPath, diagnostics);
+        await client.ready();
+        client.send(JSON.stringify({ type: "source_toggle", id: "alpha", on: 0 }));
+        const verdict = await awaitSourceResult(client, "alpha");
+        // The refusal rides the same result message the panel already knows how
+        // to show — not silence, not a diagnostic the panel would never read.
+        expect(verdict.ok).toBe(0);
+        expect(verdict.error).toBe(`Source "alpha" is the only observer; a watch session needs at least one.`);
+        await client.close();
+      } finally {
+        await result.session.stop();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses toggling the gate and unknown ids with honest errors", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+      const socketPath = panelEndpoint(dir);
+      const diagnostics: string[] = [];
+      const { result } = await startSession({
+        sourceEntries: [{ id: "alpha", label: "Alpha", create: () => new ScriptedSource("alpha", []) }],
+        env: { SQUID_PANEL_SOCKET: socketPath },
+        logError: (line) => diagnostics.push(line),
+      });
+      if ("configError" in result) throw new Error(result.configError);
+      try {
+        const client = new PanelTestClient(socketPath, diagnostics);
+        await client.ready();
+
+        // The gate is not in the catalog, so the honest answer is "unknown" —
+        // the panel never saw it in the dump and cannot stop what it never saw.
+        client.send(JSON.stringify({ type: "source_toggle", id: "capture-gate", on: 0 }));
+        const gateVerdict = await awaitSourceResult(client, "capture-gate");
+        expect(gateVerdict.ok).toBe(0);
+        expect(gateVerdict.error).toBe(`Unknown source "capture-gate".`);
+
+        client.send(JSON.stringify({ type: "source_toggle", id: "nope", on: 1 }));
+        const nopeVerdict = await awaitSourceResult(client, "nope");
+        expect(nopeVerdict.ok).toBe(0);
+        expect(nopeVerdict.error).toBe(`Unknown source "nope".`);
+
+        await client.close();
+      } finally {
+        await result.session.stop();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses toggling an unsupported source over the wire", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+      const socketPath = panelEndpoint(dir);
+      const diagnostics: string[] = [];
+      const { result } = await startSession({
+        sourceEntries: [
+          // The catalog needs one startable source; the ghost proves the
+          // unsupported refusal on top of a healthy session.
+          { id: "alpha", label: "Alpha", create: () => new ScriptedSource("alpha", []) },
+          { id: "ghost", label: "Ghost" },
+        ],
+        env: { SQUID_PANEL_SOCKET: socketPath },
+        logError: (line) => diagnostics.push(line),
+      });
+      if ("configError" in result) throw new Error(result.configError);
+      try {
+        const client = new PanelTestClient(socketPath, diagnostics);
+        await client.ready();
+        client.send(JSON.stringify({ type: "source_toggle", id: "ghost", on: 1 }));
+        const verdict = await awaitSourceResult(client, "ghost");
+        expect(verdict.ok).toBe(0);
+        expect(verdict.error).toBe(`Source "ghost" is not available in this run.`);
+        await client.close();
+      } finally {
+        await result.session.stop();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("delivers an event emitted during a stop before reporting the stop", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+      const socketPath = panelEndpoint(dir);
+      // A source whose stop emits one last event while draining — the tail the
+      // stop contract promises never to lose.
+      class TailEmitter implements ActivitySource {
+        public emit: ActivityEventEmitter | undefined = undefined;
+        public constructor(public readonly id: string) {}
+        public async start(emit: ActivityEventEmitter): Promise<void> {
+          this.emit = emit;
+        }
+        public async stop(): Promise<void> {
+          await this.emit?.(fileSaved("fs-9", "src/tail.ts"));
+        }
+      }
+      const tail = new TailEmitter("tail");
+      const diagnostics: string[] = [];
+      const { result } = await startSession({
+        sourceEntries: [
+          { id: "tail", label: "Tail", create: () => tail },
+          { id: "alpha", label: "Alpha", create: () => new ScriptedSource("alpha", []) },
+        ],
+        env: { SQUID_PANEL_SOCKET: socketPath },
+        logError: (line) => diagnostics.push(line),
+        agentOptions: { reply: "noted" },
+      });
+      if ("configError" in result) throw new Error(result.configError);
+      try {
+        const client = new PanelTestClient(socketPath, diagnostics);
+        await client.ready();
+
+        client.send(JSON.stringify({ type: "source_toggle", id: "tail", on: 0 }));
+        const verdict = await awaitSourceResult(client, "tail");
+        expect(verdict.ok).toBe(1);
+        // The tail event reached the pipeline before the stop resolved: the
+        // world state the panel sees reflects it, so nothing observed was lost.
+        const world = await waitForLine(() =>
+          client.lines
+            .map(parsePanelLine)
+            .find((parsed) => parsed.type === "world_state" && parsed.lastEvent === "file_saved"),
+        );
+        expect(world.lastEvent).toBe("file_saved");
+
+        await client.close();
+      } finally {
+        await result.session.stop();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
   });
 
   /**
@@ -1342,6 +1633,7 @@ describe("the control panel on a watch session", () => {
       const { result } = await startSession({
         sources: [source],
         env: { SQUID_PANEL_SOCKET: socketPath },
+        logError: (line) => diagnostics.push(line),
         agentConfigured: false,
         createAgentSession: factory,
         configPath: join(dir, "config.json"),
@@ -1349,7 +1641,6 @@ describe("the control panel on a watch session", () => {
         modelProvider: "bifrost",
         defaultModelId: "deepseek-v4-flash",
         defaultBaseUrl: "https://default.example/v1",
-        logError: (line) => diagnostics.push(line),
       });
       if ("configError" in result) throw new Error(result.configError);
       const client = new PanelTestClient(socketPath, diagnostics);

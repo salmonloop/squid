@@ -5,7 +5,7 @@ import { loadConfiguredEnvironment } from "./effective-env.js";
 import { BrowserPageActivitySource } from "./browser-page-source.js";
 import { EditorSaveActivitySource } from "./editor-save-source.js";
 import { FilesystemActivitySource } from "./filesystem-source.js";
-import type { ActivitySource } from "./activity-source.js";
+import type { SourceEntry } from "./activity-source.js";
 import type { FilePayload } from "./protocol.js";
 import { resolveBrowserReader } from "./resolve-browser-reader.js";
 import { resolveEditorSaveReader } from "./resolve-editor-save-reader.js";
@@ -141,33 +141,55 @@ export async function startDesktopWatch(
       // browser reader observes the tree the store writes into, so they cannot
       // feed themselves.
       const excludedPaths = await watchedSinkExclusions(context, canonicalRoot);
-      const sources: ActivitySource[] = [
-        new FilesystemActivitySource({
-          root,
-          include: (relativePath) => !excludedPaths.has(relativePath),
-          onDiagnostic: context.onDiagnostic,
-        }),
-        new ScreenTextActivitySource({
-          readerFactory: reader.readerFactory,
-          onDiagnostic: context.onDiagnostic,
-        }),
+      const entries: SourceEntry[] = [
+        {
+          id: "filesystem-local",
+          label: "Files",
+          create: () => new FilesystemActivitySource({
+            root,
+            include: (relativePath) => !excludedPaths.has(relativePath),
+            onDiagnostic: context.onDiagnostic,
+          }),
+        },
+        {
+          id: "screen-text-host",
+          label: "Screen",
+          create: () => new ScreenTextActivitySource({
+            readerFactory: reader.readerFactory,
+            onDiagnostic: context.onDiagnostic,
+          }),
+        },
       ];
+      // Declared even when disabled, with no `create`: the panel's dump shows
+      // the capability exists but this run cannot start it (state
+      // `unsupported`), rather than hiding it and implying an all-seeing run.
       if (browser.enabled) {
         // Before the terminal source but after the screen source, so a page is
         // observed once a foreground exists to attribute it to. The reducer drops
-        // an owner that does not match the current foreground, and `admitSearch`
-        // requires the selection to have been observed *after* the page, so
-        // ordering here decides whether the three ever agree.
-        sources.push(new BrowserPageActivitySource({
-          readerFactory: browser.readerFactory,
-          onDiagnostic: context.onDiagnostic,
-        }));
+        // an owner that does not match the current foreground, so ordering here
+        // decides whether the two ever agree.
+        entries.push({
+          id: "browser-page-host",
+          label: "Browser",
+          create: () => new BrowserPageActivitySource({
+            readerFactory: browser.readerFactory,
+            onDiagnostic: context.onDiagnostic,
+          }),
+        });
+      } else {
+        entries.push({ id: "browser-page-host", label: "Browser" });
       }
       if (terminal.enabled) {
-        sources.push(new TerminalCommandActivitySource({
-          readerFactory: terminal.readerFactory,
-          onDiagnostic: context.onDiagnostic,
-        }));
+        entries.push({
+          id: "terminal-command-host",
+          label: "Terminal",
+          create: () => new TerminalCommandActivitySource({
+            readerFactory: terminal.readerFactory,
+            onDiagnostic: context.onDiagnostic,
+          }),
+        });
+      } else {
+        entries.push({ id: "terminal-command-host", label: "Terminal" });
       }
       if (editorSaves.enabled) {
         // Last, and the only source that reports ownership rather than
@@ -176,13 +198,19 @@ export async function startDesktopWatch(
         // unattributed save can never satisfy. Ordering after the screen source
         // keeps the projection's foreground current before the strongest claim
         // lands.
-        sources.push(new EditorSaveActivitySource({
-          readerFactory: editorSaves.readerFactory,
-          root: canonicalRoot,
-          onDiagnostic: context.onDiagnostic,
-        }));
+        entries.push({
+          id: "editor-save-host",
+          label: "Editor saves",
+          create: () => new EditorSaveActivitySource({
+            readerFactory: editorSaves.readerFactory,
+            root: canonicalRoot,
+            onDiagnostic: context.onDiagnostic,
+          }),
+        });
+      } else {
+        entries.push({ id: "editor-save-host", label: "Editor saves" });
       }
-      return sources;
+      return entries;
     },
     // One line shape for both sources, read from the projection rather than the
     // raw payload so capture-policy redaction survives into the log. `path` is
