@@ -379,7 +379,7 @@ export async function startWatchSession(
     try {
       panelServer = await startPanelServer({
         socketPath: panel.socketPath,
-        onControl: (op) => {
+        onControl: (op, requestId) => {
           if (commandPath === undefined) {
             logError(JSON.stringify({ panelControl: op, error: "The capture gate is off." }));
             return;
@@ -389,13 +389,13 @@ export async function startWatchSession(
           });
         },
         onDiagnostic: (line) => logError(line),
-        onConfigGet: () => {
+        onConfigGet: (requestId) => {
           // The dump is re-read every time, so what the panel shows reflects
           // sets that landed after this process started — there is no cache to
           // go stale.
           const dump = configDumpEntries(configService);
           if (!dump.ok) {
-            panelServer?.broadcast(panelConfigResult({ ok: false, error: dump.error }));
+            panelServer?.broadcast(panelConfigResult({ ok: false, error: dump.error, ...(requestId === undefined ? {} : { requestId }) }));
             return;
           }
           for (const entry of dump.entries) {
@@ -403,11 +403,12 @@ export async function startWatchSession(
           }
           panelServer?.broadcast(panelConfigEnd(dump.entries.length));
         },
-        onConfigSet: (id, value) => {
+        onConfigSet: (id, value, requestId) => {
           const outcome = applyConfigSet(configService, id, value);
           panelServer?.broadcast(
             panelConfigResult({
               id,
+              ...(requestId === undefined ? {} : { requestId }),
               ok: outcome.ok,
               ...(outcome.ok ? { applies: outcome.applies } : { error: outcome.error }),
             }),
@@ -420,13 +421,13 @@ export async function startWatchSession(
             tryStartAgent();
           }
         },
-        onSourceGet: () => {
+        onSourceGet: (requestId) => {
           const manager = sourceManagerRef.manager;
           if (manager === undefined) {
             // The window between the panel server listening and the catalog
             // being built. A refusal, not silence: a panel waiting on a dump
             // that never ends is a worse lie than an honest "not yet".
-            panelServer?.broadcast(panelSourceResult({ ok: false, error: "The source catalog is still starting." }));
+            panelServer?.broadcast(panelSourceResult({ ok: false, error: "The source catalog is still starting.", ...(requestId === undefined ? {} : { requestId }) }));
             return;
           }
           const snapshot = manager.snapshot();
@@ -435,21 +436,21 @@ export async function startWatchSession(
           }
           panelServer?.broadcast(panelSourceEnd(snapshot.length));
         },
-        onSourceToggle: (id, on) => {
+        onSourceToggle: (id, on, requestId) => {
           const manager = sourceManagerRef.manager;
           if (manager === undefined) {
-            panelServer?.broadcast(panelSourceResult({ id, ok: false, error: "The source catalog is still starting." }));
+            panelServer?.broadcast(panelSourceResult({ id, ok: false, error: "The source catalog is still starting.", ...(requestId === undefined ? {} : { requestId }) }));
             return;
           }
           // The manager returns a result instead of throwing — including for
           // unknown ids and refusals — so the panel learns the verdict either way.
           void (on ? manager.start(id) : manager.stop(id)).then((result) => {
             panelServer?.broadcast(
-              panelSourceResult(result.ok ? { id, ok: true } : { id, ok: false, error: result.error }),
+              panelSourceResult(result.ok ? { id, ok: true, ...(requestId === undefined ? {} : { requestId }) } : { id, ok: false, error: result.error, ...(requestId === undefined ? {} : { requestId }) }),
             );
           });
         },
-        onServiceControl: (op) => {
+        onServiceControl: (op, requestId) => {
           // Only a supervised run may restart: the supervisor is what respawns
           // the process, and an unsupervised exit would look like a crash to
           // whoever started it by hand. Refused with a diagnostic, not silence.
