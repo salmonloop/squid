@@ -315,4 +315,60 @@ describe("applyConfigSet on the endpoint keys", () => {
     expect(firstModel.id).toBe("chosen-model");
     rmSync(dir, { recursive: true, force: true });
   });
+
+  it("saves a model id without deleting the provider's other models", () => {
+    // The write used to replace the whole `models` array, so saving an id
+    // through the form pruned a catalog it does not own. The saved id leads --
+    // that position is what a session opens -- and the rest keep their order.
+    const dir = tempDir("siblings");
+    const opts = options(dir);
+    expect(applyConfigSet(opts, "apiKey", API_KEY)).toEqual({ ok: true, applies: "now" });
+    const modelsPath = join(opts.agentDir, "models.json");
+    const seeded = JSON.parse(readFileSync(modelsPath, "utf8")) as {
+      providers: Record<string, { baseUrl: string; models: Record<string, unknown>[] }>;
+    };
+    const provider = seeded.providers.bifrost;
+    if (provider === undefined) throw new Error("bifrost provider missing after the key write");
+    provider.models = [
+      { id: "first-model", name: "first", contextWindow: 4096 },
+      { id: "second-model", name: "second", contextWindow: 8192 },
+    ];
+    writeFileSync(modelsPath, JSON.stringify(seeded), "utf8");
+
+    expect(applyConfigSet(opts, "modelId", "second-model")).toEqual({ ok: true, applies: "now" });
+    const after = JSON.parse(readFileSync(modelsPath, "utf8")) as {
+      providers: Record<string, { models: { id: string; contextWindow?: number }[] }>;
+    };
+    const entry = after.providers.bifrost;
+    if (entry === undefined) throw new Error("bifrost provider missing from models.json");
+    expect(entry.models.map((model) => model.id)).toEqual(["second-model", "first-model"]);
+    // The chosen entry was hand-tuned; promoting it must not regenerate it and
+    // silently reset the limits the user set.
+    expect(entry.models[0]?.contextWindow).toBe(8192);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("generates an entry for an id the catalog does not have yet, keeping the rest", () => {
+    const dir = tempDir("new-id");
+    const opts = options(dir);
+    expect(applyConfigSet(opts, "apiKey", API_KEY)).toEqual({ ok: true, applies: "now" });
+    const modelsPath = join(opts.agentDir, "models.json");
+    const seeded = JSON.parse(readFileSync(modelsPath, "utf8")) as {
+      providers: Record<string, { models: Record<string, unknown>[] }>;
+    };
+    const provider = seeded.providers.bifrost;
+    if (provider === undefined) throw new Error("bifrost provider missing after the key write");
+    provider.models = [{ id: "kept-model", name: "kept" }];
+    writeFileSync(modelsPath, JSON.stringify(seeded), "utf8");
+
+    expect(applyConfigSet(opts, "modelId", "brand-new")).toEqual({ ok: true, applies: "now" });
+    const after = JSON.parse(readFileSync(modelsPath, "utf8")) as {
+      providers: Record<string, { models: { id: string }[] }>;
+    };
+    expect(after.providers.bifrost?.models.map((model) => model.id)).toEqual([
+      "brand-new",
+      "kept-model",
+    ]);
+    rmSync(dir, { recursive: true, force: true });
+  });
 });
