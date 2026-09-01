@@ -95,20 +95,24 @@ describe("config schema", () => {
 describe("resolveConfigPath", () => {
   it("names each platform's own config home", () => {
     const home = "/home/me";
-    // Asserted segment by segment, in the separator the *host* produces, because
-    // the darwin and win32 branches build their paths with the platform-sensitive
-    // `join`. Rebuilding the expectation with the same `join` would compare a
-    // function against itself; naming the segments and the order they appear in
-    // is the part that is actually a contract.
-    const segmentsOf = (path: string): string[] => path.split(/[\\/]/);
-    expect(segmentsOf(pathOf(resolveConfigPath({ env: {}, platform: "darwin", home }))).slice(-4))
-      .toEqual(["Library", "Application Support", "Squid", "config.json"]);
-    expect(segmentsOf(pathOf(resolveConfigPath({ env: {}, platform: "win32", home }))).slice(-4))
-      .toEqual(["AppData", "Roaming", "Squid", "config.json"]);
-    // The linux branch is spelled out in full instead, because it is the one that
-    // must be POSIX whatever host it runs on: the resolver reaches for
-    // `posix.join` there precisely so a Windows runner cannot make it emit
-    // backslashes, and only a literal catches that.
+    // Literals, in each platform's own dialect, and that is the whole point: the
+    // resolver joins with `posix.join` or `win32.join` per branch rather than the
+    // host-sensitive `join`, so these strings are the same on every runner. An
+    // expectation rebuilt with the host's `join` would instead agree with a
+    // resolver that also used it — the same function on both sides of the equals,
+    // passing everywhere and proving nothing.
+    expect(pathOf(resolveConfigPath({ env: {}, platform: "darwin", home })))
+      .toBe("/home/me/Library/Application Support/Squid/config.json");
+    // Windows spells a bare-rooted home this way; the segments are what matter
+    // and the separator is the one the branch is written for.
+    expect(pathOf(resolveConfigPath({ env: {}, platform: "win32", home })))
+      .toBe("\\home\\me\\AppData\\Roaming\\Squid\\config.json");
+    // A real Windows home, with APPDATA set the way the OS sets it.
+    expect(pathOf(resolveConfigPath({
+      env: { APPDATA: "C:\\Users\\me\\AppData\\Roaming" },
+      platform: "win32",
+      home: "C:\\Users\\me",
+    }))).toBe("C:\\Users\\me\\AppData\\Roaming\\Squid\\config.json");
     expect(pathOf(resolveConfigPath({ env: {}, platform: "linux", home })))
       .toBe("/home/me/.config/squid/config.json");
   });
