@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, posix } from "node:path";
+import { dirname, join, posix } from "node:path";
 import { PANEL_PIPE_PREFIX, resolvePanel, type PanelResolution } from "./resolve-panel.js";
 
 /**

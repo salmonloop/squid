@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { isAbsolute, posix, win32 } from "node:path";
+import { posix, win32 } from "node:path";
 
 /**
  * Where the config file lives, per platform.
