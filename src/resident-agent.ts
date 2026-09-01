@@ -6,6 +6,7 @@ import type {
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   createPiSession,
+  resolveConfiguredModel,
   resolveModel,
   resolvePiModel,
   startPiModelRuntime,
@@ -69,7 +70,11 @@ export type ResidentSessionFactory = (spec: {
 /** The default factory: resolves the model and builds the agent's live session. */
 export const createDefaultResidentSession: ResidentSessionFactory = async (spec) => {
   const modelRuntime = await startPiModelRuntime();
-  const { provider, modelId } = resolvePiModel({});
+  // The stored entry, not the env default: the settings form writes the model id
+  // into Pi's `models.json`, and looking up the default instead would miss any
+  // id the user saved — reporting "no model configured" for the one they just
+  // configured.
+  const { provider, modelId } = resolveConfiguredModel(getAgentDir());
   const model = resolveModel(modelRuntime, provider, modelId);
   if (model === null) {
     throw new Error(`No resident-agent model is configured: ${provider}/${modelId}`);

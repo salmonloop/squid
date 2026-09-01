@@ -82,6 +82,16 @@ against a type that no longer existed and still pass.
   continues the most recent session for its working directory, so a restart resumes the
   agent's memory rather than waking it up amnesiac.
 
+  Two model resolutions live here, and the distinction is load-bearing.
+  `resolvePiModel` is the **default** — what a write falls back to and what
+  first-run offers as a suggestion. `resolveConfiguredModel` is the **answer**:
+  the id stored in Pi's `models.json` for the provider, which is what the
+  settings form writes and therefore what a session must open. Conflating them
+  made the form's `modelId` field save successfully and then stop the agent from
+  starting, because the lookup used a default the write had just replaced. An
+  explicit `modelId` still outranks both — a caller that knows which model it
+  means is not second-guessed by a file.
+
 ### Capture and the watch loop
 
 - `src/activity-source.ts` — the source contract every capture adapter implements.

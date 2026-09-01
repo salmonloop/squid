@@ -165,11 +165,41 @@ export async function askFirstRunAnswers(
  * it is what a reader of this file needs to know.
  */
 
+/** The catalog entry a Squid-side write generates for one model id. */
+function generatedModelEntry(modelId: string): Record<string, unknown> {
+  return {
+    id: modelId,
+    name: modelId,
+    reasoning: true,
+    input: ["text"],
+    contextWindow: DEFAULT_CONTEXT_WINDOW,
+    maxTokens: DEFAULT_MAX_TOKENS,
+    // Usage accounting shows zero cost until the user edits the entry;
+    // guessing a price would be worse than showing none.
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  };
+}
+
+/** The `id` of a catalog entry, when it has a readable one. */
+function entryModelId(entry: unknown): string | undefined {
+  if (typeof entry !== "object" || entry === null) return undefined;
+  const id = (entry as { id?: unknown }).id;
+  return typeof id === "string" ? id : undefined;
+}
+
 /**
  * The endpoint half of the configuration, shared by the first-run write and
  * `writeModelEndpoint`: one provider's models.json entry, rewritten while every
  * other provider the user has configured is preserved. Clobbering a user's
  * other logins to add ours is not a default anyone consented to.
+ *
+ * The same argument applies one level down, and it did not used to: this wrote
+ * a single-element `models` array, so saving a model id through the settings
+ * form deleted every other model the user had listed under that provider. A
+ * catalog is not ours to prune either. The saved id leads the array — that
+ * position is what `readModelEntry` reports and therefore what a session opens
+ * — and the rest follow in their existing order, with any stale copy of the
+ * saved id removed so the same model cannot appear twice.
  */
 function writeProviderEntry(
   agentDir: string,
@@ -187,22 +217,20 @@ function writeProviderEntry(
       ? models.providers
       : {}
   ) as Record<string, unknown>;
+  const existing = providers[provider];
+  const priorModels =
+    typeof existing === "object" && existing !== null && Array.isArray((existing as { models?: unknown }).models)
+      ? ((existing as { models: unknown[] }).models)
+      : [];
+  // A hand-written entry for this id keeps whatever the user tuned on it
+  // (context window, real costs); only its position changes. Absent that, the
+  // generated shape is the fallback.
+  const saved = priorModels.find((entry) => entryModelId(entry) === modelId) ?? generatedModelEntry(modelId);
+  const siblings = priorModels.filter((entry) => entryModelId(entry) !== modelId);
   providers[provider] = {
     baseUrl,
     api: "openai-completions",
-    models: [
-      {
-        id: modelId,
-        name: modelId,
-        reasoning: true,
-        input: ["text"],
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: DEFAULT_MAX_TOKENS,
-        // Usage accounting shows zero cost until the user edits the entry;
-        // guessing a price would be worse than showing none.
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      },
-    ],
+    models: [saved, ...siblings],
   };
   models.providers = providers;
   writeJsonAtomic(modelsPath, models);

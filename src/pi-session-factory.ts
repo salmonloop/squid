@@ -8,6 +8,7 @@ import {
   type InlineExtension,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { readModelEntry } from "./app-model.js";
 
 export type { ModelRuntime, InlineExtension };
 
@@ -31,7 +32,16 @@ export interface PiModelOptions {
   readonly modelId?: string;
 }
 
-/** Resolves the provider/model id pair against env defaults, exactly as each caller did. */
+/**
+ * Resolves the provider/model id pair against env defaults, exactly as each
+ * caller did.
+ *
+ * The `modelId` here is a **default**, not the answer to "which model is
+ * configured". It is what a write falls back to when nothing is stored yet and
+ * what first-run offers as a suggestion. Which model a live session opens is
+ * whatever the settings form last wrote into Pi's `models.json` — read that
+ * with `resolveConfiguredModel`, not this.
+ */
 export function resolvePiModel(options: PiModelOptions): {
   readonly provider: string;
   readonly modelId: string;
@@ -40,6 +50,35 @@ export function resolvePiModel(options: PiModelOptions): {
     provider: options.provider ?? process.env.PI_MODEL_PROVIDER ?? "bifrost",
     modelId: options.modelId ?? process.env.PI_MODEL_ID ?? "deepseek-v4-flash",
   };
+}
+
+/**
+ * The model a session should actually open: the id stored in Pi's `models.json`
+ * for this provider, falling back to the default only when nothing is stored.
+ *
+ * This exists because the two were conflated, and the settings form is what
+ * exposed it. Saving `modelId` rewrites the provider's `models.json` entry —
+ * that file is Pi's store and the only place a model id belongs, so the write
+ * was right. But a session resolved its model from `resolvePiModel`, i.e. from
+ * the env default, and looked up an id the form had just replaced. The result
+ * was a field that reported a successful save and then stopped the agent from
+ * starting: `resolveModel` returned null for an id no longer in the catalog.
+ *
+ * Reading the stored entry is not a second source of truth; it is the first
+ * one. A Squid-side copy of the model id would be the parallel store
+ * `app-model.ts` exists to prevent.
+ */
+export function resolveConfiguredModel(
+  agentDir: string,
+  options: PiModelOptions = {},
+): { readonly provider: string; readonly modelId: string } {
+  const { provider, modelId: fallback } = resolvePiModel(options);
+  // An explicit id is a caller that already knows which model it means -- a
+  // test, an eval run -- and a file does not get to second-guess it. Only the
+  // *default* defers to the store.
+  if (options.modelId !== undefined) return { provider, modelId: options.modelId };
+  const stored = readModelEntry(agentDir, provider);
+  return { provider, modelId: stored?.modelId ?? fallback };
 }
 
 /** Starts the long-lived model runtime. One per provider instance. */
