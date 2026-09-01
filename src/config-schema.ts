@@ -35,9 +35,21 @@
  * `SQUID_LAST_COMMAND`. The panel socket names where *this* process talks to
  * the panel — one half of a pair whose other half must agree — and it stays
  * env-only so a config file cannot point a running session's panel at an
- * arbitrary path. Model credentials are absent because they are Pi's own store
- * (`models.json`/`auth.json`), never a Squid-side parallel copy —
+ * arbitrary path. Model *credentials* are absent because they are Pi's own
+ * store (`models.json`/`auth.json`), never a Squid-side parallel copy —
  * `app-model.ts` owns that contract.
+ *
+ * `modelProvider` is the one row here that is not a `SQUID_*` variable, and the
+ * distinction it rests on is worth stating: it is the *key* Squid looks Pi's
+ * two files up under, not any of their content. Storing a key name is not
+ * keeping a parallel copy of what it addresses. It belongs in the file rather
+ * than beside the other three model settings because those write *into* Pi's
+ * store while this decides which entry they write to — a choice that has to be
+ * readable before the settings service is constructed, which is exactly what
+ * the file layer is for. Without it, a run supervised by the panel was pinned
+ * to whatever `PI_MODEL_PROVIDER` defaults to, because the supervisor clears
+ * the environment it spawns the brain with; two logins against one endpoint
+ * were unreachable.
  *
  * The three source FIFO paths are *present*, and that is a correction rather
  * than a preference. `captureGate`, `terminal`, and `editorSaves` each offer
@@ -132,6 +144,20 @@ function validatorFor(key: Omit<ConfigKey, "validate">): ConfigKey["validate"] {
 }
 
 const CONFIG_KEY_TABLE: readonly Omit<ConfigKey, "validate">[] = [
+  {
+    id: "modelProvider",
+    env: "PI_MODEL_PROVIDER",
+    label: "Model provider",
+    kind: "text",
+    // Pi keys `models.json` and `auth.json` by this string, so it has to be
+    // usable as an object key and recognizable in a file a user may open. A
+    // path separator or a dot would still work as a key while reading as a
+    // path or a nested field to anyone looking at the JSON.
+    refine: (raw) =>
+      /^[A-Za-z0-9_-]+$/.test(raw)
+        ? { ok: true }
+        : { ok: false, error: "Model provider must be letters, digits, dashes, or underscores." },
+  },
   { id: "watchRoot", env: "SQUID_WATCH_ROOT", label: "Watch root", kind: "text" },
   { id: "databasePath", env: "SQUID_DB", label: "Database path", kind: "text" },
   { id: "retentionHours", env: "SQUID_RETENTION_HOURS", label: "Retention (hours)", kind: "int" },

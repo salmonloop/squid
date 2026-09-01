@@ -13,7 +13,12 @@ import {
   writeModelConfiguration,
   type FirstRunIO,
 } from "../src/app-model.js";
-import { ensureSupervisedConfig, prepareLaunch, spawnPanelProcess } from "../src/squid-app.js";
+import {
+  ensureSupervisedConfig,
+  prepareLaunch,
+  spawnPanelProcess,
+  type LaunchPreparation,
+} from "../src/squid-app.js";
 
 describe("defaultPanelEndpoint", () => {
   it("names the platform's transport: a pipe on Windows, a socket path elsewhere", () => {
@@ -226,7 +231,47 @@ describe("prepareLaunch", () => {
       env: withConfig(base.configPath, { SQUID_WATCH_ROOT: hostRoot }),
       agentDir: join(mkdtempSync(join(tmpdir(), "squid-empty-agent-")), "agent"),
     });
-    expect(prepared).toEqual({ needsFirstRun: true });
+    // The provider rides along because first-run has to write under the same
+    // key the settings service will later edit; two resolutions of it could
+    // disagree once `modelProvider` became a file-backed setting.
+    expect(prepared).toEqual({ needsFirstRun: true, provider: "bifrost" });
+  });
+
+  it("takes the provider from the config file, after its own step 0", () => {
+    // The launch the panel recommends clears the environment before spawning
+    // this process, so a provider read before the file merge is always the
+    // hardcoded default -- which is how `PI_MODEL_PROVIDER` stayed unreachable
+    // from the settings form. The resolution has to happen downstream of step 0,
+    // and it has to be the resolution the caller then writes under.
+    const dir = mkdtempSync(join(tmpdir(), "squid-provider-"));
+    const configPath = join(dir, "config.json");
+    writeFileSync(configPath, JSON.stringify({ modelProvider: "gateway-two" }), "utf8");
+    const agentDir = mkdtempSync(join(tmpdir(), "squid-provider-agent-"));
+    writeFileSync(
+      join(agentDir, "models.json"),
+      JSON.stringify({ providers: { "gateway-two": { baseUrl: "https://two/v1" } } }),
+    );
+    writeFileSync(
+      join(agentDir, "auth.json"),
+      JSON.stringify({ "gateway-two": { type: "api_key", key: "k" } }),
+    );
+
+    // No `provider` passed, and no `PI_MODEL_PROVIDER` in the env: exactly the
+    // supervised shape. The entry is keyed `gateway-two`, so reaching `ready`
+    // at all proves the file's value was what the model check looked up.
+    const prepared = prepareLaunch({
+      platform: process.platform,
+      agentDir,
+      env: withConfig(configPath, { SQUID_WATCH_ROOT: hostRoot }),
+    });
+    const ready = expectReady(prepared);
+    expect(ready.provider).toBe("gateway-two");
+    // And it travels onward the same way every other file setting does, so a
+    // spawned panel and the session agree with the process that resolved it.
+    expect(ready.env.PI_MODEL_PROVIDER).toBe("gateway-two");
+
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
   });
 
   it("wires the default endpoint through the same resolver an explicit value takes", () => {
@@ -324,12 +369,14 @@ function readyAgentDir(): string {
   return dir;
 }
 
-function expectReady(result: ReturnType<typeof prepareLaunch>): {
-  env: Record<string, string | undefined>;
-  root: string;
-  panelSocket: string;
-  configPath: string;
-} {
+/**
+ * Narrows to the ready branch, returning the production type rather than a
+ * restatement of its fields. The hand-written shape it used to declare was one
+ * more place to forget: a field added to `LaunchPreparation` typechecked
+ * everywhere except here, where a test reading it failed for a reason that had
+ * nothing to do with the assertion.
+ */
+function expectReady(result: ReturnType<typeof prepareLaunch>): LaunchPreparation {
   if (!("ready" in result)) throw new Error(`expected ready, got ${JSON.stringify(result)}`);
   return result.ready;
 }

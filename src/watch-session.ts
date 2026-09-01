@@ -272,8 +272,12 @@ export async function startWatchSession(
     configPath: options.configPath,
     env,
     agentDir: options.agentDir ?? getAgentDir(),
-    provider: options.modelProvider ?? resolvePiModel({}).provider,
-    defaultModelId: options.defaultModelId ?? resolvePiModel({}).modelId,
+    // `env` here is the merged one — config file under process env — so a
+    // file-backed `modelProvider` reaches this the same way every resolver's
+    // setting does. Reading `process.env` instead would make the row writable
+    // and inert.
+    provider: options.modelProvider ?? resolvePiModel({ env }).provider,
+    defaultModelId: options.defaultModelId ?? resolvePiModel({ env }).modelId,
     defaultBaseUrl: options.defaultBaseUrl ?? DEFAULT_BASE_URL,
     agentLive: () => agent !== undefined,
   };
