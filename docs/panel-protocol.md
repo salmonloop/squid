@@ -766,3 +766,28 @@ Three rules the Rust half holds to that are not visible in the signatures:
   `count` is compared against what arrived: the parser drops a row it cannot read,
   and a missing setting that looked like a setting which does not exist would be
   silence reading as an answer.
+
+## Version 2 (nested UI protocol)
+
+A subscriber may negotiate V2 with `{"type":"subscribe","protocolVersion":2}`. Omitting
+`protocolVersion` remains V1. The server tracks the selected version per connection:
+legacy subscribers receive the flat messages documented above, while V2 subscribers receive a
+nested `snapshot` immediately followed by nested `event` envelopes for ordinary broadcasts.
+
+```jsonc
+{"type":"snapshot","protocolVersion":2,"state":{"connection":{"status":"connected"},
+ "session":{},"activity":{},"sources":[],"config":[],"prompts":[]}}
+```
+
+An event has `{ "type":"event", "protocolVersion":2, "event": { "type": "world_state",
+"data": { ... } } }`. The projection is display-safe: every string is sanitized; raw selections,
+arguments, and secret values are never present. V2 config entries may carry `group`, `description`,
+and `secretPresent` (without a secret value). Source entries may carry a plain-language `reason`
+and a non-secret `repair` configuration descriptor. Prompt records may carry `why` and
+`denyConsequence`. The current session does not expose every V2 fact, so absent information is
+omitted rather than fabricated.
+
+All control messages may include a non-empty string `requestId`; handlers propagate it to
+config/source result messages when they have a result. This lets V2 consumers correlate concurrent
+commands. Malformed or unwired commands remain diagnostics; integrations that can return a result
+should send a failed correlated result instead of reporting only to stderr.
