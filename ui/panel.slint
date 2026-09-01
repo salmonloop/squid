@@ -247,6 +247,12 @@ export component PanelWindow inherits Window {
     in property <string> service-state;
     in property <string> service-detail;
     callback restart-service();
+    // Recovery from a tripped crash guard, which is terminal for a *round* of
+    // supervision rather than for the panel. In `failed` there is no brain on the
+    // socket, so Restart has nothing to write to; this starts a fresh round with
+    // a clean crash log. Offered only in `failed` — while a round is live, a
+    // second one would race it for the endpoint.
+    callback start-service();
 
     // --- E. Sources -------------------------------------------------------
     // The whole declared catalog, three states, rendered generically. The
@@ -525,10 +531,23 @@ export component PanelWindow inherits Window {
             // Only where it can work: an unsupervised brain refuses a restart,
             // because exiting with nobody to respawn it would read as a crash to
             // whoever started it by hand.
-            if root.supervised: Button {
+            //
+            // And only while there is a brain to ask. Once the crash guard has
+            // tripped, Restart would write to a socket with nothing on the other
+            // end — silently dropped, so the button would look like it worked.
+            // The same spot offers Start instead, which is a different request:
+            // not "stop and come back" but "begin again, the guard is cleared".
+            if root.supervised && root.service-state != "failed": Button {
                 text: "Restart brain";
                 clicked => {
                     root.restart-service();
+                }
+            }
+
+            if root.supervised && root.service-state == "failed": Button {
+                text: "Start brain";
+                clicked => {
+                    root.start-service();
                 }
             }
         }

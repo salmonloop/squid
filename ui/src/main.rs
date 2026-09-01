@@ -258,10 +258,11 @@ fn main() {
     }
     {
         let outgoing = outgoing.clone();
-        // Only reachable while `supervised` is set, which today is never: the
-        // panel is not yet the process that spawns the brain. The line is wired
-        // now so the button has somewhere to go the moment it is, and the brain
-        // refuses it unsupervised in any case.
+        // Reachable while `supervised` is set, which a panel-first run sets from
+        // `launch.brain()`. The brain refuses `op:"restart"` unless it sees
+        // `SQUID_SUPERVISED`, so an attached panel's button is hidden and the
+        // request would be refused anyway — two independent guards on the one
+        // operation that exits a healthy process on purpose.
         window.on_restart_service(move || outgoing.send(&control_line(Control::Restart)));
     }
     {
@@ -326,20 +327,35 @@ fn main() {
     if let Some(brain) = launch.brain() {
         let brain = brain.to_path_buf();
         let endpoint = endpoint_text.clone();
-        let handle = window.as_weak();
         // Idle until the first spawn reports: the window opens before the child
         // exists, and "running" written optimistically here would be a claim about
         // a process that has not been created yet.
         window.set_service_state(supervisor::ServiceState::Idle.label().into());
-        thread::spawn(move || {
-            supervisor::supervise(&brain, &endpoint, |state| {
-                let label = state.label().to_owned();
-                let detail = state.detail();
-                let _ = handle.upgrade_in_event_loop(move |window| {
-                    window.set_service_state(label.into());
-                    window.set_service_detail(detail.into());
-                });
-            });
+        start_supervision(window.as_weak(), brain.clone(), endpoint.clone());
+
+        // Recovering from a tripped crash guard. `supervise` returns once it will
+        // not spawn again, which left the panel showing `failed` with no way
+        // forward: the Restart button writes to a socket that by then has no
+        // brain on it, and an unconnected write is dropped rather than queued. So
+        // the guard's terminal decision ends a *round* of supervision, and this
+        // starts a new one with a fresh crash log.
+        //
+        // Only from `failed`, and that is the whole guard: while a round is live
+        // the button is hidden, so a second thread cannot race the first for the
+        // endpoint. The user asking again is also the signal the guard was
+        // waiting for — three crashes in a minute means "stop trying until a
+        // human looks", not "never again".
+        let handle = window.as_weak();
+        window.on_start_service(move || {
+            let Some(window) = handle.upgrade() else {
+                return;
+            };
+            if window.get_service_state() != supervisor::ServiceState::FAILED_LABEL {
+                return;
+            }
+            window.set_service_state(supervisor::ServiceState::Idle.label().into());
+            window.set_service_detail(SharedString::new());
+            start_supervision(window.as_weak(), brain.clone(), endpoint.clone());
         });
     }
 
@@ -354,6 +370,32 @@ fn main() {
     if let Err(error) = window.run() {
         startup::abort(Startup::Platform(error.to_string()));
     }
+}
+
+/// Runs one round of supervision on its own thread, reporting each state change
+/// to the window.
+///
+/// Its own thread because `wait()` blocks and blocking the Slint event loop
+/// would freeze the window this exists to keep informative. Nothing here touches
+/// a Slint property directly: every state change hops to the UI thread the same
+/// way the transport reader's messages do.
+///
+/// "One round" is the unit because a tripped crash guard ends supervision rather
+/// than the process — `supervise` returns, having reported why, and the panel
+/// stays up showing it. Starting a second round is how the user says "I have
+/// looked at it, try again", which is exactly the signal the guard was holding
+/// out for.
+fn start_supervision(handle: slint::Weak<PanelWindow>, brain: PathBuf, endpoint: String) {
+    thread::spawn(move || {
+        supervisor::supervise(&brain, &endpoint, |state| {
+            let label = state.label().to_owned();
+            let detail = state.detail();
+            let _ = handle.upgrade_in_event_loop(move |window| {
+                window.set_service_state(label.into());
+                window.set_service_detail(detail.into());
+            });
+        });
+    });
 }
 
 /// Moves one message onto the UI thread and applies it.

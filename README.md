@@ -400,7 +400,13 @@ mode. Fill the model base URL, model id, and API key in **SETTINGS**; the key go
 only to Pi's `models.json`/`auth.json` and is never displayed back. Everything
 else lives in Squid's own config file. A saved setting that says `restart` takes
 effect when you click **Restart brain**; the brain drains in its ordinary order
-and the panel starts its replacement. The **SOURCES** list independently starts
+and the panel starts its replacement. Three crashes inside a minute stop the
+retries and leave the service reading `failed` — a broken install should not
+burn a battery being respawned. That is terminal for a round of supervision,
+not for the panel: **Start brain** takes the place of Restart there and begins
+a fresh round with a clean crash log, because the user asking again is the
+signal the guard was holding out for. Restart is hidden in that state, since
+it writes to a socket with no brain on it and an unconnected write is dropped. The **SOURCES** list independently starts
 and stops observers, except the last running observer (the session needs one)
 and the capture gate (which is a pause switch, not a source).
 
