@@ -31,15 +31,23 @@
  * always has. The env layer keeps its `""` semantics; the file layer never
  * has any.
  *
- * Deliberately absent: the interop endpoints (`SQUID_PANEL_SOCKET`,
- * `SQUID_CONTROL_FIFO`, `SQUID_TERMINAL_FIFO`, `SQUID_EDITOR_FIFO`) and the
- * shell-side `SQUID_LAST_COMMAND`. The endpoints name where *this* process
- * talks to others — one half of a pair whose other half must agree — and a
- * settings form is the wrong place to hand-edit a socket path; they stay
- * env-only, which also keeps a config file from being able to point a running
- * session's panel at an arbitrary path. Model credentials are absent because
- * they are Pi's own store (`models.json`/`auth.json`), never a Squid-side
- * parallel copy — `app-model.ts` owns that contract.
+ * Deliberately absent: `SQUID_PANEL_SOCKET` and the shell-side
+ * `SQUID_LAST_COMMAND`. The panel socket names where *this* process talks to
+ * the panel — one half of a pair whose other half must agree — and it stays
+ * env-only so a config file cannot point a running session's panel at an
+ * arbitrary path. Model credentials are absent because they are Pi's own store
+ * (`models.json`/`auth.json`), never a Squid-side parallel copy —
+ * `app-model.ts` owns that contract.
+ *
+ * The three source FIFO paths are *present*, and that is a correction rather
+ * than a preference. `captureGate`, `terminal`, and `editorSaves` each offer
+ * exactly one legal value, and each of those values is refused at startup
+ * unless its companion path is set. While the paths were env-only, the panel
+ * offered three settings whose only selectable value guaranteed a `configError`
+ * and exit 2 — and because the settings form renders what a *live* brain dumps,
+ * a brain that refused to start left no form to undo the choice in. Offering a
+ * value the same form cannot satisfy is the defect; a path that names a FIFO
+ * this process reads is ordinary configuration, unlike the socket it serves.
  */
 
 /** The value shapes a setting can take, as the panel renders them. */
@@ -92,6 +100,26 @@ function validateText(raw: string): ConfigValidation {
     : { ok: true };
 }
 
+/**
+ * A FIFO path must be absolute, and the settings form is where saying so is
+ * useful: the resolver refuses a relative path at startup, which for a
+ * supervised brain means exit 2 and no form left to fix it in. Same rule as
+ * each resolver's own `isAbsolute` check, stated here in the layer that can
+ * still refuse the value while a brain is running.
+ *
+ * `isAbsolute` is deliberately not imported: this validator runs in the brain
+ * and in the panel's dump alike, and POSIX is the dialect the config file is
+ * written in — a Windows host would otherwise accept `C:\\pipe` here and
+ * reject it in a resolver that judged by POSIX rules.
+ */
+function validateFifoPath(label: string, raw: string): ConfigValidation {
+  const whitespace = validateText(raw);
+  if (!whitespace.ok) return whitespace;
+  return raw.startsWith("/")
+    ? { ok: true }
+    : { ok: false, error: `${label} must be an absolute path.` };
+}
+
 function validatorFor(key: Omit<ConfigKey, "validate">): ConfigKey["validate"] {
   return (raw: string): ConfigValidation => {
     // Unset, not a value: the caller omits the variable, so there is nothing
@@ -109,13 +137,34 @@ const CONFIG_KEY_TABLE: readonly Omit<ConfigKey, "validate">[] = [
   { id: "retentionHours", env: "SQUID_RETENTION_HOURS", label: "Retention (hours)", kind: "int" },
   { id: "agentTurnTimeoutMs", env: "SQUID_AGENT_TURN_TIMEOUT_MS", label: "Agent turn timeout (ms)", kind: "int" },
   { id: "captureGate", env: "SQUID_CONTROL", label: "Capture gate", kind: "enum", values: ["fifo"] },
+  {
+    id: "captureGatePath",
+    env: "SQUID_CONTROL_FIFO",
+    label: "Capture gate FIFO",
+    kind: "text",
+    refine: (raw) => validateFifoPath("Capture gate FIFO", raw),
+  },
   { id: "screenReader", env: "SQUID_SCREEN_READER", label: "Screen reader", kind: "enum", values: ["synthetic", "darwin", "linux", "windows"] },
   { id: "screenPollMs", env: "SQUID_SCREEN_POLL_MS", label: "Screen poll (ms)", kind: "int" },
   { id: "browser", env: "SQUID_BROWSER", label: "Browser pages", kind: "enum", values: ["synthetic", "darwin"] },
   { id: "browserPollMs", env: "SQUID_BROWSER_POLL_MS", label: "Browser poll (ms)", kind: "int" },
   { id: "terminal", env: "SQUID_TERMINAL", label: "Terminal commands", kind: "enum", values: ["fifo"] },
+  {
+    id: "terminalPath",
+    env: "SQUID_TERMINAL_FIFO",
+    label: "Terminal FIFO",
+    kind: "text",
+    refine: (raw) => validateFifoPath("Terminal FIFO", raw),
+  },
   { id: "terminalPollMs", env: "SQUID_TERMINAL_POLL_MS", label: "Terminal poll (ms)", kind: "int" },
   { id: "editorSaves", env: "SQUID_EDITOR_SAVES", label: "Editor saves", kind: "enum", values: ["fifo"] },
+  {
+    id: "editorSavesPath",
+    env: "SQUID_EDITOR_FIFO",
+    label: "Editor saves FIFO",
+    kind: "text",
+    refine: (raw) => validateFifoPath("Editor saves FIFO", raw),
+  },
   { id: "editorPollMs", env: "SQUID_EDITOR_POLL_MS", label: "Editor poll (ms)", kind: "int" },
   { id: "capturePollMs", env: "SQUID_CONTROL_POLL_MS", label: "Gate poll (ms)", kind: "int" },
   {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_KEYS, configKeyByEnv, configKeyById } from "../src/config-schema.js";
@@ -80,6 +80,102 @@ describe("config schema", () => {
     // layer accepts it too — refusing here would make a value work by env and
     // fail by file, an asymmetry with no defender.
     expect(exclude.validate("code, terminal").ok).toBe(true);
+  });
+
+  it("pairs every backend enum with a path the same form can set", () => {
+    // The defect this covers: while the FIFO paths were env-only, each of these
+    // three enums offered exactly one legal value, and choosing it guaranteed a
+    // startup configError -- from a form that only exists while a brain is
+    // running. An enum whose value the same form cannot satisfy is a trap, so
+    // the pairing is asserted rather than left to whoever adds the next backend.
+    for (const [enumId, pathId] of [
+      ["captureGate", "captureGatePath"],
+      ["terminal", "terminalPath"],
+      ["editorSaves", "editorSavesPath"],
+    ] as const) {
+      const backend = configKeyById(enumId);
+      const path = configKeyById(pathId);
+      expect(backend?.kind).toBe("enum");
+      expect(backend?.values).toEqual(["fifo"]);
+      expect(path?.kind).toBe("text");
+    }
+  });
+
+  it("judges a FIFO path by POSIX rules on every host", () => {
+    // The config file is written in one dialect, and the resolvers judge
+    // absoluteness with their own POSIX-shaped check. A host-sensitive
+    // `isAbsolute` here would accept `C:\\pipe` on Windows and then watch a
+    // resolver refuse it, moving the error past the form that could fix it.
+    for (const id of ["captureGatePath", "terminalPath", "editorSavesPath"] as const) {
+      const key = configKeyById(id)!;
+      expect(key.validate("/run/squid/gate")).toEqual({ ok: true });
+      expect(key.validate("gate.fifo").ok).toBe(false);
+      expect(key.validate("./gate.fifo").ok).toBe(false);
+      expect(key.validate("C:\\pipe\\gate").ok).toBe(false);
+      // Same whitespace rule as every other text row: a pasted newline is a
+      // different path, and the file layer refuses rather than trims.
+      expect(key.validate("/run/squid/gate ").ok).toBe(false);
+    }
+  });
+
+  it("accounts for every SQUID_ variable the source tree reads", () => {
+    // `config-schema.ts` claims this asymmetry IS the check that catches a new
+    // SQUID_* variable added without deciding whether a user may configure it.
+    // That claim lived only in a comment, so the check it describes never ran:
+    // three variables sat outside the table for months while the panel offered
+    // the enums that required them. Reading the tree is what makes the claim
+    // true rather than aspirational.
+    //
+    // Every name found in `src` must be one of three things: a row in the
+    // table, a documented exemption, or -- if it is neither -- a decision
+    // nobody has made yet, which is exactly what should fail here.
+    const EXEMPT = new Map<string, string>([
+      // The panel endpoint names where this process talks to the panel. One
+      // half of a pair whose other half must agree; a config file that could
+      // repoint it would repoint a running session's panel.
+      ["SQUID_PANEL_SOCKET", "interop endpoint, env-only by design"],
+      // Written by the shell hook, read as one command's payload. Not a setting.
+      ["SQUID_LAST_COMMAND", "shell-side payload, not configuration"],
+      // Says where the config file IS; it cannot live inside the file it names.
+      ["SQUID_CONFIG", "names the config file, so it cannot be in it"],
+      // Set by the supervisor on the child it spawned. A run cannot award
+      // itself the right to accept a restart.
+      ["SQUID_SUPERVISED", "supervisor's claim about the child, not a setting"],
+      // Named only in prose: the egress policy it configured was deleted with
+      // the action layer that enforced it. Listed so a reader knows the
+      // remaining mentions are history, not a gap.
+      ["SQUID_SEARCH_EGRESS", "removed with the action layer; comments only"],
+    ]);
+
+    const names = new Set<string>();
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+          continue;
+        }
+        if (!entry.name.endsWith(".ts")) continue;
+        for (const match of readFileSync(full, "utf8").matchAll(/SQUID_[A-Z_]+/g)) {
+          names.add(match[0]);
+        }
+      }
+    };
+    walk(join(import.meta.dir, "..", "src"));
+
+    // A guard on the guard: a walk that found nothing would pass every
+    // assertion below while checking nothing at all.
+    expect(names.size).toBeGreaterThan(CONFIG_KEYS.length);
+
+    const unaccounted = [...names].filter(
+      (name) => configKeyByEnv(name) === undefined && !EXEMPT.has(name),
+    );
+    expect(unaccounted).toEqual([]);
+
+    // And the other direction: an exemption for a name the tree no longer
+    // mentions is a stale note that would quietly excuse a future collision.
+    const stale = [...EXEMPT.keys()].filter((name) => !names.has(name));
+    expect(stale).toEqual([]);
   });
 
   it("carries every label and kind the panel will render", () => {
