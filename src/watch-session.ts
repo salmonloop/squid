@@ -473,12 +473,16 @@ export async function startWatchSession(
             },
           );
         },
-        onConnect: () => {
-          // Standing state, replayed per client rather than broadcast once:
+        onSubscribe: () => {
+          // Standing state, replayed per subscriber rather than broadcast once:
           // broadcast reaches only whoever is registered at that instant, and
           // a panel attaches after the session — often seconds after, and in
-          // the panel-first flow always after. Every connect gets the current
+          // the panel-first flow always after. Every subscribe gets the current
           // truth, so the panel never infers readiness from silence.
+          //
+          // Keyed to `subscribe`, not to a connection being accepted: a Windows
+          // command write is its own connection, and replaying into one is an
+          // `EPIPE` that makes the panel pull its dumps and provoke two more.
           panelServer?.broadcast(
             panelServiceLine({ agentState: agent === undefined ? "needs_config" : "ready" }),
           );

@@ -349,6 +349,23 @@ impl Answer {
     }
 }
 
+/// Serializes a `subscribe`, newline included.
+///
+/// The first line a *reading* connection sends, and the only line that changes
+/// what a connection is rather than asking for something. Until it arrives the
+/// server writes nothing to that connection.
+///
+/// It exists because accepting a connection and having a reader behind it are
+/// different facts on Windows, where the write direction opens a connection per
+/// line (see `transport::OutgoingHandle`). A server that replayed standing state
+/// at accept would write into those write-only connections and get `EPIPE` per
+/// click — and since the panel answers `service` by pulling its dumps, each
+/// `EPIPE` would provoke two more. Declaring the reader is what breaks that loop
+/// at its source rather than filtering its symptoms.
+pub fn subscribe_line() -> String {
+    "{\"type\":\"subscribe\"}\n".to_owned()
+}
+
 /// Serializes a `config_get`, newline included. No fields: the request is the
 /// whole message, and the dump comes back as its own lines.
 pub fn config_get_line() -> String {

@@ -253,11 +253,15 @@ fn write_line(pipe_name: &Path, line: &str) -> io::Result<()> {
 /// somebody home". It is deliberately *not* a read — a session that has bound but
 /// has not yet pushed a line is still a session, and waiting for a first message
 /// would spawn a second brain next to a perfectly live one.
+///
+/// Deliberately does *not* [`subscribe`]. An unsubscribed connection is one the
+/// server never writes to and never reports dropping, so the guard costs the
+/// session no traffic and no diagnostic — it asks the question and leaves.
 pub fn probe(endpoint: &Path) -> bool {
     connect(endpoint).is_ok()
 }
 
-/// Connects, reads until the connection ends, and connects again. Never returns./// Connects, reads until the connection ends, and connects again. Never returns.
+/// Connects, reads until the connection ends, and connects again. Never returns.
 ///
 /// Runs on the reader thread: `connect`, `read`, and `sleep` all block, and
 /// blocking Slint's event loop would freeze the window. `deliver` is called on
@@ -267,17 +271,23 @@ pub fn run(socket_path: &Path, outgoing: &Outgoing, mut deliver: impl FnMut(Inco
     let mut backoff = FIRST_BACKOFF;
     loop {
         if let Ok(stream) = connect(socket_path) {
-            // This thread reads from the connection it just made; the UI thread
-            // gets whatever it needs to write independently of that read. What
-            // "independently" costs differs per platform, which is the whole
-            // subject of [`OutgoingHandle`].
-            if let Ok(handle) = outgoing_handle(&stream, socket_path) {
-                // Reset only after a connection actually stands up. A ladder
-                // that reset on attempt rather than success would never climb.
-                backoff = FIRST_BACKOFF;
-                outgoing.adopt(handle);
-                read_messages(stream, &mut deliver);
-                outgoing.release();
+            // Announce the reader before anything else. Until this lands the
+            // server holds the connection but writes nothing to it, so a failure
+            // here is a connection that would sit silent forever — treated as a
+            // failed connect and retried, rather than parked on.
+            if subscribe(&stream).is_ok() {
+                // This thread reads from the connection it just made; the UI
+                // thread gets whatever it needs to write independently of that
+                // read. What "independently" costs differs per platform, which is
+                // the whole subject of [`OutgoingHandle`].
+                if let Ok(handle) = outgoing_handle(&stream, socket_path) {
+                    // Reset only after a connection actually stands up. A ladder
+                    // that reset on attempt rather than success would never climb.
+                    backoff = FIRST_BACKOFF;
+                    outgoing.adopt(handle);
+                    read_messages(stream, &mut deliver);
+                    outgoing.release();
+                }
             }
         }
         // Sleep after a dropped connection as well as after a refused one: a
@@ -296,9 +306,21 @@ pub fn run(socket_path: &Path, outgoing: &Outgoing, mut deliver: impl FnMut(Inco
 /// file, and `OpenOptions::open` is `CreateFileW` with `OPEN_EXISTING`, so a
 /// missing pipe fails rather than creating a file named after it.
 ///
-/// Read access only. This connection is the reader's, the write direction is its
-/// own (see [`OutgoingHandle`]), and a handle that cannot write is one that
-/// cannot interleave a stray byte into the server's inbound framing.
+/// Opened for reading *and* writing, though it writes exactly one line ever: the
+/// [`subscribe`] that declares a reader is here. Everything else this process
+/// says goes out through [`OutgoingHandle`], which on Windows is a separate
+/// connection per line.
+///
+/// The write access is not a relaxation of the old read-only handle for its own
+/// sake — it is the whole mechanism. Subscription has to arrive on the connection
+/// being subscribed, and on Windows the outgoing half is a *different* connection
+/// every time; sending it there would subscribe a socket that closes at the end
+/// of the call and leave this one silent forever.
+///
+/// It also does not reintroduce the serialization the split exists to avoid. That
+/// bites when the UI thread writes while the reader is parked in `ReadFile`; this
+/// write happens on the reader thread before it parks, so nothing is ever waiting
+/// on the file object's lock.
 ///
 /// No `WaitNamedPipe` on the busy path. If every instance is taken the open
 /// fails with `ERROR_PIPE_BUSY` and the caller's backoff ladder retries, which is
@@ -312,8 +334,25 @@ fn connect(socket_path: &Path) -> io::Result<PanelStream> {
 
     #[cfg(windows)]
     {
-        OpenOptions::new().read(true).open(socket_path)
+        OpenOptions::new().read(true).write(true).open(socket_path)
     }
+}
+
+/// Declares that a reader is behind this connection, so the server may broadcast
+/// to it.
+///
+/// Written on the connection itself rather than through [`Outgoing`], and that is
+/// the point: on Windows the outgoing half is a fresh connection per line, so a
+/// subscribe sent that way would name a connection that is already closing.
+///
+/// One function for both platforms because `&UnixStream` and `&File` are both
+/// `Write`, so nothing here needs the stream mutably or a `cfg`.
+fn subscribe(stream: &PanelStream) -> io::Result<()> {
+    let mut stream = stream;
+    stream.write_all(crate::protocol::subscribe_line().as_bytes())?;
+    // Flushed for the same reason a click is: a subscribe sitting in a buffer is
+    // a panel the server will never speak to.
+    stream.flush()
 }
 
 /// Derives the UI thread's write handle from a connection the reader just made.
@@ -644,6 +683,36 @@ mod tests {
         // Three lines out, three lines back: the escaped value did not end its
         // own object early and turn the tail into messages of its own.
         assert_eq!(received.lines().count(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subscribe_goes_out_on_the_read_connection_itself() {
+        // The load-bearing detail of the fix. Subscription must arrive on the
+        // connection being subscribed, and on Windows the outgoing half is a
+        // *different* connection every line — sending it through `Outgoing` would
+        // subscribe a socket that closes at the end of the call and leave the
+        // reader silent forever. Unix cannot observe that difference, but it can
+        // observe that `subscribe` writes to the stream it was handed.
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        subscribe(&ours).expect("subscribe");
+        drop(ours);
+        let mut received = String::new();
+        BufReader::new(theirs)
+            .read_to_string(&mut received)
+            .expect("read back");
+        assert_eq!(received, "{\"type\":\"subscribe\"}\n");
+    }
+
+    #[test]
+    fn the_subscribe_line_is_one_framed_object() {
+        // Framed like every other outgoing line: one object, one newline. A
+        // subscribe that arrived without its terminator would sit in the server's
+        // buffer and the panel would look connected but never be spoken to.
+        let line = crate::protocol::subscribe_line();
+        assert_eq!(line, "{\"type\":\"subscribe\"}\n");
+        assert!(line.ends_with('\n'));
+        assert_eq!(line.lines().count(), 1);
     }
 
     #[test]

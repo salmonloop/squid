@@ -229,10 +229,13 @@ Pushed when the agent finishes a turn.
 
 ### `service`
 
-The brain's own standing state, announced to each panel **as it connects** — not
-broadcast once at startup. A broadcast reaches only whoever is registered at that
-instant, and a panel connects after the session starts, every time; so standing
-facts are replayed per client rather than shouted once into an empty room. The
+The brain's own standing state, announced to each panel **as it subscribes** —
+not broadcast once at startup. A broadcast reaches only whoever is registered at
+that instant, and a panel connects after the session starts, every time; so
+standing facts are replayed per subscriber rather than shouted once into an empty
+room. Keyed to `subscribe` and not to an accepted connection, for the reason in
+*Panel → TS*: a Windows command write is a connection of its own, and a replay
+into one is an `EPIPE` that provokes the next replay. The
 Rust panel silently ignores this message until the panel-rendering phase wires
 a UI for it.
 
@@ -372,6 +375,7 @@ selection must not be able to reach this process at all.
 ## Panel → TS
 
 ```jsonc
+{"type":"subscribe"}
 {"type":"control","op":"pause"}
 {"type":"control","op":"resume"}
 {"type":"control","op":"restart"}
@@ -384,6 +388,31 @@ selection must not be able to reach this process at all.
 
 `op` is exactly `pause`, `resume`, or `restart`. `answer` is exactly `approved`
 or `declined`. An unrecognized value is dropped, not guessed at.
+
+**`subscribe` is the first line a reading connection sends, and the server writes
+nothing to a connection that has not sent it.** Accepting a connection and having
+a reader behind it are different facts, and on Windows they are usually not the
+same one: the write direction opens a connection *per line*, write-only, closed by
+the end of the call. A server that replayed standing state at accept would write
+into those and get `EPIPE` per click — and because the panel answers `service` by
+pulling its two dumps, each `EPIPE` provokes two more connections. Measured on
+Windows as a console filling with `Panel client dropped: EPIPE` at 2 → 4 → 8.
+
+So the rule is the protocol's rather than a platform branch:
+
+- The **reading** connection sends `subscribe` immediately after connecting, and
+  sends it **on that connection**, never through the outgoing half — on Windows
+  the outgoing half is a different connection that is already closing.
+- A **command** connection never subscribes, is never written to, and its close is
+  not a dropped panel. The supervisor's liveness probe is silent for the same
+  reason: it connects, does not subscribe, and leaves.
+- A second `subscribe` on a live connection is ignored with a diagnostic.
+  Replaying standing state again would make the panel pull its dumps again, which
+  is the same loop by a shorter route.
+- Unix arrives at the same place by the same route: its one duplex socket
+  subscribes once, then both reads and writes.
+
+`onSubscribe` — not "on connect" — is where the server replays `service`.
 
 **Pause and resume do not change capture state directly.** They append the
 corresponding line to the existing capture-gate command path
@@ -602,8 +631,8 @@ export function startPanelServer(options: {
   readonly onConfigGet?: () => void;
   readonly onConfigSet?: (id: string, value: string) => void;
   readonly onDiagnostic?: (line: string) => void;
-  /** Runs once per newly registered client, after it can receive broadcasts. */
-  readonly onConnect?: (clientCount: number) => void;
+  /** Runs once per newly subscribed client, after it can receive broadcasts. */
+  readonly onSubscribe?: (clientCount: number) => void;
 }): Promise<PanelServer>;
 
 // src/config-service.ts — the semantics between the panel and the stores.
@@ -701,6 +730,7 @@ pub struct SourceResultLine {
     pub error: Option<String>,
 }
 pub fn parse_incoming(line: &str) -> Option<Incoming>;
+pub fn subscribe_line() -> String;            // {"type":"subscribe"}
 pub fn control_line(op: Control) -> String;   // {"type":"control","op":"pause"}
 pub fn answer_line(prompt_id: i64, answer: Answer) -> String;
 pub fn config_get_line() -> String;           // {"type":"config_get"}
