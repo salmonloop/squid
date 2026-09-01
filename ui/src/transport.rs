@@ -612,6 +612,12 @@ mod tests {
         assert!(matches!(seen[6], Incoming::SourceResult(_)));
     }
 
+    // `UnixStream::pair` is the seam, so this is Unix-only like every other test
+    // that reaches for it. On Windows the write direction is a name reopened per
+    // line rather than a socket pair (see `OutgoingHandle`), and the type does not
+    // exist there at all — an ungated test does not fail on Windows, it stops the
+    // crate from compiling, which is how this cost the panel's whole cargo job.
+    #[cfg(unix)]
     #[test]
     fn what_the_settings_form_writes_arrives_as_whole_lines() {
         // The outgoing half for the new surfaces, framed the way the server's
