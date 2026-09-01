@@ -1,0 +1,18 @@
+import { Button, CheckBox } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { SourceRow } from "model.slint";
+
+export component SourceCard inherits Rectangle {
+    in property <SourceRow> source;
+    callback toggle(string, bool);
+    background: Theme.surface; border-radius: 7px; border-width: 1px; border-color: Theme.line;
+    VerticalLayout {
+        padding: 12px; spacing: 8px;
+        HorizontalLayout {
+            spacing: 8px;
+            CheckBox { text: root.source.label; checked: root.source.state == "running"; enabled: root.source.state != "unsupported"; horizontal-stretch: 1; toggled => { root.toggle(root.source.id, self.checked); } }
+            Text { text: root.source.state == "unsupported" ? "Unavailable" : (root.source.state == "running" ? "Watching" : "Stopped"); color: root.source.state == "running" ? Theme.success : Theme.text-muted; font-size: 11px; vertical-alignment: center; }
+        }
+        if root.source.state == "unsupported": Text { text: "This source is not available for this session."; color: Theme.text-muted; font-size: 11px; wrap: word-wrap; }
+    }
+}

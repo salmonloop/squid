@@ -1,0 +1,17 @@
+import { Palette } from "std-widgets.slint";
+// Fluent Palette's system color scheme instead of carrying a second light theme.
+export global Theme {
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+    out property <brush> canvas: dark ? #1d1d1d : #f7f7f7;
+    out property <brush> surface: dark ? #262626 : #ffffff;
+    out property <brush> surface-muted: dark ? #303030 : #f1f1f1;
+    out property <brush> text: dark ? #f4f4f4 : #202020;
+    out property <brush> text-muted: dark ? #c9c9c9 : #5e5e5e;
+    out property <brush> line: dark ? #4a4a4a : #d4d4d4;
+    out property <brush> accent: dark ? #8cc8ff : #005fb8;
+    out property <brush> accent-ink: dark ? #061b2d : #ffffff;
+    out property <brush> success: dark ? #75d6a2 : #107c41;
+    out property <brush> warning: dark ? #f5ca7a : #9a6700;
+    out property <brush> danger: dark ? #ffb4ab : #c42b1c;
+    out property <brush> focus: dark ? #8cc8ff : #005fb8;
+}

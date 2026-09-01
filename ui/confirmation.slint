@@ -1,0 +1,21 @@
+import { Button } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+export component ConfirmationSection inherits Rectangle {
+    in property <bool> pending;
+    in property <string> kind;
+    in property <string> summary;
+    in property <string> expires-at;
+    callback approve(); callback decline();
+    background: pending ? Theme.surface-muted : Theme.surface; border-radius: 8px; border-width: 1px; border-color: pending ? Theme.warning : Theme.line;
+    VerticalLayout {
+        padding: 14px; spacing: 8px;
+        Text { text: pending ? "Confirmation needed" : "Confirmations"; color: Theme.text; font-size: 14px; font-weight: 700; }
+        Text { text: pending ? (root.kind + ": " + root.summary) : "Nothing needs your attention right now."; color: Theme.text-muted; font-size: 12px; wrap: word-wrap; }
+        if pending: HorizontalLayout {
+            Text { text: root.expires-at == "" ? "Review before continuing" : "Expires " + root.expires-at; color: Theme.warning; font-size: 11px; horizontal-stretch: 1; vertical-alignment: center; }
+            Button { text: "Decline"; clicked => { root.decline(); } }
+            Button { text: "Approve"; primary: true; clicked => { root.approve(); } }
+        }
+    }
+}
