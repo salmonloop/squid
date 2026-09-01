@@ -36,6 +36,36 @@ bun run watch:files -- /absolute/project/root
 bun run watch:screen
 ```
 
+### Visual panel smoke harness
+
+`bun run ui:smoke` runs the real release `ui/target/release/squid-ui` under an
+isolated Xvfb display, attaches it to an in-process Unix-socket fixture, waits
+for a mapped X11 window, saves PNGs, and sends a real xdotool interaction. Build
+the binary first:
+
+```bash
+cargo build --release --manifest-path ui/Cargo.toml
+bun run ui:smoke
+# Or test a different binary:
+bun run ui:smoke -- /absolute/path/to/squid-ui
+```
+
+The harness requires Linux/Unix sockets plus `Xvfb`, `xdotool`, `xwininfo`
+(`x11-utils`), and ImageMagick's `import`. It detects missing commands and exits
+with an actionable error rather than assuming CI installed them. Output goes to
+a unique `/tmp/squid-ui-smoke-*` directory and every screenshot path is printed.
+It polls for the fixture subscription, mapped window, and reply instead of using
+fixed startup sleeps; cleanup terminates the panel and Xvfb and closes the socket
+on both success and failure.
+
+The fixture sends only supported current flat wire messages: service states,
+world state, an agent line, an unsupported source dump, and a prompt when the
+current protocol supports it. Slint currently has no stable accessibility tree,
+so interaction prefers keyboard focus traversal (Decline then Approve) and falls
+back to a documented window-relative click coordinate if the host changes focus
+behavior. This is a plumbing smoke test, not a contract for unimplemented UI v2
+APIs or pixel layout.
+
 `typecheck` covers `src` and `tests` in two passes. The build config compiles only
 `src`, so checking the suites needs its own config — without it a test could assert
 against a type that no longer existed and still pass.

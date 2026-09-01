@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "bun run src/main.ts",
     "history:delete": "bun run src/history-delete.ts",
+    "ui:smoke": "bun run src/ui-smoke.ts",
     "test": "bun test",
     "watch:desktop": "bun run src/watch-desktop.ts",
     "watch:files": "bun run src/watch-files.ts",
