@@ -42,11 +42,17 @@ export function defaultPanelEndpoint(
   // a relative path, so honoring a malformed XDG_RUNTIME_DIR here would only
   // move the failure from a sane default to a broken startup.
   const runtimeDir = env.XDG_RUNTIME_DIR;
-  const base = runtimeDir !== undefined && isAbsolute(runtimeDir)
+  // `posix.isAbsolute`, not the bare export: this is the *non*-win32 branch, so
+  // it must judge by POSIX rules whatever host it runs on — the same reason
+  // `resolvePanel` spells it out. The bare `isAbsolute` follows
+  // `process.platform`, so on a Windows host it would call `C:\tmp` absolute and
+  // this branch would emit `C:\tmp/squid-panel.sock`: a mixed-dialect endpoint,
+  // and one the Rust mirror (`supervisor::default_endpoint`, which tests
+  // `starts_with('/')`) would never compute. The two sides agreeing without
+  // being told is the entire job of this function.
+  const base = runtimeDir !== undefined && posix.isAbsolute(runtimeDir)
     ? runtimeDir
     : "/tmp";
-  // The non-win32 branch judges paths by POSIX rules whatever host it runs on,
-  // for the same reason `resolvePanel` does.
   return posix.join(base, "squid-panel.sock");
 }
 

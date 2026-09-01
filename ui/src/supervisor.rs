@@ -486,6 +486,26 @@ mod tests {
             // the endpoint resolver refuses a relative path, so honoring it would
             // move a sane default into a broken startup.
             assert_eq!(default_endpoint(Some("run/user")), "/tmp/squid-panel.sock");
+            // Windows-shaped values are not absolute *here*, and must not be:
+            // `starts_with('/')` is the POSIX rule, matching the TypeScript
+            // mirror's `posix.isAbsolute`. The TS side originally used the
+            // host-sensitive `isAbsolute`, which on a Windows runner would have
+            // accepted these and emitted `C:\tmp/squid-panel.sock` — an endpoint
+            // this side would never compute, so the panel would start a brain and
+            // then fail to find it. Both halves are pinned to the same inputs.
+            assert_eq!(default_endpoint(Some("C:\\tmp")), "/tmp/squid-panel.sock");
+            assert_eq!(
+                default_endpoint(Some("\\\\server\\share")),
+                "/tmp/squid-panel.sock"
+            );
+            assert_eq!(default_endpoint(Some("")), "/tmp/squid-panel.sock");
+            // No endpoint may mix separators.
+            for runtime_dir in ["/run/user/1000", "run/user", "C:\\tmp", ""] {
+                assert!(
+                    !default_endpoint(Some(runtime_dir)).contains('\\'),
+                    "endpoint for {runtime_dir:?} must not hold a backslash"
+                );
+            }
         }
     }
 
