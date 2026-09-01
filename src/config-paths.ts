@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { isAbsolute, join, posix, win32 } from "node:path";
+import { isAbsolute, posix, win32 } from "node:path";
 
 /**
  * Where the config file lives, per platform.
@@ -55,17 +55,25 @@ function defaultConfigPath(
   platform: NodeJS.Platform,
   home: string,
 ): string {
+  // Each branch joins in the dialect of the platform it is *for*, never the
+  // host's. `join` follows `process.platform`, so a branch that mixed it with a
+  // dialect-specific call would be the half-connected seam `resolve-panel.ts`
+  // warns about: on a Windows host the linux branch used to build its base with
+  // `join` and then extend it with `posix.join`, producing
+  // `\home\me\.config/squid/config.json` — backslashes for the part the host
+  // wrote, forward slashes for the part POSIX did, and a path neither platform
+  // would open.
   if (platform === "win32") {
-    const appData = env.APPDATA ?? join(home, "AppData", "Roaming");
-    return join(appData, "Squid", "config.json");
+    const appData = env.APPDATA ?? win32.join(home, "AppData", "Roaming");
+    return win32.join(appData, "Squid", "config.json");
   }
   if (platform === "darwin") {
-    return join(home, "Library", "Application Support", "Squid", "config.json");
+    return posix.join(home, "Library", "Application Support", "Squid", "config.json");
   }
   // The XDG default is the only one of the three a portable environment
   // variable moves, so it is honored — but only when absolute, for the same
   // reason the override above is.
   const xdg = env.XDG_CONFIG_HOME;
-  const base = xdg !== undefined && posix.isAbsolute(xdg) ? xdg : join(home, ".config");
+  const base = xdg !== undefined && posix.isAbsolute(xdg) ? xdg : posix.join(home, ".config");
   return posix.join(base, "squid", "config.json");
 }
