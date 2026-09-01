@@ -328,13 +328,32 @@ describe("createSyntheticBrowserPageReader", () => {
       onFrame: (frame) => seen.push(frame),
       onError: () => {},
     });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    reader.close();
+    try {
+      // Waits for the frames rather than for a stretch of wall clock. A fixed
+      // sleep encodes an assumption about timer granularity that is only true on
+      // the developer's machine: Windows resolves a timer to roughly 15.6ms, so
+      // "sleep 20ms and expect two 1ms ticks" is a coin flip there and this test
+      // failed on the Windows runner while passing everywhere else. The deadline
+      // below is a failure bound, not the thing being measured.
+      const deadline = Date.now() + 5_000;
+      while (seen.length < frames.length && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(seen.map((frame) => frame.url)).toEqual([
+        "https://example.com/a",
+        "https://example.com/b",
+      ]);
 
-    expect(seen.map((frame) => frame.url)).toEqual([
-      "https://example.com/a",
-      "https://example.com/b",
-    ]);
+      // And then it stops: the script is exhausted and not looping, so no
+      // further frame may arrive however long the reader is left open. This is
+      // the half the old fixed sleep could only assert by accident — it stopped
+      // watching at 20ms.
+      const settled = seen.length;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(seen.length).toBe(settled);
+    } finally {
+      reader.close();
+    }
   });
 
   it("stays quiet for an empty script instead of scheduling a dead timer", async () => {
