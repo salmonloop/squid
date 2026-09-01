@@ -95,12 +95,22 @@ describe("config schema", () => {
 describe("resolveConfigPath", () => {
   it("names each platform's own config home", () => {
     const home = "/home/me";
-    expect(pathOf(resolveConfigPath({ env: {}, platform: "darwin", home })))
-      .toBe(join(home, "Library", "Application Support", "Squid", "config.json"));
+    // Asserted segment by segment, in the separator the *host* produces, because
+    // the darwin and win32 branches build their paths with the platform-sensitive
+    // `join`. Rebuilding the expectation with the same `join` would compare a
+    // function against itself; naming the segments and the order they appear in
+    // is the part that is actually a contract.
+    const segmentsOf = (path: string): string[] => path.split(/[\\/]/);
+    expect(segmentsOf(pathOf(resolveConfigPath({ env: {}, platform: "darwin", home }))).slice(-4))
+      .toEqual(["Library", "Application Support", "Squid", "config.json"]);
+    expect(segmentsOf(pathOf(resolveConfigPath({ env: {}, platform: "win32", home }))).slice(-4))
+      .toEqual(["AppData", "Roaming", "Squid", "config.json"]);
+    // The linux branch is spelled out in full instead, because it is the one that
+    // must be POSIX whatever host it runs on: the resolver reaches for
+    // `posix.join` there precisely so a Windows runner cannot make it emit
+    // backslashes, and only a literal catches that.
     expect(pathOf(resolveConfigPath({ env: {}, platform: "linux", home })))
       .toBe("/home/me/.config/squid/config.json");
-    expect(pathOf(resolveConfigPath({ env: {}, platform: "win32", home })))
-      .toBe(join(home, "AppData", "Roaming", "Squid", "config.json"));
   });
 
   it("honors an absolute XDG_CONFIG_HOME and refuses a relative one", () => {
@@ -273,9 +283,12 @@ describe("loadConfiguredEnvironment", () => {
     const path = join(dir, "config.json");
     writeConfig(path, JSON.stringify({ retentionHours: "72" }));
 
+    // The host's platform, not a declared one: the path came from the host's
+    // own `mkdtemp`, and telling the resolver it is looking at Linux while
+    // handing it `C:\Users\...` makes POSIX rules call that path relative.
+    // A test that declares a platform must also speak that platform's paths.
     const loaded = loadConfiguredEnvironment(
       { SQUID_CONFIG: path, SQUID_RETENTION_HOURS: "24" },
-      { platform: "linux" },
     );
     expect("env" in loaded).toBe(true);
     if ("env" in loaded) {
@@ -290,7 +303,6 @@ describe("loadConfiguredEnvironment", () => {
     writeConfig(brokenFile, "{not json");
     expect("configError" in loadConfiguredEnvironment(
       { SQUID_CONFIG: brokenFile },
-      { platform: "linux" },
     )).toBe(true);
 
     expect("configError" in loadConfiguredEnvironment(
@@ -302,7 +314,6 @@ describe("loadConfiguredEnvironment", () => {
   it("produces the raw env unchanged when no file exists", () => {
     const loaded = loadConfiguredEnvironment(
       { SQUID_CONFIG: join(tempDir(), "absent.json"), SQUID_WATCH_ROOT: "/tmp/demo" },
-      { platform: "linux" },
     );
     expect("env" in loaded).toBe(true);
     if ("env" in loaded) expect(loaded.env.SQUID_WATCH_ROOT).toBe("/tmp/demo");
