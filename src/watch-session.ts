@@ -31,6 +31,7 @@ import { sqliteWatchExclusions } from "./sqlite-event-store.js";
 import type { ToolSummary } from "./tool-catalog.js";
 import { resolvePanel } from "./resolve-panel.js";
 import { startPanelServer, type PanelServer } from "./panel-server.js";
+import { PanelConfirmationSurface } from "./panel-confirmation-surface.js";
 import {
   panelAgentLine,
   panelConfigEnd,
@@ -374,12 +375,15 @@ export async function startWatchSession(
   const sourceManagerRef: { manager: SourceManager | undefined } = { manager: undefined };
 
   let panelServer: PanelServer | undefined;
+  // The adapter is deliberately inert until a future execution seam calls it:
+  // current custom tools are read-only and Pi's sandbox owns tool safety.
+  const panelConfirmation = new PanelConfirmationSurface({ server: () => panelServer });
   if (panel.enabled) {
     const commandPath = env.SQUID_CONTROL_FIFO;
     try {
       panelServer = await startPanelServer({
         socketPath: panel.socketPath,
-        onControl: (op, requestId) => {
+        onControl: (op) => {
           if (commandPath === undefined) {
             logError(JSON.stringify({ panelControl: op, error: "The capture gate is off." }));
             return;
@@ -389,13 +393,20 @@ export async function startWatchSession(
           });
         },
         onDiagnostic: (line) => logError(line),
-        onConfigGet: (requestId) => {
+        onAnswer: (promptId, answer) => {
+          // Correlation belongs to the surface, never the socket parser: stale,
+          // duplicate, and unknown answers cannot settle a different prompt.
+          if (!panelConfirmation.onAnswer(promptId, answer)) {
+            logError(`Panel answer ignored: no pending prompt ${promptId}.`);
+          }
+        },
+        onConfigGet: () => {
           // The dump is re-read every time, so what the panel shows reflects
           // sets that landed after this process started — there is no cache to
           // go stale.
           const dump = configDumpEntries(configService);
           if (!dump.ok) {
-            panelServer?.broadcast(panelConfigResult({ ok: false, error: dump.error, ...(requestId === undefined ? {} : { requestId }) }));
+            panelServer?.broadcast(panelConfigResult({ ok: false, error: dump.error }));
             return;
           }
           for (const entry of dump.entries) {
@@ -403,12 +414,11 @@ export async function startWatchSession(
           }
           panelServer?.broadcast(panelConfigEnd(dump.entries.length));
         },
-        onConfigSet: (id, value, requestId) => {
+        onConfigSet: (id, value) => {
           const outcome = applyConfigSet(configService, id, value);
           panelServer?.broadcast(
             panelConfigResult({
               id,
-              ...(requestId === undefined ? {} : { requestId }),
               ok: outcome.ok,
               ...(outcome.ok ? { applies: outcome.applies } : { error: outcome.error }),
             }),
@@ -421,13 +431,13 @@ export async function startWatchSession(
             tryStartAgent();
           }
         },
-        onSourceGet: (requestId) => {
+        onSourceGet: () => {
           const manager = sourceManagerRef.manager;
           if (manager === undefined) {
             // The window between the panel server listening and the catalog
             // being built. A refusal, not silence: a panel waiting on a dump
             // that never ends is a worse lie than an honest "not yet".
-            panelServer?.broadcast(panelSourceResult({ ok: false, error: "The source catalog is still starting.", ...(requestId === undefined ? {} : { requestId }) }));
+            panelServer?.broadcast(panelSourceResult({ ok: false, error: "The source catalog is still starting." }));
             return;
           }
           const snapshot = manager.snapshot();
@@ -436,21 +446,21 @@ export async function startWatchSession(
           }
           panelServer?.broadcast(panelSourceEnd(snapshot.length));
         },
-        onSourceToggle: (id, on, requestId) => {
+        onSourceToggle: (id, on) => {
           const manager = sourceManagerRef.manager;
           if (manager === undefined) {
-            panelServer?.broadcast(panelSourceResult({ id, ok: false, error: "The source catalog is still starting.", ...(requestId === undefined ? {} : { requestId }) }));
+            panelServer?.broadcast(panelSourceResult({ id, ok: false, error: "The source catalog is still starting." }));
             return;
           }
           // The manager returns a result instead of throwing — including for
           // unknown ids and refusals — so the panel learns the verdict either way.
           void (on ? manager.start(id) : manager.stop(id)).then((result) => {
             panelServer?.broadcast(
-              panelSourceResult(result.ok ? { id, ok: true, ...(requestId === undefined ? {} : { requestId }) } : { id, ok: false, error: result.error, ...(requestId === undefined ? {} : { requestId }) }),
+              panelSourceResult(result.ok ? { id, ok: true } : { id, ok: false, error: result.error }),
             );
           });
         },
-        onServiceControl: (op, requestId) => {
+        onServiceControl: (op) => {
           // Only a supervised run may restart: the supervisor is what respawns
           // the process, and an unsupervised exit would look like a crash to
           // whoever started it by hand. Refused with a diagnostic, not silence.
@@ -745,6 +755,9 @@ export async function startWatchSession(
       // agent itself, and only then the store — an in-flight ingest still needs
       // somewhere to land.
       await drainAgentTurns();
+      // Withdraw before tearing down the transport. An answered or cancelled
+      // panel request is spent; a stop never leaves a live-looking prompt.
+      await panelConfirmation.close();
       if (panelServer !== undefined) await panelServer.close();
       agent?.dispose();
       await watch.dispose();

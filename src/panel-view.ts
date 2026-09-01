@@ -38,6 +38,21 @@ export interface PanelAgentLine {
   readonly text?: string;
 }
 
+export interface PanelConfirmationPrompt {
+  readonly type: "prompt";
+  readonly promptId: number;
+  readonly kind: string;
+  readonly summary: string;
+  readonly why: string;
+  readonly denyConsequence: string;
+  readonly expiresAt: string;
+}
+
+export interface PanelConfirmationCancel {
+  readonly type: "cancel";
+  readonly promptId: number;
+}
+
 export interface PanelServiceLine {
   readonly type: "service";
   readonly agentState: "ready" | "needs_config";
@@ -117,6 +132,8 @@ export type PanelMessage =
   | PanelWorldState
   | PanelAgentLine
   | PanelServiceLine
+  | PanelConfirmationPrompt
+  | PanelConfirmationCancel
   | PanelConfigLine
   | PanelConfigEnd
   | PanelConfigResult
@@ -203,6 +220,27 @@ export function panelAgentLine(input: {
       ? {}
       : { text: sanitizeAuditText(input.text, "rationale").text }),
   };
+}
+
+/**
+ * Builds the deliberately payload-free confirmation prompt for the panel.
+ * The request type has no arguments or selection fields; sanitization prevents
+ * untrusted prose from smuggling controls or credentials over the flat wire.
+ */
+export function panelConfirmationPrompt(input: Omit<PanelConfirmationPrompt, "type">): PanelConfirmationPrompt {
+  return {
+    type: "prompt",
+    promptId: input.promptId,
+    kind: sanitizeAuditText(input.kind, "diagnostic").text,
+    summary: sanitizeAuditText(input.summary, "diagnostic").text,
+    why: sanitizeAuditText(input.why, "diagnostic").text,
+    denyConsequence: sanitizeAuditText(input.denyConsequence, "diagnostic").text,
+    expiresAt: input.expiresAt,
+  };
+}
+
+export function panelConfirmationCancel(promptId: number): PanelConfirmationCancel {
+  return { type: "cancel", promptId };
 }
 
 /**
