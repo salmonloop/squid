@@ -111,6 +111,11 @@ pub enum ServiceState {
 }
 
 impl ServiceState {
+    /// The label a tripped guard leaves on screen, named because it is also a
+    /// *condition*: only from here may a new round of supervision be started, so
+    /// the spelling is shared rather than repeated at the comparison site.
+    pub const FAILED_LABEL: &'static str = "failed";
+
     /// The one-word label the window shows. Deliberately not derived from
     /// `Debug`: a rename of a variant should not silently rewrite what a user
     /// reads.
@@ -119,7 +124,7 @@ impl ServiceState {
             Self::Idle => "idle",
             Self::Running => "running",
             Self::Restarting { .. } => "restarting",
-            Self::Failed { .. } => "failed",
+            Self::Failed { .. } => Self::FAILED_LABEL,
         }
     }
 
@@ -673,6 +678,58 @@ mod tests {
             }
             .detail(),
             "boom"
+        );
+    }
+
+    #[test]
+    fn the_failed_label_is_the_one_state_a_new_round_may_start_from() {
+        // `main.rs` compares the window's `service-state` against this constant to
+        // decide whether Start may run, and `panel.slint` swaps Restart for Start
+        // on the same string. Three readers, one spelling — a rename that moved
+        // only two of them would leave a button that either never appears or races
+        // a live supervision round for the endpoint.
+        assert_eq!(ServiceState::FAILED_LABEL, "failed");
+        assert_eq!(
+            ServiceState::Failed {
+                reason: "three crashes".to_owned()
+            }
+            .label(),
+            ServiceState::FAILED_LABEL
+        );
+        // And nothing else may: each of these means a round is still live, so
+        // starting a second one would put two brains on one endpoint.
+        for state in [
+            ServiceState::Idle,
+            ServiceState::Running,
+            ServiceState::Restarting {
+                reason: "backoff".to_owned(),
+            },
+        ] {
+            assert_ne!(state.label(), ServiceState::FAILED_LABEL);
+        }
+    }
+
+    #[test]
+    fn a_fresh_round_starts_from_a_clean_crash_log() {
+        // The guard trips on three crashes in a minute and `supervise` returns.
+        // A new round builds its own `CrashLog`, which is what makes the user's
+        // "try again" a first failure rather than the fourth — otherwise Start
+        // would trip the guard again on the next single crash.
+        let mut log = CrashLog::new();
+        let start = Instant::now();
+        for _ in 0..CRASH_LIMIT {
+            log.record(start);
+        }
+        assert!(log.record(start) > CRASH_LIMIT);
+
+        let mut fresh = CrashLog::new();
+        assert_eq!(fresh.record(start), 1);
+        assert_eq!(
+            decide_after_exit(Some(1), 1, first_backoff()),
+            ExitDecision::Retry {
+                after: first_backoff(),
+                reason: "the session exited 1; restarting".to_owned(),
+            }
         );
     }
 
