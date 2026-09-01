@@ -394,6 +394,15 @@ and the panel starts its replacement. The **SOURCES** list independently starts
 and stops observers, except the last running observer (the session needs one)
 and the capture gate (which is a pause switch, not a source).
 
+The three FIFO-backed capabilities — capture gate, terminal commands, editor
+saves — each take a backend and the absolute path it reads, and both halves are
+rows in the same form. They have to be: each backend offers exactly one value,
+and that value is refused at startup without its path, so a form that offered
+the backend alone could write a setting that stopped the brain from starting —
+and with no brain there is no dump, so no form to undo it in. The path rows are
+judged by POSIX rules on every host, because the config file is written in one
+dialect no matter which platform reads it.
+
 You can still run `squid` by hand. Its panel child attaches normally. You can
 also start `squid-ui` with a non-empty `SQUID_PANEL_SOCKET` to attach to a session
 someone else started. An endpoint set to an empty string is refused rather than
