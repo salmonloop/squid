@@ -50,11 +50,22 @@ export interface LaunchPreparation {
   readonly panelSocket: string;
   /** The one resolved location the panel-first path may initialize when absent. */
   readonly configPath: string;
+  /**
+   * The provider this run keys Pi's files under, resolved from the merged env so
+   * a file-backed `modelProvider` is honoured. Returned rather than recomputed
+   * by the caller: it decides which entry first-run writes and which entry the
+   * settings service edits, and two resolutions of it could disagree.
+   */
+  readonly provider: string;
 }
 
 export type PrepareLaunchResult =
   | { readonly configError: string }
-  | { readonly needsFirstRun: true }
+  | {
+      readonly needsFirstRun: true;
+      /** The provider first-run must write under; see `LaunchPreparation`. */
+      readonly provider: string;
+    }
   | { readonly ready: LaunchPreparation };
 
 /**
@@ -70,7 +81,12 @@ export function prepareLaunch(options: {
   readonly env: Record<string, string | undefined>;
   readonly platform: NodeJS.Platform;
   readonly agentDir: string;
-  readonly provider: string;
+  /**
+   * Overrides the provider instead of reading it from the merged env. Tests and
+   * callers that already know which entry they mean pass it; a production launch
+   * omits it so the config file's `modelProvider` is what decides.
+   */
+  readonly provider?: string;
   /**
    * The panel-supervised child has no interactive stdin: an absent model is not
    * a console-first-run question there, it is the `needs_config` state the panel
@@ -91,7 +107,13 @@ export function prepareLaunch(options: {
   }
   const mergedEnv = loaded.env;
 
-  const status = modelConfigurationStatus(options.agentDir, options.provider);
+  // After step 0, because `modelProvider` is a file-backed setting and the
+  // supervisor clears the environment it spawns this process with: resolving the
+  // provider before the merge would read the hardcoded default in exactly the
+  // launch the panel recommends.
+  const provider = resolvePiModel({ env: mergedEnv, ...(options.provider === undefined ? {} : { provider: options.provider }) }).provider;
+
+  const status = modelConfigurationStatus(options.agentDir, provider);
   if (status.kind !== "ready") {
     if (status.kind === "malformed-models") {
       return {
@@ -104,7 +126,7 @@ export function prepareLaunch(options: {
     // that says nothing. Let the watch session start headless instead; it sees its
     // panel endpoint and reports `needs_config`, then this same process starts the
     // agent once the form writes the missing model files.
-    if (options.allowNeedsConfig !== true) return { needsFirstRun: true };
+    if (options.allowNeedsConfig !== true) return { needsFirstRun: true, provider };
   }
 
   const root = resolveWatchRoot(mergedEnv, options.platform);
@@ -131,6 +153,7 @@ export function prepareLaunch(options: {
       root,
       panelSocket: panel.enabled ? panel.socketPath : "",
       configPath: loaded.configPath,
+      provider,
     },
   };
 }
@@ -239,22 +262,28 @@ if (import.meta.main) {
   const platform = process.platform;
   const env = process.env;
   const agentDir = getAgentDir();
-  const model = resolvePiModel({});
 
+  // No provider is passed: `prepareLaunch` resolves it after its own step 0, so
+  // the config file's `modelProvider` decides. Resolving it here would read the
+  // hardcoded default under the supervisor, which clears the environment.
   const supervised = env.SQUID_SUPERVISED === "1";
   let prepared = prepareLaunch({
     env,
     platform,
     agentDir,
-    provider: model.provider,
     ...(supervised ? { allowNeedsConfig: true } : {}),
   });
   if ("needsFirstRun" in prepared) {
+    const provider = prepared.provider;
     const answers = await askFirstRunAnswers(consoleFirstRunIO(), {
-      modelId: model.modelId,
+      // The suggestion only; whatever the user types is what gets written and,
+      // from then on, what `resolveConfiguredModel` reports.
+      modelId: resolvePiModel({ env }).modelId,
     });
-    writeModelConfiguration(agentDir, model.provider, answers);
-    prepared = prepareLaunch({ env, platform, agentDir, provider: model.provider });
+    // Under the provider the preparation resolved, not a second reading of it:
+    // first-run must write the entry the settings service will later edit.
+    writeModelConfiguration(agentDir, provider, answers);
+    prepared = prepareLaunch({ env, platform, agentDir, provider });
     // The setup wrote both halves of the configuration; still not ready means
     // something outside this conversation's control (permissions, a full
     // disk). Reporting beats looping back into the same questions.

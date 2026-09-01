@@ -118,7 +118,7 @@ describe("config schema", () => {
     }
   });
 
-  it("accounts for every SQUID_ variable the source tree reads", () => {
+  it("accounts for every configuration variable the source tree reads", () => {
     // `config-schema.ts` claims this asymmetry IS the check that catches a new
     // SQUID_* variable added without deciding whether a user may configure it.
     // That claim lived only in a comment, so the check it describes never ran:
@@ -129,6 +129,11 @@ describe("config schema", () => {
     // Every name found in `src` must be one of three things: a row in the
     // table, a documented exemption, or -- if it is neither -- a decision
     // nobody has made yet, which is exactly what should fail here.
+    //
+    // `PI_MODEL_*` is swept as well as `SQUID_*`, because a check that only
+    // knew our own prefix is how `PI_MODEL_PROVIDER` stayed unconfigurable
+    // while looking accounted for. The prefix a variable happens to carry is
+    // not what decides whether a user may set it.
     const EXEMPT = new Map<string, string>([
       // The panel endpoint names where this process talks to the panel. One
       // half of a pair whose other half must agree; a config file that could
@@ -145,6 +150,11 @@ describe("config schema", () => {
       // the action layer that enforced it. Listed so a reader knows the
       // remaining mentions are history, not a gap.
       ["SQUID_SEARCH_EGRESS", "removed with the action layer; comments only"],
+      // The default model id a write falls back to and first-run suggests.
+      // Which model a session opens is the id stored in Pi's `models.json`,
+      // read by `resolveConfiguredModel` -- a file-backed copy of it would be
+      // the parallel store `app-model.ts` exists to prevent.
+      ["PI_MODEL_ID", "a write-time default; the stored entry is the answer"],
     ]);
 
     const names = new Set<string>();
@@ -156,7 +166,7 @@ describe("config schema", () => {
           continue;
         }
         if (!entry.name.endsWith(".ts")) continue;
-        for (const match of readFileSync(full, "utf8").matchAll(/SQUID_[A-Z_]+/g)) {
+        for (const match of readFileSync(full, "utf8").matchAll(/\b(?:SQUID|PI_MODEL)_[A-Z_]+/g)) {
           names.add(match[0]);
         }
       }

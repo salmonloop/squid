@@ -397,7 +397,11 @@ environment silently wins over what the form saves.
 
 With no model configured, the panel starts the sensors in `needs configuration`
 mode. Fill the model base URL, model id, and API key in **SETTINGS**; the key goes
-only to Pi's `models.json`/`auth.json` and is never displayed back. Everything
+only to Pi's `models.json`/`auth.json` and is never displayed back. **Model
+provider** names the key those two files are stored under, so it lives in
+Squid's config file rather than in Pi's — storing a key name is not keeping a
+copy of what it addresses — and it takes effect on restart, because it decides
+which entry the settings service reads before that service is built. Everything
 else lives in Squid's own config file. A saved setting that says `restart` takes
 effect when you click **Restart brain**; the brain drains in its ordinary order
 and the panel starts its replacement. Three crashes inside a minute stop the

@@ -30,6 +30,13 @@ export type { ModelRuntime, InlineExtension };
 export interface PiModelOptions {
   readonly provider?: string;
   readonly modelId?: string;
+  /**
+   * The environment to read the defaults from. Callers that have already merged
+   * the config file under the process env — every entry does, as step 0 — must
+   * pass it, or a file-backed `modelProvider` would be invisible here while
+   * being visible to every resolver.
+   */
+  readonly env?: Record<string, string | undefined>;
 }
 
 /**
@@ -46,9 +53,10 @@ export function resolvePiModel(options: PiModelOptions): {
   readonly provider: string;
   readonly modelId: string;
 } {
+  const env = options.env ?? process.env;
   return {
-    provider: options.provider ?? process.env.PI_MODEL_PROVIDER ?? "bifrost",
-    modelId: options.modelId ?? process.env.PI_MODEL_ID ?? "deepseek-v4-flash",
+    provider: options.provider ?? env.PI_MODEL_PROVIDER ?? "bifrost",
+    modelId: options.modelId ?? env.PI_MODEL_ID ?? "deepseek-v4-flash",
   };
 }
 
