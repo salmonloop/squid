@@ -49,6 +49,25 @@ import { isPanelNamedPipe } from "./resolve-panel.js";
  * function the startup check reads, so “is this a pipe” has one answer in this
  * codebase rather than one per call site.
  *
+ * ## A connection is not a panel until it says so
+ *
+ * Accepting a connection and having a reader on the other end are different
+ * facts, and on Windows they are routinely not the same one. There the panel's
+ * write direction opens a fresh connection **per line** — it has to, see
+ * `ui/src/transport.rs` — and that connection is write-only and closed by the
+ * end of the call. A server that counted every accepted connection as a panel
+ * would push standing state into it and get `EPIPE`, once per click, and worse:
+ * the replay makes the panel pull its dumps, each pull is another connection,
+ * each connection another replay. Measured on Windows as a console filling with
+ * `Panel client dropped: EPIPE` at 2 → 4 → 8.
+ *
+ * So a connection joins the broadcast set only when it sends `subscribe`, and
+ * `onSubscribe` fires there rather than at `open`. A command connection never
+ * subscribes and is therefore never written to; the supervisor's liveness probe,
+ * which connects and drops, is silent for the same reason. Unix reaches the same
+ * place by the same route — its one duplex socket subscribes once and then both
+ * sends and receives — so the rule is the protocol's, not a platform branch.
+ *
  * ## A dead panel must not take down the watch session
  *
  * The panel is an observer of a session that has real work to do. Every failure
@@ -82,13 +101,17 @@ export interface PanelServerOptions {
   readonly onSourceToggle?: (id: string, on: boolean) => void;
   readonly onDiagnostic?: (line: string) => void;
   /**
-   * Runs once per newly registered client, after it can receive broadcasts.
+   * Runs once per newly *subscribed* client, after it can receive broadcasts.
    * Standing state the panel must know from its first second — the `service`
    * line — is replayed here, not broadcast once at startup: broadcast reaches
    * only whoever is registered at that instant, and a panel connects after the
    * server starts, every time.
+   *
+   * Keyed to `subscribe` rather than to accepting a connection, because those
+   * are different facts: on Windows a write-only connection arrives per outgoing
+   * line and replaying into one is an `EPIPE` that provokes the next replay.
    */
-  readonly onConnect?: (clientCount: number) => void;
+  readonly onSubscribe?: (clientCount: number) => void;
 }
 
 /** Wire-illegal characters in a config_set field; the panel never sends them. */
@@ -109,10 +132,16 @@ interface Client {
   outbound: string;
   /** Set once the client is gone, so a queued drain does not resurrect it. */
   dropped: boolean;
+  /**
+   * Whether this connection asked to receive broadcasts. Only a subscriber is in
+   * `clients`; a connection that only ever writes is tracked here and never
+   * written to.
+   */
+  subscribed: boolean;
 }
 
 export async function startPanelServer(options: PanelServerOptions): Promise<PanelServer> {
-  const { socketPath, onControl, onServiceControl, onAnswer, onConfigGet, onConfigSet, onSourceGet, onSourceToggle, onDiagnostic, onConnect } = options;
+  const { socketPath, onControl, onServiceControl, onAnswer, onConfigGet, onConfigSet, onSourceGet, onSourceToggle, onDiagnostic, onSubscribe } = options;
   const diagnostic = (line: string): void => {
     onDiagnostic?.(line);
   };
@@ -125,16 +154,27 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
   const clients = new Set<Client>();
   const clientOf = new WeakMap<Socket<undefined>, Client>();
 
+  /**
+   * Ends one connection and says why — but only for a connection that had
+   * declared itself a panel.
+   *
+   * An unsubscribed connection ending is the ordinary shape of a Windows
+   * command write and of the supervisor's liveness probe: both connect, do their
+   * one thing, and close. Announcing those would report normal traffic as a
+   * failure, at exactly the rate the user clicks.
+   */
   const drop = (client: Client, reason: string): void => {
     if (client.dropped) return;
     client.dropped = true;
     clients.delete(client);
-    diagnostic(`Panel client dropped: ${reason}`);
+    if (client.subscribed) diagnostic(`Panel client dropped: ${reason}`);
     try {
       client.socket.end();
     } catch (error) {
       // The socket was already gone, which is the usual reason we are here.
-      diagnostic(`Panel client close failed: ${describeErrorForAudit(error)}`);
+      if (client.subscribed) {
+        diagnostic(`Panel client close failed: ${describeErrorForAudit(error)}`);
+      }
     }
   };
 
@@ -178,6 +218,23 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
       return;
     }
     const record = parsed as Record<string, unknown>;
+    if (record.type === "subscribe") {
+      // The one message that changes what this connection *is*. Idempotent: a
+      // second subscribe on a live connection would otherwise replay standing
+      // state and, since the panel answers `service` by pulling its dumps,
+      // invite the client to ask again forever.
+      if (client.subscribed) {
+        diagnostic("Panel subscribe ignored: this connection is already subscribed.");
+        return;
+      }
+      client.subscribed = true;
+      clients.add(client);
+      // Registered first, then announced: the hook exists so standing state can
+      // be replayed to the one client that just arrived, and a broadcast inside
+      // it must reach that client.
+      onSubscribe?.(clients.size);
+      return;
+    }
     if (record.type === "control") {
       const op = record.op;
       if (op === "restart") {
@@ -286,13 +343,18 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
 
   const socketHandlers = {
     open: (socket: Socket<undefined>) => {
-      const client: Client = { socket, buffer: "", outbound: "", dropped: false };
-      clients.add(client);
+      // Tracked so its bytes can be framed, but deliberately *not* added to
+      // `clients`: whether there is a reader behind this connection is not known
+      // yet, and on Windows the answer is usually no. `subscribe` is what moves
+      // it into the broadcast set.
+      const client: Client = {
+        socket,
+        buffer: "",
+        outbound: "",
+        dropped: false,
+        subscribed: false,
+      };
       clientOf.set(socket, client);
-      // Registered first, then announced: the hook exists so standing state can
-      // be replayed to the one client that just arrived, and a broadcast inside
-      // it must reach that client.
-      onConnect?.(clients.size);
     },
     data: (socket: Socket<undefined>, chunk: Uint8Array) => {
       const client = clientOf.get(socket);

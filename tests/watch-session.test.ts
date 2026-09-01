@@ -727,33 +727,24 @@ describe("the resident agent in the ingest loop", () => {
  * written here — that the gap was Bun's `node:net` read path on Windows pipes.
  * It was not.
  *
- * The real gap is a registration race. The server registers a client in its
- * `open` handler, and `broadcast` is a one-shot pass over whoever is registered
- * *at that moment* — nothing is re-delivered. On Unix the registration has
- * landed by the time `Bun.connect` resolves, so "connected" already means
- * "registered". On Windows it does not: a broadcast issued straight after a
- * connect is received by nobody. `tests/panel-server.test.ts` bridges this by
- * waiting for `clientCount === 1`, but the session owns its panel server and
- * deliberately does not expose it — and it should not have to, for a test to
- * work.
+ * `ready()` is the protocol's own handshake rather than a test device. A
+ * connection is not a panel until it sends `subscribe`, and the server replies to
+ * that by replaying `service` — so waiting for a `service` line is waiting for
+ * exactly the state the tests below need: registered, and reachable by every
+ * later broadcast.
  *
- * So the handshake lives in the client. `ready()` sends one deliberately
- * malformed probe line after connecting; the server refuses it with a
- * diagnostic that can only be produced once the client is registered, because
- * the `data` handler ignores unregistered sockets. The probe is side-effect
- * free — it fails JSON parsing before any control op is even considered.
- * Waiting for that diagnostic makes "ready" mean what the tests below need:
- * from here on, every broadcast reaches this client.
+ * This replaces an earlier trick that sent a deliberately malformed line and
+ * waited for the refusal diagnostic. That existed because registration happened
+ * at accept and was unobservable from out here; subscription is observable by
+ * construction, because the server answers it.
  */
 class PanelTestClient {
   readonly lines: string[] = [];
   private carry = "";
   private socket: Socket<undefined> | null = null;
   private readonly opened: Promise<void>;
-  private readonly diagnostics: readonly string[];
 
-  public constructor(socketPath: string, diagnostics: readonly string[]) {
-    this.diagnostics = diagnostics;
+  public constructor(socketPath: string) {
     this.opened = (async () => {
       this.socket = await Bun.connect<undefined>({
         unix: socketPath,
@@ -775,14 +766,13 @@ class PanelTestClient {
 
   public async ready(): Promise<void> {
     await this.opened;
-    // One probe, then wait for its refusal. The diagnostic names no client, but
-    // the session's logError channel carries only this panel's diagnostics, and
-    // the only lines a freshly connected client can provoke are its own
-    // refusals — so a hit here is this client's handshake, not someone else's.
-    this.socket?.write("probe\n");
+    // The protocol's own first line. The server registers this connection and
+    // replays `service` in response, so the reply is the acknowledgement — no
+    // out-of-band signal needed.
+    this.socket?.write('{"type":"subscribe"}\n');
     const deadline = Date.now() + 2000;
     for (;;) {
-      if (this.diagnostics.some((line) => line.includes("Panel line refused"))) return;
+      if (this.lines.some((line) => line.includes('"type":"service"'))) return;
       if (Date.now() > deadline) {
         throw new Error("timed out waiting for the panel server to register this client");
       }
@@ -862,7 +852,7 @@ describe("the control panel on a watch session", () => {
     if ("configError" in result) throw new Error(result.configError);
     try {
       expect(result.session.banner.panel).toBe(socketPath);
-      const client = new PanelTestClient(socketPath, diagnostics);
+      const client = new PanelTestClient(socketPath);
       await client.ready();
 
       // Every attach opens with the service state — a normal session says
@@ -903,7 +893,7 @@ describe("the control panel on a watch session", () => {
     });
     if ("configError" in result) throw new Error(result.configError);
     try {
-      const client = new PanelTestClient(socketPath, diagnostics);
+      const client = new PanelTestClient(socketPath);
       await client.ready();
 
       await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
@@ -935,7 +925,7 @@ describe("the control panel on a watch session", () => {
     });
     if ("configError" in result) throw new Error(result.configError);
     try {
-      const client = new PanelTestClient(socketPath, diagnostics);
+      const client = new PanelTestClient(socketPath);
       await client.ready();
 
       await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
@@ -966,7 +956,7 @@ describe("the control panel on a watch session", () => {
     });
     if ("configError" in result) throw new Error(result.configError);
     try {
-      const client = new PanelTestClient(socketPath, diagnostics);
+      const client = new PanelTestClient(socketPath);
       await client.ready();
 
       await source.emit!(applicationActivated("ev-1", "9"));
@@ -1023,7 +1013,7 @@ describe("the control panel on a watch session", () => {
     });
     if ("configError" in result) throw new Error(result.configError);
     try {
-      const client = new PanelTestClient(socketPath, diagnostics);
+      const client = new PanelTestClient(socketPath);
       await client.ready();
 
       client.send(JSON.stringify({ type: "control", op: "pause" }));
@@ -1124,7 +1114,7 @@ describe("the control panel on a watch session", () => {
       expect(lifecycle).toEqual(["start:alpha"]);
       expect(agentLog.disposed).toBe(0);
 
-      const client = new PanelTestClient(socketPath, diagnostics);
+      const client = new PanelTestClient(socketPath);
       await client.ready();
 
       // The client attached after the announcement, so hearing the service
@@ -1251,7 +1241,7 @@ describe("the control panel on a watch session", () => {
       });
       if ("configError" in result) throw new Error(result.configError);
       try {
-        const client = new PanelTestClient(socketPath, diagnostics);
+        const client = new PanelTestClient(socketPath);
         await client.ready();
         client.send(JSON.stringify({ type: "source_get" }));
         const rows = await awaitSourceEnd(client);
@@ -1295,7 +1285,7 @@ describe("the control panel on a watch session", () => {
       if ("configError" in result) throw new Error(result.configError);
       try {
         expect(builds).toHaveLength(1); // startup built beta once
-        const client = new PanelTestClient(socketPath, diagnostics);
+        const client = new PanelTestClient(socketPath);
         await client.ready();
 
         const cursor = { from: 0 };
@@ -1330,7 +1320,7 @@ describe("the control panel on a watch session", () => {
       });
       if ("configError" in result) throw new Error(result.configError);
       try {
-        const client = new PanelTestClient(socketPath, diagnostics);
+        const client = new PanelTestClient(socketPath);
         await client.ready();
         client.send(JSON.stringify({ type: "source_toggle", id: "alpha", on: 0 }));
         const verdict = await awaitSourceResult(client, "alpha");
@@ -1356,7 +1346,7 @@ describe("the control panel on a watch session", () => {
       });
       if ("configError" in result) throw new Error(result.configError);
       try {
-        const client = new PanelTestClient(socketPath, diagnostics);
+        const client = new PanelTestClient(socketPath);
         await client.ready();
 
         // The gate is not in the catalog, so the honest answer is "unknown" —
@@ -1394,7 +1384,7 @@ describe("the control panel on a watch session", () => {
       });
       if ("configError" in result) throw new Error(result.configError);
       try {
-        const client = new PanelTestClient(socketPath, diagnostics);
+        const client = new PanelTestClient(socketPath);
         await client.ready();
         client.send(JSON.stringify({ type: "source_toggle", id: "ghost", on: 1 }));
         const verdict = await awaitSourceResult(client, "ghost");
@@ -1435,7 +1425,7 @@ describe("the control panel on a watch session", () => {
       });
       if ("configError" in result) throw new Error(result.configError);
       try {
-        const client = new PanelTestClient(socketPath, diagnostics);
+        const client = new PanelTestClient(socketPath);
         await client.ready();
 
         client.send(JSON.stringify({ type: "source_toggle", id: "tail", on: 0 }));
@@ -1508,7 +1498,7 @@ describe("the control panel on a watch session", () => {
         logError: (line) => diagnostics.push(line),
       });
       if ("configError" in result) throw new Error(result.configError);
-      const client = new PanelTestClient(socketPath, diagnostics);
+      const client = new PanelTestClient(socketPath);
       await client.ready();
       return {
         dir,
@@ -1654,7 +1644,7 @@ describe("the control panel on a watch session", () => {
         defaultBaseUrl: "https://default.example/v1",
       });
       if ("configError" in result) throw new Error(result.configError);
-      const client = new PanelTestClient(socketPath, diagnostics);
+      const client = new PanelTestClient(socketPath);
       try {
         expect(result.session.banner.agent).toBe("needs_config");
         await client.ready();
@@ -1769,7 +1759,7 @@ describe("the control panel and the capture policy's redaction", () => {
     });
     if ("configError" in result) throw new Error(result.configError);
     try {
-      const client = new PanelTestClient(socketPath, diagnostics);
+      const client = new PanelTestClient(socketPath);
       await client.ready();
 
       await source.emit!(createActivityEvent({

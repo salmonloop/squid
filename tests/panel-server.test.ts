@@ -27,12 +27,20 @@ const WORLD_LINE: PanelMessage = {
 
 interface Harness {
   readonly socketPath: string;
-  /** Connects a client and collects whole lines it receives. */
+  /**
+   * Connects a client, declares it a reader, and collects whole lines it
+   * receives — the shape every panel has on the wire.
+   */
   connect(): Promise<TestClient>;
-  /** The wire the onConnect tests announce standing state through. */
+  /**
+   * Connects without subscribing: a Windows command write, or the supervisor's
+   * liveness probe. The server must never write to one of these.
+   */
+  connectSilent(): Promise<TestClient>;
+  /** The wire the onSubscribe tests announce standing state through. */
   announce: PanelServer["broadcast"];
-  /** Replaceable so a test can supply its own onConnect hook. */
-  onConnect?: (clientCount: number) => void;
+  /** Replaceable so a test can supply its own onSubscribe hook. */
+  onSubscribe?: (clientCount: number) => void;
   start(options?: {
     readonly onControl?: (op: "pause" | "resume") => void;
     readonly onServiceControl?: (op: "restart") => void;
@@ -52,6 +60,8 @@ interface TestClient {
   readonly lines: string[];
   /** Resolves once `count` whole lines have arrived. */
   waitFor(count: number): Promise<void>;
+  /** Sends one raw line, newline included by the caller's text. */
+  send(line: string): void;
   close(): void;
 }
 
@@ -80,14 +90,22 @@ async function withHarness(body: (harness: Harness) => Promise<void>): Promise<v
         ...(options.onSourceGet === undefined ? {} : { onSourceGet: options.onSourceGet }),
         ...(options.onSourceToggle === undefined ? {} : { onSourceToggle: options.onSourceToggle }),
         ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
-        ...(harness.onConnect === undefined ? {} : { onConnect: harness.onConnect }),
+        ...(harness.onSubscribe === undefined ? {} : { onSubscribe: harness.onSubscribe }),
       });
       servers.push(server);
-      // Late-bound so a test can set `harness.onConnect` between start calls.
+      // Late-bound so a test can set `harness.onSubscribe` between start calls.
       harness.announce = server.broadcast;
       return server;
     },
     connect: async () => {
+      const client = await harness.connectSilent();
+      // Every real panel's first line. Without it the server holds the
+      // connection but writes nothing to it, so a broadcast test would be
+      // asserting against a connection that is not a panel yet.
+      client.send('{"type":"subscribe"}\n');
+      return client;
+    },
+    connectSilent: async () => {
       const lines: string[] = [];
       let carry = "";
       let want = Number.POSITIVE_INFINITY;
@@ -116,6 +134,9 @@ async function withHarness(body: (harness: Harness) => Promise<void>): Promise<v
           await new Promise<void>((resolve) => {
             notify = resolve;
           });
+        },
+        send: (line) => {
+          socket.write(line);
         },
         close: () => socket.end(),
       };
@@ -192,6 +213,9 @@ describe.skipIf(process.platform === "win32")("startPanelServer transport", () =
       const server = await harness.start();
       try {
         const client = await harness.connect();
+        // Subscribing is a round trip, so "connected" is not yet "registered" —
+        // the same wait every other broadcast test here does.
+        await until(() => server.clientCount === 1, "the client to register");
         server.broadcast(WORLD_LINE);
         await client.waitFor(1);
 
@@ -763,6 +787,11 @@ describe.skipIf(process.platform !== "win32")("startPanelServer named pipe", () 
       const lines: string[] = [];
       const notify = { fn: null as (() => void) | null, want: Number.POSITIVE_INFINITY };
       const client = await pipeConnect(pipeName, lines, notify);
+      // A connection is not a panel until it says so, and on this transport that
+      // rule is the point: the panel's *write* direction arrives as its own
+      // connection per line, and a server that broadcast into one would EPIPE per
+      // click. This is the reading connection, so it subscribes.
+      client.write('{"type":"subscribe"}\n');
       await until(() => server.clientCount === 1, "the pipe client to register");
 
       server.broadcast(WORLD_LINE);
@@ -779,6 +808,45 @@ describe.skipIf(process.platform !== "win32")("startPanelServer named pipe", () 
       expect(ops).toEqual(["pause"]);
 
       client.end();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("a write-only connection is never broadcast to and never reported dropped", async () => {
+    // The EPIPE storm, reproduced on the only transport that has it. The panel's
+    // outgoing half opens a connection per line, writes, and lets it close — so
+    // this is that shape exactly. A server that registered it at accept would
+    // write standing state into a closing, readerless pipe and report
+    // `Panel client dropped: EPIPE`; the panel answers the replayed `service` by
+    // pulling both dumps, and each pull is another connection. 2 → 4 → 8.
+    const pipeName = freePipeName();
+    const ops: string[] = [];
+    const diagnostics: string[] = [];
+    const server = await startPanelServer({
+      socketPath: pipeName,
+      onControl: (op) => ops.push(op),
+      onDiagnostic: (line) => diagnostics.push(line),
+      // Standing state, replayed per subscriber. If registration happened at
+      // accept, this line would be written into the connection below.
+      onSubscribe: () => server.broadcast(WORLD_LINE),
+    });
+    try {
+      const lines: string[] = [];
+      const notify = { fn: null as (() => void) | null, want: Number.POSITIVE_INFINITY };
+      const writer = await pipeConnect(pipeName, lines, notify);
+      // One line, then gone — no subscribe, because this connection never reads.
+      writer.write('{"type":"control","op":"pause"}\n');
+      await until(() => ops.length === 1, "the control op to arrive");
+      writer.end();
+      await settle();
+
+      // The op landed, so the click is not lost.
+      expect(ops).toEqual(["pause"]);
+      // Nothing was pushed at it, and its close was not a panel failing.
+      expect(lines).toEqual([]);
+      expect(server.clientCount).toBe(0);
+      expect(diagnostics).toEqual([]);
     } finally {
       await server.close();
     }
@@ -824,13 +892,107 @@ describe.skipIf(process.platform !== "win32")("startPanelServer named pipe", () 
   });
 });
 
-describe("startPanelServer onConnect", () => {
+describe("startPanelServer subscribe", () => {
+  it("does not write to a connection that never subscribed", async () => {
+    // The bug this exists to prevent. On Windows the panel's write direction
+    // opens a connection per line, write-only and closed by the end of the call.
+    // A server that pushed standing state into one got `EPIPE` per click — and
+    // since the panel answers `service` by pulling its dumps, each `EPIPE`
+    // provoked two more connections.
+    await withHarness(async (harness) => {
+      const diagnostics: string[] = [];
+      const server = await harness.start({ onDiagnostic: (line) => diagnostics.push(line) });
+      const silent = await harness.connectSilent();
+      // A command line, the way a Windows write connection uses its one trip.
+      silent.send('{"type":"control","op":"pause"}\n');
+      await settle();
+
+      expect(server.clientCount).toBe(0);
+      server.broadcast(WORLD_LINE);
+      await settle();
+
+      expect(silent.lines).toEqual([]);
+      expect(diagnostics.filter((line) => line.includes("dropped"))).toEqual([]);
+    });
+  });
+
+  it("still acts on a command from a connection that never subscribed", async () => {
+    // Not writing to it is not the same as ignoring it: the Windows write
+    // connection is how every click arrives.
+    await withHarness(async (harness) => {
+      const ops: string[] = [];
+      await harness.start({ onControl: (op) => ops.push(op) });
+      const silent = await harness.connectSilent();
+      silent.send('{"type":"control","op":"pause"}\n');
+      await until(() => ops.length === 1, "the control op to arrive");
+
+      expect(ops).toEqual(["pause"]);
+    });
+  });
+
+  it("closing an unsubscribed connection is not a dropped panel", async () => {
+    // The supervisor's liveness probe connects and leaves, and a Windows command
+    // connection closes at the end of every click. Reporting those as failures is
+    // the console flood by a different route.
+    await withHarness(async (harness) => {
+      const diagnostics: string[] = [];
+      const server = await harness.start({ onDiagnostic: (line) => diagnostics.push(line) });
+      const probe = await harness.connectSilent();
+      probe.close();
+      await settle();
+
+      expect(server.clientCount).toBe(0);
+      expect(diagnostics).toEqual([]);
+    });
+  });
+
+  it("subscribing registers the connection for broadcasts", async () => {
+    await withHarness(async (harness) => {
+      const server = await harness.start();
+      const client = await harness.connectSilent();
+      expect(server.clientCount).toBe(0);
+
+      client.send('{"type":"subscribe"}\n');
+      await until(() => server.clientCount === 1, "the client to register");
+
+      server.broadcast(WORLD_LINE);
+      await client.waitFor(1);
+      expect(JSON.parse(client.lines[0] ?? "")).toEqual(WORLD_LINE);
+    });
+  });
+
+  it("a second subscribe is refused rather than replaying standing state again", async () => {
+    // A replay per subscribe would be the original loop by a shorter route: the
+    // panel answers `service` by pulling both dumps, and each pull would arrive
+    // as another subscribe on Windows.
+    await withHarness(async (harness) => {
+      const diagnostics: string[] = [];
+      const subscribes: number[] = [];
+      harness.onSubscribe = (count) => subscribes.push(count);
+      const server = await harness.start({ onDiagnostic: (line) => diagnostics.push(line) });
+      const client = await harness.connectSilent();
+      client.send('{"type":"subscribe"}\n');
+      await until(() => server.clientCount === 1, "the client to register");
+
+      client.send('{"type":"subscribe"}\n');
+      await until(
+        () => diagnostics.some((line) => line.includes("already subscribed")),
+        "the duplicate subscribe to be refused",
+      );
+
+      expect(subscribes).toEqual([1]);
+      expect(server.clientCount).toBe(1);
+    });
+  });
+});
+
+describe("startPanelServer onSubscribe", () => {
   it("delivers standing state to a client that connects after the server started", async () => {
     // The reason the hook exists: broadcast is a one-shot pass over whoever is
     // registered at that instant, and a panel attaches after the server starts,
-    // every time. The replay inside onConnect is what the late client hears.
+    // every time. The replay inside onSubscribe is what the late client hears.
     await withHarness(async (harness) => {
-      harness.onConnect = () => harness.announce(WORLD_LINE);
+      harness.onSubscribe = () => harness.announce(WORLD_LINE);
       await harness.start();
 
       const client = await harness.connect();
@@ -843,7 +1005,7 @@ describe("startPanelServer onConnect", () => {
   it("runs once per connect, and only after that client is registered", async () => {
     await withHarness(async (harness) => {
       const connects: number[] = [];
-      harness.onConnect = (count) => {
+      harness.onSubscribe = (count) => {
         // `count` proves registration happened first: the hook runs with the
         // new client already in the set, so a broadcast inside it reaches it.
         connects.push(count);
