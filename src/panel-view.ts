@@ -59,6 +59,10 @@ export interface PanelConfigEntryInput {
   readonly applies: "now" | "restart";
   readonly overridden: boolean;
   readonly values?: readonly string[];
+  /** V2-only UI metadata; legacy messages omit it. */
+  readonly group?: string;
+  readonly description?: string;
+  readonly secretPresent?: boolean;
 }
 
 export interface PanelConfigLine {
@@ -80,6 +84,7 @@ export interface PanelConfigEnd {
 export interface PanelConfigResult {
   readonly type: "config_result";
   readonly id?: string;
+  readonly requestId?: string;
   readonly ok: 0 | 1;
   readonly applies?: "now" | "restart";
   readonly error?: string;
@@ -90,6 +95,9 @@ export interface PanelSourceLine {
   readonly id: string;
   readonly label: string;
   readonly state: "running" | "stopped" | "unsupported";
+  /** V2-only plain-language explanation and repair affordance. */
+  readonly reason?: string;
+  readonly repair?: { readonly configId?: string; readonly label?: string };
 }
 
 export interface PanelSourceEnd {
@@ -100,6 +108,7 @@ export interface PanelSourceEnd {
 export interface PanelSourceResult {
   readonly type: "source_result";
   readonly id?: string;
+  readonly requestId?: string;
   readonly ok: 0 | 1;
   readonly error?: string;
 }
@@ -252,10 +261,12 @@ export function panelConfigResult(result: {
   readonly ok: boolean;
   readonly applies?: "now" | "restart";
   readonly error?: string;
+  readonly requestId?: string;
 }): PanelConfigResult {
   return {
     type: "config_result",
     ...(result.id === undefined ? {} : { id: sanitizeAuditText(result.id, "diagnostic").text }),
+    ...(result.requestId === undefined ? {} : { requestId: sanitizeAuditText(result.requestId, "diagnostic").text }),
     ok: result.ok ? 1 : 0,
     ...(result.applies === undefined ? {} : { applies: result.applies }),
     ...(result.error === undefined ? {} : { error: sanitizeAuditText(result.error, "diagnostic").text }),
@@ -272,6 +283,9 @@ export function panelSourceLine(input: {
   readonly id: string;
   readonly label: string;
   readonly state: "running" | "stopped" | "unsupported";
+  /** V2-only plain-language explanation and repair affordance. */
+  readonly reason?: string;
+  readonly repair?: { readonly configId?: string; readonly label?: string };
 }): PanelSourceLine {
   return {
     type: "source",
@@ -294,13 +308,58 @@ export function panelSourceResult(result: {
   readonly id?: string;
   readonly ok: boolean;
   readonly error?: string;
+  readonly requestId?: string;
 }): PanelSourceResult {
   return {
     type: "source_result",
     ...(result.id === undefined ? {} : { id: sanitizeAuditText(result.id, "diagnostic").text }),
+    ...(result.requestId === undefined ? {} : { requestId: sanitizeAuditText(result.requestId, "diagnostic").text }),
     ok: result.ok ? 1 : 0,
     ...(result.error === undefined ? {} : { error: sanitizeAuditText(result.error, "diagnostic").text }),
   };
+}
+
+/** Version 2 is deliberately nested; it is never sent to a legacy subscriber. */
+export interface PanelV2Snapshot {
+  readonly type: "snapshot";
+  readonly protocolVersion: 2;
+  readonly state: {
+    readonly connection: { readonly status: "connected" };
+    readonly session: { readonly status?: "ready" | "needs_config"; readonly capture?: { readonly status: "open" | "paused" } };
+    readonly activity: Record<string, unknown>;
+    readonly sources: readonly Record<string, unknown>[];
+    readonly config: readonly Record<string, unknown>[];
+    readonly prompts: readonly Record<string, unknown>[];
+  };
+}
+export interface PanelV2Event {
+  readonly type: "event";
+  readonly protocolVersion: 2;
+  readonly event: { readonly type: string; readonly data: Record<string, unknown> };
+}
+export type PanelV2Message = PanelV2Snapshot | PanelV2Event;
+
+/** Converts only display-safe legacy projections into a nested V2 event. */
+export function panelV2Event(message: PanelMessage): PanelV2Event {
+  const { type, ...data } = message as PanelMessage & Record<string, unknown>;
+  return { type: "event", protocolVersion: 2, event: { type, data: sanitizeV2Data(data) } };
+}
+
+/** V2 metadata is sanitized at the same boundary as legacy display text. */
+export function panelV2Config(entry: PanelConfigEntryInput): Record<string, unknown> {
+  return sanitizeV2Data({ id: entry.id, label: entry.label, kind: entry.kind, value: entry.kind === "secret" ? undefined : entry.value,
+    applies: entry.applies, overridden: entry.overridden, values: entry.values, group: entry.group,
+    description: entry.description, secretPresent: entry.kind === "secret" ? Boolean(entry.secretPresent) : undefined });
+}
+export function panelV2Source(entry: Parameters<typeof panelSourceLine>[0]): Record<string, unknown> {
+  return sanitizeV2Data({ id: entry.id, label: entry.label, state: entry.state, reason: entry.reason, repair: entry.repair });
+}
+
+function sanitizeV2Data(value: unknown): any {
+  if (typeof value === "string") return sanitizeAuditText(value, "diagnostic").text;
+  if (Array.isArray(value)) return value.map(sanitizeV2Data);
+  if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).flatMap(([key, child]) => child === undefined ? [] : [[key, sanitizeV2Data(child)]]));
+  return value;
 }
 
 /**

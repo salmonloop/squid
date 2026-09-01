@@ -1,8 +1,8 @@
 import { chmodSync, existsSync, statSync, unlinkSync } from "node:fs";
 import type { Socket } from "bun";
 import { describeErrorForAudit } from "./audit-text.js";
-import type { PanelMessage } from "./panel-view.js";
-import { panelLine } from "./panel-view.js";
+import type { PanelMessage, PanelV2Message } from "./panel-view.js";
+import { panelLine, panelV2Event } from "./panel-view.js";
 import { isPanelNamedPipe } from "./resolve-panel.js";
 
 /**
@@ -86,19 +86,21 @@ import { isPanelNamedPipe } from "./resolve-panel.js";
 export interface PanelServer {
   /** Sends to every connected panel. A write failure drops that client only. */
   broadcast(message: PanelMessage): void;
+  /** Sends an explicit V2 snapshot/event only to V2 subscribers. */
+  broadcastV2(message: PanelV2Message): void;
   readonly clientCount: number;
   close(): Promise<void>;
 }
 
 export interface PanelServerOptions {
   readonly socketPath: string;
-  readonly onControl: (op: "pause" | "resume") => void;
-  readonly onServiceControl?: (op: "restart") => void;
-  readonly onAnswer?: (promptId: number, answer: "approved" | "declined") => void;
-  readonly onConfigGet?: () => void;
-  readonly onConfigSet?: (id: string, value: string) => void;
-  readonly onSourceGet?: () => void;
-  readonly onSourceToggle?: (id: string, on: boolean) => void;
+  readonly onControl: (op: "pause" | "resume", requestId?: string) => void;
+  readonly onServiceControl?: (op: "restart", requestId?: string) => void;
+  readonly onAnswer?: (promptId: number, answer: "approved" | "declined", requestId?: string) => void;
+  readonly onConfigGet?: (requestId?: string) => void;
+  readonly onConfigSet?: (id: string, value: string, requestId?: string) => void;
+  readonly onSourceGet?: (requestId?: string) => void;
+  readonly onSourceToggle?: (id: string, on: boolean, requestId?: string) => void;
   readonly onDiagnostic?: (line: string) => void;
   /**
    * Runs once per newly *subscribed* client, after it can receive broadcasts.
@@ -111,7 +113,7 @@ export interface PanelServerOptions {
    * are different facts: on Windows a write-only connection arrives per outgoing
    * line and replaying into one is an `EPIPE` that provokes the next replay.
    */
-  readonly onSubscribe?: (clientCount: number) => void;
+  readonly onSubscribe?: (clientCount: number, protocolVersion: 1 | 2) => void;
 }
 
 /** Wire-illegal characters in a config_set field; the panel never sends them. */
@@ -138,6 +140,7 @@ interface Client {
    * written to.
    */
   subscribed: boolean;
+  protocolVersion: 1 | 2;
 }
 
 export async function startPanelServer(options: PanelServerOptions): Promise<PanelServer> {
@@ -145,6 +148,9 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
   const diagnostic = (line: string): void => {
     onDiagnostic?.(line);
   };
+  const requestIdOf = (record: Record<string, unknown>): string | undefined =>
+    typeof record.requestId === "string" && record.requestId.length > 0 && !HAS_CONTROL_CHAR.test(record.requestId)
+      ? record.requestId : undefined;
 
   // The spelling decides, not `process.platform`: it is what Bun itself reads to
   // choose a transport, so a value that is a pipe here is a pipe there.
@@ -227,12 +233,20 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
         diagnostic("Panel subscribe ignored: this connection is already subscribed.");
         return;
       }
+      const protocolVersion = record.protocolVersion === 2 ? 2 : 1;
+      // Unknown values deliberately negotiate down: old senders did not send this field.
+      client.protocolVersion = protocolVersion;
       client.subscribed = true;
       clients.add(client);
       // Registered first, then announced: the hook exists so standing state can
       // be replayed to the one client that just arrived, and a broadcast inside
       // it must reach that client.
-      onSubscribe?.(clients.size);
+      onSubscribe?.(clients.size, client.protocolVersion);
+      if (client.protocolVersion === 2) {
+        client.outbound += JSON.stringify({ type: "snapshot", protocolVersion: 2, state: {
+          connection: { status: "connected" }, session: {}, activity: {}, sources: [], config: [], prompts: [] } }) + "\n";
+        flush(client);
+      }
       return;
     }
     if (record.type === "control") {
@@ -242,14 +256,14 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
           diagnostic("Panel control refused: no service-control handler is wired.");
           return;
         }
-        onServiceControl(op);
+        onServiceControl(op, requestIdOf(record));
         return;
       }
       if (op !== "pause" && op !== "resume") {
         diagnostic("Panel control refused: op must be exactly pause, resume, or restart.");
         return;
       }
-      onControl(op);
+      onControl(op, requestIdOf(record));
       return;
     }
     if (record.type === "config_get") {
@@ -257,7 +271,7 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
         diagnostic("Panel config_get refused: no config handler is wired.");
         return;
       }
-      onConfigGet();
+      onConfigGet(requestIdOf(record));
       return;
     }
     if (record.type === "config_set") {
@@ -281,7 +295,7 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
         diagnostic("Panel config_set refused: no config handler is wired.");
         return;
       }
-      onConfigSet(id, value);
+      onConfigSet(id, value, requestIdOf(record));
       return;
     }
     if (record.type === "source_get") {
@@ -289,7 +303,7 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
         diagnostic("Panel source_get refused: no source handler is wired.");
         return;
       }
-      onSourceGet();
+      onSourceGet(requestIdOf(record));
       return;
     }
     if (record.type === "source_toggle") {
@@ -316,7 +330,7 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
         diagnostic("Panel source_toggle refused: no source handler is wired.");
         return;
       }
-      onSourceToggle(id, on === 1);
+      onSourceToggle(id, on === 1, requestIdOf(record));
       return;
     }
     if (record.type === "answer") {
@@ -335,7 +349,7 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
         diagnostic("Panel answer refused: no confirmation handler is wired.");
         return;
       }
-      onAnswer(promptId, answer);
+      onAnswer(promptId, answer, requestIdOf(record));
       return;
     }
     diagnostic("Panel line refused: unrecognized type.");
@@ -353,6 +367,7 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
         outbound: "",
         dropped: false,
         subscribed: false,
+        protocolVersion: 1,
       };
       clientOf.set(socket, client);
     },
@@ -424,6 +439,15 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
         return;
       }
       for (const client of [...clients]) {
+        const outgoing = client.protocolVersion === 2 ? `${JSON.stringify(panelV2Event(message))}\n` : line;
+        client.outbound += outgoing;
+        flush(client);
+      }
+    },
+    broadcastV2: (message: PanelV2Message): void => {
+      const line = `${JSON.stringify(message)}\n`;
+      for (const client of [...clients]) {
+        if (client.protocolVersion !== 2) continue;
         client.outbound += line;
         flush(client);
       }
