@@ -29,6 +29,25 @@ describe("defaultPanelEndpoint", () => {
     expect(defaultPanelEndpoint({ XDG_RUNTIME_DIR: "run/user" }, "linux"))
       .toBe("/tmp/squid-panel.sock");
   });
+
+  it("judges the runtime directory by POSIX rules whatever host it runs on", () => {
+    // A Windows-shaped value handed to the *linux* branch. The bare `isAbsolute`
+    // follows `process.platform`, so on a Windows runner it calls these absolute
+    // and the branch emits `C:\tmp/squid-panel.sock` — a mixed-dialect endpoint
+    // the Rust mirror (`supervisor::default_endpoint`, which tests
+    // `starts_with('/')`) would never compute. Two ends that disagree about the
+    // endpoint is a panel that starts a brain and then cannot find it, which is
+    // exactly what this function exists to prevent.
+    expect(defaultPanelEndpoint({ XDG_RUNTIME_DIR: "C:\\tmp" }, "linux"))
+      .toBe("/tmp/squid-panel.sock");
+    expect(defaultPanelEndpoint({ XDG_RUNTIME_DIR: "\\\\server\\share" }, "linux"))
+      .toBe("/tmp/squid-panel.sock");
+    // And no endpoint this function returns may ever mix separators.
+    for (const runtimeDir of ["/run/user/1000", "run/user", "C:\\tmp", ""]) {
+      const endpoint = defaultPanelEndpoint({ XDG_RUNTIME_DIR: runtimeDir }, "linux");
+      expect(endpoint.includes("\\")).toBe(false);
+    }
+  });
 });
 
 describe("resolveWatchRoot", () => {
