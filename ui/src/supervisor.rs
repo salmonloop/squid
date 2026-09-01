@@ -317,7 +317,16 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 /// supervisor correctly decides to spawn. The brain then clears the stale path
 /// itself before binding, which is `startPanelServer`'s job and not this one's.
 pub fn session_is_listening(endpoint: &Path) -> bool {
-    let deadline = Instant::now() + PROBE_TIMEOUT;
+    probe_until(endpoint, PROBE_TIMEOUT)
+}
+
+/// The probe loop with an explicit budget.
+///
+/// Split out so a test can state a short one: the production window exists to
+/// cover a session that is still binding, and waiting it out twice for the two
+/// negative cases would add three seconds to every suite run for no coverage.
+fn probe_until(endpoint: &Path, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
     loop {
         if crate::transport::probe(endpoint) {
             return true;
@@ -346,41 +355,70 @@ pub fn session_is_listening(endpoint: &Path) -> bool {
 /// stdout and stderr are inherited so the brain's diagnostics land wherever the
 /// panel's own do — a supervised run's log is the panel's console, and swallowing
 /// it would make a failing session unexplainable.
-pub fn spawn_brain(brain: &Path, endpoint: &str) -> io::Result<Child> {
-    let mut command = Command::new(brain);
-    command.env_clear();
-    // All are location/runtime variables, not Squid behavior. Windows needs
-    // SYSTEMROOT/WINDIR to create normal child processes; Unix needs HOME for
-    // Pi's own config location; the XDG pair names the same locations the TS
-    // config resolver uses. Missing values stay missing — inventing one here
-    // would be a new default separate from the brain's.
-    for name in [
-        "HOME",
-        "USERPROFILE",
-        "APPDATA",
-        "LOCALAPPDATA",
-        "XDG_CONFIG_HOME",
-        "XDG_RUNTIME_DIR",
-        "PATH",
-        "SYSTEMROOT",
-        "WINDIR",
-        "TEMP",
-        "TMP",
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
+/// The location and runtime variables a child is allowed to inherit.
+///
+/// All are location/runtime, not Squid behavior. Windows needs SYSTEMROOT/WINDIR
+/// to create normal child processes; Unix needs HOME for Pi's own config
+/// location; the XDG pair names the same locations the TS config resolver uses.
+/// Missing values stay missing — inventing one here would be a new default
+/// separate from the brain's.
+pub const INHERITED_ENV: &[&str] = &[
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_CONFIG_HOME",
+    "XDG_RUNTIME_DIR",
+    "PATH",
+    "SYSTEMROOT",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+];
+
+/// The exact environment a supervised brain is given, as data.
+///
+/// Split out from the spawn so the allowlist is assertable without creating a
+/// process. That mattered more than it sounds: this list is the mechanism that
+/// makes the settings file the authority — a stray `SQUID_BROWSER` in the
+/// panel's parent environment must not outrank what the form saved — and it was
+/// covered by nothing, because everything around it needed a real child.
+///
+/// `lookup` reads the parent environment, injected so a test can state one
+/// instead of depending on the developer machine's.
+pub fn child_env(
+    endpoint: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<(&'static str, String)> {
+    let mut env: Vec<(&str, String)> = Vec::new();
+    for name in INHERITED_ENV {
+        if let Some(value) = lookup(name) {
+            env.push((name, value));
         }
     }
     // The config-file *locator* is the one Squid variable that travels. It
     // points to the file rather than selecting a behavior, and leaving it behind
     // would make a panel opened with SQUID_CONFIG edit one file while the brain
     // starts from another.
-    if let Some(value) = std::env::var_os("SQUID_CONFIG") {
-        command.env("SQUID_CONFIG", value);
+    if let Some(value) = lookup("SQUID_CONFIG") {
+        env.push(("SQUID_CONFIG", value));
+    }
+    // The two the panel itself owns, last so they cannot be shadowed by a
+    // parent value of the same name.
+    env.push((crate::transport::SOCKET_ENV, endpoint.to_owned()));
+    env.push((SUPERVISED_ENV, "1".to_owned()));
+    env
+}
+
+pub fn spawn_brain(brain: &Path, endpoint: &str) -> io::Result<Child> {
+    let mut command = Command::new(brain);
+    command.env_clear();
+    for (name, value) in child_env(endpoint, |name| {
+        std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
+    }) {
+        command.env(name, value);
     }
     command
-        .env(crate::transport::SOCKET_ENV, endpoint)
-        .env(SUPERVISED_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -731,6 +769,225 @@ mod tests {
                 reason: "the session exited 1; restarting".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn the_child_inherits_locations_and_nothing_that_selects_behavior() {
+        // This allowlist is what makes the settings file the authority: a stray
+        // `SQUID_BROWSER` in whatever shell opened the panel must not outrank
+        // what the form saved. It was covered by nothing, because every test
+        // around it needed a real child.
+        let parent = |name: &str| -> Option<String> {
+            match name {
+                "HOME" => Some("/home/me".to_owned()),
+                "PATH" => Some("/usr/bin".to_owned()),
+                "SQUID_CONFIG" => Some("/home/me/squid.json".to_owned()),
+                // Every one of these selects a behavior the form owns.
+                "SQUID_BROWSER" => Some("darwin".to_owned()),
+                "SQUID_WATCH_ROOT" => Some("/somewhere/else".to_owned()),
+                "SQUID_TERMINAL" => Some("fifo".to_owned()),
+                "PI_MODEL_PROVIDER" => Some("someone-elses-gateway".to_owned()),
+                // And this one would point the child at another panel.
+                "SQUID_PANEL_SOCKET" => Some("/tmp/not-ours".to_owned()),
+                _ => None,
+            }
+        };
+
+        let env = child_env("/run/squid/panel.sock", parent);
+        let names: Vec<&str> = env.iter().map(|(name, _)| *name).collect();
+
+        assert!(names.contains(&"HOME"));
+        assert!(names.contains(&"PATH"));
+        // The locator travels because it points at the file rather than
+        // selecting a behavior; a panel opened with it must not edit one file
+        // while its brain starts from another.
+        assert!(names.contains(&"SQUID_CONFIG"));
+        for blocked in [
+            "SQUID_BROWSER",
+            "SQUID_WATCH_ROOT",
+            "SQUID_TERMINAL",
+            "PI_MODEL_PROVIDER",
+        ] {
+            assert!(!names.contains(&blocked), "{blocked} reached the child");
+        }
+        // Absent variables stay absent: inventing a value here would be a new
+        // default, separate from the brain's own.
+        assert!(!names.contains(&"XDG_RUNTIME_DIR"));
+
+        // The two the panel owns are the panel's, whatever the parent said.
+        let socket = env
+            .iter()
+            .find(|(name, _)| *name == crate::transport::SOCKET_ENV)
+            .map(|(_, value)| value.as_str());
+        assert_eq!(socket, Some("/run/squid/panel.sock"));
+        let supervised = env
+            .iter()
+            .find(|(name, _)| *name == SUPERVISED_ENV)
+            .map(|(_, value)| value.as_str());
+        assert_eq!(supervised, Some("1"));
+        // Written last, so a parent value of the same name cannot shadow them:
+        // `Command::env` keeps the final assignment.
+        assert_eq!(
+            names.iter().filter(|name| **name == SUPERVISED_ENV).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_supervised_flag_is_the_brains_permission_to_be_restarted() {
+        // The brain refuses `op:"restart"` unless it sees this, because exiting
+        // with nobody to respawn it would read as a crash to whoever started it
+        // by hand. Only a real supervisor may set it, so it is asserted to be
+        // present here and nowhere a parent could forge it in.
+        let env = child_env("endpoint", |_| None);
+        assert_eq!(
+            env,
+            vec![
+                (crate::transport::SOCKET_ENV, "endpoint".to_owned()),
+                (SUPERVISED_ENV, "1".to_owned()),
+            ]
+        );
+    }
+
+    /// Writes an executable that exits with `code`, and records each run by
+    /// appending a line to `log`. Unix-only: the point is a real `spawn`/`wait`
+    /// round trip, and a portable shim would test the shim.
+    #[cfg(unix)]
+    fn fake_brain(dir: &Path, log: &Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-brain");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho run >> {}\n{script}\n", log.display()),
+        )
+        .expect("write the fake brain");
+        let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+        path
+    }
+
+    #[cfg(unix)]
+    fn runs_recorded(log: &Path) -> usize {
+        std::fs::read_to_string(log)
+            .map(|body| body.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervise_spawns_a_real_child_and_stops_when_it_refuses_startup() {
+        // The spawn and wait themselves, not the policy around them: everything
+        // else in this module is a pure function, and `spawn_brain`/`supervise`
+        // had no test caller at all -- the env allowlist and the retry ladder
+        // were connected to a real process only by review.
+        let dir = std::env::temp_dir().join(format!("squid-sup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let log = dir.join("runs");
+        // Exit 2 is "startup refused": a config error a retry cannot fix. One
+        // run, then a terminal stop -- respawning a typo is the crash loop the
+        // guard exists to prevent, just faster.
+        let brain = fake_brain(&dir, &log, "exit 2");
+
+        let mut states: Vec<String> = Vec::new();
+        supervise(&brain, "unused-endpoint", |state| {
+            states.push(state.label().to_owned())
+        });
+
+        assert_eq!(
+            runs_recorded(&log),
+            1,
+            "a refused startup must not be retried"
+        );
+        assert_eq!(states.first().map(String::as_str), Some("running"));
+        assert_eq!(
+            states.last().map(String::as_str),
+            Some(ServiceState::FAILED_LABEL)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervise_retries_a_crash_until_the_guard_trips() {
+        // A brain that always fails is respawned with backoff and then stopped:
+        // three non-zero exits in a minute is not transient, and respawning it
+        // forever would burn a battery to hide a broken install. The ladder
+        // starts at 250ms, so CRASH_LIMIT rounds cost well under a second.
+        let dir = std::env::temp_dir().join(format!("squid-crash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let log = dir.join("runs");
+        let brain = fake_brain(&dir, &log, "exit 1");
+
+        let mut states: Vec<String> = Vec::new();
+        supervise(&brain, "unused-endpoint", |state| {
+            states.push(state.label().to_owned())
+        });
+
+        // Exactly the guard's limit: the run that trips it is the last one.
+        assert_eq!(runs_recorded(&log), CRASH_LIMIT);
+        assert_eq!(
+            states.last().map(String::as_str),
+            Some(ServiceState::FAILED_LABEL)
+        );
+        // And it said why on the way, rather than dying quietly.
+        assert!(states.iter().any(|label| label == "restarting"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervise_reports_a_missing_binary_instead_of_spinning_on_it() {
+        // Spawning failed rather than the brain failing. Terminal, because the
+        // next attempt runs the same execve against the same path -- and the
+        // message names the path, which is the whole of what a double-clicking
+        // user has to go on.
+        let missing = Path::new("/nonexistent/squid-brain-that-is-not-there");
+        let mut reported: Vec<ServiceState> = Vec::new();
+        supervise(missing, "unused-endpoint", |state| reported.push(state));
+
+        assert_eq!(reported.len(), 1, "a failed spawn must not report running");
+        match reported.first() {
+            Some(ServiceState::Failed { reason }) => {
+                assert!(reason.contains("squid-brain-that-is-not-there"), "{reason}")
+            }
+            other => panic!("expected a Failed report, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_answers_yes_only_when_something_is_accepting() {
+        // The probe IS the double-start guard: `Bun.listen({ unix })` does not
+        // reliably report EADDRINUSE, so two brains on one path would both appear
+        // to bind and then split connections. A connect that succeeds is the one
+        // cheap reliable answer this side has, and it had no test.
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("squid-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // Nothing there at all: no session, so the supervisor should spawn. The
+        // short budget is the whole difference from production, where the window
+        // covers a session that is still binding.
+        let short = Duration::from_millis(50);
+        let absent = dir.join("absent.sock");
+        assert!(!probe_until(&absent, short));
+
+        // A live listener answers, so the panel attaches instead of starting a
+        // second brain that would fight it for the socket.
+        let live = dir.join("live.sock");
+        let listener = UnixListener::bind(&live).expect("bind the fake session");
+        assert!(session_is_listening(&live));
+
+        // A stale socket file from a crashed run is not a false positive: the
+        // connect is refused because nothing is accepting, so spawning is right.
+        // The brain clears the stale path itself before binding.
+        drop(listener);
+        assert!(live.exists(), "the socket file outlives its listener");
+        assert!(!probe_until(&live, short));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

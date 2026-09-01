@@ -338,6 +338,18 @@ That last point is worth stating as a rule. A green gate cannot see a requiremen
 was never wired: every module could typecheck and every other suite pass while the ingest
 closure quietly never reached the agent. The loop tests exist to assert the wiring itself.
 
+The panel's supervision path is held to the same rule, because it was the clearest
+example of the failure. `spawn_brain`, `supervise`, and the probe had no test caller at
+all: the retry ladder and the crash window were covered as pure functions, while the
+process handling around them rested on review. Three things are asserted against real
+behavior now. `child_env` states the inherited environment as data, so the allowlist
+that makes the settings file the authority — a stray `SQUID_BROWSER` in the parent must
+not outrank the form — is checkable without a child. `supervise` runs actual children
+that exit 1 and 2, proving a refused startup is not retried and a crash loop stops at
+the guard. And the probe is exercised against a live Unix listener and a stale socket
+file, since it is the double-start guard and a false positive there would put two brains
+on one endpoint.
+
 ## Continuous integration and releases
 
 Two workflows, and the split between them matters. `.github/workflows/ci.yml` runs the
