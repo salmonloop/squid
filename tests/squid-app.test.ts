@@ -156,13 +156,22 @@ describe("askFirstRunAnswers", () => {
   });
 });
 
+/** An absolute directory in the host's own dialect, for the cases that only need one. */
+const hostRoot = mkdtempSync(join(tmpdir(), "squid-root-"));
+
 describe("prepareLaunch", () => {
   // A configured agent directory: without it every case below answers
   // needsFirstRun before any other resolution gets a turn. The config path is
   // pointed at a file that does not exist so the suite never reads whatever a
   // developer machine happens to keep at the platform default.
+  // The host's own platform, deliberately. Every case below hands the resolver a
+  // path that came from the host's `mkdtemp`, and declaring a different platform
+  // would tell it to judge `C:\Users\...` by POSIX rules — which call it
+  // relative, so the whole suite would fail on a Windows runner for a reason
+  // that has nothing to do with what it is testing. The watch-root cases that
+  // genuinely need a fixed platform name one themselves.
   const base = {
-    platform: "linux" as const,
+    platform: process.platform,
     agentDir: readyAgentDir(),
     provider: "bifrost",
     configPath: absentConfigPath(),
@@ -176,14 +185,16 @@ describe("prepareLaunch", () => {
     const prepared = prepareLaunch({
       ...base,
       env: withConfig(base.configPath, {
-        SQUID_WATCH_ROOT: "/tmp/demo",
+        // The host's own temp dir: an absolute path by whatever rules this
+        // platform uses, which is what `prepareLaunch` checks it against.
+        SQUID_WATCH_ROOT: hostRoot,
         SQUID_SUPERVISED: "1",
       }),
       agentDir: join(mkdtempSync(join(tmpdir(), "squid-empty-agent-")), "agent"),
       allowNeedsConfig: true,
     });
     const ready = expectReady(prepared);
-    expect(ready.root).toBe("/tmp/demo");
+    expect(ready.root).toBe(hostRoot);
     expect(ready.env.SQUID_SUPERVISED).toBe("1");
   });
 
@@ -193,7 +204,7 @@ describe("prepareLaunch", () => {
     // a session with no model.
     const prepared = prepareLaunch({
       ...base,
-      env: withConfig(base.configPath, { SQUID_WATCH_ROOT: "/tmp/demo" }),
+      env: withConfig(base.configPath, { SQUID_WATCH_ROOT: hostRoot }),
       agentDir: join(mkdtempSync(join(tmpdir(), "squid-empty-agent-")), "agent"),
     });
     expect(prepared).toEqual({ needsFirstRun: true });
@@ -201,9 +212,15 @@ describe("prepareLaunch", () => {
 
   it("wires the default endpoint through the same resolver an explicit value takes", () => {
     // The assertion is not that a default exists — it is that the packaged run
-    // and a CLI run agree on what the endpoint means for a platform.
+    // and a CLI run agree on what the endpoint means for a platform. Pinned to
+    // linux because the expectation is a POSIX socket path, so the config path
+    // handed alongside it has to be a POSIX one too.
     const ready = expectReady(
-      prepareLaunch({ ...base, env: withConfig(base.configPath, { SQUID_WATCH_ROOT: "/tmp/demo" }) }),
+      prepareLaunch({
+        ...base,
+        platform: "linux",
+        env: withConfig("/tmp/squid-absent/config.json", { SQUID_WATCH_ROOT: "/tmp/demo" }),
+      }),
     );
     expect(ready.panelSocket).toBe("/tmp/squid-panel.sock");
   });
@@ -211,7 +228,8 @@ describe("prepareLaunch", () => {
   it("rejects a relative watch root before any sink opens", () => {
     const result = prepareLaunch({
       ...base,
-      env: withConfig(base.configPath, { SQUID_WATCH_ROOT: "relative" }),
+      platform: "linux",
+      env: withConfig("/tmp/squid-absent/config.json", { SQUID_WATCH_ROOT: "relative" }),
     });
     expect("configError" in result).toBe(true);
   });
