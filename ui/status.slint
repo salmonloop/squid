@@ -1,0 +1,29 @@
+import { Theme } from "theme.slint";
+
+export component StatusDot inherits Rectangle {
+    in property <string> state;
+    width: 10px; height: 10px; border-radius: 5px;
+    background: state == "failed" ? Theme.danger : (state == "paused" || state == "needs_config" || state == "restarting" ? Theme.warning : (state == "ready" || state == "running" || state == "open" || state == "replied" ? Theme.success : Theme.text-muted));
+}
+
+export component StatusSummary inherits Rectangle {
+    in property <string> agent-state;
+    in property <string> service-state;
+    in property <string> gate;
+    in property <string> updated-at;
+    in property <string> detail;
+    background: Theme.surface; border-radius: 8px; border-width: 1px; border-color: Theme.line;
+    VerticalLayout {
+        padding: 16px; spacing: 10px;
+        HorizontalLayout {
+            spacing: 10px;
+            StatusDot { state: root.service-state == "" ? root.agent-state : root.service-state; }
+            VerticalLayout {
+                spacing: 2px; horizontal-stretch: 1;
+                Text { text: root.agent-state == "needs_config" ? "Finish setup to begin" : (root.agent-state == "ready" ? "Squid is ready" : "Waiting for a session"); color: Theme.text; font-size: 18px; font-weight: 700; }
+                Text { text: root.detail == "" ? (root.updated-at == "" ? "No observations received yet" : "Updated " + root.updated-at) : root.detail; color: Theme.text-muted; font-size: 12px; wrap: word-wrap; }
+            }
+            Text { text: root.gate == "paused" ? "Capture paused" : (root.gate == "open" ? "Capture on" : "Capture unknown"); color: root.gate == "paused" ? Theme.warning : Theme.text-muted; font-size: 12px; vertical-alignment: center; }
+        }
+    }
+}

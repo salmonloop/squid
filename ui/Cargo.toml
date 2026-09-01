@@ -17,6 +17,7 @@ path = "src/main.rs"
 # actually enforced.
 slint = { version = "1.17.1", default-features = false, features = [
     "compat-1-2",
+    "accessibility",
     "std",
     "backend-winit",
     "renderer-femtovg",
