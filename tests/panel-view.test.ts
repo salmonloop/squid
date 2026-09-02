@@ -374,6 +374,8 @@ describe("panelConfigLine", () => {
       applies: "restart",
       overridden: true,
       values: ["synthetic", "darwin", "linux", "windows"],
+      group: "Screen",
+      description: "How Squid reads the words on your screen.",
     })).toEqual({
       type: "config",
       id: "screenReader",
@@ -383,6 +385,11 @@ describe("panelConfigLine", () => {
       applies: "restart",
       overridden: 1,
       values: "synthetic;darwin;linux;windows",
+      // Scalars beside the rest, not a nested shape: the panel buckets rows by
+      // this string, and a tree here would mean teaching the hand-written Rust
+      // parser arrays and objects to say what a flat pass already says.
+      group: "Screen",
+      description: "How Squid reads the words on your screen.",
     });
   });
 
@@ -397,11 +404,21 @@ describe("panelConfigLine", () => {
     });
     expect("overridden" in line).toBe(false);
     expect("values" in line).toBe(false);
+    // The display fields go the same way. A caller that has only the five
+    // required fields still gets a wire-legal row, which is the compatibility
+    // the metadata was added as optional scalars to keep: an older brain omits
+    // them and the panel loses a heading, never the row.
+    expect("group" in line).toBe(false);
+    expect("description" in line).toBe(false);
+    expect("secretPresent" in line).toBe(false);
     // Absence on the object must survive framing: the flat parser's
     // first-key-wins has no null case to fall back on.
     const framed = JSON.parse(panelLine(line));
     expect("overridden" in framed).toBe(false);
     expect("values" in framed).toBe(false);
+    expect("group" in framed).toBe(false);
+    expect("description" in framed).toBe(false);
+    expect("secretPresent" in framed).toBe(false);
   });
 
   it("passes a secret's empty value through as the empty string", () => {
@@ -420,6 +437,65 @@ describe("panelConfigLine", () => {
     expect(JSON.parse(panelLine(line)).value).toBe("");
   });
 
+  it("discloses that a secret is stored without carrying any of it", () => {
+    // `secretPresent` is spelled the way `overridden` is — 1 or absent — because
+    // it is the same kind of thing: a claim about the value rather than the
+    // value. What it buys is the difference between an empty field the user may
+    // leave alone and one they must fill, which was previously knowable only by
+    // saving an empty value and reading the refusal back.
+    const stored = panelConfigLine({
+      id: "apiKey",
+      label: "API key",
+      kind: "secret",
+      value: "",
+      applies: "now",
+      overridden: false,
+      secretPresent: true,
+    });
+    expect(stored.secretPresent).toBe(1);
+    // Still no value, in the same line that admits a key exists. The flag is
+    // the whole disclosure; if this ever carried text the exception would have
+    // become the thing it was allowed instead of.
+    expect(stored.value).toBe("");
+    expect(JSON.parse(panelLine(stored)).secretPresent).toBe(1);
+
+    const absent = panelConfigLine({
+      id: "apiKey",
+      label: "API key",
+      kind: "secret",
+      value: "",
+      applies: "now",
+      overridden: false,
+      secretPresent: false,
+    });
+    // Omitted rather than sent as 0: "nothing stored" already has a spelling on
+    // this wire, and it is the missing field.
+    expect("secretPresent" in absent).toBe(false);
+  });
+
+  it("sanitizes group and description like every other display string", () => {
+    // Authored strings today, which is exactly why they are not trusted: a
+    // choke point that sanitized some of its display fields and not others is
+    // one edit away from putting a control character on a line the panel parses
+    // by hand. Escaped rather than literal control bytes in this source — a raw
+    // one makes git treat the file as binary and grep go quiet on it.
+    const line = panelConfigLine({
+      id: "retentionHours",
+      label: "Retention (hours)",
+      kind: "int",
+      value: "72",
+      applies: "restart",
+      overridden: false,
+      group: "His\u0007tory",
+      description: "How long Squid keeps what it\u0007recorded.",
+    });
+    expect(line.group).not.toContain("\u0007");
+    expect(line.description).not.toContain("\u0007");
+    // And the framed line still parses as one object, which is the property the
+    // sanitizer is actually protecting.
+    expect(JSON.parse(panelLine(line)).type).toBe("config");
+  });
+
   it("sanitizes id, label, and value as diagnostics", () => {
     // A value came from a file the user hand-edited, so none of the three
     // fields is trusted prose — the sanitizer is what keeps the line flat.
@@ -427,11 +503,11 @@ describe("panelConfigLine", () => {
       id: "watchRoot",
       label: "Watch root",
       kind: "text",
-      value: "/home/me/notes",
+      value: "/home/me\u0007/notes",
       applies: "restart",
       overridden: false,
     });
-    expect(line.value).not.toContain("");
+    expect(line.value).not.toContain("\u0007");
   });
 });
 
@@ -472,8 +548,8 @@ describe("panelConfigResult", () => {
   });
 
   it("sanitizes id and error like every diagnostic on the wire", () => {
-    const result = panelConfigResult({ id: "key", ok: false, error: "bad" });
-    expect(result.id).not.toContain("");
-    expect(result.error).not.toContain("");
+    const result = panelConfigResult({ id: "key\u0007", ok: false, error: "bad\u0007" });
+    expect(result.id).not.toContain("\u0007");
+    expect(result.error).not.toContain("\u0007");
   });
 });

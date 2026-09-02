@@ -9,6 +9,28 @@
  * catches a new SQUID_* variable added without deciding whether a user may
  * configure it.
  *
+ * `group` and `description` are display metadata, and they live here for the
+ * same reason `label` does: the panel renders what the wire hands it, so a
+ * grouping decided in Rust would be a second schema — one that disagrees with
+ * this one the first time a setting moves, with nothing to catch it. They are
+ * metadata and not *structure*: `group` is a scalar on a flat line, never a
+ * nesting, because the panel's parser is flat by design and a tree on the wire
+ * would buy nothing that bucketing by value does not already do.
+ *
+ * A group names the capability or the question a setting belongs to, in the
+ * user's terms — "Screen", "Pause control" — never the subsystem that happens
+ * to implement it. Rows of one group are deliberately *not* contiguous in table
+ * order: the capture gate's poll interval sits at the end beside the other
+ * intervals it was added with, and reordering the table would silently reorder
+ * the form. So the panel buckets by value rather than assuming runs, and this
+ * table stays free to grow in the order settings were introduced.
+ *
+ * A description says what a setting changes about what the user gets. Not what
+ * its name already says: "How long Squid keeps what it recorded before deleting
+ * it" earns its line, while "the retention hours" is the label again with more
+ * words, and a row nobody can describe except by its own name is a row whose
+ * purpose was never decided.
+ *
  * Everything is a string at the storage layer; typing lives in `validate`.
  * That is what keeps a value crossing to the panel as one string (never an
  * inferred number) and what keeps the file diffable against the wire: the file
@@ -65,6 +87,43 @@
 /** The value shapes a setting can take, as the panel renders them. */
 export type ConfigValueKind = "text" | "int" | "enum";
 
+/**
+ * The capabilities a setting can belong to — the panel's whole grouping
+ * vocabulary, closed rather than a free string so a new setting has to name an
+ * existing capability or argue for a new one in a diff.
+ *
+ * "Advanced" is absent, and its absence is the point: it is not a capability,
+ * it is what a settings screen files a row under when nobody wanted to explain
+ * it, and every row here has to be explainable in one sentence to earn its
+ * `description` anyway. Making it unspellable turns that from a review comment
+ * into a type error.
+ *
+ * Listed in the order the form is expected to read, which is also first
+ * appearance in a dump (the model rows lead it): what answers, where it looks,
+ * what it keeps, what it never touches. That ordering rides no wire field —
+ * the panel can recover it from the dump — so this list stays advice about
+ * presentation rather than a second protocol.
+ */
+export type ConfigGroup =
+  /** Which model answers, under which login, and how long it may take. */
+  | "Model"
+  /** Which part of the filesystem is watched. */
+  | "Files"
+  /** Reading the words on screen. */
+  | "Screen"
+  /** Seeing which pages are open. */
+  | "Browser"
+  /** Learning which commands ran. */
+  | "Terminal"
+  /** Learning which files were saved. */
+  | "Editor saves"
+  /** Stopping and starting capture. */
+  | "Pause control"
+  /** What is kept, where, and for how long. */
+  | "History"
+  /** What is never recorded at all. */
+  | "Privacy";
+
 export type ConfigValidation =
   | { readonly ok: true }
   | { readonly ok: false; readonly error: string };
@@ -76,6 +135,18 @@ export interface ConfigKey {
   readonly env: string;
   /** What the panel shows. Carried on the wire, never re-typed in Rust. */
   readonly label: string;
+  /**
+   * The capability that owns this setting, in the user's words. The panel
+   * buckets rows by this string; see the module comment for why it is a scalar
+   * and why the vocabulary has no "Advanced" in it.
+   */
+  readonly group: ConfigGroup;
+  /**
+   * One plain sentence on what this changes for the user, shown beside the
+   * field. Required, not optional: a setting offered without one is a setting
+   * the panel asks a user to decide about with nothing to decide on.
+   */
+  readonly description: string;
   readonly kind: ConfigValueKind;
   /** The allowed spellings, for `kind: "enum"`. */
   readonly values?: readonly string[];
@@ -148,6 +219,8 @@ const CONFIG_KEY_TABLE: readonly Omit<ConfigKey, "validate">[] = [
     id: "modelProvider",
     env: "PI_MODEL_PROVIDER",
     label: "Model provider",
+    group: "Model",
+    description: "Which of your saved model logins this Squid answers with.",
     kind: "text",
     // Pi keys `models.json` and `auth.json` by this string, so it has to be
     // usable as an object key and recognizable in a file a user may open. A
@@ -158,45 +231,167 @@ const CONFIG_KEY_TABLE: readonly Omit<ConfigKey, "validate">[] = [
         ? { ok: true }
         : { ok: false, error: "Model provider must be letters, digits, dashes, or underscores." },
   },
-  { id: "watchRoot", env: "SQUID_WATCH_ROOT", label: "Watch root", kind: "text" },
-  { id: "databasePath", env: "SQUID_DB", label: "Database path", kind: "text" },
-  { id: "retentionHours", env: "SQUID_RETENTION_HOURS", label: "Retention (hours)", kind: "int" },
-  { id: "agentTurnTimeoutMs", env: "SQUID_AGENT_TURN_TIMEOUT_MS", label: "Agent turn timeout (ms)", kind: "int" },
-  { id: "captureGate", env: "SQUID_CONTROL", label: "Capture gate", kind: "enum", values: ["fifo"] },
+  {
+    id: "watchRoot",
+    env: "SQUID_WATCH_ROOT",
+    label: "Watch root",
+    group: "Files",
+    description: "The folder whose file activity Squid pays attention to.",
+    kind: "text",
+  },
+  {
+    id: "databasePath",
+    env: "SQUID_DB",
+    label: "Database path",
+    group: "History",
+    description: "Where on disk Squid keeps the record of what it saw.",
+    kind: "text",
+  },
+  {
+    id: "retentionHours",
+    env: "SQUID_RETENTION_HOURS",
+    label: "Retention (hours)",
+    group: "History",
+    description: "How long Squid keeps what it recorded before deleting it.",
+    kind: "int",
+  },
+  {
+    id: "agentTurnTimeoutMs",
+    env: "SQUID_AGENT_TURN_TIMEOUT_MS",
+    label: "Agent turn timeout (ms)",
+    // Grouped with the model, not filed away as a tuning knob: how long you
+    // wait for an answer is a fact about the model you picked, and a user whose
+    // answers keep getting cut short looks for the cause beside the model, not
+    // under a heading named after the code that enforces the deadline.
+    group: "Model",
+    description: "How long Squid waits for an answer before giving up on it.",
+    kind: "int",
+  },
+  {
+    id: "captureGate",
+    env: "SQUID_CONTROL",
+    label: "Capture gate",
+    group: "Pause control",
+    description: "How you tell Squid to stop and start watching.",
+    kind: "enum",
+    values: ["fifo"],
+  },
   {
     id: "captureGatePath",
     env: "SQUID_CONTROL_FIFO",
     label: "Capture gate FIFO",
+    group: "Pause control",
+    description: "Where Squid listens for your stop and start requests.",
     kind: "text",
     refine: (raw) => validateFifoPath("Capture gate FIFO", raw),
   },
-  { id: "screenReader", env: "SQUID_SCREEN_READER", label: "Screen reader", kind: "enum", values: ["synthetic", "darwin", "linux", "windows"] },
-  { id: "screenPollMs", env: "SQUID_SCREEN_POLL_MS", label: "Screen poll (ms)", kind: "int" },
-  { id: "browser", env: "SQUID_BROWSER", label: "Browser pages", kind: "enum", values: ["synthetic", "darwin"] },
-  { id: "browserPollMs", env: "SQUID_BROWSER_POLL_MS", label: "Browser poll (ms)", kind: "int" },
-  { id: "terminal", env: "SQUID_TERMINAL", label: "Terminal commands", kind: "enum", values: ["fifo"] },
+  {
+    id: "screenReader",
+    env: "SQUID_SCREEN_READER",
+    label: "Screen reader",
+    group: "Screen",
+    description: "How Squid reads the words on your screen.",
+    kind: "enum",
+    values: ["synthetic", "darwin", "linux", "windows"],
+  },
+  {
+    id: "screenPollMs",
+    env: "SQUID_SCREEN_POLL_MS",
+    label: "Screen poll (ms)",
+    group: "Screen",
+    description: "How often Squid looks at the screen. The default is usually right.",
+    kind: "int",
+  },
+  {
+    id: "browser",
+    env: "SQUID_BROWSER",
+    label: "Browser pages",
+    group: "Browser",
+    description: "How Squid sees which pages you have open.",
+    kind: "enum",
+    values: ["synthetic", "darwin"],
+  },
+  {
+    id: "browserPollMs",
+    env: "SQUID_BROWSER_POLL_MS",
+    label: "Browser poll (ms)",
+    group: "Browser",
+    description: "How often Squid looks at your open pages. The default is usually right.",
+    kind: "int",
+  },
+  {
+    id: "terminal",
+    env: "SQUID_TERMINAL",
+    label: "Terminal commands",
+    group: "Terminal",
+    description: "How Squid learns which commands you ran.",
+    kind: "enum",
+    values: ["fifo"],
+  },
   {
     id: "terminalPath",
     env: "SQUID_TERMINAL_FIFO",
     label: "Terminal FIFO",
+    group: "Terminal",
+    description: "Where your shell tells Squid about the commands you ran.",
     kind: "text",
     refine: (raw) => validateFifoPath("Terminal FIFO", raw),
   },
-  { id: "terminalPollMs", env: "SQUID_TERMINAL_POLL_MS", label: "Terminal poll (ms)", kind: "int" },
-  { id: "editorSaves", env: "SQUID_EDITOR_SAVES", label: "Editor saves", kind: "enum", values: ["fifo"] },
+  {
+    id: "terminalPollMs",
+    env: "SQUID_TERMINAL_POLL_MS",
+    label: "Terminal poll (ms)",
+    group: "Terminal",
+    description: "How often Squid checks for new commands. The default is usually right.",
+    kind: "int",
+  },
+  {
+    id: "editorSaves",
+    env: "SQUID_EDITOR_SAVES",
+    label: "Editor saves",
+    group: "Editor saves",
+    description: "How Squid learns when you save a file.",
+    kind: "enum",
+    values: ["fifo"],
+  },
   {
     id: "editorSavesPath",
     env: "SQUID_EDITOR_FIFO",
     label: "Editor saves FIFO",
+    group: "Editor saves",
+    description: "Where your editor tells Squid about the files you saved.",
     kind: "text",
     refine: (raw) => validateFifoPath("Editor saves FIFO", raw),
   },
-  { id: "editorPollMs", env: "SQUID_EDITOR_POLL_MS", label: "Editor poll (ms)", kind: "int" },
-  { id: "capturePollMs", env: "SQUID_CONTROL_POLL_MS", label: "Gate poll (ms)", kind: "int" },
+  {
+    id: "editorPollMs",
+    env: "SQUID_EDITOR_POLL_MS",
+    label: "Editor poll (ms)",
+    group: "Editor saves",
+    description: "How often Squid checks for saved files. The default is usually right.",
+    kind: "int",
+  },
+  {
+    id: "capturePollMs",
+    env: "SQUID_CONTROL_POLL_MS",
+    label: "Gate poll (ms)",
+    // The gate's own interval, grouped with the gate rather than with the other
+    // intervals it happens to sit beside in this table. This row is the reason
+    // the panel buckets by value: by position it would land under whatever came
+    // before it.
+    group: "Pause control",
+    description: "How often Squid checks whether you asked it to pause. The default is usually right.",
+    kind: "int",
+  },
   {
     id: "excludeApplications",
     env: "SQUID_EXCLUDE",
     label: "Excluded applications",
+    group: "Privacy",
+    // The exclusion verdict drops the whole event, structural fact included
+    // (`ExcludingCapturePolicy`), which is what lets this description promise
+    // more than redaction does without overstating what the code delivers.
+    description: "Applications Squid records nothing from, not even that they were open.",
     kind: "text",
     // An empty entry is the one typo that changes what gets captured, so it is
     // refused here as it is in `parseExclusionList` — same rule, stated once in
