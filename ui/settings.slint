@@ -2,21 +2,118 @@ import { Button, LineEdit } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { SettingRow } from "model.slint";
 
+// A small trailing marker beside a settings row.
+//
+// A real chip rather than the old bare 10px text: two of those on one row
+// pushed the Save button sideways and changed the field's width relative to its
+// neighbours, so rows visibly misaligned depending on override state.
+component Marker inherits Rectangle {
+    in property <string> text;
+    in property <brush> tint;
+
+    background: Theme.surface-sunken;
+    border-radius: 4px;
+
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        padding-top: 2px;
+        padding-bottom: 2px;
+        Text {
+            text: root.text;
+            color: root.tint;
+            font-size: 11px;
+            vertical-alignment: center;
+            wrap: no-wrap;
+        }
+    }
+}
+
+// One setting, named for what it does rather than for the variable behind it.
+//
+// `description` and `group` ride the wire from the brain's own schema; this file
+// holds no key names and no idea which setting belongs to which capability. That
+// is what keeps the panel a form renderer instead of a second copy of the
+// schema — and it is why a new setting appears here correctly without a Rust
+// change.
 export component SettingEditor inherits Rectangle {
     in property <SettingRow> setting;
     callback save(string, string);
-    background: Theme.surface-muted; border-radius: 6px;
+
+    background: Theme.surface-sunken;
+    border-radius: 6px;
+
     VerticalLayout {
-        padding: 10px; spacing: 6px;
+        padding: Theme.gap;
+        spacing: Theme.gap-tight;
+
         HorizontalLayout {
-            Text { text: root.setting.label; color: Theme.text; font-size: 12px; font-weight: 600; horizontal-stretch: 1; }
-            if root.setting.overridden: Text { text: "Environment override"; color: Theme.warning; font-size: 10px; }
-            if root.setting.applies == "restart": Text { text: "Restart required"; color: Theme.warning; font-size: 10px; }
+            spacing: Theme.gap-tight;
+
+            Text {
+                text: root.setting.label;
+                color: Theme.text;
+                font-size: 13px;
+                font-weight: 600;
+                horizontal-stretch: 1;
+                wrap: word-wrap;
+            }
+            // An environment variable is winning. Disclosed rather than hidden:
+            // without it, a value that saves and visibly does not apply looks
+            // like a bug in the save.
+            if root.setting.overridden: Marker {
+                text: "set elsewhere";
+                tint: Theme.caution;
+            }
+            if root.setting.applies == "restart": Marker {
+                text: "needs restart";
+                tint: Theme.caution;
+            }
         }
+
+        // What the setting is for, in one sentence. The label alone could not
+        // explain `retentionHours` to anyone who had not read the source.
+        if root.setting.description != "": Text {
+            text: root.setting.description;
+            color: Theme.text-muted;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+
         HorizontalLayout {
-            editor := LineEdit { text: root.setting.value; placeholder-text: root.setting.kind == "secret" ? "Write-only value" : ""; input-type: root.setting.kind == "secret" ? InputType.password : InputType.text; horizontal-stretch: 1; accepted(value) => { root.save(root.setting.id, value); } }
-            Button { text: "Save"; clicked => { root.save(root.setting.id, editor.text); } }
+            spacing: Theme.gap-tight;
+
+            editor := LineEdit {
+                text: root.setting.value;
+                // A stored secret reads as "already set" rather than as an empty
+                // field. The value is structurally absent from every dump, so an
+                // empty box used to be the only thing a saved key looked like —
+                // indistinguishable from never having entered one.
+                placeholder-text: root.setting.kind == "secret"
+                    ? (root.setting.secret-present ? "Saved. Type to replace it." : "Not set yet")
+                    : "";
+                input-type: root.setting.kind == "secret" ? InputType.password : InputType.text;
+                horizontal-stretch: 1;
+                accessible-label: root.setting.label;
+                accessible-description: root.setting.description;
+                accepted(value) => { root.save(root.setting.id, value); }
+            }
+            Button {
+                text: "Save";
+                // Nothing typed is nothing to save. The old form kept all
+                // eighteen Save buttons live at all times, so the control gave
+                // no signal about which row had actually been edited.
+                enabled: editor.text != root.setting.value;
+                accessible-description: "Save " + root.setting.label;
+                clicked => { root.save(root.setting.id, editor.text); }
+            }
         }
-        if root.setting.values != "": Text { text: "Allowed values: " + root.setting.values; color: Theme.text-muted; font-size: 10px; wrap: word-wrap; }
+
+        if root.setting.values != "": Text {
+            text: "Choose one of: " + root.setting.values;
+            color: Theme.text-muted;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
     }
 }

@@ -615,6 +615,8 @@ mod tests {
                 kind: "run_tests".to_owned(),
                 summary: "bun test".to_owned(),
                 expires_at: "e".to_owned(),
+                why: None,
+                deny_consequence: None,
             })
         );
         assert_eq!(seen[3], Incoming::Cancel { prompt_id: 4 });

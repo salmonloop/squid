@@ -9,10 +9,10 @@
 //! ```jsonc
 //! {"type":"world_state","updatedAt":"...","lastEvent":"file_saved","application":"Code","window":"main.ts","gate":"open","selectionLength":42,"recentActions":"copy;file_saved","episodeEvents":17}
 //! {"type":"agent","at":"...","status":"replied","text":"ran the tests; they pass"}
-//! {"type":"prompt","promptId":1,"candidateId":"...","kind":"run_tests","summary":"...","expiresAt":"..."}
+//! {"type":"prompt","promptId":1,"candidateId":"...","kind":"run_tests","summary":"...","expiresAt":"...","why":"...","denyConsequence":"..."}
 //! {"type":"cancel","promptId":1}
 //! {"type":"service","agentState":"ready"}
-//! {"type":"config","id":"watchRoot","label":"Watch root","kind":"text","value":"/","applies":"restart"}
+//! {"type":"config","id":"watchRoot","label":"Watch root","kind":"text","value":"/","applies":"restart","group":"Files","description":"..."}
 //! {"type":"config_end","count":21}
 //! {"type":"config_result","id":"watchRoot","ok":1,"applies":"restart"}
 //! {"type":"source","id":"filesystem-local","label":"Filesystem","state":"running"}
@@ -130,18 +130,31 @@ pub struct AgentLine {
     pub text: Option<String>,
 }
 
-/// The four fields a prompt is allowed to carry.
+/// Everything a prompt is allowed to carry.
 ///
 /// `candidateId` is accepted on the wire and deliberately not kept: the window
 /// has no use for it, and a field that is never stored cannot be displayed.
 /// There is no `arguments` field to drop, because the TypeScript side never
 /// sends one — the selection cannot reach this process at all.
+///
+/// `why` and `deny_consequence` are optional additions rather than required
+/// fields, and both are scalars. A nested object here would make an older panel
+/// drop the whole line instead of ignoring the part it does not know, which is
+/// the difference between a forward-compatible field and a breaking one.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Prompt {
     pub prompt_id: i64,
     pub kind: String,
     pub summary: String,
     pub expires_at: String,
+    /// Why this is being asked now. Optional, and the panel shows nothing rather
+    /// than inventing a reason: a capability that explains itself is worth more
+    /// than a window that guesses on its behalf.
+    pub why: Option<String>,
+    /// What will not happen if the person refuses. The one sentence that turns a
+    /// refusal from a guess into a decision, and the reason it is shown without
+    /// being expanded.
+    pub deny_consequence: Option<String>,
 }
 
 /// One settings row, exactly the fields the TS dump sends.
@@ -160,6 +173,19 @@ pub struct ConfigLine {
     pub applies: String,
     pub overridden: Option<i64>,
     pub values: Option<String>,
+    /// The user-facing capability this setting belongs to, named by the brain's
+    /// own schema. Optional because an older brain does not send it; the panel
+    /// groups by whatever arrives and recognizes no id of its own, which is what
+    /// keeps the grouping out of this binary.
+    pub group: Option<String>,
+    /// One plain sentence saying what the setting does. A label alone cannot
+    /// explain a retention window to someone who has not read the source.
+    pub description: Option<String>,
+    /// Whether a credential is already stored. Never the credential: the value
+    /// itself is structurally absent from every dump, so without this flag an
+    /// empty field is the only thing a saved key can look like — and that is
+    /// indistinguishable from never having set one.
+    pub secret_present: Option<i64>,
 }
 
 /// The verdict on one set. `id` is absent on a dump-level refusal, which is why
@@ -233,6 +259,8 @@ pub fn parse_incoming(line: &str) -> Option<Incoming> {
             kind: text_field(&fields, "kind")?,
             summary: text_field(&fields, "summary")?,
             expires_at: text_field(&fields, "expiresAt")?,
+            why: optional_text_field(&fields, "why"),
+            deny_consequence: optional_text_field(&fields, "denyConsequence"),
         })),
         "cancel" => Some(Incoming::Cancel {
             prompt_id: int_field(&fields, "promptId")?,
@@ -251,6 +279,9 @@ pub fn parse_incoming(line: &str) -> Option<Incoming> {
             applies: text_field(&fields, "applies")?,
             overridden: optional_int_field(&fields, "overridden"),
             values: optional_text_field(&fields, "values"),
+            group: optional_text_field(&fields, "group"),
+            description: optional_text_field(&fields, "description"),
+            secret_present: optional_int_field(&fields, "secretPresent"),
         })),
         "config_end" => Some(Incoming::ConfigEnd {
             count: int_field(&fields, "count")?,
@@ -748,6 +779,8 @@ mod tests {
                 kind: "run_tests".to_owned(),
                 summary: "bun test".to_owned(),
                 expires_at: "2030-01-01T00:01:00.000Z".to_owned(),
+                why: None,
+                deny_consequence: None,
             })
         );
     }
@@ -1090,6 +1123,9 @@ mod tests {
                 // Stays joined. Splitting here would be string surgery the flat
                 // wire exists to avoid.
                 values: Some("synthetic;darwin;linux;windows".to_owned()),
+                group: None,
+                description: None,
+                secret_present: None,
             }))
         );
         // A secret's value is the empty string, which is a real value and not an
@@ -1106,8 +1142,52 @@ mod tests {
                 applies: "now".to_owned(),
                 overridden: None,
                 values: None,
+                group: None,
+                description: None,
+                secret_present: None,
             }))
         );
+    }
+
+    /// The three display fields the grouped form needs, and the reason they are
+    /// optional: a brain that predates them still produces a renderable row, and
+    /// this side must not treat their absence as a malformed line.
+    #[test]
+    fn a_config_row_carries_its_group_description_and_secret_presence() {
+        let line = "{\"type\":\"config\",\"id\":\"apiKey\",\"label\":\"API key\",\"kind\":\"secret\",\"value\":\"\",\"applies\":\"restart\",\"group\":\"Model\",\"description\":\"Lets Squid talk to the model.\",\"secretPresent\":1}";
+        let Some(Incoming::Config(row)) = parse_incoming(line) else {
+            panic!("recognized");
+        };
+        assert_eq!(row.group.as_deref(), Some("Model"));
+        assert_eq!(
+            row.description.as_deref(),
+            Some("Lets Squid talk to the model.")
+        );
+        assert_eq!(row.secret_present, Some(1));
+        // The credential itself is still structurally absent. A presence flag is
+        // the whole disclosure; anything more would be the value by instalments.
+        assert_eq!(row.value, "");
+    }
+
+    /// A prompt may explain itself, and the panel shows nothing when it does not.
+    #[test]
+    fn a_prompt_carries_its_reason_and_the_cost_of_refusing() {
+        let line = "{\"type\":\"prompt\",\"promptId\":3,\"kind\":\"run_tests\",\"summary\":\"bun test\",\"expiresAt\":\"z\",\"why\":\"The tests were changed.\",\"denyConsequence\":\"Squid will not check them.\"}";
+        let Some(Incoming::Prompt(prompt)) = parse_incoming(line) else {
+            panic!("recognized");
+        };
+        assert_eq!(prompt.why.as_deref(), Some("The tests were changed."));
+        assert_eq!(
+            prompt.deny_consequence.as_deref(),
+            Some("Squid will not check them.")
+        );
+
+        let bare = "{\"type\":\"prompt\",\"promptId\":3,\"kind\":\"run_tests\",\"summary\":\"bun test\",\"expiresAt\":\"z\"}";
+        let Some(Incoming::Prompt(prompt)) = parse_incoming(bare) else {
+            panic!("recognized");
+        };
+        assert_eq!(prompt.why, None);
+        assert_eq!(prompt.deny_consequence, None);
     }
 
     #[test]

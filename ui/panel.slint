@@ -4,60 +4,391 @@ import { SourceRow, SettingRow } from "model.slint";
 import { StatusSummary } from "status.slint";
 import { SourceCard } from "source-card.slint";
 import { SettingEditor } from "settings.slint";
-import { ConfirmationSection } from "confirmation.slint";
+import { ConfirmationCard, DeferredNotice } from "confirmation.slint";
 
+// Re-exported for the generated Rust bindings, which build these rows.
 export { SourceRow, SettingRow }
 
-component SectionTitle inherits Text { color: Theme.text; font-size: 15px; font-weight: 700; }
-component EvidenceRow inherits HorizontalLayout {
-    in property <string> label; in property <string> value; spacing: 12px;
-    Text { text: root.label; color: Theme.text-muted; font-size: 12px; width: 104px; }
-    Text { text: root.value == "" ? "Not observed" : root.value; color: Theme.text; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
+// A section heading. More space above than below, so a heading belongs to what
+// follows it rather than floating between two groups.
+component Heading inherits Text {
+    color: Theme.text;
+    font-size: 15px;
+    font-weight: 700;
 }
 
-export component PanelWindow inherits Window {
-    in property <string> updated-at; in property <string> last-event; in property <string> application; in property <string> window-title; in property <string> gate;
-    in property <int> selection-length: -1; in property <string> recent-actions; in property <int> episode-events: -1;
-    in property <string> agent-status; in property <string> agent-text; in property <string> agent-at;
-    callback pause(); callback resume();
-    in property <string> agent-state; in property <bool> supervised; in property <string> service-state; in property <string> service-detail;
-    callback restart-service(); callback start-service();
-    in property <[SourceRow]> sources; callback toggle-source(string, bool);
-    in property <[SettingRow]> settings; callback save-setting(string, string); callback refresh(); in property <string> status;
-    in property <bool> prompt-pending; in property <string> prompt-kind; in property <string> prompt-summary; in property <string> prompt-expires-at;
-    callback approve(); callback decline();
+// One label/value line in the evidence block.
+component EvidenceRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
 
-    title: "Squid"; always-on-top: false; preferred-width: 640px; preferred-height: 760px; min-width: 460px; background: Theme.canvas;
+    spacing: Theme.gap;
+
+    Text {
+        text: root.label;
+        color: Theme.text-muted;
+        font-size: 13px;
+        width: Theme.label-column;
+        vertical-alignment: top;
+    }
+    Text {
+        // Never a bare dash. "Nothing seen yet" is a real state and saying so is
+        // shorter to understand than a punctuation mark the reader has to decode.
+        text: root.value == "" ? "Nothing seen yet" : root.value;
+        color: root.value == "" ? Theme.text-muted : Theme.text;
+        font-size: 13px;
+        wrap: word-wrap;
+        horizontal-stretch: 1;
+    }
+}
+
+// Squid's resident control panel.
+//
+// The old shape was one flat list of six sections named after this repository's
+// own modules — WORLD, LAST AGENT TURN, CAPTURE, SERVICE, SOURCES, SETTINGS —
+// with twenty-two settings rows always on screen. That is a directory of the
+// source tree, and nobody arrives with that question. A person arrives with
+// three: is it watching, did it see anything, and does it need me.
+//
+// So the order here is fixed and it is not negotiable by content: state first,
+// any decision it is blocked on second, evidence third, the senses fourth, and
+// configuration only ever inside the sense that owns it. There is no Advanced
+// page, tab, or switch, and no catch-all group — an advanced control is advanced
+// relative to one capability, so it lives behind that capability's own door.
+export component PanelWindow inherits Window {
+    in property <string> updated-at;
+    in property <string> last-event;
+    in property <string> application;
+    in property <string> window-title;
+    in property <string> gate;
+    in property <int> selection-length: -1;
+    in property <string> recent-actions;
+    in property <int> episode-events: -1;
+    in property <string> agent-status;
+    in property <string> agent-text;
+    in property <string> agent-at;
+    callback pause();
+    callback resume();
+    in property <string> agent-state;
+    in property <bool> supervised;
+    in property <string> service-state;
+    in property <string> service-detail;
+    callback restart-service();
+    callback start-service();
+    in property <[SourceRow]> sources;
+    callback toggle-source(string, bool);
+    in property <[SettingRow]> settings;
+    // The rows belonging to whichever group is open, filtered in Rust. Slint has
+    // no way to take a subset of a model, and rendering all of them with the
+    // non-matching ones hidden would leave their layout space behind.
+    in property <[SettingRow]> group-settings;
+    // The distinct setting groups that belong to no single sense, in dump order,
+    // with any group a source card already owns removed. Built in Rust from the
+    // two dumps rather than derived here: hardcoding the list would put the
+    // brain's schema in this file — the one thing the wire's `group` field
+    // exists to avoid.
+    in property <[string]> setting-groups;
+    callback save-setting(string, string);
+    callback refresh();
+    in property <string> status;
+    in property <bool> prompt-pending;
+    in property <string> prompt-kind;
+    in property <string> prompt-summary;
+    in property <string> prompt-expires-at;
+    in property <string> prompt-why;
+    in property <string> prompt-deny-consequence;
+    callback approve();
+    callback decline();
+
+    // Which capability's settings are open, by group name. Empty means none, and
+    // that is the resting state: configuration is never the first thing on
+    // screen. Rust owns the value because it also owns the filtered rows — a
+    // group opened here without them would render an empty door.
+    in-out property <string> open-group;
+    callback select-group(string);
+    // A decision the person set aside. Local to the window on purpose — the
+    // request is still live on the brain's side, and the engine's own deadline
+    // still decides it. Deferring changes what this surface shows, never what
+    // was answered.
+    property <bool> deferred: false;
+
+    // Counted in Rust rather than tracked here: the session refuses to stop the
+    // last running observer, so each card needs to know whether it is that one.
+    // Reading it from the catalog keeps the panel from holding a second opinion
+    // about which sources are up.
+    in property <int> running-sources: 0;
+
+    title: "Squid";
+    always-on-top: false;
+    preferred-width: 640px;
+    preferred-height: 780px;
+    min-width: 480px;
+    // A minimum height, because the old window had none: shrinking it clipped
+    // the confirmation, the one surface with a deadline and consequences.
+    min-height: 420px;
+    background: Theme.canvas;
+    default-font-size: 13px;
+
     VerticalLayout {
-        padding: 20px; spacing: 18px;
-        HorizontalLayout { Text { text: "Squid"; color: Theme.text; font-size: 22px; font-weight: 700; horizontal-stretch: 1; } Button { text: "Refresh"; clicked => { root.refresh(); } } }
-        StatusSummary { agent-state: root.agent-state; service-state: root.service-state; gate: root.gate; updated-at: root.updated-at; detail: root.service-detail; }
+        padding: Theme.gap-loose;
+        spacing: Theme.gap;
+
+        HorizontalLayout {
+            spacing: Theme.gap;
+            Text {
+                text: "Squid";
+                color: Theme.text;
+                font-size: 22px;
+                font-weight: 700;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Button {
+                text: "Refresh";
+                accessible-description: "Ask the session for its current settings and sources.";
+                clicked => { root.refresh(); }
+            }
+        }
+
+        // State, always. Never scrolls out of reach, never waits behind content.
+        StatusSummary {
+            agent-state: root.agent-state;
+            service-state: root.service-state;
+            gate: root.gate;
+            updated-at: root.updated-at;
+            detail: root.service-detail;
+            decision-pending: root.prompt-pending;
+        }
+
+        // The decision, second, above everything else — and above the scroll
+        // region, so it cannot be pushed off the bottom by a long settings list.
+        // This is the defect a real smoke run caught: the confirmation used to
+        // sit last inside the scroll view, below twenty-two settings rows, while
+        // the header cheerfully said "Squid is ready".
+        if root.prompt-pending && !root.deferred: ConfirmationCard {
+            kind: root.prompt-kind;
+            summary: root.prompt-summary;
+            expires-at: root.prompt-expires-at;
+            why: root.prompt-why;
+            deny-consequence: root.prompt-deny-consequence;
+            allow => { root.deferred = false; root.approve(); }
+            decline => { root.deferred = false; root.decline(); }
+            defer => { root.deferred = true; }
+        }
+
+        if root.prompt-pending && root.deferred: DeferredNotice {
+            reopen => { root.deferred = false; }
+        }
+
         ScrollView {
-            horizontal-stretch: 1; vertical-stretch: 1;
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+
             VerticalLayout {
-                spacing: 18px;
-                SectionTitle { text: "Recent activity"; }
-                Rectangle { background: Theme.surface; border-radius: 8px; border-width: 1px; border-color: Theme.line; VerticalLayout { padding: 14px; spacing: 8px;
-                    EvidenceRow { label: "Application"; value: root.application; } EvidenceRow { label: "Window"; value: root.window-title; } EvidenceRow { label: "Last event"; value: root.last-event; } EvidenceRow { label: "Latest action"; value: root.recent-actions; }
-                    EvidenceRow { label: "Agent"; value: root.agent-status == "" ? "No recent response" : root.agent-status + (root.agent-at == "" ? "" : " at " + root.agent-at); }
-                    if root.agent-text != "": Text { text: root.agent-text; color: Theme.text-muted; font-size: 12px; wrap: word-wrap; max-height: 72px; overflow: elide; }
-                } }
-                SectionTitle { text: "Capture"; }
-                Rectangle { background: Theme.surface; border-radius: 8px; border-width: 1px; border-color: Theme.line; VerticalLayout { padding: 14px; spacing: 8px;
-                    Text { text: root.gate == "paused" ? "Capture is paused" : (root.gate == "open" ? "Capture is on" : "Capture state has not been reported"); color: Theme.text; font-size: 13px; font-weight: 600; }
-                    HorizontalLayout { if root.gate != "paused": Button { text: "Pause capture"; clicked => { root.pause(); } } if root.gate != "open": Button { text: "Resume capture"; primary: true; clicked => { root.resume(); } } if root.supervised && root.service-state != "failed": Button { text: "Restart service"; clicked => { root.restart-service(); } } if root.supervised && root.service-state == "failed": Button { text: "Start service"; primary: true; clicked => { root.start-service(); } } }
-                } }
-                HorizontalLayout { SectionTitle { text: "Sources"; horizontal-stretch: 1; } Text { text: "Choose what Squid can observe"; color: Theme.text-muted; font-size: 11px; } }
-                if root.sources.length == 0: Text { text: "Sources will appear when the session reports its catalog."; color: Theme.text-muted; font-size: 12px; }
-                for source in root.sources: SourceCard { source: source; toggle(id, enabled) => { root.toggle-source(id, enabled); } }
-                SectionTitle { text: "Configuration and technical details"; }
-                Rectangle { background: Theme.surface; border-radius: 8px; border-width: 1px; border-color: Theme.line; VerticalLayout { padding: 14px; spacing: 10px;
-                    Text { text: root.agent-state == "needs_config" ? "Add the model connection details to enable responses." : "Connection settings and service details stay here when you need them."; color: Theme.text-muted; font-size: 12px; wrap: word-wrap; }
-                    if root.status != "": Text { text: root.status; color: Theme.warning; font-size: 11px; wrap: word-wrap; }
-                    if root.settings.length == 0: Text { text: "No settings have been reported yet."; color: Theme.text-muted; font-size: 12px; }
-                    for setting in root.settings: SettingEditor { setting: setting; save(id, value) => { root.save-setting(id, value); } }
-                } }
-                ConfirmationSection { pending: root.prompt-pending; kind: root.prompt-kind; summary: root.prompt-summary; expires-at: root.prompt-expires-at; approve => { root.approve(); } decline => { root.decline(); } }
+                spacing: Theme.gap-loose;
+
+                // What Squid can see, and the only place its configuration
+                // lives. Cards first because "is it watching my browser" is a
+                // question people actually have; the raw settings behind each one
+                // open only when asked for.
+                VerticalLayout {
+                    spacing: Theme.gap;
+                    Heading { text: "What Squid can watch"; }
+
+                    if root.sources.length == 0: Text {
+                        text: "The session has not reported what it can watch yet.";
+                        color: Theme.text-muted;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+
+                    for source in root.sources: VerticalLayout {
+                        spacing: Theme.gap-tight;
+
+                        SourceCard {
+                            source: source;
+                            only-observer: source.state == "running" && root.running-sources <= 1;
+                            expanded: root.open-group == source.label;
+                            toggle(id, on) => { root.toggle-source(id, on); }
+                            // Both doors lead to the same place. "Set it up" is
+                            // the repair path and "Settings" is the curiosity
+                            // path; there is no third, global one.
+                            configure(id) => { root.select-group(source.label); }
+                            open(id) => { root.select-group(source.label); }
+                        }
+
+                        // The capability's own settings, matched by the group the
+                        // brain's schema assigned. Rust does the filtering: Slint
+                        // cannot take a subset of a model, and the alternative —
+                        // rendering every row and hiding the ones that do not
+                        // match — leaves their layout space behind.
+                        if root.open-group == source.label: VerticalLayout {
+                            spacing: Theme.gap-tight;
+                            padding-left: Theme.gap-loose;
+                            for setting in root.group-settings: SettingEditor {
+                                setting: setting;
+                                save(id, value) => { root.save-setting(id, value); }
+                            }
+                        }
+                    }
+                }
+
+                // Capture, with the consequence written out. Pause is the one
+                // control that must never be hard to find.
+                VerticalLayout {
+                    spacing: Theme.gap;
+                    Heading { text: "Recording"; }
+                    Rectangle {
+                        background: Theme.surface;
+                        border-radius: Theme.radius;
+                        border-width: 1px;
+                        border-color: Theme.line;
+                        VerticalLayout {
+                            padding: Theme.pad;
+                            spacing: Theme.gap;
+                            Text {
+                                text: root.gate == "paused"
+                                    ? "Paused. Nothing new is being recorded."
+                                    : (root.gate == "open"
+                                        ? "Recording what happens on this machine."
+                                        : "The session has not said whether it is recording.");
+                                color: Theme.text;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                spacing: Theme.gap;
+                                alignment: start;
+                                // Exactly one action when the state is known.
+                                // Both were offered when it was unknown, which
+                                // asked the person to guess which one applied.
+                                if root.gate == "open": Button {
+                                    text: "Pause recording";
+                                    accessible-description: "Stop recording new activity until you resume.";
+                                    clicked => { root.pause(); }
+                                }
+                                if root.gate == "paused": Button {
+                                    text: "Resume recording";
+                                    accessible-description: "Start recording activity again.";
+                                    clicked => { root.resume(); }
+                                }
+                                if root.gate != "open" && root.gate != "paused": Button {
+                                    text: "Ask again";
+                                    accessible-description: "Ask the session whether it is recording.";
+                                    clicked => { root.refresh(); }
+                                }
+                                if root.supervised && root.service-state == "failed": Button {
+                                    text: "Start Squid again";
+                                    accessible-description: "Restart the stopped session.";
+                                    clicked => { root.start-service(); }
+                                }
+                                if root.supervised && root.service-state != "failed": Button {
+                                    text: "Restart Squid";
+                                    accessible-description: "Stop the session and start it again.";
+                                    clicked => { root.restart-service(); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Evidence. Third, because it answers "what has it actually
+                // seen" — the question that makes the rest of the panel
+                // believable — but it is not what a person opens the window for.
+                VerticalLayout {
+                    spacing: Theme.gap;
+                    Heading { text: "What Squid has seen"; }
+                    Rectangle {
+                        background: Theme.surface;
+                        border-radius: Theme.radius;
+                        border-width: 1px;
+                        border-color: Theme.line;
+                        VerticalLayout {
+                            padding: Theme.pad;
+                            spacing: Theme.gap-tight;
+                            EvidenceRow { label: "In front of you"; value: root.application; }
+                            EvidenceRow { label: "Window"; value: root.window-title; }
+                            EvidenceRow { label: "Most recent"; value: root.last-event; }
+                            EvidenceRow { label: "Recently"; value: root.recent-actions; }
+                            EvidenceRow {
+                                label: "Squid last said";
+                                value: root.agent-status == ""
+                                    ? ""
+                                    : (root.agent-status == "failed" ? "It could not finish" : "It replied")
+                                      + (root.agent-at == "" ? "" : " at " + root.agent-at);
+                            }
+                            if root.agent-text != "": Text {
+                                text: root.agent-text;
+                                color: Theme.text-muted;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                                max-height: 84px;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+
+                // Settings that belong to no single sense: the model connection,
+                // how long history is kept, which applications to stay out of.
+                // Grouped by the brain's own group names, one door each.
+                VerticalLayout {
+                    spacing: Theme.gap;
+                    Heading { text: "Squid itself"; }
+
+                    if root.settings.length == 0: Text {
+                        text: "The session has not reported its settings yet.";
+                        color: Theme.text-muted;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+
+                    // The last verdict from the session, wherever it came from.
+                    // Kept beside the settings it usually concerns rather than
+                    // at the very bottom of the window, which is where a refused
+                    // source toggle used to report itself.
+                    if root.status != "": Text {
+                        text: root.status;
+                        color: Theme.caution;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+
+                    for group in root.setting-groups: VerticalLayout {
+                        spacing: Theme.gap-tight;
+                        Rectangle {
+                            background: Theme.surface;
+                            border-radius: Theme.radius;
+                            border-width: 1px;
+                            border-color: root.open-group == group ? Theme.focus : Theme.line;
+                            HorizontalLayout {
+                                padding: Theme.pad;
+                                spacing: Theme.gap;
+                                Text {
+                                    text: group;
+                                    color: Theme.text;
+                                    font-size: 14px;
+                                    font-weight: 600;
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                }
+                                Button {
+                                    text: root.open-group == group ? "Close" : "Open";
+                                    accessible-description: (root.open-group == group ? "Hide" : "Show") + " the " + group + " settings.";
+                                    clicked => { root.select-group(group); }
+                                }
+                            }
+                        }
+                        if root.open-group == group: VerticalLayout {
+                            spacing: Theme.gap-tight;
+                            padding-left: Theme.gap-loose;
+                            for setting in root.group-settings: SettingEditor {
+                                setting: setting;
+                                save(id, value) => { root.save-setting(id, value); }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
