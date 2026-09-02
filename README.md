@@ -51,20 +51,30 @@ bun run ui:smoke -- /absolute/path/to/squid-ui
 ```
 
 The harness requires Linux/Unix sockets plus `Xvfb`, `xdotool`, `xwininfo`
-(`x11-utils`), and ImageMagick's `import`. It detects missing commands and exits
-with an actionable error rather than assuming CI installed them. Output goes to
-a unique `/tmp/squid-ui-smoke-*` directory and every screenshot path is printed.
-It polls for the fixture subscription, mapped window, and reply instead of using
-fixed startup sleeps; cleanup terminates the panel and Xvfb and closes the socket
-on both success and failure.
+(`x11-utils`), and `ffmpeg` — the last one grabs and crops the window from the
+same `xwininfo` geometry that proved it viewable. It detects missing commands and
+exits with an actionable error rather than assuming CI installed them. Output goes
+to a unique `/tmp/squid-ui-smoke-*` directory and every screenshot path is
+printed. It polls for the fixture subscription, mapped window, and reply instead
+of using fixed startup sleeps; cleanup terminates the panel and Xvfb and closes
+the socket on both success and failure.
 
-The fixture sends only supported current flat wire messages: service states,
-world state, an agent line, an unsupported source dump, and a prompt when the
-current protocol supports it. Slint currently has no stable accessibility tree,
-so interaction prefers keyboard focus traversal (Decline then Approve) and falls
-back to a documented window-relative click coordinate if the host changes focus
-behavior. This is a plumbing smoke test, not a contract for unimplemented UI v2
-APIs or pixel layout.
+The run asserts three things about a confirmation: **Later** does not answer, a
+deferred decision can be brought back, and a settled prompt refuses a second
+answer. It drives the buttons with clicks at window-relative coordinates, and the
+reason is measured rather than preferred: under a bare Xvfb there is no window
+manager to give the window focus, so a synthetic `Return` is delivered to nothing.
+Each coordinate asserts *which* answer it produced, so a layout change that moves
+a button makes the expected answer wrong or absent instead of silently hitting a
+neighbour.
+
+Two things the harness therefore cannot claim. It does not verify the
+no-default-button rule — a `Return` that produces no answer here proves only that
+no key arrived — so that rule is enforced in `ui/confirmation.slint`, where no
+button is `primary` and none is given focus. And it renders in whatever colour
+scheme the display reports, which under Xvfb is the light one: there is no desktop
+portal to ask, and Slint 1.17 exposes no environment override, so dark mode is
+verified by reading `ui/theme.slint` rather than by screenshot.
 
 `typecheck` covers `src` and `tests` in two passes. The build config compiles only
 `src`, so checking the suites needs its own config — without it a test could assert

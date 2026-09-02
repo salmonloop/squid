@@ -30,4 +30,6 @@ a global Advanced area.
 - Keep native titlebar. Do not imitate drag/move controls unavailable in Slint 1.17.
 - State is never colour-only. Custom controls expose a role, label, description,
 and focus treatment through Slint accessibility.
-- Confirmation is a separate Window, with no default action and fail-closed close.
+- Confirmation takes the top of the resident window, above the scroll region, with
+no default action and fail-closed close. A separate Window is the eventual shape;
+see DESIGN.md for why it is not what ships yet.
