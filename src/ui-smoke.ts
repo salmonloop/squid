@@ -107,8 +107,8 @@ function panelFixture(socketPath: string): Promise<Fixture> {
               const reply = JSON.parse(line) as PanelReply;
               replies.push(reply);
               if (reply.type === "subscribe") announce();
-              if (reply.type === "config_get") { send({ type: "config", id: "model", label: "Model", kind: "text", value: "", applies: "restart" }); send({ type: "config_end", count: 1 }); }
-              if (reply.type === "source_get") { send({ type: "source", id: "screen", label: "Screen text", state: "unsupported" }); send({ type: "source_end", count: 1 }); }
+              if (reply.type === "config_get") { for (const row of CONFIG_ROWS) send(row); send({ type: "config_end", count: CONFIG_ROWS.length }); }
+              if (reply.type === "source_get") { for (const row of SOURCE_ROWS) send(row); send({ type: "source_end", count: SOURCE_ROWS.length }); }
             } catch { /* Production server refuses malformed input; fixture does not invent a reply. */ }
           }
           newline = buffer.indexOf("\n");
@@ -185,57 +185,75 @@ async function screenshot(display: string, geometry: WindowGeometry, path: strin
   if (result.code !== 0) fail(`could not save ${path}: ${result.stderr.trim() || "ffmpeg x11grab failed"}`);
 }
 
-/** How many Tab steps the walk will try before giving up on reaching a button. */
-const MAX_TAB_STEPS = 12;
 /** How long to wait for an answer that must NOT arrive. Short: absence is the assertion. */
-const NEGATIVE_WAIT_MS = 600;
+const NEGATIVE_WAIT_MS = 700;
+
+/**
+ * Where the three confirmation buttons sit, in window-relative pixels.
+ *
+ * Coordinates, and not the keyboard, because a keyboard is not available here:
+ * under a bare Xvfb there is no window manager to give the window focus, so
+ * `xdotool key` is delivered to nothing and every key press silently does
+ * nothing. Measured on this machine: a synthetic click lands and answers, a
+ * synthetic Return does not.
+ *
+ * That is also why this file cannot assert the no-default-button rule. A Return
+ * that produces no answer here proves only that no key arrived, which would be a
+ * pass for the wrong reason — the honest thing is to leave the claim to the Slint
+ * source, where no button is `primary` and none is given focus, and to say so
+ * rather than to fake the measurement.
+ *
+ * A hardcoded position is a real cost, and it is bounded: each entry asserts
+ * which answer it produced, so a layout change that moves a button makes the
+ * expected answer wrong or absent. It cannot silently hit a neighbour and pass.
+ */
+const BUTTONS = {
+  decline: { x: 426, y: 307 },
+  later: { x: 504, y: 307 },
+  allow: { x: 574, y: 307 },
+} as const;
+
+/** The Review button on the deferred notice, which takes the place of the card. */
+const REVIEW = { x: 574, y: 200 } as const;
+
+/**
+ * The settings dump the fixture serves.
+ *
+ * Grouped, described, and deliberately not contiguous by group — the real schema
+ * interleaves them, so a renderer that detected runs instead of bucketing by
+ * value would pass against a tidier fixture and fail against the brain. One
+ * secret row carries `secretPresent` so the screenshots show a stored credential
+ * reading as stored rather than as an empty box.
+ */
+const CONFIG_ROWS: readonly Record<string, unknown>[] = [
+  { type: "config", id: "modelId", label: "Model", kind: "text", value: "gpt-5", applies: "restart", group: "Model", description: "Which model answers when Squid needs to think." },
+  { type: "config", id: "apiKey", label: "API key", kind: "secret", value: "", applies: "restart", group: "Model", description: "Lets Squid reach the model. Stored by Pi, never shown here.", secretPresent: 1 },
+  { type: "config", id: "watchRoot", label: "Watched folder", kind: "text", value: "/home/you/project", applies: "restart", group: "Files", description: "The folder Squid notices changes in." },
+  { type: "config", id: "retentionHours", label: "Keep activity for", kind: "int", value: "24", applies: "restart", group: "History", description: "How long Squid keeps what it recorded before deleting it." },
+  { type: "config", id: "screenReader", label: "Screen reading", kind: "enum", value: "", applies: "restart", group: "Screen", description: "How Squid reads the words on screen.", values: "linux" },
+  { type: "config", id: "excludeApplications", label: "Never watch these apps", kind: "text", value: "1Password", applies: "restart", group: "Privacy", description: "Squid records nothing at all from the apps you list." },
+  { type: "config", id: "databasePath", label: "Where history is kept", kind: "text", value: "", applies: "restart", group: "History", description: "The file Squid writes its record to. Empty keeps it in memory only." },
+];
+
+/** The catalog the fixture serves: one running, one off, one that needs setting up. */
+const SOURCE_ROWS: readonly Record<string, unknown>[] = [
+  { type: "source", id: "filesystem-local", label: "Files", state: "running" },
+  { type: "source", id: "screen-text-host", label: "Screen", state: "running" },
+  { type: "source", id: "browser-page-host", label: "Browser", state: "unsupported" },
+];
 
 /** Whether any answer for this prompt has reached the fixture yet. */
 function answerFor(fixture: Fixture, promptId: number): PanelReply | undefined {
   return fixture.replies.find((reply) => reply.type === "answer" && reply.promptId === promptId);
 }
 
-/**
- * Walks the keyboard to a confirmation button and reports which answer it sent.
- *
- * Self-discovering rather than a hardcoded Tab count. A fixed count encodes this
- * layout's focus order into the check, so the next honest layout change fails
- * here for no reason — and worse, a count that lands on the wrong button still
- * produces *an* answer, which reads as a pass.
- *
- * The first Return is pressed before any Tab, and its job is to find nothing.
- * That is the assertion the research asks for: a confirmation with a default
- * button is answered by whoever was mid-keystroke when it appeared, and Apple's
- * own guidance is to give a consequential alert no default at all. Absence has
- * to be measured, so this waits out a real interval rather than checking once.
- */
-async function walkToAnswer(
-  display: string,
-  windowId: string,
-  fixture: Fixture,
-  promptId: number,
-): Promise<{ readonly answer: string; readonly tabs: number }> {
-  const env = { ...process.env, DISPLAY: display };
-  await run("xdotool", ["windowactivate", "--sync", windowId], env);
-
-  await run("xdotool", ["key", "--window", windowId, "Return"], env);
-  await wait(NEGATIVE_WAIT_MS);
-  const premature = answerFor(fixture, promptId);
-  if (premature !== undefined) {
-    fail(
-      `Return answered the prompt with no button focused (${JSON.stringify(premature.answer)}). ` +
-        "A consequential confirmation must have no default button.",
-    );
-  }
-
-  for (let tabs = 1; tabs <= MAX_TAB_STEPS; tabs += 1) {
-    await run("xdotool", ["key", "--window", windowId, "Tab"], env);
-    await run("xdotool", ["key", "--window", windowId, "Return"], env);
-    await wait(POLL_MS * 2);
-    const reply = answerFor(fixture, promptId);
-    if (reply !== undefined) return { answer: String(reply.answer), tabs };
-  }
-  return fail(`no confirmation button answered within ${MAX_TAB_STEPS} Tab steps`);
+async function click(display: string, windowId: string, at: { readonly x: number; readonly y: number }): Promise<void> {
+  const result = await run(
+    "xdotool",
+    ["mousemove", "--window", windowId, String(at.x), String(at.y), "click", "1"],
+    { ...process.env, DISPLAY: display },
+  );
+  if (result.code !== 0) fail(`could not click at ${at.x},${at.y}: ${result.stderr.trim() || "xdotool failed"}`);
 }
 
 async function main(): Promise<void> {
@@ -265,19 +283,42 @@ async function main(): Promise<void> {
     await screenshot(display.display, window, pending);
     log(`ui:smoke screenshot: ${pending}`);
 
-    const walked = await walkToAnswer(display.display, window.id, fixture, PROMPT_ID);
-    log(`ui:smoke answered ${JSON.stringify(walked.answer)} after ${walked.tabs} Tab step(s)`);
+    // Later is the third answer, and it must not answer. The request stays
+    // pending on the brain's side; only what this surface shows changes.
+    await click(display.display, window.id, BUTTONS.later);
+    await wait(NEGATIVE_WAIT_MS);
+    const afterDefer = answerFor(fixture, PROMPT_ID);
+    if (afterDefer !== undefined) {
+      fail(`Later sent an answer (${JSON.stringify(afterDefer.answer)}); deferring is not deciding`);
+    }
+    const deferred = join(outputDirectory, "02-decision-deferred.png");
+    await screenshot(display.display, window, deferred);
+    log(`ui:smoke screenshot: ${deferred}`);
+
+    // Bringing it back has to work, or Later would be a way to lose a decision.
+    await click(display.display, window.id, REVIEW);
+    await wait(NEGATIVE_WAIT_MS);
+
+    await click(display.display, window.id, BUTTONS.decline);
+    const answer = await fixture.waitFor(
+      "the declined answer",
+      (reply) => reply.type === "answer" && reply.promptId === PROMPT_ID,
+    );
+    if (answer.answer !== "declined") {
+      fail(`clicking Decline produced ${JSON.stringify(answer.answer)}; the buttons have moved`);
+    }
+    log(`ui:smoke answered ${JSON.stringify(answer.answer)}`);
 
     // The panel must stop showing a settled decision. A prompt still on screen
     // after an answer invites a second click on a question already closed.
-    const settled = join(outputDirectory, "02-decision-settled.png");
+    const settled = join(outputDirectory, "03-decision-settled.png");
     await screenshot(display.display, window, settled);
     log(`ui:smoke screenshot: ${settled}`);
 
-    // One prompt, one answer. A second Return on the settled surface must not
-    // produce a second line for the same id.
+    // One prompt, one answer. Clicking where the buttons were must not produce a
+    // second line for the same id.
     const before = fixture.replies.filter((reply) => reply.type === "answer").length;
-    await run("xdotool", ["key", "--window", window.id, "Return"], { ...process.env, DISPLAY: display.display });
+    await click(display.display, window.id, BUTTONS.allow);
     await wait(NEGATIVE_WAIT_MS);
     const after = fixture.replies.filter((reply) => reply.type === "answer").length;
     if (after !== before) fail(`a settled prompt accepted another answer (${before} then ${after})`);

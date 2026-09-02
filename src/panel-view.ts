@@ -276,7 +276,7 @@ export function panelConfirmationCancel(promptId: number): PanelConfirmationCanc
  * startup, because broadcast is a one-shot pass over whoever is registered at
  * that moment and the panel connects after the session, not before. A panel that
  * never hears this line infers nothing; `agentState: "needs_config"` is the
- * signal that the session is running headless-配置-less and the settings form is
+ * signal that the session is running configuration-less and the settings form is
  * the way out.
  */
 export function panelServiceLine(input: {
