@@ -1,2 +1,50 @@
-export struct SourceRow { id: string, label: string, state: string }
-export struct SettingRow { id: string, label: string, kind: string, value: string, applies: string, overridden: bool, values: string }
+// The two row shapes the wire delivers, and the only structs the panel holds.
+//
+// Both stay flat strings on purpose. Everything here arrives from the brain: the
+// panel holds no list of setting names, no notion of which key belongs to which
+// capability, and no idea which ones need a restart. That is what keeps this a
+// form renderer rather than a second copy of the brain's schema — see
+// docs/panel-protocol.md.
+
+// One source-catalog row. `state` stays the string the brain sent —
+// "running" | "stopped" | "unsupported" — rather than a bool, so a capability
+// this run cannot start is a third answer instead of an unchecked box that looks
+// like a choice the user made.
+export struct SourceRow {
+    id: string,
+    label: string,
+    state: string,
+}
+
+export struct SettingRow {
+    id: string,
+    label: string,
+    // "text" | "int" | "enum" | "secret". Only `secret` changes the editor, and
+    // only into a masked one; the brain validates every kind either way.
+    kind: string,
+    value: string,
+    // "now" | "restart", shown as a marker so a value that will not take effect
+    // until the brain restarts does not look like it already has.
+    applies: string,
+    // An environment variable is shadowing the file. Disclosed rather than
+    // hidden: without it, a saved value that visibly does not apply looks like a
+    // bug in the save.
+    overridden: bool,
+    // ";"-joined enum choices, rendered as a hint. Kept joined because the wire
+    // is flat here, and splitting it would be parser work in a file with no
+    // tests of its own.
+    values: string,
+    // The user-facing capability this setting belongs to, named by the brain's
+    // schema. The panel groups by this string and never by an id it recognises,
+    // which is what lets a new setting land in the right place with no change
+    // here.
+    group: string,
+    // One plain sentence saying what the setting does. A label alone cannot
+    // explain a retention window or a poll interval to someone who has not read
+    // the source.
+    description: string,
+    // Whether a credential is already stored. The value itself is structurally
+    // absent from every dump, so without this an empty box is the only thing a
+    // saved key can look like — indistinguishable from never having set one.
+    secret-present: bool,
+}

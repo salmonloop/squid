@@ -1,18 +1,124 @@
-import { Button, CheckBox } from "std-widgets.slint";
+import { Button, Switch } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { SourceRow } from "model.slint";
 
+// One sense, as a card that is both its own status and its own way in.
+//
+// The old panel split these: a checkbox in SOURCES said `unsupported`, and the
+// two settings that would fix it sat in a form two sections below, under names
+// like `SQUID_BROWSER`. The symptom and the cure were never in the same place,
+// and nothing on screen connected them. Here the card that reports the problem
+// carries the button that opens it — which is also why the panel needs no
+// global "Advanced" page: depth is reached through the thing you were already
+// looking at.
 export component SourceCard inherits Rectangle {
     in property <SourceRow> source;
+    // True when this is the only observer still running. The session refuses to
+    // stop the last one, so the card explains that before a click can fail
+    // rather than after — a refusal delivered two sections away, in the shared
+    // status line, was the old shape.
+    in property <bool> only-observer;
+    in property <bool> expanded;
+
     callback toggle(string, bool);
-    background: Theme.surface; border-radius: 7px; border-width: 1px; border-color: Theme.line;
+    callback configure(string);
+    callback open(string);
+
+    // Plain language, never the wire's own word. `running`, `stopped`, and
+    // `unsupported` are protocol tokens; a person reads none of them.
+    out property <string> state-text:
+        root.source.state == "running" ? "Watching"
+        : root.source.state == "unsupported" ? "Not set up"
+        : "Off";
+
+    out property <brush> state-tint:
+        root.source.state == "running" ? Theme.calm
+        : root.source.state == "unsupported" ? Theme.caution
+        : Theme.text-muted;
+
+    // `unsupported` means this run cannot start the capability — and for the
+    // three optional senses that is almost always an absent setting rather than
+    // an absent machine. So the card offers to open its own settings instead of
+    // reporting a dead end.
+    out property <bool> repairable: root.source.state == "unsupported";
+
+    background: Theme.surface;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: root.expanded ? Theme.focus : Theme.line;
+
     VerticalLayout {
-        padding: 12px; spacing: 8px;
+        padding: Theme.pad;
+        spacing: Theme.gap-tight;
+
         HorizontalLayout {
-            spacing: 8px;
-            CheckBox { text: root.source.label; checked: root.source.state == "running"; enabled: root.source.state != "unsupported"; horizontal-stretch: 1; toggled => { root.toggle(root.source.id, self.checked); } }
-            Text { text: root.source.state == "unsupported" ? "Unavailable" : (root.source.state == "running" ? "Watching" : "Stopped"); color: root.source.state == "running" ? Theme.success : Theme.text-muted; font-size: 11px; vertical-alignment: center; }
+            spacing: Theme.gap;
+
+            VerticalLayout {
+                spacing: 2px;
+                horizontal-stretch: 1;
+
+                Text {
+                    text: root.source.label;
+                    color: Theme.text;
+                    font-size: 14px;
+                    font-weight: 600;
+                }
+                Text {
+                    text: root.state-text;
+                    color: root.state-tint;
+                    font-size: 12px;
+                }
+            }
+
+            // A switch, not a checkbox: this starts and stops a process that
+            // watches the machine, which is a setting rather than a selection.
+            // Disabled only when there is genuinely nothing to toggle; the
+            // last-observer case stays enabled so the explanation below is what
+            // the person reads, not a control that silently does nothing.
+            Switch {
+                checked: root.source.state == "running";
+                enabled: !root.repairable && !root.only-observer;
+                accessible-label: root.source.label;
+                accessible-description: root.source.label + " is " + root.state-text;
+                toggled => { root.toggle(root.source.id, self.checked); }
+            }
         }
-        if root.source.state == "unsupported": Text { text: "This source is not available for this session."; color: Theme.text-muted; font-size: 11px; wrap: word-wrap; }
+
+        if root.only-observer && root.source.state == "running": Text {
+            text: "This is the only thing Squid is watching. Turn on another before switching this one off.";
+            color: Theme.text-muted;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+
+        if root.repairable: HorizontalLayout {
+            spacing: Theme.gap;
+            Text {
+                text: "Squid cannot start this yet. It needs a setting first.";
+                color: Theme.text-muted;
+                font-size: 12px;
+                wrap: word-wrap;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Button {
+                text: "Set it up";
+                accessible-description: "Open the settings that " + root.source.label + " needs.";
+                clicked => { root.configure(root.source.id); }
+            }
+        }
+
+        // The local escape hatch. Not a global technical mode: the raw values
+        // for this one capability, reachable from this one capability, and
+        // closed again by the same control.
+        if !root.repairable: HorizontalLayout {
+            alignment: start;
+            Button {
+                text: root.expanded ? "Hide settings" : "Settings";
+                accessible-description: (root.expanded ? "Hide" : "Show") + " the settings for " + root.source.label;
+                clicked => { root.open(root.source.id); }
+            }
+        }
     }
 }

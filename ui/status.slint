@@ -1,29 +1,226 @@
 import { Theme } from "theme.slint";
 
-export component StatusDot inherits Rectangle {
-    in property <string> state;
-    width: 10px; height: 10px; border-radius: 5px;
-    background: state == "failed" ? Theme.danger : (state == "paused" || state == "needs_config" || state == "restarting" ? Theme.warning : (state == "ready" || state == "running" || state == "open" || state == "replied" ? Theme.success : Theme.text-muted));
+// The panel's whole state vocabulary, and the one place it is decided.
+//
+// Six states, each identified four ways at once: a drawn shape, a plain-language
+// title, a sentence naming the consequence, and only then a colour. The shape is
+// what makes the set survive greyscale and colour-blindness — the panel used to
+// distinguish every state by hex alone, so a green dot and a red dot were the
+// same dot to roughly one man in twelve.
+//
+// `severity` is deliberately ordered: the mapping below reads it top-down and
+// stops at the first match, so a pending decision outranks a healthy session.
+// That ordering is the fix for the worst thing the old panel did — it said
+// "Squid is ready" in calm green while a confirmation sat unanswered and
+// off-screen below the settings form.
+export enum PanelState { waiting, needs-hand, paused, working, limited, watching }
+
+// The shape for one state, drawn rather than typed.
+//
+// A `Path` with SVG commands instead of a glyph from the system font: an
+// emoji or a unicode dingbat renders differently on every host, at a size the
+// font decides, in a colour it may refuse to change. These are 24-unit boxes so
+// the stroke weight matches across all six.
+component StateShape inherits Rectangle {
+    in property <PanelState> state;
+    in property <brush> tint;
+
+    width: 22px;
+    height: 22px;
+
+    // Watching: a filled disc. The steady state, and the only one with no
+    // interior detail — nothing is wrong, so there is nothing to read.
+    if root.state == PanelState.watching: Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: "M 12 3 A 9 9 0 1 1 11.99 3 Z";
+        fill: root.tint;
+    }
+
+    // Paused: two upright bars. Reads as paused at 22px and in greyscale, which
+    // a hollow circle would not.
+    if root.state == PanelState.paused: Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: "M 8 4 L 11 4 L 11 20 L 8 20 Z M 13 4 L 16 4 L 16 20 L 13 20 Z";
+        fill: root.tint;
+    }
+
+    // Working: a three-quarter ring. Static on purpose — a spinning indicator
+    // for a steady state reads as stuck, and Microsoft's own notification-area
+    // guidance says an icon's presence already asserts continuous activity.
+    if root.state == PanelState.working: Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: "M 12 4 A 8 8 0 1 1 4 12";
+        stroke: root.tint;
+        stroke-width: 3px;
+        fill: transparent;
+    }
+
+    // Limited: a hollow ring. Same silhouette as watching, hollowed out, so the
+    // pair reads as "the shape of working, without the substance".
+    if root.state == PanelState.limited: Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: "M 12 4 A 8 8 0 1 1 11.99 4 Z";
+        stroke: root.tint;
+        stroke-width: 2.5px;
+        fill: transparent;
+    }
+
+    // Needs a hand: a triangle. The one silhouette that is not round, because it
+    // is the one state a person has to act on.
+    if root.state == PanelState.needs-hand: Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: "M 12 3 L 22 20 L 2 20 Z";
+        fill: root.tint;
+    }
+
+    // Waiting for you: a disc with a mark cut out of it. Its own silhouette
+    // rather than the watching disc with a badge stuck on the corner — an
+    // overlay at this size reads as one lumpy blob, and the whole point of the
+    // set is that the six shapes stay apart from each other in greyscale.
+    //
+    // The cut-out is drawn in the surface colour rather than punched out of the
+    // path, because this shape only ever sits on a card and a second fill is one
+    // line where an even-odd subpath would be four.
+    if root.state == PanelState.waiting: Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: "M 12 3 A 9 9 0 1 1 11.99 3 Z";
+        fill: root.tint;
+    }
+    if root.state == PanelState.waiting: Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: "M 10.9 6.5 L 13.1 6.5 L 12.8 13.5 L 11.2 13.5 Z M 12 15.4 A 1.4 1.4 0 1 1 11.99 15.4 Z";
+        fill: Theme.surface;
+    }
 }
 
+// The header that answers "what is Squid doing right now".
+//
+// Everything here is derived from the wire; nothing is remembered. The
+// precedence in `state` is the component's real content — see the enum's note.
 export component StatusSummary inherits Rectangle {
     in property <string> agent-state;
     in property <string> service-state;
     in property <string> gate;
     in property <string> updated-at;
     in property <string> detail;
-    background: Theme.surface; border-radius: 8px; border-width: 1px; border-color: Theme.line;
-    VerticalLayout {
-        padding: 16px; spacing: 10px;
-        HorizontalLayout {
-            spacing: 10px;
-            StatusDot { state: root.service-state == "" ? root.agent-state : root.service-state; }
-            VerticalLayout {
-                spacing: 2px; horizontal-stretch: 1;
-                Text { text: root.agent-state == "needs_config" ? "Finish setup to begin" : (root.agent-state == "ready" ? "Squid is ready" : "Waiting for a session"); color: Theme.text; font-size: 18px; font-weight: 700; }
-                Text { text: root.detail == "" ? (root.updated-at == "" ? "No observations received yet" : "Updated " + root.updated-at) : root.detail; color: Theme.text-muted; font-size: 12px; wrap: word-wrap; }
+    in property <bool> decision-pending;
+
+    // First match wins, most urgent first.
+    out property <PanelState> state:
+        root.decision-pending ? PanelState.waiting
+        : root.service-state == "failed" ? PanelState.needs-hand
+        : root.agent-state == "needs_config" ? PanelState.needs-hand
+        : root.gate == "paused" ? PanelState.paused
+        : root.service-state == "restarting" ? PanelState.working
+        // No reading yet is not health. Until an observation arrives there is
+        // nothing to claim, and claiming it anyway is how a dead session looks
+        // like a quiet machine.
+        : root.updated-at == "" ? PanelState.limited
+        : root.gate == "" ? PanelState.limited
+        : PanelState.watching;
+
+    out property <string> title:
+        root.state == PanelState.waiting ? "Waiting for you"
+        : root.state == PanelState.needs-hand ? (root.service-state == "failed" ? "Squid has stopped" : "Finish setup to begin")
+        : root.state == PanelState.paused ? "Paused"
+        : root.state == PanelState.working ? "Starting up"
+        : root.state == PanelState.limited ? "Not watching yet"
+        : "Watching";
+
+    // The consequence, not a restatement of the title. This is the sentence a
+    // person reads to decide whether they need to do anything.
+    out property <string> consequence:
+        root.state == PanelState.waiting ? "Squid is asking permission before it acts."
+        : root.state == PanelState.needs-hand && root.service-state == "failed" ? "Nothing is being watched until it starts again."
+        : root.state == PanelState.needs-hand ? "Squid is watching, but it cannot think yet."
+        : root.state == PanelState.paused ? "Squid will not record anything new until you resume."
+        : root.state == PanelState.working ? "Squid is coming back up."
+        : root.state == PanelState.limited ? "Squid has not reported anything it has seen."
+        : "Squid is recording what happens on this machine.";
+
+    out property <brush> tint:
+        root.state == PanelState.waiting ? Theme.danger
+        : root.state == PanelState.needs-hand ? (root.service-state == "failed" ? Theme.danger : Theme.caution)
+        : root.state == PanelState.paused ? Theme.caution
+        : root.state == PanelState.working ? Theme.caution
+        : root.state == PanelState.limited ? Theme.text-muted
+        : Theme.calm;
+
+    background: Theme.surface;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: root.state == PanelState.watching ? Theme.line : root.tint;
+
+    // One accessible node for the whole summary. A screen reader should hear the
+    // state and its consequence as one sentence, not six unlabelled fragments.
+    accessible-role: text;
+    accessible-label: "Squid status";
+    accessible-description: root.title + ". " + root.consequence;
+
+    HorizontalLayout {
+        padding: Theme.pad;
+        spacing: Theme.gap;
+
+        StateShape {
+            state: root.state;
+            tint: root.tint;
+            y: 2px;
+        }
+
+        VerticalLayout {
+            spacing: 2px;
+            horizontal-stretch: 1;
+
+            Text {
+                text: root.title;
+                color: Theme.text;
+                font-size: 19px;
+                font-weight: 700;
             }
-            Text { text: root.gate == "paused" ? "Capture paused" : (root.gate == "open" ? "Capture on" : "Capture unknown"); color: root.gate == "paused" ? Theme.warning : Theme.text-muted; font-size: 12px; vertical-alignment: center; }
+            Text {
+                text: root.consequence;
+                color: Theme.text-muted;
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+            // The supervisor's own words, when it has any. Kept verbatim: it
+            // names a real failure, and paraphrasing it here would be a second
+            // opinion the panel is not entitled to.
+            if root.detail != "": Text {
+                text: root.detail;
+                color: root.tint;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+            // Never "as of" alone. A timestamp with no claim attached is what let
+            // stale data read as current.
+            Text {
+                text: root.updated-at == "" ? "" : "Last saw activity at " + root.updated-at;
+                color: Theme.text-muted;
+                font-size: 12px;
+                wrap: no-wrap;
+            }
         }
     }
 }

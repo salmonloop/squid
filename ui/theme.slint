@@ -1,17 +1,54 @@
 import { Palette } from "std-widgets.slint";
-// Fluent Palette's system color scheme instead of carrying a second light theme.
+
+// One place every colour, radius, and gap in the panel comes from.
+//
+// Derived from Fluent's `Palette.color-scheme` rather than carrying a second
+// theme: the ship target is Windows, where the scheme is a system preference,
+// and a panel that stayed light on a dark desktop would be the only window that
+// did. Every value below therefore answers the scheme instead of being a
+// literal, and no component is allowed a raw hex — the old panel had twelve of
+// them tuned for white, which is why it was unreadable the moment the desktop
+// went dark.
 export global Theme {
     out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
-    out property <brush> canvas: dark ? #1d1d1d : #f7f7f7;
-    out property <brush> surface: dark ? #262626 : #ffffff;
-    out property <brush> surface-muted: dark ? #303030 : #f1f1f1;
-    out property <brush> text: dark ? #f4f4f4 : #202020;
-    out property <brush> text-muted: dark ? #c9c9c9 : #5e5e5e;
-    out property <brush> line: dark ? #4a4a4a : #d4d4d4;
-    out property <brush> accent: dark ? #8cc8ff : #005fb8;
-    out property <brush> accent-ink: dark ? #061b2d : #ffffff;
-    out property <brush> success: dark ? #75d6a2 : #107c41;
-    out property <brush> warning: dark ? #f5ca7a : #9a6700;
-    out property <brush> danger: dark ? #ffb4ab : #c42b1c;
-    out property <brush> focus: dark ? #8cc8ff : #005fb8;
+
+    // Surfaces, from furthest back to nearest front. Three is the ceiling: a
+    // fourth would mean a card inside a card inside a card, which is depth
+    // standing in for hierarchy.
+    out property <brush> canvas: dark ? #1b1b1f : #f4f5f7;
+    out property <brush> surface: dark ? #26262b : #ffffff;
+    out property <brush> surface-sunken: dark ? #1f1f24 : #eef0f3;
+
+    // Text. `text-muted` carries labels and secondary lines, so it is tuned for
+    // contrast against `surface` rather than picked for prettiness: the old
+    // panel's #999999 on white measured about 2.9:1 and was where it put the
+    // one deadline the user had to read.
+    out property <brush> text: dark ? #f2f3f5 : #1a1c1f;
+    out property <brush> text-muted: dark ? #b9bcc2 : #56595f;
+
+    out property <brush> line: dark ? #3c3d43 : #d6d9de;
+    out property <brush> focus: dark ? #7cb8ff : #0b5cad;
+
+    // State colours. Each is the *fourth* channel of a state, never the only
+    // one: WCAG 1.4.1 is explicit that a green-means-good, red-means-bad pair
+    // needs a visible non-colour difference no matter how far apart the two
+    // luminances are, so every use of these sits beside a shape and a word.
+    out property <brush> calm: dark ? #6cd39b : #0f7038;
+    out property <brush> caution: dark ? #f0c274 : #8a5a00;
+    out property <brush> danger: dark ? #ffb3a7 : #b3261e;
+
+    // A spacing scale, so a gap is chosen from a set rather than typed. The old
+    // panel used one 10px gap for everything, which is why a section header, its
+    // rows, and the next section all sat the same distance apart and nothing
+    // read as a group.
+    out property <length> gap-tight: 6px;
+    out property <length> gap: 12px;
+    out property <length> gap-loose: 20px;
+    out property <length> pad: 16px;
+    out property <length> radius: 10px;
+
+    // The label column every field shares. One property rather than the six
+    // copies of `122px` the old panel carried, three of which had drifted to
+    // different vertical alignments.
+    out property <length> label-column: 132px;
 }

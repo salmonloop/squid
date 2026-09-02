@@ -32,7 +32,9 @@ mod startup;
 mod supervisor;
 mod transport;
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -74,6 +76,36 @@ const POISONED: &str = "pending prompt lock poisoned; refusing to answer";
 struct Dumps {
     settings: Vec<ConfigLine>,
     sources: Vec<SourceLine>,
+}
+
+/// The last dump of each kind, kept on the UI thread so a disclosure is local.
+///
+/// The window shows one capability's settings at a time, and it decides which
+/// rows those are by matching the brain's own `group` against the source's own
+/// label. Both halves of that match live here rather than in Slint: Slint cannot
+/// take a subset of a model, and a filter written there would have needed the
+/// panel to recognise setting ids — the one thing the wire's `group` field exists
+/// to prevent.
+///
+/// A thread-local rather than a lock, and that is the load-bearing part: every
+/// reader and writer here is the Slint event loop. The reader thread cannot hold
+/// a reference to it — `upgrade_in_event_loop` takes a `Send` closure, and this
+/// deliberately is not — so the only way to reach it is from inside a closure the
+/// event loop is already running. A mutex would have been a claim about threads
+/// that never touch it.
+#[derive(Default)]
+struct ViewState {
+    settings: RefCell<Vec<ConfigLine>>,
+    sources: RefCell<Vec<SourceLine>>,
+}
+
+thread_local! {
+    static VIEW: Rc<ViewState> = Rc::new(ViewState::default());
+}
+
+/// Runs `body` against the UI thread's view state.
+fn with_view<T>(body: impl FnOnce(&ViewState) -> T) -> T {
+    VIEW.with(|state| body(state))
 }
 
 /// The one line `--version` prints, and the only place the binary names itself.
@@ -254,6 +286,25 @@ fn main() {
         window.on_refresh(move || {
             outgoing.send(&config_get_line());
             outgoing.send(&source_get_line());
+        });
+    }
+    {
+        // Opening a capability's settings is entirely local: the rows are already
+        // here from the last dump, so a disclosure costs no round trip and cannot
+        // fail. Toggling closed is the same call with the same name, which is why
+        // one control both opens and closes a door.
+        let handle = window.as_weak();
+        window.on_select_group(move |group| {
+            let Some(window) = handle.upgrade() else {
+                return;
+            };
+            let next = if window.get_open_group() == group {
+                SharedString::new()
+            } else {
+                group
+            };
+            window.set_open_group(next);
+            refresh_groups(&window);
         });
     }
     {
@@ -485,27 +536,90 @@ fn apply(
 /// so a dump can arrive one row short with nothing else to show it. A user who
 /// reads a missing key as "not a setting" would be misled by silence, so the
 /// shortfall is stated in the status line.
+///
+/// The rows are also kept, not just projected. The panel shows one group's
+/// settings at a time, and re-asking the brain for the whole dump every time a
+/// door opens would make a local disclosure a round trip.
 fn show_settings(window: &PanelWindow, rows: Vec<ConfigLine>, count: i64) {
     let note = dump_note("settings", rows.len(), count);
-    let form: Vec<SettingRow> = rows
-        .into_iter()
-        .map(|row| SettingRow {
-            id: row.id.into(),
-            label: row.label.into(),
-            kind: row.kind.into(),
-            value: row.value.into(),
-            applies: row.applies.into(),
-            // Anything but an explicit 1 reads as not overridden: this is a
-            // disclosure, and claiming one on a malformed field would be worse
-            // than leaving it off.
-            overridden: row.overridden == Some(1),
-            values: row.values.unwrap_or_default().into(),
-        })
-        .collect();
+    let form: Vec<SettingRow> = rows.iter().map(setting_row).collect();
+    with_view(|state| *state.settings.borrow_mut() = rows);
     window.set_settings(ModelRc::new(VecModel::from(form)));
+    refresh_groups(window);
     if let Some(note) = note {
         window.set_status(note.into());
     }
+}
+
+/// One wire row as the window's own struct.
+///
+/// Everything optional collapses to a value that reads as "not stated" rather
+/// than as a claim: an absent `group` puts the setting in no capability's door,
+/// and an absent `secretPresent` reads as no stored credential. Anything but an
+/// explicit `1` on either flag is treated as false, because both are disclosures
+/// and asserting one from a malformed field is worse than leaving it off.
+fn setting_row(row: &ConfigLine) -> SettingRow {
+    SettingRow {
+        id: row.id.clone().into(),
+        label: row.label.clone().into(),
+        kind: row.kind.clone().into(),
+        value: row.value.clone().into(),
+        applies: row.applies.clone().into(),
+        overridden: row.overridden == Some(1),
+        values: row.values.clone().unwrap_or_default().into(),
+        group: row.group.clone().unwrap_or_default().into(),
+        description: row.description.clone().unwrap_or_default().into(),
+        secret_present: row.secret_present == Some(1),
+    }
+}
+
+/// Recomputes the group list, the open group's rows, and the running count.
+///
+/// Both dumps feed this, so it runs after either one lands. The group list is
+/// the distinct `group` values in dump order with any group a source card
+/// already owns removed — a capability's settings belong behind that capability,
+/// and listing them twice would make the second copy the "advanced" pile this
+/// design exists to avoid.
+fn refresh_groups(window: &PanelWindow) {
+    with_view(|state| refresh_groups_from(window, state));
+}
+
+fn refresh_groups_from(window: &PanelWindow, state: &ViewState) {
+    let settings = state.settings.borrow();
+    let sources = state.sources.borrow();
+
+    let owned_by_a_source: Vec<&str> = sources.iter().map(|row| row.label.as_str()).collect();
+    let mut groups: Vec<SharedString> = Vec::new();
+    for row in settings.iter() {
+        let Some(group) = row.group.as_deref() else {
+            continue;
+        };
+        if group.is_empty() || owned_by_a_source.contains(&group) {
+            continue;
+        }
+        if groups.iter().any(|seen| seen.as_str() == group) {
+            continue;
+        }
+        groups.push(group.into());
+    }
+    window.set_setting_groups(ModelRc::new(VecModel::from(groups)));
+
+    let open = window.get_open_group();
+    let rows: Vec<SettingRow> = settings
+        .iter()
+        .filter(|row| row.group.as_deref() == Some(open.as_str()))
+        .map(setting_row)
+        .collect();
+    window.set_group_settings(ModelRc::new(VecModel::from(rows)));
+
+    window.set_running_sources(
+        sources
+            .iter()
+            .filter(|row| row.state == "running")
+            .count()
+            .try_into()
+            .unwrap_or(i32::MAX),
+    );
 }
 
 /// Replaces the source list with a dump. Same swap-whole discipline as
@@ -513,14 +627,16 @@ fn show_settings(window: &PanelWindow, rows: Vec<ConfigLine>, count: i64) {
 fn show_sources(window: &PanelWindow, rows: Vec<SourceLine>, count: i64) {
     let note = dump_note("sources", rows.len(), count);
     let list: Vec<SourceRow> = rows
-        .into_iter()
+        .iter()
         .map(|row| SourceRow {
-            id: row.id.into(),
-            label: row.label.into(),
-            state: row.state.into(),
+            id: row.id.clone().into(),
+            label: row.label.clone().into(),
+            state: row.state.clone().into(),
         })
         .collect();
+    with_view(|state| *state.sources.borrow_mut() = rows);
     window.set_sources(ModelRc::new(VecModel::from(list)));
+    refresh_groups(window);
     if let Some(note) = note {
         window.set_status(note.into());
     }
@@ -625,6 +741,11 @@ fn show_prompt(window: &slint::Weak<PanelWindow>, pending: &Pending, prompt: Pro
         window.set_prompt_kind(prompt.kind.into());
         window.set_prompt_summary(prompt.summary.into());
         window.set_prompt_expires_at(prompt.expires_at.into());
+        // Absent reads as empty, and the card hides the line rather than printing
+        // a heading with nothing under it. A request that does not explain itself
+        // is shown without an explanation, never with one invented here.
+        window.set_prompt_why(prompt.why.unwrap_or_default().into());
+        window.set_prompt_deny_consequence(prompt.deny_consequence.unwrap_or_default().into());
         // Last, so the buttons appear only once the text beside them is the text
         // of this prompt.
         window.set_prompt_pending(true);
@@ -687,6 +808,8 @@ fn clear_prompt(window: PanelWindow) {
     window.set_prompt_kind(SharedString::new());
     window.set_prompt_summary(SharedString::new());
     window.set_prompt_expires_at(SharedString::new());
+    window.set_prompt_why(SharedString::new());
+    window.set_prompt_deny_consequence(SharedString::new());
 }
 
 #[cfg(test)]

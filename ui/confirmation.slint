@@ -1,21 +1,179 @@
 import { Button } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 
-export component ConfirmationSection inherits Rectangle {
-    in property <bool> pending;
+// The one surface where getting it wrong has a real consequence.
+//
+// Four decisions here come from measurement rather than taste, and each one
+// reverses what the panel used to do:
+//
+// **No default button, and Allow is not primary.** A prominent default moves
+// consent by roughly twenty points and leaves people reporting they felt
+// tricked; Apple's own guidance is that a consequential alert should have no
+// default at all, so Return finds nothing until a person has chosen a button
+// with the keyboard. The old panel made Approve `primary: true`, which is the
+// interface leaning on the answer.
+//
+// **Three answers, not two.** Microsoft's own warning checklist says a security
+// decision may be deferred, and a prompt offering only yes and no is answered at
+// random once it has been seen a few times. Later is a real answer here: it
+// stands the request down on screen without approving it, and the engine's
+// deadline still decides in the end.
+//
+// **The summary is capped.** It used to have no ceiling in a window with no
+// minimum height, so a long command pushed both buttons off the bottom edge.
+//
+// **The deadline is legible.** It used to be the lowest-contrast text in the
+// file, which is a poor place for the only time-critical fact on screen.
+export component ConfirmationCard inherits Rectangle {
     in property <string> kind;
     in property <string> summary;
     in property <string> expires-at;
-    callback approve(); callback decline();
-    background: pending ? Theme.surface-muted : Theme.surface; border-radius: 8px; border-width: 1px; border-color: pending ? Theme.warning : Theme.line;
+    // Optional, and hidden when the wire does not carry them. A capability that
+    // explains itself is better than a panel that invents an explanation.
+    in property <string> why;
+    in property <string> deny-consequence;
+
+    callback allow();
+    callback decline();
+    callback defer();
+
+    background: Theme.surface;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.danger;
+
+    accessible-role: text;
+    accessible-label: "Permission needed";
+    accessible-description: "Squid wants to " + root.kind + ". " + root.summary;
+
     VerticalLayout {
-        padding: 14px; spacing: 8px;
-        Text { text: pending ? "Confirmation needed" : "Confirmations"; color: Theme.text; font-size: 14px; font-weight: 700; }
-        Text { text: pending ? (root.kind + ": " + root.summary) : "Nothing needs your attention right now."; color: Theme.text-muted; font-size: 12px; wrap: word-wrap; }
-        if pending: HorizontalLayout {
-            Text { text: root.expires-at == "" ? "Review before continuing" : "Expires " + root.expires-at; color: Theme.warning; font-size: 11px; horizontal-stretch: 1; vertical-alignment: center; }
-            Button { text: "Decline"; clicked => { root.decline(); } }
-            Button { text: "Approve"; primary: true; clicked => { root.approve(); } }
+        padding: Theme.pad;
+        spacing: Theme.gap;
+
+        Text {
+            text: "Squid wants to " + (root.kind == "" ? "act" : root.kind);
+            color: Theme.text;
+            font-size: 17px;
+            font-weight: 700;
+            wrap: word-wrap;
+        }
+
+        // The reason, when the request carries one. First, because it is what a
+        // person needs before the mechanics.
+        if root.why != "": Text {
+            text: root.why;
+            color: Theme.text;
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+
+        // What will run. Monospace here is not costume — it is a command, and
+        // its exact spelling is the thing being authorised.
+        Rectangle {
+            background: Theme.surface-sunken;
+            border-radius: 6px;
+            VerticalLayout {
+                padding: Theme.gap;
+                Text {
+                    text: root.summary == "" ? "No details were provided." : root.summary;
+                    color: Theme.text;
+                    font-family: "monospace";
+                    font-size: 12px;
+                    wrap: word-wrap;
+                    // Capped, and elided rather than clipped: the buttons below
+                    // must stay on screen no matter how long the summary is.
+                    max-height: 96px;
+                    overflow: elide;
+                }
+            }
+        }
+
+        // The cost of saying no, stated before the buttons. Little Snitch shows
+        // this even to people who never expand anything, and it is the sentence
+        // that makes a refusal an informed choice rather than a guess.
+        if root.deny-consequence != "": Text {
+            text: "If you decline: " + root.deny-consequence;
+            color: Theme.text-muted;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+
+        HorizontalLayout {
+            spacing: Theme.gap;
+
+            Text {
+                text: root.expires-at == "" ? "This request has no deadline." : "Expires at " + root.expires-at;
+                color: Theme.caution;
+                font-size: 13px;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                wrap: word-wrap;
+            }
+        }
+
+        // Equal weight, and in the order a Windows reader scans. None is
+        // primary; none holds focus until asked for.
+        HorizontalLayout {
+            spacing: Theme.gap;
+            alignment: end;
+
+            Button {
+                text: "Decline";
+                accessible-description: "Refuse this request. Squid will not act.";
+                clicked => { root.decline(); }
+            }
+            Button {
+                text: "Later";
+                accessible-description: "Set this aside without answering. It stays pending until it expires.";
+                clicked => { root.defer(); }
+            }
+            Button {
+                text: "Allow";
+                accessible-description: "Permit Squid to " + root.kind + " once.";
+                clicked => { root.allow(); }
+            }
+        }
+    }
+}
+
+// The standing reminder that a set-aside decision is still waiting.
+//
+// Deferring must not lose the request. This is the one thing Home keeps showing
+// after Later, so a person can come back to it — an unanswered prompt that
+// vanished from the interface would be indistinguishable from one that was
+// answered.
+export component DeferredNotice inherits Rectangle {
+    callback reopen();
+
+    background: Theme.surface;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.caution;
+
+    HorizontalLayout {
+        padding: Theme.pad;
+        spacing: Theme.gap;
+
+        VerticalLayout {
+            spacing: 2px;
+            horizontal-stretch: 1;
+            Text {
+                text: "A decision is still waiting";
+                color: Theme.text;
+                font-size: 14px;
+                font-weight: 700;
+            }
+            Text {
+                text: "You set this aside. Squid will not act until you answer, and the request expires on its own.";
+                color: Theme.text-muted;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
+        Button {
+            text: "Review";
+            accessible-description: "Show the decision you set aside.";
+            clicked => { root.reopen(); }
         }
     }
 }
