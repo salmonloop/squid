@@ -135,7 +135,21 @@ export interface PanelSourceLine {
   readonly id: string;
   readonly label: string;
   readonly state: "running" | "stopped" | "unsupported";
-  /** V2-only plain-language explanation and repair affordance. */
+}
+
+/**
+ * Why a source is in the state it is, and what would repair it.
+ *
+ * V2 only, and `repair` is the reason: it is a nested object, which the flat
+ * `source` line cannot carry — the hand parser drops a whole line containing one
+ * rather than ignoring the field. So this shape never appears on `PanelSourceLine`,
+ * and a builder for the flat line does not accept it. Accepting an input and
+ * discarding it is worse than refusing it, because the caller is told nothing.
+ */
+export interface PanelSourceDetail {
+  readonly id: string;
+  readonly label: string;
+  readonly state: "running" | "stopped" | "unsupported";
   readonly reason?: string;
   readonly repair?: { readonly configId?: string; readonly label?: string };
 }
@@ -371,9 +385,6 @@ export function panelSourceLine(input: {
   readonly id: string;
   readonly label: string;
   readonly state: "running" | "stopped" | "unsupported";
-  /** V2-only plain-language explanation and repair affordance. */
-  readonly reason?: string;
-  readonly repair?: { readonly configId?: string; readonly label?: string };
 }): PanelSourceLine {
   return {
     type: "source",
@@ -430,24 +441,48 @@ export type PanelV2Message = PanelV2Snapshot | PanelV2Event;
 /** Converts only display-safe legacy projections into a nested V2 event. */
 export function panelV2Event(message: PanelMessage): PanelV2Event {
   const { type, ...data } = message as PanelMessage & Record<string, unknown>;
-  return { type: "event", protocolVersion: 2, event: { type, data: sanitizeV2Data(data) } };
+  return { type: "event", protocolVersion: 2, event: { type, data: sanitizedRecord(data) } };
 }
 
 /** V2 metadata is sanitized at the same boundary as legacy display text. */
 export function panelV2Config(entry: PanelConfigEntryInput): Record<string, unknown> {
-  return sanitizeV2Data({ id: entry.id, label: entry.label, kind: entry.kind, value: entry.kind === "secret" ? undefined : entry.value,
+  return sanitizedRecord({ id: entry.id, label: entry.label, kind: entry.kind, value: entry.kind === "secret" ? undefined : entry.value,
     applies: entry.applies, overridden: entry.overridden, values: entry.values, group: entry.group,
     description: entry.description, secretPresent: entry.kind === "secret" ? Boolean(entry.secretPresent) : undefined });
 }
-export function panelV2Source(entry: Parameters<typeof panelSourceLine>[0]): Record<string, unknown> {
-  return sanitizeV2Data({ id: entry.id, label: entry.label, state: entry.state, reason: entry.reason, repair: entry.repair });
+export function panelV2Source(entry: PanelSourceDetail): Record<string, unknown> {
+  return sanitizedRecord({ id: entry.id, label: entry.label, state: entry.state, reason: entry.reason, repair: entry.repair });
 }
 
-function sanitizeV2Data(value: unknown): any {
+/**
+ * Sanitizes every string anywhere in a V2 payload, however deeply nested.
+ *
+ * Recursive rather than field-by-field because the V2 shape is nested and a
+ * per-field call is a list somebody has to remember to extend. This module is the
+ * privacy choke point — everything the panel renders passes through here — so the
+ * safe default has to be structural: a new field is sanitized because it is a
+ * string, not because a maintainer noticed it.
+ *
+ * An `undefined` value drops its key rather than becoming `null`. "Not observed"
+ * is a real state the panel renders in words, and the Rust parser refuses a line
+ * carrying `null` outright.
+ */
+function sanitizeV2Data(value: unknown): unknown {
   if (typeof value === "string") return sanitizeAuditText(value, "diagnostic").text;
   if (Array.isArray(value)) return value.map(sanitizeV2Data);
-  if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).flatMap(([key, child]) => child === undefined ? [] : [[key, sanitizeV2Data(child)]]));
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).flatMap(([key, child]) =>
+        child === undefined ? [] : [[key, sanitizeV2Data(child)]],
+      ),
+    );
+  }
   return value;
+}
+
+/** Narrows a sanitized payload back to the object shape its caller declared. */
+function sanitizedRecord(value: unknown): Record<string, unknown> {
+  return sanitizeV2Data(value) as Record<string, unknown>;
 }
 
 /**

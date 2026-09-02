@@ -137,9 +137,3 @@ export class SerialConfirmationPolicy implements ActionConfirmationPolicy {
     }
   }
 }
-
-export function isUnavailableSurfaceError(_error: unknown): boolean {
-  // Kept as a compatibility predicate for surfaces that classify their own
-  // shutdown errors. The policy itself now fail-closes every surface failure.
-  return true;
-}
