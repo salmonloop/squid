@@ -15,9 +15,12 @@ const POLL_MS = 100;
 const STARTUP_TIMEOUT_MS = 15_000;
 const INTERACTION_TIMEOUT_MS = 5_000;
 const WINDOW_TITLE = "Squid";
+/** The prompt the fixture raises, and the only id an answer may name. */
+const PROMPT_ID = 41;
 
 interface CommandResult { readonly code: number | null; readonly stdout: string; readonly stderr: string }
 interface PanelReply { readonly type?: unknown; readonly op?: unknown; readonly promptId?: unknown; readonly answer?: unknown }
+interface WindowGeometry { readonly id: string; readonly x: number; readonly y: number; readonly width: number; readonly height: number }
 interface Fixture {
   readonly socketPath: string;
   readonly replies: readonly PanelReply[];
@@ -91,7 +94,7 @@ function panelFixture(socketPath: string): Promise<Fixture> {
         send({ type: "service", agentState: "ready" });
         send({ type: "world_state", updatedAt: "2026-09-01T12:00:00.000Z", lastEvent: "file_saved", application: "Smoke Fixture", window: "panel-smoke.ts", gate: "open", selectionLength: 7, recentActions: "file_saved", episodeEvents: 1 });
         send({ type: "agent", at: "2026-09-01T12:00:01.000Z", status: "replied", text: "Smoke fixture connected." });
-        send({ type: "prompt", promptId: 41, kind: "run_tests", summary: "bun test", expiresAt: "2026-09-01T12:05:00.000Z" });
+        send({ type: "prompt", promptId: PROMPT_ID, kind: "run_tests", summary: "bun test", expiresAt: "2026-09-01T12:05:00.000Z" });
       };
       socket.on("data", (chunk: Buffer) => {
         buffer += chunk.toString("utf8");
@@ -126,38 +129,120 @@ function panelFixture(socketPath: string): Promise<Fixture> {
   });
 }
 
-async function awaitWindow(display: string): Promise<string> {
+/**
+ * The panel window's id and absolute geometry, once it is actually on screen.
+ *
+ * `IsViewable` rather than mere existence: `xdotool search` keeps matching a
+ * window after it is unmapped, so presence is not the question. Geometry is
+ * read from the same `xwininfo` call that proved viewability, because a second
+ * call could land after a resize and crop the screenshot to the wrong box.
+ */
+async function awaitWindow(display: string): Promise<WindowGeometry> {
   const env = { ...process.env, DISPLAY: display };
   return eventually("a mapped Squid window", async () => {
     const found = await run("xdotool", ["search", "--name", `^${WINDOW_TITLE}$`], env);
     for (const id of found.stdout.trim().split(/\s+/)) {
       if (id.length === 0) continue;
       const info = await run("xwininfo", ["-id", id], env);
-      if (info.code === 0 && info.stdout.includes("IsViewable")) return id;
+      if (info.code !== 0 || !info.stdout.includes("IsViewable")) continue;
+      const read = (label: string): number | null => {
+        const match = info.stdout.match(new RegExp(`${label}:\\s+(-?\\d+)`));
+        return match?.[1] === undefined ? null : Number(match[1]);
+      };
+      const x = read("Absolute upper-left X");
+      const y = read("Absolute upper-left Y");
+      const width = read("Width");
+      const height = read("Height");
+      if (x === null || y === null || width === null || height === null) continue;
+      return { id, x, y, width, height };
     }
     return null;
   });
 }
 
-async function screenshot(display: string, windowId: string, path: string): Promise<void> {
-  const result = await run("import", ["-display", display, "-window", windowId, path], { ...process.env, DISPLAY: display });
-  if (result.code !== 0) fail(`could not save ${path}: ${result.stderr.trim() || "ImageMagick import failed"}`);
+/**
+ * Screenshot of one window, cropped to exactly that window's geometry.
+ *
+ * `ffmpeg -f x11grab` rather than ImageMagick's `import`: the same tool is
+ * already the repo's image converter, and its `+x,y` offset plus `-video_size`
+ * crop to the window without a second process. `import -window` would be one
+ * call, but it puts ImageMagick on the prerequisite list for a check whose
+ * whole job is to be runnable.
+ *
+ * Cropping rather than grabbing the whole root: under a bare Xvfb there is no
+ * window manager, so the rest of the screen is uninitialised noise that would
+ * dominate any visual review of the panel itself.
+ */
+async function screenshot(display: string, geometry: WindowGeometry, path: string): Promise<void> {
+  const result = await run("ffmpeg", [
+    "-loglevel", "error",
+    "-f", "x11grab",
+    "-video_size", `${geometry.width}x${geometry.height}`,
+    "-i", `${display}+${geometry.x},${geometry.y}`,
+    "-frames:v", "1",
+    "-y", path,
+  ]);
+  if (result.code !== 0) fail(`could not save ${path}: ${result.stderr.trim() || "ffmpeg x11grab failed"}`);
 }
 
-async function clickApprove(display: string, windowId: string): Promise<void> {
+/** How many Tab steps the walk will try before giving up on reaching a button. */
+const MAX_TAB_STEPS = 12;
+/** How long to wait for an answer that must NOT arrive. Short: absence is the assertion. */
+const NEGATIVE_WAIT_MS = 600;
+
+/** Whether any answer for this prompt has reached the fixture yet. */
+function answerFor(fixture: Fixture, promptId: number): PanelReply | undefined {
+  return fixture.replies.find((reply) => reply.type === "answer" && reply.promptId === promptId);
+}
+
+/**
+ * Walks the keyboard to a confirmation button and reports which answer it sent.
+ *
+ * Self-discovering rather than a hardcoded Tab count. A fixed count encodes this
+ * layout's focus order into the check, so the next honest layout change fails
+ * here for no reason — and worse, a count that lands on the wrong button still
+ * produces *an* answer, which reads as a pass.
+ *
+ * The first Return is pressed before any Tab, and its job is to find nothing.
+ * That is the assertion the research asks for: a confirmation with a default
+ * button is answered by whoever was mid-keystroke when it appeared, and Apple's
+ * own guidance is to give a consequential alert no default at all. Absence has
+ * to be measured, so this waits out a real interval rather than checking once.
+ */
+async function walkToAnswer(
+  display: string,
+  windowId: string,
+  fixture: Fixture,
+  promptId: number,
+): Promise<{ readonly answer: string; readonly tabs: number }> {
   const env = { ...process.env, DISPLAY: display };
-  // Slint has no stable accessibility selector. The prompt order is Decline,
-  // Approve, so keyboard traversal is preferred. The final click is a documented
-  // window-relative fallback for host themes that alter focus traversal.
-  if ((await run("xdotool", ["windowactivate", "--sync", windowId, "key", "Tab", "Tab", "Return"], env)).code === 0) return;
-  if ((await run("xdotool", ["mousemove", "--window", windowId, "400", "760", "click", "1"], env)).code !== 0) fail("could not drive panel input with xdotool");
+  await run("xdotool", ["windowactivate", "--sync", windowId], env);
+
+  await run("xdotool", ["key", "--window", windowId, "Return"], env);
+  await wait(NEGATIVE_WAIT_MS);
+  const premature = answerFor(fixture, promptId);
+  if (premature !== undefined) {
+    fail(
+      `Return answered the prompt with no button focused (${JSON.stringify(premature.answer)}). ` +
+        "A consequential confirmation must have no default button.",
+    );
+  }
+
+  for (let tabs = 1; tabs <= MAX_TAB_STEPS; tabs += 1) {
+    await run("xdotool", ["key", "--window", windowId, "Tab"], env);
+    await run("xdotool", ["key", "--window", windowId, "Return"], env);
+    await wait(POLL_MS * 2);
+    const reply = answerFor(fixture, promptId);
+    if (reply !== undefined) return { answer: String(reply.answer), tabs };
+  }
+  return fail(`no confirmation button answered within ${MAX_TAB_STEPS} Tab steps`);
 }
 
 async function main(): Promise<void> {
   await requireCommand("Xvfb", "the Xvfb package");
   await requireCommand("xdotool", "the xdotool package");
   await requireCommand("xwininfo", "the x11-utils package");
-  await requireCommand("import", "ImageMagick");
+  await requireCommand("ffmpeg", "the ffmpeg package");
   const root = resolve(dirname(new URL(import.meta.url).pathname), "..");
   const binary = process.argv[2] ?? join(root, "ui", "target", "release", "squid-ui");
   try { await access(binary); } catch { fail(`compiled panel missing at ${binary}; run \`cargo build --release --manifest-path ui/Cargo.toml\`, or pass its path after \`bun run ui:smoke --\`.`); }
@@ -173,16 +258,31 @@ async function main(): Promise<void> {
     log(`ui:smoke output directory: ${outputDirectory}`);
     log(`ui:smoke display: ${display.display}, panel: ${basename(binary)}`);
     await fixture.waitFor("panel subscription", (reply) => reply.type === "subscribe");
-    const windowId = await awaitWindow(display.display);
-    const mapped = join(outputDirectory, "mapped.png");
-    await screenshot(display.display, windowId, mapped);
-    log(`ui:smoke screenshot: ${mapped}`);
-    await clickApprove(display.display, windowId);
-    const answer = await fixture.waitFor("approved prompt reply", (reply) => reply.type === "answer" && reply.promptId === 41 && reply.answer === "approved");
-    const after = join(outputDirectory, "after-approve.png");
-    await screenshot(display.display, windowId, after);
-    log(`ui:smoke screenshot: ${after}`);
-    log(`ui:smoke passed (${JSON.stringify(answer)})`);
+    const window = await awaitWindow(display.display);
+    log(`ui:smoke window: ${window.id} at ${window.width}x${window.height}+${window.x}+${window.y}`);
+
+    const pending = join(outputDirectory, "01-decision-pending.png");
+    await screenshot(display.display, window, pending);
+    log(`ui:smoke screenshot: ${pending}`);
+
+    const walked = await walkToAnswer(display.display, window.id, fixture, PROMPT_ID);
+    log(`ui:smoke answered ${JSON.stringify(walked.answer)} after ${walked.tabs} Tab step(s)`);
+
+    // The panel must stop showing a settled decision. A prompt still on screen
+    // after an answer invites a second click on a question already closed.
+    const settled = join(outputDirectory, "02-decision-settled.png");
+    await screenshot(display.display, window, settled);
+    log(`ui:smoke screenshot: ${settled}`);
+
+    // One prompt, one answer. A second Return on the settled surface must not
+    // produce a second line for the same id.
+    const before = fixture.replies.filter((reply) => reply.type === "answer").length;
+    await run("xdotool", ["key", "--window", window.id, "Return"], { ...process.env, DISPLAY: display.display });
+    await wait(NEGATIVE_WAIT_MS);
+    const after = fixture.replies.filter((reply) => reply.type === "answer").length;
+    if (after !== before) fail(`a settled prompt accepted another answer (${before} then ${after})`);
+
+    log("ui:smoke passed");
   } finally {
     stop(panel);
     stop(display?.server);
