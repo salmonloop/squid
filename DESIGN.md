@@ -71,8 +71,18 @@ when it was last heard from and disables/redirects actions honestly.
 
 ## Confirmation
 
-A confirmation is an independent native window because it requires protected
-focus. It always shows decision-critical information: action, reason, outcome
-of refusal, a sanitized summary, and expiry. It never receives command arguments
-or selection text. Allow, Decline, and Later are visually balanced; no button is
-the default, Return cannot approve, and closing/expiry/disconnect fail closed.
+A confirmation takes over the top of the resident window, directly under the
+status header and above the scroll region. It cannot be pushed off-screen by
+content below it, and the status header names the pending decision rather than
+reporting health. It always shows decision-critical information: action, reason,
+outcome of refusal, a sanitized summary, and expiry. It never receives command
+arguments or selection text. Allow, Decline, and Later are visually balanced; no
+button is the default, Return cannot approve, and closing/expiry/disconnect fail
+closed. Later defers without deciding, and the deferred decision stays visible
+until it is answered or expires.
+
+A separate native window is the eventual shape, because a consequential decision
+deserves protected focus. It is deliberately not what ships here: the defect worth
+fixing first was that the decision was invisible and unreachable, and moving it
+above the fold fixes that with one window's lifecycle instead of two. Promoting it
+to its own window is a later change, not a rewrite of this one.
