@@ -196,6 +196,69 @@ describe("config schema", () => {
       if (key.kind === "enum") expect(key.values?.length ?? 0).toBeGreaterThan(0);
     }
   });
+
+  it("files every setting under the capability a user would look for it in", () => {
+    // Restated here rather than derived from the table, which is the only way
+    // this assertion is worth running: a check that read `key.group` back would
+    // agree with any grouping at all, including one that quietly moved a row.
+    // The mapping is a product decision, so it is written down twice on purpose.
+    const EXPECTED = new Map<string, string>([
+      ["modelProvider", "Model"],
+      ["agentTurnTimeoutMs", "Model"],
+      ["watchRoot", "Files"],
+      ["screenReader", "Screen"],
+      ["screenPollMs", "Screen"],
+      ["browser", "Browser"],
+      ["browserPollMs", "Browser"],
+      ["terminal", "Terminal"],
+      ["terminalPath", "Terminal"],
+      ["terminalPollMs", "Terminal"],
+      ["editorSaves", "Editor saves"],
+      ["editorSavesPath", "Editor saves"],
+      ["editorPollMs", "Editor saves"],
+      ["captureGate", "Pause control"],
+      ["captureGatePath", "Pause control"],
+      ["capturePollMs", "Pause control"],
+      ["databasePath", "History"],
+      ["retentionHours", "History"],
+      ["excludeApplications", "Privacy"],
+    ]);
+    // Widened to plain strings on purpose, so this comparison does not inherit
+    // the `ConfigGroup` union: adding a group to the type and to the table would
+    // still have to answer to the map above rather than typecheck its way past
+    // it.
+    const actual = new Map<string, string>(CONFIG_KEYS.map((key) => [key.id, key.group]));
+    expect(actual).toEqual(EXPECTED);
+
+    // A group names a capability the user has a question about, never the code
+    // that implements it — and "Advanced" is neither. It is where a settings
+    // screen files the rows nobody wanted to explain, which is exactly the
+    // outcome `description` exists to make impossible.
+    for (const key of CONFIG_KEYS) expect(key.group).not.toBe("Advanced");
+  });
+
+  it("explains every setting in one sentence that is not its own name", () => {
+    const seen = new Map<string, string>();
+    for (const key of CONFIG_KEYS) {
+      // Sentence-shaped, because this is prose the panel prints beside a field
+      // and not a keyword list: a fragment reads as a truncated label.
+      expect(key.description).toMatch(/^[A-Z].*\.$/);
+      expect(key.description).toContain(" ");
+      // Not the label again. A row whose only description is its own name is a
+      // row whose purpose was never actually decided, and the panel would be
+      // spending a line to repeat itself.
+      expect(key.description.toLowerCase()).not.toBe(key.label.toLowerCase());
+      // Nor a clone of another row's. Four poll intervals share a shape and are
+      // the easy place to paste one sentence four times, which would leave the
+      // user unable to tell which interval they are looking at.
+      const clash = seen.get(key.description);
+      expect(clash).toBeUndefined();
+      seen.set(key.description, key.id);
+    }
+    // The sanitizer caps display text at 200 characters, so a description that
+    // needed truncating would reach the panel ending mid-word.
+    for (const key of CONFIG_KEYS) expect(key.description.length).toBeLessThan(200);
+  });
 });
 
 describe("resolveConfigPath", () => {

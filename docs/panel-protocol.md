@@ -255,14 +255,14 @@ fields are fixed-vocabulary strings.
 
 One settings row per message, sent as the reply to `config_get` (a dump).
 The schema rides the wire — `label`/`kind`/`values` come from the TS side's
-one settings table — so the panel hardcodes no key and stays a dumb client
-across settings changes.
+one settings table, and so do the `group`/`description` display fields — so the
+panel hardcodes no key and stays a dumb client across settings changes.
 
 ```jsonc
-{"type":"config","id":"watchRoot","label":"Watch root","kind":"text","value":"/home/me","applies":"restart","overridden":1}
-{"type":"config","id":"screenReader","label":"Screen reader","kind":"enum","value":"linux","applies":"restart","values":"synthetic;linux;windows"}
-{"type":"config","id":"apiKey","label":"API key","kind":"secret","value":"","applies":"restart"}
-{"type":"config_end","count":18}
+{"type":"config","id":"watchRoot","label":"Watch root","kind":"text","value":"/home/me","applies":"restart","overridden":1,"group":"Files","description":"The folder whose file activity Squid pays attention to."}
+{"type":"config","id":"screenReader","label":"Screen reader","kind":"enum","value":"linux","applies":"restart","values":"synthetic;linux;windows","group":"Screen","description":"How Squid reads the words on your screen."}
+{"type":"config","id":"apiKey","label":"API key","kind":"secret","value":"","applies":"restart","group":"Model","description":"The secret that lets Squid use that model on your behalf.","secretPresent":1}
+{"type":"config_end","count":22}
 ```
 
 | field | type | required | notes |
@@ -275,9 +275,30 @@ across settings changes.
 | `applies` | `"now"` \| `"restart"` | yes | when a saved value takes effect |
 | `overridden` | `0` \| `1` | no | present only when an env var is governing this run, so the file value shown is not the live one |
 | `values` | string | no | `;`-joined enum choices, `enum` kind only |
+| `group` | string | no | the capability this row belongs under, **sanitized** |
+| `description` | string | no | one sentence on what it changes, **sanitized** |
+| `secretPresent` | `0` \| `1` | no | present only when a credential is stored, `secret` kind only |
 
 The dump shows the **file** value even when overridden: the form edits the
 file, and `overridden: 1` is the disclosure that the live run disagrees.
+
+**Grouping is metadata, not structure.** `group` is a scalar string the panel
+buckets rows by; the wire never nests them. A tree here would mean teaching the
+hand-written Rust parser arrays and nested objects — a second half-tested JSON
+implementation — to express something a pass over flat rows already expresses.
+Group names the user-facing capability ("Screen", "Pause control", "History"),
+never the subsystem behind it, and there is deliberately no "Advanced": a row
+that cannot be explained in one sentence is a row to reconsider offering, not to
+file away. Rows of one group are **not** contiguous in dump order, so a renderer
+must bucket by value rather than assume runs. Group *order* rides no field —
+first appearance in the dump is the order, which puts the model rows first.
+
+`group` and `description` are optional on the wire so a brain older than the
+panel still produces a usable form: the Rust side reads them with the same
+tolerant optional-text path as every other display field, and their absence
+costs a heading, never the row. The same holds in reverse — the parser skips
+scalar fields it does not know, which is why adding these was a wire change and
+not a parser rewrite.
 
 **The secret rule is structural, not a convention.** A credential never rides
 the wire in either direction more than once: the dump reports a secret's value
@@ -285,6 +306,16 @@ as the empty string, and the only message that ever carries a real key is the
 panel's `config_set` for it — which is never echoed back, never logged, and
 never quoted in a diagnostic, on either side. There is no "show me the stored
 key" operation at all.
+
+`secretPresent` is the narrowest exception to that silence and is not one in
+substance: it says a credential *exists*, and nothing about what it is. It
+exists because the rule above hid an honest distinction — a stored key and no
+key at all both render as an empty field, so the only way to tell them apart was
+to save an empty value and read back either "kept" or "no API key is stored
+yet", which is a probe in the one field where a mistaken save is least
+recoverable. It is spelled `0`/`1` and omitted when false, exactly like
+`overridden`, because it is the same kind of thing: a disclosure about the value
+rather than the value.
 
 ### `config_result`
 
@@ -366,11 +397,32 @@ without redesigning the transport.
 
 ```jsonc
 {"type":"prompt","promptId":1,"kind":"run_tests","summary":"…","expiresAt":"2026-08-27T10:00:30.000Z"}
+{"type":"prompt","promptId":2,"kind":"run_tests","summary":"bun test","expiresAt":"…","why":"The last edit touched the parser.","denyConsequence":"The change ships unverified."}
 {"type":"cancel","promptId":1}
 ```
 
+| field | type | required | notes |
+|---|---|---|---|
+| `type` | `"prompt"` | yes | |
+| `promptId` | integer | yes | echoed by `answer` |
+| `kind` | string | yes | |
+| `summary` | string | yes | what will happen, **sanitized** |
+| `expiresAt` | string | yes | after this, silence is a refusal |
+| `why` | string | no | why it is being asked, **sanitized** |
+| `denyConsequence` | string | no | what declining gives up, **sanitized** |
+
 `promptId` is an integer. There is **no** `arguments` field and never will be: the
 selection must not be able to reach this process at all.
+
+`why` and `denyConsequence` exist because a dialog that states only what will
+happen makes approval the cheaper answer: the user can see the command but not
+what refusing costs, and "just approve it" is what that asymmetry teaches. Both
+are optional and independent — a sender with a reason but no stated cost is the
+ordinary case, and a consequence must never be invented to fill the field, since
+the user would then be weighing a cost nobody claimed. A prompt carrying neither
+is still a prompt and must still render; the panel reads both through the same
+tolerant optional-text path as every other display field, so an absent
+explanation costs a line of the dialog and never the ability to answer.
 
 ## Panel → TS
 
@@ -534,6 +586,9 @@ export interface PanelConfigLine {
   readonly applies: "now" | "restart";
   readonly overridden?: 0 | 1;     // present only when true
   readonly values?: string;        // ";"-joined, enum only
+  readonly group?: string;         // capability heading, sanitized
+  readonly description?: string;   // one sentence, sanitized
+  readonly secretPresent?: 0 | 1;  // present only when true, secret kind only
 }
 export interface PanelConfigEnd {
   readonly type: "config_end";
@@ -635,9 +690,28 @@ export function startPanelServer(options: {
   readonly onSubscribe?: (clientCount: number) => void;
 }): Promise<PanelServer>;
 
+// src/config-schema.ts — the one table of file-backed settings, and the
+// closed vocabulary the form groups them by. "Advanced" is not in it: a row
+// that needs no explanation does not need a group to hide under.
+export type ConfigGroup =
+  | "Model" | "Files" | "Screen" | "Browser" | "Terminal"
+  | "Editor saves" | "Pause control" | "History" | "Privacy";
+
 // src/config-service.ts — the semantics between the panel and the stores.
 // File-backed keys go to the Squid config file; the three model keys go to
 // Pi's own models.json/auth.json. The secret's value never leaves a set.
+export interface ConfigDumpEntry {
+  readonly id: string;
+  readonly label: string;
+  readonly group: ConfigGroup;    // required here; optional on the wire
+  readonly description: string;   // required here; optional on the wire
+  readonly kind: "text" | "int" | "enum" | "secret";
+  readonly value: string;
+  readonly applies: "now" | "restart";
+  readonly overridden: boolean;
+  readonly values?: readonly string[];
+  readonly secretPresent?: boolean;  // secret kind only, and only when stored
+}
 export interface ConfigServiceOptions {
   readonly configPath: string | undefined;
   readonly env: Record<string, string | undefined>;
@@ -650,6 +724,8 @@ export interface ConfigServiceOptions {
 export const MODEL_CONFIG_KEYS: readonly {
   readonly id: "modelBaseUrl" | "modelId" | "apiKey";
   readonly label: string;
+  readonly group: ConfigGroup;
+  readonly description: string;
   readonly kind: "text" | "secret";
 }[];
 export function isModelConfigKey(id: string): boolean;

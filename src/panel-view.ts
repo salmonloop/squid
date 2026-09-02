@@ -65,6 +65,13 @@ export type PanelConfigKind = "text" | "int" | "enum" | "secret";
  * One settings entry as the form needs it, structurally what `config-service`
  * dumps. Declared here rather than imported so this module keeps its two
  * dependencies (sanitizer, projection type) and stays pure.
+ *
+ * `group` and `description` are optional here while the dump makes them
+ * required, and the asymmetry is deliberate: the dump is the one producer that
+ * must always have decided them, whereas this builder is written against the
+ * *wire* contract, where an absent field is a legal state a receiver has to
+ * survive. A test replaying an older entry, or a caller that has only the five
+ * fields a row needs to be editable, still gets a wire-legal line out.
  */
 export interface PanelConfigEntryInput {
   readonly id: string;
@@ -74,7 +81,6 @@ export interface PanelConfigEntryInput {
   readonly applies: "now" | "restart";
   readonly overridden: boolean;
   readonly values?: readonly string[];
-  /** V2-only UI metadata; legacy messages omit it. */
   readonly group?: string;
   readonly description?: string;
   readonly secretPresent?: boolean;
@@ -89,6 +95,25 @@ export interface PanelConfigLine {
   readonly applies: "now" | "restart";
   readonly overridden?: 0 | 1;
   readonly values?: string;
+  /**
+   * Display metadata: the capability heading this row belongs under, and one
+   * sentence about it. Scalars on the same flat line as everything else — the
+   * grouping the panel draws is bucketed from these strings, never sent as a
+   * nested shape, because a tree here would mean growing the hand parser a
+   * second half-tested JSON implementation for no rendering it cannot already
+   * do. Optional so an older brain's dump still parses: the Rust side reads
+   * them with the same tolerant helper as every other optional text field, so
+   * their absence costs a heading, never the row.
+   */
+  readonly group?: string;
+  readonly description?: string;
+  /**
+   * A credential is stored behind an always-empty `secret` field. `1` only,
+   * omitted otherwise, exactly like `overridden` — a disclosure spelled the way
+   * the wire already spells disclosures, and the narrowest thing that can be
+   * said about a stored key without saying any of it.
+   */
+  readonly secretPresent?: 0 | 1;
 }
 
 export interface PanelConfigEnd {
@@ -269,6 +294,20 @@ export function panelServiceLine(input: {
  *
  * `overridden` is the env-wins disclosure, sent only when true so the flat line
  * stays minimal. `values` (enum choices) joins with `;` like every list here.
+ *
+ * `group` and `description` are display text and take the same sanitizer as the
+ * label, on the same grounds: both are authored strings today, and a choke point
+ * that trusted *some* of its display fields would be one edit away from carrying
+ * a control character onto a line the panel parses by hand. They are omitted
+ * when absent rather than sent as `""`, because empty is a value the panel would
+ * have to render — a heading with no name — while absence is the state it already
+ * knows how to skip.
+ *
+ * `secretPresent` is the one field here that is a claim rather than a rendering:
+ * it says a credential is stored, so the form can distinguish an empty field
+ * that may be left alone from one that must be filled. It carries no part of the
+ * key, which is why it is a flag and not text — there is no string here for a
+ * sanitizer to have missed.
  */
 export function panelConfigLine(entry: PanelConfigEntryInput): PanelConfigLine {
   return {
@@ -280,6 +319,17 @@ export function panelConfigLine(entry: PanelConfigEntryInput): PanelConfigLine {
     applies: entry.applies,
     ...(entry.overridden ? { overridden: 1 } : {}),
     ...(entry.values === undefined ? {} : { values: entry.values.join(";") }),
+    ...(entry.group === undefined
+      ? {}
+      : { group: sanitizeAuditText(entry.group, "diagnostic").text }),
+    ...(entry.description === undefined
+      ? {}
+      : { description: sanitizeAuditText(entry.description, "diagnostic").text }),
+    // Not sanitized, because there is no text here to sanitize: a bit says a
+    // credential exists and carries none of it. Sent only when true, so the
+    // absence of the field is the "nothing stored" answer rather than a second
+    // spelling of it.
+    ...(entry.secretPresent ? { secretPresent: 1 } : {}),
   };
 }
 

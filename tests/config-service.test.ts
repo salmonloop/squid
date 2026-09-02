@@ -11,7 +11,7 @@ import {
   type ConfigDumpEntry,
   type ConfigServiceOptions,
 } from "../src/config-service.js";
-import { CONFIG_KEYS } from "../src/config-schema.js";
+import { CONFIG_KEYS, configKeyById } from "../src/config-schema.js";
 import { writeModelConfiguration } from "../src/app-model.js";
 
 /**
@@ -66,6 +66,16 @@ describe("MODEL_CONFIG_KEYS", () => {
     // subtle bug from a credential written to the Squid config file.
     for (const key of CONFIG_KEYS) expect(isModelConfigKey(key.id)).toBe(false);
   });
+
+  it("groups all three under Model, alongside the provider row in the other table", () => {
+    // Which store a setting is written to is not a fact the form organizes by.
+    // These three live in Pi's files and `modelProvider` lives in the Squid
+    // config file, and the user asking "what answers me, and with what login"
+    // is asking one question — a form that split them by storage would be
+    // confessing an implementation detail nobody asked about.
+    for (const key of MODEL_CONFIG_KEYS) expect(key.group).toBe("Model");
+    expect(configKeyById("modelProvider")?.group).toBe("Model");
+  });
 });
 
 describe("configDumpEntries", () => {
@@ -89,6 +99,51 @@ describe("configDumpEntries", () => {
     if (!result.ok) throw new Error(result.error);
     expect(entryOf(result, "apiKey").kind).toBe("secret");
     expect(entryOf(result, "apiKey").value).toBe("");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("says whether a credential is stored without saying any of it", () => {
+    // The distinction the secret rule hid: a stored key and no key at all both
+    // render as an empty field, and the only way to tell them apart used to be
+    // saving an empty value to see which refusal came back. The flag answers it
+    // without the probe — and the value stays empty in both cases, which is the
+    // half of this that must never regress.
+    const dir = tempDir("secret-present");
+    const before = configDumpEntries(options(dir));
+    if (!before.ok) throw new Error(before.error);
+    expect(entryOf(before, "apiKey").secretPresent).toBeUndefined();
+    expect(entryOf(before, "apiKey").value).toBe("");
+
+    seedCredential(options(dir).agentDir, "bifrost");
+    const after = configDumpEntries(options(dir));
+    if (!after.ok) throw new Error(after.error);
+    expect(entryOf(after, "apiKey").secretPresent).toBe(true);
+    expect(entryOf(after, "apiKey").value).toBe("");
+    // And nowhere else: the flag is a claim about a credential, so a row with
+    // no credential to have must not carry one.
+    for (const entry of after.entries) {
+      if (entry.kind !== "secret") expect(entry.secretPresent).toBeUndefined();
+    }
+    // The stored key itself must not appear anywhere in the dump, in any field.
+    expect(JSON.stringify(after.entries)).not.toContain(API_KEY);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("carries a group and a description for every one of the 22 settings", () => {
+    // The panel groups by what the wire tells it, so an entry that reached the
+    // form without a group would be a row the user has to place themselves. The
+    // count is asserted too: the two tables are joined here, and a setting that
+    // silently stopped being dumped would otherwise still pass every field
+    // check below.
+    const dir = tempDir("dump");
+    const result = configDumpEntries(options(dir));
+    if (!result.ok) throw new Error(result.error);
+    expect(result.entries).toHaveLength(22);
+    for (const entry of result.entries) {
+      expect(entry.group.length).toBeGreaterThan(0);
+      expect(entry.group).not.toBe("Advanced");
+      expect(entry.description).toMatch(/^[A-Z].*\.$/);
+    }
     rmSync(dir, { recursive: true, force: true });
   });
 

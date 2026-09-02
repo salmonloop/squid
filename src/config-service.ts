@@ -1,6 +1,7 @@
 import {
   configKeyById,
   CONFIG_KEYS,
+  type ConfigGroup,
   type ConfigValueKind,
 } from "./config-schema.js";
 import { readConfigFile, updateConfigFile } from "./config-file.js";
@@ -29,12 +30,28 @@ import {
  * why an endpoint edit goes through `writeModelEndpoint` (models.json only):
  * the credential half is simply not touched.
  *
+ * What the dump does say is whether a credential *exists*, as `secretPresent`.
+ * That is the one fact the rule above accidentally hid: two very different
+ * states — a key is stored, or none ever was — both render as an empty field,
+ * so the only way to distinguish them was to save nothing and read the refusal.
+ * A yes/no is not the secret, and it is derived from `hasStoredCredential`,
+ * which is the only question this module asks about a stored key.
+ *
  * Applies is per key, not global: file-backed settings are read once at
  * startup by the resolvers, so any write to them can only land after a
  * restart. A model setting saved while no agent is live can take effect
  * immediately — `watch-session` starts the agent from the same files on
  * recovery — but once an agent is running, Pi's session already holds the old
  * endpoint, and honesty wins: that set also says "restart".
+ *
+ * Display metadata rides along with every entry, `group` and `description`
+ * beside `label`. It comes from `config-schema.ts` for the file-backed keys and
+ * from `MODEL_CONFIG_KEYS` for the three that live in Pi's store, which is the
+ * same split as everything else here — but the panel must not be able to tell,
+ * because a form that grouped one store's rows and not the other's would be
+ * confessing an implementation detail the user has no use for. So both halves
+ * carry the same three display fields, and neither is optional: an entry cannot
+ * reach the wire without having been placed under a capability and explained.
  */
 
 /** The kinds a dump can name — the schema's three plus the secret case. */
@@ -43,6 +60,10 @@ export type ConfigSettingKind = ConfigValueKind | "secret";
 export interface ConfigDumpEntry {
   readonly id: string;
   readonly label: string;
+  /** The capability the form files this row under. Never decided in the panel. */
+  readonly group: ConfigGroup;
+  /** One sentence on what this changes for the user, shown beside the field. */
+  readonly description: string;
   readonly kind: ConfigSettingKind;
   /** Empty string means unset — the form starts from empty, not from a guess. */
   readonly value: string;
@@ -50,6 +71,22 @@ export interface ConfigDumpEntry {
   /** An env var is governing this run, so the file value is not the live one. */
   readonly overridden: boolean;
   readonly values?: readonly string[];
+  /**
+   * A credential is stored for this row — the existence of one, never any part
+   * of it. Only a `secret` kind carries this, and only when there is one to
+   * report, so an absent flag reads as "nothing stored" without a second
+   * spelling for it.
+   *
+   * It exists because the secret rule left one honest question unanswerable. A
+   * secret's value is always the empty string here, so a stored key and no key
+   * at all render identically, and the only way to tell them apart was to save
+   * an empty field and read back either "kept" or "no API key is stored yet" —
+   * a probe, in the one field where a mistaken save is least recoverable.
+   * Reporting presence is not reporting the secret: nothing in this module
+   * reads a stored key back, and this flag is derived from
+   * `hasStoredCredential`, which answers only yes or no.
+   */
+  readonly secretPresent?: boolean;
 }
 
 export type ConfigDump =
@@ -63,6 +100,13 @@ export type ConfigSetResult =
 export interface ModelConfigKey {
   readonly id: string;
   readonly label: string;
+  /**
+   * Typed as the schema's own union rather than a loose string, so these three
+   * cannot invent a tenth capability that the nineteen file-backed rows have no
+   * way to join. The vocabulary is one vocabulary even though the table is two.
+   */
+  readonly group: ConfigGroup;
+  readonly description: string;
   readonly kind: ConfigSettingKind;
 }
 
@@ -72,11 +116,37 @@ export interface ModelConfigKey {
  * their own rules and write to Pi's store, and a key that names the wrong
  * store in the shared table would be one subtle bug away from writing a
  * credential into the Squid config file.
+ *
+ * All three group under "Model" alongside `modelProvider`, which does live in
+ * the shared table — the store a setting is written to is not a fact the form
+ * organizes by. The user asks one question here ("what answers me, and with
+ * what login"), and four rows answer it from two files.
  */
 export const MODEL_CONFIG_KEYS: readonly ModelConfigKey[] = [
-  { id: "modelBaseUrl", label: "Model API base URL", kind: "text" },
-  { id: "modelId", label: "Model id", kind: "text" },
-  { id: "apiKey", label: "API key", kind: "secret" },
+  {
+    id: "modelBaseUrl",
+    label: "Model API base URL",
+    group: "Model",
+    description: "Where Squid reaches the model it asks.",
+    kind: "text",
+  },
+  {
+    id: "modelId",
+    label: "Model id",
+    group: "Model",
+    description: "Which model does the thinking.",
+    kind: "text",
+  },
+  {
+    id: "apiKey",
+    label: "API key",
+    group: "Model",
+    // Describes what the key is *for*, not what it is: this row's value is the
+    // one thing the dump never carries, so the sentence beside an always-empty
+    // field is all the user has to go on.
+    description: "The secret that lets Squid use that model on your behalf.",
+    kind: "secret",
+  },
 ];
 
 export function isModelConfigKey(id: string): boolean {
@@ -115,11 +185,16 @@ export function configDumpEntries(options: ConfigServiceOptions): ConfigDump {
   const entries: ConfigDumpEntry[] = [];
   const overriddenEnv = (name: string): boolean => options.env[name] !== undefined;
   const applies = (): "now" | "restart" => (options.agentLive() ? "restart" : "now");
+  // Asked once for the whole dump rather than per row: it reads Pi's auth store,
+  // and only the one secret row has any use for the answer.
+  const storedCredential = hasStoredCredential(options.agentDir, options.provider);
 
   for (const key of MODEL_CONFIG_KEYS) {
     entries.push({
       id: key.id,
       label: key.label,
+      group: key.group,
+      description: key.description,
       kind: key.kind,
       // The secret's value is structurally absent from every dump: empty is
       // "nothing to show", which is also exactly what "keep what is stored"
@@ -131,6 +206,9 @@ export function configDumpEntries(options: ConfigServiceOptions): ConfigDump {
           : entry?.modelId ?? "",
       applies: applies(),
       overridden: key.id === "modelId" ? overriddenEnv("PI_MODEL_ID") : false,
+      // Keyed off the kind, not off the id: whichever row is the secret one is
+      // the row that can say whether a credential is behind its empty field.
+      ...(key.kind === "secret" && storedCredential ? { secretPresent: true } : {}),
     });
   }
 
@@ -138,6 +216,10 @@ export function configDumpEntries(options: ConfigServiceOptions): ConfigDump {
     entries.push({
       id: key.id,
       label: key.label,
+      // Copied from the table, not decided here: this module owns *where a
+      // setting lives*, and how it is presented is the schema's business.
+      group: key.group,
+      description: key.description,
       kind: key.kind,
       value: values[key.id] ?? "",
       applies: "restart",
