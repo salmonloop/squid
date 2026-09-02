@@ -378,6 +378,17 @@ export async function startWatchSession(
   // The adapter is deliberately inert until a future execution seam calls it:
   // current custom tools are read-only and Pi's sandbox owns tool safety.
   const panelConfirmation = new PanelConfirmationSurface({ server: () => panelServer });
+  /**
+   * Echoes a command's own correlation id back on its verdict.
+   *
+   * Omitted rather than sent empty when the panel did not supply one: a legacy
+   * panel sends no `requestId`, and inventing one would make a verdict look
+   * like the answer to a request that was never asked. Two rapid edits to the
+   * same key are otherwise indistinguishable, because `id` alone cannot tell
+   * them apart.
+   */
+  const correlate = (requestId: string | undefined): { requestId?: string } =>
+    requestId === undefined ? {} : { requestId };
   if (panel.enabled) {
     const commandPath = env.SQUID_CONTROL_FIFO;
     try {
@@ -400,13 +411,15 @@ export async function startWatchSession(
             logError(`Panel answer ignored: no pending prompt ${promptId}.`);
           }
         },
-        onConfigGet: () => {
+        onConfigGet: (requestId) => {
           // The dump is re-read every time, so what the panel shows reflects
           // sets that landed after this process started — there is no cache to
           // go stale.
           const dump = configDumpEntries(configService);
           if (!dump.ok) {
-            panelServer?.broadcast(panelConfigResult({ ok: false, error: dump.error }));
+            panelServer?.broadcast(
+              panelConfigResult({ ok: false, error: dump.error, ...correlate(requestId) }),
+            );
             return;
           }
           for (const entry of dump.entries) {
@@ -414,11 +427,12 @@ export async function startWatchSession(
           }
           panelServer?.broadcast(panelConfigEnd(dump.entries.length));
         },
-        onConfigSet: (id, value) => {
+        onConfigSet: (id, value, requestId) => {
           const outcome = applyConfigSet(configService, id, value);
           panelServer?.broadcast(
             panelConfigResult({
               id,
+              ...correlate(requestId),
               ok: outcome.ok,
               ...(outcome.ok ? { applies: outcome.applies } : { error: outcome.error }),
             }),
@@ -431,13 +445,19 @@ export async function startWatchSession(
             tryStartAgent();
           }
         },
-        onSourceGet: () => {
+        onSourceGet: (requestId) => {
           const manager = sourceManagerRef.manager;
           if (manager === undefined) {
             // The window between the panel server listening and the catalog
             // being built. A refusal, not silence: a panel waiting on a dump
             // that never ends is a worse lie than an honest "not yet".
-            panelServer?.broadcast(panelSourceResult({ ok: false, error: "The source catalog is still starting." }));
+            panelServer?.broadcast(
+              panelSourceResult({
+                ok: false,
+                error: "The source catalog is still starting.",
+                ...correlate(requestId),
+              }),
+            );
             return;
           }
           const snapshot = manager.snapshot();
@@ -446,17 +466,28 @@ export async function startWatchSession(
           }
           panelServer?.broadcast(panelSourceEnd(snapshot.length));
         },
-        onSourceToggle: (id, on) => {
+        onSourceToggle: (id, on, requestId) => {
           const manager = sourceManagerRef.manager;
           if (manager === undefined) {
-            panelServer?.broadcast(panelSourceResult({ id, ok: false, error: "The source catalog is still starting." }));
+            panelServer?.broadcast(
+              panelSourceResult({
+                id,
+                ok: false,
+                error: "The source catalog is still starting.",
+                ...correlate(requestId),
+              }),
+            );
             return;
           }
           // The manager returns a result instead of throwing — including for
           // unknown ids and refusals — so the panel learns the verdict either way.
           void (on ? manager.start(id) : manager.stop(id)).then((result) => {
             panelServer?.broadcast(
-              panelSourceResult(result.ok ? { id, ok: true } : { id, ok: false, error: result.error }),
+              panelSourceResult(
+                result.ok
+                  ? { id, ok: true, ...correlate(requestId) }
+                  : { id, ok: false, error: result.error, ...correlate(requestId) },
+              ),
             );
           });
         },
