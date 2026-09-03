@@ -267,7 +267,26 @@ pub fn probe(endpoint: &Path) -> bool {
 /// blocking Slint's event loop would freeze the window. `deliver` is called on
 /// this thread for every message, so its body must hop to the UI thread before
 /// touching a property.
-pub fn run(socket_path: &Path, outgoing: &Outgoing, mut deliver: impl FnMut(Incoming)) {
+///
+/// `link` reports the connection's own comings and goings — `true` once a
+/// connection stands up, `false` when that connection ends — on the same thread
+/// and under the same rule. It is deliberately not called before the first
+/// connection ever stands up: "was connected and lost it" and "has never reached
+/// a session" are different facts, and a `false` at startup would collapse them.
+///
+/// This is the one thing about itself the transport reports, and the distinction
+/// that makes it allowed: whether *this panel* holds a connection is a fact about
+/// the panel, not a reading of the world the projection describes. Without it the
+/// window keeps its last reading on screen with nothing marking it as stale, and
+/// a header derived from that reading goes on saying Squid is recording after the
+/// brain has died — which a supervised run catches through the supervisor and an
+/// attached run had no way to catch at all.
+pub fn run(
+    socket_path: &Path,
+    outgoing: &Outgoing,
+    mut deliver: impl FnMut(Incoming),
+    mut link: impl FnMut(bool),
+) {
     let mut backoff = FIRST_BACKOFF;
     loop {
         if let Ok(stream) = connect(socket_path) {
@@ -285,8 +304,13 @@ pub fn run(socket_path: &Path, outgoing: &Outgoing, mut deliver: impl FnMut(Inco
                     // that reset on attempt rather than success would never climb.
                     backoff = FIRST_BACKOFF;
                     outgoing.adopt(handle);
+                    link(true);
                     read_messages(stream, &mut deliver);
                     outgoing.release();
+                    // Reported after `release`, so anything the UI does in
+                    // response cannot find a handle this loop has already given
+                    // up on.
+                    link(false);
                 }
             }
         }

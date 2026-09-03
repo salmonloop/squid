@@ -73,6 +73,11 @@ export component PanelWindow inherits Window {
     in property <bool> supervised;
     in property <string> service-state;
     in property <string> service-detail;
+    // Whether a connection this window once held has since dropped. Set from the
+    // transport, never from the wire — it is the panel's fact about itself. False
+    // before the first connection ever stands up, because never having reached a
+    // session is a different state from having lost one.
+    in property <bool> link-lost;
     callback restart-service();
     callback start-service();
     in property <[SourceRow]> sources;
@@ -158,6 +163,14 @@ export component PanelWindow inherits Window {
             updated-at: root.updated-at;
             detail: root.service-detail;
             decision-pending: root.prompt-pending;
+            link-lost: root.link-lost;
+            // The header's "Watching" is a claim about observers, so it reads the
+            // catalog rather than inferring from a timestamp. `sources.length` is
+            // computed here instead of handing the model across the boundary:
+            // whether the catalog arrived is a scalar, and the rows themselves are
+            // no business of a status line.
+            running-sources: root.running-sources;
+            sources-known: root.sources.length > 0;
         }
 
         // The decision, second, above everything else — and above the scroll

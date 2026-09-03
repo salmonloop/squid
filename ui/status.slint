@@ -125,27 +125,77 @@ export component StatusSummary inherits Rectangle {
     in property <string> updated-at;
     in property <string> detail;
     in property <bool> decision-pending;
+    // What is actually being observed, which is what a header claiming "Watching"
+    // is claiming. Two properties, not one: the count alone cannot say whether it
+    // has been told anything, and its declared default of zero is written only
+    // from inside a dump handler (`ui/src/main.rs`), so a zero that means "nobody
+    // has said yet" is indistinguishable from a zero that means "nothing is up".
+    // `sources-known` is the catalog's arrival, and a session that has sent one
+    // has sent every declared entry.
+    in property <int> running-sources;
+    in property <bool> sources-known;
+    // Whether the window's own connection dropped after having stood up. Every
+    // other input here is a reading of the world; this one is the panel's fact
+    // about itself, and it is what stops the readings from being narrated as
+    // current after there is nobody left to send new ones.
+    in property <bool> link-lost;
+
+    // Which reading of `limited` applies, named once rather than spelled out in
+    // three places. The state, the title, and the sentence must never disagree
+    // about which of them is true.
+    out property <bool> nothing-switched-on: root.sources-known && root.running-sources == 0;
 
     // First match wins, most urgent first.
     out property <PanelState> state:
         root.decision-pending ? PanelState.waiting
         : root.service-state == "failed" ? PanelState.needs-hand
+        // A dropped connection outranks everything below it, because everything
+        // below it is derived from readings that stopped arriving. It sits under
+        // the supervisor's `failed` on purpose: a supervised run knows the brain
+        // stopped and can say so precisely, while this is the only signal an
+        // attached run ever gets. It also outranks `needs_config`, which is a
+        // standing fact from a session that is no longer talking.
+        : root.link-lost ? PanelState.needs-hand
         : root.agent-state == "needs_config" ? PanelState.needs-hand
+        // Paused on the explicit token, and on nothing else. An empty `gate` is
+        // the pause-control capability being unconfigured — off by default, and
+        // never a source card, so most runs never populate it — and it used to
+        // fall through to `limited`. That made a healthy default run say "Not
+        // watching yet" for its whole life, contradicted by its own timestamp
+        // line and by the cards below it reading "Watching". Not knowing whether
+        // capture *can* be paused says nothing about whether it is happening.
+        // The Recording section reports that gap in words, and offers to ask
+        // again; a header has no business turning it into a claim.
+        //
+        // The token itself stays load-bearing here and cannot be replaced by the
+        // observer count: a held gate leaves every observer running, so a count
+        // would read that as watching while nothing is being recorded.
         : root.gate == "paused" ? PanelState.paused
         : root.service-state == "restarting" ? PanelState.working
+        // Nothing switched on, ahead of the no-reading case: it is the more
+        // specific of the two and the only one a person can act on. Not a
+        // defensive guard for an impossible state — the startup floor counts the
+        // gate as a source (`src/watch-session.ts:664-675`), so a session with no
+        // startable observer at all is a run the wire can really report.
+        : root.nothing-switched-on ? PanelState.limited
         // No reading yet is not health. Until an observation arrives there is
         // nothing to claim, and claiming it anyway is how a dead session looks
         // like a quiet machine.
         : root.updated-at == "" ? PanelState.limited
-        : root.gate == "" ? PanelState.limited
         : PanelState.watching;
 
     out property <string> title:
         root.state == PanelState.waiting ? "Waiting for you"
-        : root.state == PanelState.needs-hand ? (root.service-state == "failed" ? "Squid has stopped" : "Finish setup to begin")
+        : root.state == PanelState.needs-hand ? (root.service-state == "failed" ? "Squid has stopped" : root.link-lost ? "Lost contact with Squid" : "Finish setup to begin")
         : root.state == PanelState.paused ? "Paused"
         : root.state == PanelState.working ? "Starting up"
-        : root.state == PanelState.limited ? "Not watching yet"
+        // Two readings, and neither may claim what this component cannot see.
+        // "Nothing reported yet" is reached before the first reading arrives —
+        // which includes a panel that has never reached a session at all — so it
+        // says only that nothing has been reported, never that Squid is watching
+        // and never that it looked. "Seen" would claim the looking, which is the
+        // same overreach `EvidenceRow` in `panel.slint` had to give up.
+        : root.state == PanelState.limited ? (root.nothing-switched-on ? "Nothing switched on" : "Nothing reported yet")
         : "Watching";
 
     // The consequence, not a restatement of the title. This is the sentence a
@@ -153,15 +203,21 @@ export component StatusSummary inherits Rectangle {
     out property <string> consequence:
         root.state == PanelState.waiting ? "Squid is asking permission before it acts."
         : root.state == PanelState.needs-hand && root.service-state == "failed" ? "Nothing is being watched until it starts again."
+        // Deliberately about the readings, not about the machine: this window
+        // cannot tell a stopped brain from a dropped socket, so it says what it
+        // does know — everything on screen is from before the connection went,
+        // and it keeps trying.
+        : root.state == PanelState.needs-hand && root.link-lost ? "Nothing here is current. Squid may have stopped; this window keeps trying to reach it."
         : root.state == PanelState.needs-hand ? "Squid is watching, but it cannot think yet."
         : root.state == PanelState.paused ? "Squid will not record anything new until you resume."
         : root.state == PanelState.working ? "Squid is coming back up."
+        : root.state == PanelState.limited && root.nothing-switched-on ? "Nothing is being watched until you turn a sense on below."
         : root.state == PanelState.limited ? "Squid has not reported anything it has seen."
         : "Squid is recording what happens on this machine.";
 
     out property <brush> tint:
         root.state == PanelState.waiting ? Theme.danger
-        : root.state == PanelState.needs-hand ? (root.service-state == "failed" ? Theme.danger : Theme.caution)
+        : root.state == PanelState.needs-hand ? ((root.service-state == "failed" || root.link-lost) ? Theme.danger : Theme.caution)
         : root.state == PanelState.paused ? Theme.caution
         : root.state == PanelState.working ? Theme.caution
         : root.state == PanelState.limited ? Theme.text-muted

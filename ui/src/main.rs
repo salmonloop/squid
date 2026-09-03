@@ -354,6 +354,12 @@ fn main() {
         // screen either — the last known reading, dated by `updated-at`, is the
         // honest thing to keep showing. Blanking the fields on disconnect would
         // make a lost connection look like a quiet machine.
+        //
+        // Keeping the reading is only honest if something says it is no longer
+        // live, which is what `link-lost` is for. It marks the reading stale
+        // rather than erasing it, so the two failures stay distinguishable: a
+        // quiet machine still shows its last reading with no warning, and a lost
+        // session shows the same reading with one.
         thread::spawn(move || {
             // The buffers live in this closure: one connection's dumps, torn down
             // with the closure if this thread ever ends. `transport::run` calls
@@ -361,9 +367,17 @@ fn main() {
             // accumulate — and nothing Slint-owned is touched until a terminator
             // posts a finished dump to the event loop.
             let mut dumps = Dumps::default();
-            transport::run(&socket_path, &outgoing, |message| {
-                apply(&handle, &pending, &outgoing, &mut dumps, message)
-            })
+            let link_handle = handle.clone();
+            transport::run(
+                &socket_path,
+                &outgoing,
+                |message| apply(&handle, &pending, &outgoing, &mut dumps, message),
+                move |connected| {
+                    let _ = link_handle.upgrade_in_event_loop(move |window| {
+                        window.set_link_lost(!connected);
+                    });
+                },
+            )
         });
     }
 
