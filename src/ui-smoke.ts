@@ -1,220 +1,77 @@
 /**
  * Visual smoke harness for the resident Slint panel.
  *
- * This drives the compiled `squid-ui` binary, a Unix-socket fixture speaking
- * the production newline-delimited wire, and Xvfb/xdotool. It is intentionally
- * outside the ordinary offline suite.
+ * This drives the compiled `squid-ui` binary and a fixture speaking the
+ * production newline-delimited wire. Everything the machine has to provide — a
+ * display, a window, a click, a picture — comes from a `SmokeHost`, so the
+ * assertions below are the same on every platform and the platform differences
+ * live in one file each. It is intentionally outside the ordinary offline suite.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { access, mkdtemp, rm } from "node:fs/promises";
-import { createServer, type Server, type Socket } from "node:net";
+import { access, mkdtemp } from "node:fs/promises";
+import { closeSync, openSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { rm } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { isPanelNamedPipe } from "./resolve-panel.js";
+import {
+  eventually,
+  INTERACTION_TIMEOUT_MS,
+  resolveSmokeHost,
+  smokeFailure,
+  wait,
+  type SmokeHost,
+  type SmokeWindow,
+} from "./ui-smoke-host.js";
 
-const POLL_MS = 100;
-const STARTUP_TIMEOUT_MS = 15_000;
-const INTERACTION_TIMEOUT_MS = 5_000;
 const WINDOW_TITLE = "Squid";
 /** The prompt the fixture raises, and the only id an answer may name. */
 const PROMPT_ID = 41;
-
-interface CommandResult { readonly code: number | null; readonly stdout: string; readonly stderr: string }
-interface PanelReply { readonly type?: unknown; readonly op?: unknown; readonly promptId?: unknown; readonly answer?: unknown }
-interface WindowGeometry { readonly id: string; readonly x: number; readonly y: number; readonly width: number; readonly height: number }
-interface Fixture {
-  readonly socketPath: string;
-  readonly replies: readonly PanelReply[];
-  readonly close: () => Promise<void>;
-  waitFor(description: string, predicate: (reply: PanelReply) => boolean, timeoutMs?: number): Promise<PanelReply>;
-}
-
-const log = (line: string): void => { process.stdout.write(`${line}\n`); };
-function fail(message: string): never { throw new Error(`ui:smoke failed — ${message}`); }
-function wait(ms: number): Promise<void> { return new Promise((done) => setTimeout(done, ms)); }
-
-async function eventually<T>(description: string, operation: () => Promise<T | null>, timeoutMs = STARTUP_TIMEOUT_MS): Promise<T> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const value = await operation();
-    if (value !== null) return value;
-    await wait(POLL_MS);
-  }
-  return fail(`timed out waiting for ${description}`);
-}
-
-function run(command: string, args: readonly string[], env?: NodeJS.ProcessEnv): Promise<CommandResult> {
-  return new Promise((done) => {
-    const child = spawn(command, args, { env: env ?? process.env, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-    child.on("error", () => done({ code: null, stdout, stderr }));
-    child.on("close", (code) => done({ code, stdout, stderr }));
-  });
-}
-
-async function requireCommand(command: string, packageHint: string): Promise<void> {
-  if ((await run("sh", ["-c", `command -v ${command}`])).code !== 0) {
-    fail(`${command} is not installed; install ${packageHint}, then rerun \`bun run ui:smoke\`.`);
-  }
-}
-
-function stop(child: ChildProcess | undefined): void {
-  if (child !== undefined && child.exitCode === null && !child.killed) child.kill("SIGTERM");
-}
-
-async function startDisplay(): Promise<{ readonly display: string; readonly server: ChildProcess }> {
-  const server = spawn("Xvfb", ["-displayfd", "1", "-screen", "0", "1280x1024x24", "-nolisten", "tcp"], { stdio: ["ignore", "pipe", "pipe"] });
-  const display = await new Promise<string>((done, reject) => {
-    let output = "";
-    server.once("error", () => reject(new Error("could not start Xvfb")));
-    server.once("exit", (code) => reject(new Error(`Xvfb exited before selecting a display (code ${code ?? "signal"})`)));
-    server.stdout.on("data", (chunk: Buffer) => {
-      output += chunk.toString();
-      const line = output.match(/^\s*(\d+)\s*\n/);
-      if (line?.[1] !== undefined) done(`:${line[1]}`);
-    });
-  });
-  return { display, server };
-}
-
-function panelFixture(socketPath: string): Promise<Fixture> {
-  return new Promise((done, reject) => {
-    const replies: PanelReply[] = [];
-    const clients = new Set<Socket>();
-    const server: Server = createServer((socket) => {
-      clients.add(socket);
-      let buffer = "";
-      const send = (message: Record<string, unknown>): void => { socket.write(`${JSON.stringify(message)}\n`); };
-      const announce = (): void => {
-        // Current protocol states: both service outcomes, unavailable source,
-        // and a prompt only because this wire revision implements it.
-        send({ type: "service", agentState: "needs_config" });
-        send({ type: "service", agentState: "ready" });
-        send({ type: "world_state", updatedAt: "2026-09-01T12:00:00.000Z", lastEvent: "file_saved", application: "Smoke Fixture", window: "panel-smoke.ts", gate: "open", selectionLength: 7, recentActions: "file_saved", episodeEvents: 1 });
-        send({ type: "agent", at: "2026-09-01T12:00:01.000Z", status: "replied", text: "Smoke fixture connected." });
-        send({ type: "prompt", promptId: PROMPT_ID, kind: "run_tests", summary: "bun test", expiresAt: "2026-09-01T12:05:00.000Z" });
-      };
-      socket.on("data", (chunk: Buffer) => {
-        buffer += chunk.toString("utf8");
-        let newline = buffer.indexOf("\n");
-        while (newline >= 0) {
-          const line = buffer.slice(0, newline).trim();
-          buffer = buffer.slice(newline + 1);
-          if (line.length > 0) {
-            try {
-              const reply = JSON.parse(line) as PanelReply;
-              replies.push(reply);
-              if (reply.type === "subscribe") announce();
-              if (reply.type === "config_get") { for (const row of CONFIG_ROWS) send(row); send({ type: "config_end", count: CONFIG_ROWS.length }); }
-              if (reply.type === "source_get") { for (const row of SOURCE_ROWS) send(row); send({ type: "source_end", count: SOURCE_ROWS.length }); }
-            } catch { /* Production server refuses malformed input; fixture does not invent a reply. */ }
-          }
-          newline = buffer.indexOf("\n");
-        }
-      });
-      socket.on("close", () => clients.delete(socket));
-    });
-    server.once("error", reject);
-    server.listen(socketPath, () => done({
-      socketPath, replies,
-      close: async () => {
-        for (const client of clients) client.destroy();
-        await new Promise<void>((closed) => server.close(() => closed()));
-        await rm(socketPath, { force: true });
-      },
-      waitFor: (description, predicate, timeoutMs = INTERACTION_TIMEOUT_MS) => eventually(description, async () => replies.find(predicate) ?? null, timeoutMs),
-    }));
-  });
-}
-
-/**
- * The panel window's id and absolute geometry, once it is actually on screen.
- *
- * `IsViewable` rather than mere existence: `xdotool search` keeps matching a
- * window after it is unmapped, so presence is not the question. Geometry is
- * read from the same `xwininfo` call that proved viewability, because a second
- * call could land after a resize and crop the screenshot to the wrong box.
- */
-async function awaitWindow(display: string): Promise<WindowGeometry> {
-  const env = { ...process.env, DISPLAY: display };
-  return eventually("a mapped Squid window", async () => {
-    const found = await run("xdotool", ["search", "--name", `^${WINDOW_TITLE}$`], env);
-    for (const id of found.stdout.trim().split(/\s+/)) {
-      if (id.length === 0) continue;
-      const info = await run("xwininfo", ["-id", id], env);
-      if (info.code !== 0 || !info.stdout.includes("IsViewable")) continue;
-      const read = (label: string): number | null => {
-        const match = info.stdout.match(new RegExp(`${label}:\\s+(-?\\d+)`));
-        return match?.[1] === undefined ? null : Number(match[1]);
-      };
-      const x = read("Absolute upper-left X");
-      const y = read("Absolute upper-left Y");
-      const width = read("Width");
-      const height = read("Height");
-      if (x === null || y === null || width === null || height === null) continue;
-      return { id, x, y, width, height };
-    }
-    return null;
-  });
-}
-
-/**
- * Screenshot of one window, cropped to exactly that window's geometry.
- *
- * `ffmpeg -f x11grab` rather than ImageMagick's `import`: the same tool is
- * already the repo's image converter, and its `+x,y` offset plus `-video_size`
- * crop to the window without a second process. `import -window` would be one
- * call, but it puts ImageMagick on the prerequisite list for a check whose
- * whole job is to be runnable.
- *
- * Cropping rather than grabbing the whole root: under a bare Xvfb there is no
- * window manager, so the rest of the screen is uninitialised noise that would
- * dominate any visual review of the panel itself.
- */
-async function screenshot(display: string, geometry: WindowGeometry, path: string): Promise<void> {
-  const result = await run("ffmpeg", [
-    "-loglevel", "error",
-    "-f", "x11grab",
-    "-video_size", `${geometry.width}x${geometry.height}`,
-    "-i", `${display}+${geometry.x},${geometry.y}`,
-    "-frames:v", "1",
-    "-y", path,
-  ]);
-  if (result.code !== 0) fail(`could not save ${path}: ${result.stderr.trim() || "ffmpeg x11grab failed"}`);
-}
-
 /** How long to wait for an answer that must NOT arrive. Short: absence is the assertion. */
 const NEGATIVE_WAIT_MS = 700;
 
-/**
- * Where the three confirmation buttons sit, in window-relative pixels.
- *
- * Coordinates, and not the keyboard, because a keyboard is not available here:
- * under a bare Xvfb there is no window manager to give the window focus, so
- * `xdotool key` is delivered to nothing and every key press silently does
- * nothing. Measured on this machine: a synthetic click lands and answers, a
- * synthetic Return does not.
- *
- * That is also why this file cannot assert the no-default-button rule. A Return
- * that produces no answer here proves only that no key arrived, which would be a
- * pass for the wrong reason — the honest thing is to leave the claim to the Slint
- * source, where no button is `primary` and none is given focus, and to say so
- * rather than to fake the measurement.
- *
- * A hardcoded position is a real cost, and it is bounded: each entry asserts
- * which answer it produced, so a layout change that moves a button makes the
- * expected answer wrong or absent. It cannot silently hit a neighbour and pass.
- */
-const BUTTONS = {
-  decline: { x: 426, y: 307 },
-  later: { x: 504, y: 307 },
-  allow: { x: 574, y: 307 },
-} as const;
+interface PanelReply {
+  readonly type?: unknown;
+  readonly op?: unknown;
+  readonly promptId?: unknown;
+  readonly answer?: unknown;
+}
 
-/** The Review button on the deferred notice, which takes the place of the card. */
-const REVIEW = { x: 574, y: 200 } as const;
+/** One connection, as `Bun.listen` hands it to the handlers below. */
+type FixtureSocket = { write(data: string): number };
+
+interface Fixture {
+  readonly endpoint: string;
+  readonly replies: readonly PanelReply[];
+  readonly close: () => Promise<void>;
+  waitFor(
+    description: string,
+    predicate: (reply: PanelReply) => boolean,
+    timeoutMs?: number,
+  ): Promise<PanelReply>;
+}
+
+const log = (line: string): void => {
+  process.stdout.write(`${line}\n`);
+};
+
+/**
+ * Ends the panel, and means it.
+ *
+ * `SIGTERM` first because a process asked to leave should be asked; `SIGKILL`
+ * after a grace period because this is a harness and a panel that outlives its
+ * run is not a tidiness problem — it is a window with the same title as the next
+ * run's, on a desktop the next run searches by title. Leaked panels are how an
+ * earlier version of this file ended up testing a previous run's window.
+ */
+async function stopPanel(child: ChildProcess | undefined): Promise<void> {
+  if (child === undefined || child.exitCode !== null || child.killed) return;
+  child.kill("SIGTERM");
+  const deadline = Date.now() + 2_000;
+  while (child.exitCode === null && Date.now() < deadline) await wait(50);
+  if (child.exitCode === null) child.kill("SIGKILL");
+}
 
 /**
  * The settings dump the fixture serves.
@@ -247,86 +104,286 @@ function answerFor(fixture: Fixture, promptId: number): PanelReply | undefined {
   return fixture.replies.find((reply) => reply.type === "answer" && reply.promptId === promptId);
 }
 
-async function click(display: string, windowId: string, at: { readonly x: number; readonly y: number }): Promise<void> {
-  const result = await run(
-    "xdotool",
-    ["mousemove", "--window", windowId, String(at.x), String(at.y), "click", "1"],
-    { ...process.env, DISPLAY: display },
-  );
-  if (result.code !== 0) fail(`could not click at ${at.x},${at.y}: ${result.stderr.trim() || "xdotool failed"}`);
+/**
+ * The fixture: one server on the endpoint, speaking the production wire.
+ *
+ * `Bun.listen({ unix })` and not `node:net`'s `createServer`, for the reason
+ * `panel-server.ts` gives and this file learned the hard way: Bun inspects the
+ * string and takes its named-pipe branch when the value spells one, so the same
+ * call binds a Unix socket and a Windows pipe. `node:net` does not — it mangles
+ * `\\.\pipe\<name>` into a relative path and refuses to bind it — so a fixture
+ * written on it can never stand in for the server the panel actually talks to.
+ * The one listen path here is the one listen path in production.
+ *
+ * On Windows the panel opens a fresh connection for every line it writes, so a
+ * connection is not a client: `announce` replies on the connection that sent
+ * `subscribe`, which is the reader, and the write-only connections come and go
+ * carrying one line each. Per-connection state therefore hangs off the socket
+ * rather than being a single "the client" — the same shape the real server uses.
+ */
+function panelFixture(endpoint: string): Promise<Fixture> {
+  const replies: PanelReply[] = [];
+  const buffers = new Map<FixtureSocket, string>();
+  /**
+   * The connection that subscribed, which is the only one worth writing to.
+   *
+   * On Unix this is the same socket every request arrives on, so it changes
+   * nothing. On Windows it is the difference between a fixture that works and one
+   * that looks like it does: the panel writes each line on a fresh write-only
+   * connection and closes it, so a dump replied to *that* connection is sent into
+   * a socket nobody will ever read. An earlier version did exactly that, and the
+   * symptom was a panel that showed "The session has not reported what it can
+   * watch yet" while the fixture's log claimed it had answered — the same shape as
+   * the real server's `clients` set, and for the same reason.
+   */
+  let reader: FixtureSocket | undefined;
+
+  const send = (socket: FixtureSocket, message: Record<string, unknown>): void => {
+    socket.write(`${JSON.stringify(message)}\n`);
+  };
+
+  const announce = (socket: FixtureSocket): void => {
+    // Current protocol states: both service outcomes, unavailable source,
+    // and a prompt only because this wire revision implements it.
+    send(socket, { type: "service", agentState: "needs_config" });
+    send(socket, { type: "service", agentState: "ready" });
+    // Deliberately no `gate`. This is the shape of a default run — pause control
+    // is off unless configured, so the field is omitted — and it is the state the
+    // header used to render as "Not watching yet" while its own cards said
+    // "Watching". The fixture used to send `gate: "open"` here and nothing else,
+    // which is why that defect shipped: the one end-to-end check never rendered
+    // the common case.
+    send(socket, { type: "world_state", updatedAt: "2026-09-01T12:00:00.000Z", lastEvent: "file_saved", application: "Smoke Fixture", window: "panel-smoke.ts", selectionLength: 7, recentActions: "file_saved", episodeEvents: 1 });
+    send(socket, { type: "agent", at: "2026-09-01T12:00:01.000Z", status: "replied", text: "Smoke fixture connected." });
+    send(socket, { type: "prompt", promptId: PROMPT_ID, kind: "run_tests", summary: "bun test", expiresAt: "2026-09-01T12:05:00.000Z" });
+  };
+
+  const consume = (socket: FixtureSocket, chunk: Uint8Array): void => {
+    const parts = `${buffers.get(socket) ?? ""}${Buffer.from(chunk).toString("utf8")}`.split("\n");
+    buffers.set(socket, parts.pop() ?? "");
+    for (const part of parts) {
+      const line = part.trim();
+      if (line.length === 0) continue;
+      try {
+        const reply = JSON.parse(line) as PanelReply;
+        replies.push(reply);
+        if (reply.type === "subscribe") {
+          reader = socket;
+          announce(socket);
+        }
+        // Answered to the reader, never to the connection that asked: see the
+        // note on `reader`. `?? socket` keeps a dump reachable if a request
+        // somehow arrives before a subscribe, rather than dropping it silently.
+        const back = reader ?? socket;
+        if (reply.type === "config_get") {
+          for (const row of CONFIG_ROWS) send(back, row);
+          send(back, { type: "config_end", count: CONFIG_ROWS.length });
+        }
+        if (reply.type === "source_get") {
+          for (const row of SOURCE_ROWS) send(back, row);
+          send(back, { type: "source_end", count: SOURCE_ROWS.length });
+        }
+      } catch {
+        /* Production server refuses malformed input; fixture does not invent a reply. */
+      }
+    }
+  };
+
+  const server = Bun.listen<undefined>({
+    unix: endpoint,
+    socket: {
+      open: (socket) => {
+        buffers.set(socket, "");
+      },
+      data: (socket, chunk) => consume(socket, chunk),
+      close: (socket) => {
+        buffers.delete(socket);
+        if (reader === socket) reader = undefined;
+      },
+      // A per-write connection on Windows is closed by the panel the moment its
+      // line is out, which surfaces here as a reset. Not an error worth ending a
+      // run over, and swallowing it is what keeps one platform's transport shape
+      // from failing the other platform's assertions.
+      error: (socket) => {
+        buffers.delete(socket);
+        if (reader === socket) reader = undefined;
+      },
+    },
+  });
+
+  // Unreferenced immediately: a listener counts as work in progress, so a run that
+  // has printed its verdict would sit open forever waiting for a connection nobody
+  // is going to make. The script's own steps are what keep this process alive, and
+  // when they finish it must exit — a harness that hangs on success leaves a window
+  // with the next run's title on the desktop the next run searches.
+  server.unref();
+
+  return Promise.resolve({
+    endpoint,
+    replies,
+    close: async () => {
+      server.stop(true);
+      // A named pipe has no filesystem entry, so there is nothing to unlink —
+      // the same question `panel-server.ts` asks through the same function, so
+      // the fixture and the server cannot disagree about what this endpoint is.
+      if (!isPanelNamedPipe(endpoint)) await rm(endpoint, { force: true });
+    },
+    waitFor: (description, predicate, timeoutMs = INTERACTION_TIMEOUT_MS) =>
+      eventually(description, async () => replies.find(predicate) ?? null, timeoutMs),
+  });
+}
+
+/**
+ * The status header's own words, when the host can read them.
+ *
+ * Only some hosts can: this reads what a screen reader would hear from the status
+ * card, which UI Automation exposes on Windows and which a bare X server has no
+ * equivalent for. So the claim is checked where it can be checked and skipped —
+ * out loud — where it cannot. A skipped assertion that says so is worth more than
+ * one faked on a platform that cannot make it.
+ *
+ * Returns `null` when the host cannot read text at all, which the caller must
+ * treat as "not checked" rather than as "nothing was said".
+ */
+async function readHeader(host: SmokeHost, window: SmokeWindow, when: string): Promise<string | null> {
+  const read = host.readStatus;
+  if (read === undefined) {
+    log(`ui:smoke skipped the header assertion (${when}): the ${host.kind} host cannot read text on screen`);
+    return null;
+  }
+  const status = await read(window);
+  if (status === null) {
+    smokeFailure(`the status card published nothing ${when}; a screen reader would hear no state at all`);
+  }
+  log(`ui:smoke header ${when}: ${status}`);
+  return status;
 }
 
 async function main(): Promise<void> {
-  await requireCommand("Xvfb", "the Xvfb package");
-  await requireCommand("xdotool", "the xdotool package");
-  await requireCommand("xwininfo", "the x11-utils package");
-  await requireCommand("ffmpeg", "the ffmpeg package");
-  const root = resolve(dirname(new URL(import.meta.url).pathname), "..");
-  const binary = process.argv[2] ?? join(root, "ui", "target", "release", "squid-ui");
-  try { await access(binary); } catch { fail(`compiled panel missing at ${binary}; run \`cargo build --release --manifest-path ui/Cargo.toml\`, or pass its path after \`bun run ui:smoke --\`.`); }
+  const host = await resolveSmokeHost();
+  // URL.pathname is POSIX-shaped even on Windows (`/C:/...`), and `resolve`
+  // interprets that as a directory below the drive it is already on — producing
+  // `C:\\C:\\...`. `fileURLToPath` is the one standard conversion that knows the
+  // host's path dialect, which is exactly why every entry point must use it here
+  // instead of shaving the slash itself.
+  const root = resolve(dirname(fileURLToPath(new URL(import.meta.url))), "..");
+  const defaultBinary = join(root, "ui", "target", "release", process.platform === "win32" ? "squid-ui.exe" : "squid-ui");
+  const binary = process.argv[2] ?? defaultBinary;
+  try {
+    await access(binary);
+  } catch {
+    smokeFailure(
+      `compiled panel missing at ${binary}; run \`cargo build --release --manifest-path ui/Cargo.toml\`, or pass its path after \`bun run ui:smoke --\`.`,
+    );
+  }
 
   const outputDirectory = await mkdtemp(join(tmpdir(), "squid-ui-smoke-"));
   let fixture: Fixture | undefined;
-  let display: { readonly display: string; readonly server: ChildProcess } | undefined;
   let panel: ChildProcess | undefined;
   try {
-    fixture = await panelFixture(join(outputDirectory, "panel.sock"));
-    display = await startDisplay();
-    panel = spawn(binary, [], { env: { ...process.env, DISPLAY: display.display, SQUID_PANEL_SOCKET: fixture.socketPath }, stdio: ["ignore", "pipe", "pipe"] });
+    fixture = await panelFixture(host.endpoint(outputDirectory));
+    const where = await host.prepare();
+    // The panel's own two streams, into a file beside the screenshots. Piping them
+    // nowhere is what the first version did, and it meant a panel that refused its
+    // endpoint failed this run with a timeout and no reason anywhere on disk.
+    const panelLog = join(outputDirectory, "panel.log");
+    const panelLogFd = openSync(panelLog, "w");
+    try {
+      panel = spawn(binary, [], {
+        env: { ...process.env, ...host.panelEnvironment(), SQUID_PANEL_SOCKET: fixture.endpoint },
+        stdio: ["ignore", panelLogFd, panelLogFd],
+      });
+    } finally {
+      closeSync(panelLogFd);
+    }
     log(`ui:smoke output directory: ${outputDirectory}`);
-    log(`ui:smoke display: ${display.display}, panel: ${basename(binary)}`);
+    log(`ui:smoke host: ${host.kind} on ${where}, panel: ${basename(binary)} (log: ${panelLog})`);
     await fixture.waitFor("panel subscription", (reply) => reply.type === "subscribe");
-    const window = await awaitWindow(display.display);
+    const window = await host.awaitWindow(WINDOW_TITLE, panel.pid ?? 0);
     log(`ui:smoke window: ${window.id} at ${window.width}x${window.height}+${window.x}+${window.y}`);
 
     const pending = join(outputDirectory, "01-decision-pending.png");
-    await screenshot(display.display, window, pending);
+    await host.screenshot(window, pending);
     log(`ui:smoke screenshot: ${pending}`);
+
+    // The header, while the decision is live. A pending confirmation outranks a
+    // healthy session in the status precedence, and that ordering is the fix for
+    // the worst thing the old panel did: say "Squid is ready" in calm green while
+    // a confirmation sat unanswered below the settings form.
+    const whilePending = await readHeader(host, window, "with a decision pending");
+    if (whilePending !== null && !/waiting for you/i.test(whilePending)) {
+      smokeFailure(`a pending decision did not reach the header, which says: ${whilePending}`);
+    }
 
     // Later is the third answer, and it must not answer. The request stays
     // pending on the brain's side; only what this surface shows changes.
-    await click(display.display, window.id, BUTTONS.later);
+    await host.activate(window, "later");
     await wait(NEGATIVE_WAIT_MS);
     const afterDefer = answerFor(fixture, PROMPT_ID);
     if (afterDefer !== undefined) {
-      fail(`Later sent an answer (${JSON.stringify(afterDefer.answer)}); deferring is not deciding`);
+      smokeFailure(`Later sent an answer (${JSON.stringify(afterDefer.answer)}); deferring is not deciding`);
     }
     const deferred = join(outputDirectory, "02-decision-deferred.png");
-    await screenshot(display.display, window, deferred);
+    await host.screenshot(window, deferred);
     log(`ui:smoke screenshot: ${deferred}`);
 
     // Bringing it back has to work, or Later would be a way to lose a decision.
-    await click(display.display, window.id, REVIEW);
+    await host.activate(window, "review");
     await wait(NEGATIVE_WAIT_MS);
 
-    await click(display.display, window.id, BUTTONS.decline);
+    await host.activate(window, "decline");
     const answer = await fixture.waitFor(
       "the declined answer",
       (reply) => reply.type === "answer" && reply.promptId === PROMPT_ID,
     );
     if (answer.answer !== "declined") {
-      fail(`clicking Decline produced ${JSON.stringify(answer.answer)}; the buttons have moved`);
+      smokeFailure(`clicking Decline produced ${JSON.stringify(answer.answer)}; the buttons have moved`);
     }
     log(`ui:smoke answered ${JSON.stringify(answer.answer)}`);
 
     // The panel must stop showing a settled decision. A prompt still on screen
     // after an answer invites a second click on a question already closed.
     const settled = join(outputDirectory, "03-decision-settled.png");
-    await screenshot(display.display, window, settled);
+    await host.screenshot(window, settled);
     log(`ui:smoke screenshot: ${settled}`);
+
+    // The header, now that nothing outranks the session's own state. This is the
+    // regression the fixture was rewritten to catch: the dump it is holding
+    // carries two running sources and no `gate` — the shape of every default run —
+    // and the header used to answer that with "Not watching yet" while the cards
+    // below it said "Watching".
+    const whenSettled = await readHeader(host, window, "with the decision settled");
+    if (whenSettled !== null) {
+      const idle = /not watching|nothing switched on|nothing reported yet/i.exec(whenSettled);
+      if (idle !== null) {
+        smokeFailure(
+          `the header claims "${idle[0]}" while the catalog reports two running sources: ${whenSettled}`,
+        );
+      }
+      if (!/watching/i.test(whenSettled)) {
+        smokeFailure(`the header does not say what the session is doing: ${whenSettled}`);
+      }
+    }
 
     // One prompt, one answer. Clicking where the buttons were must not produce a
     // second line for the same id.
     const before = fixture.replies.filter((reply) => reply.type === "answer").length;
-    await click(display.display, window.id, BUTTONS.allow);
+    await host.activate(window, "allow").catch(() => {
+      // On a host that finds controls by name, the settled card is gone and
+      // there is nothing named Allow left to click — which is itself the
+      // assertion below, reached by a different route. A host that clicks a
+      // measured position has no way to know that and clicks anyway.
+    });
     await wait(NEGATIVE_WAIT_MS);
     const after = fixture.replies.filter((reply) => reply.type === "answer").length;
-    if (after !== before) fail(`a settled prompt accepted another answer (${before} then ${after})`);
+    if (after !== before) {
+      smokeFailure(`a settled prompt accepted another answer (${before} then ${after})`);
+    }
 
     log("ui:smoke passed");
   } finally {
-    stop(panel);
-    stop(display?.server);
+    await stopPanel(panel);
+    await host.dispose();
     await fixture?.close();
   }
 }
