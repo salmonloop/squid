@@ -55,6 +55,8 @@ export interface WindowsScreenTextReaderOptions {
   readonly pollMs?: number;
   /** How long to wait before restarting a child that exited. Default 2000ms. */
   readonly restartMs?: number;
+  /** The host to judge against. Defaults to this process; see the macOS reader. */
+  readonly platform?: NodeJS.Platform;
   /** Injected in tests so no suite starts a real interpreter. */
   readonly spawn?: () => StreamingChild;
 }
@@ -268,9 +270,10 @@ function spawnSampler(script: string): StreamingChild {
 export function createWindowsScreenTextReader(
   options: WindowsScreenTextReaderOptions = {},
 ): ScreenTextReaderFactory {
-  if (options.spawn === undefined && process.platform !== "win32") {
+  const platform = options.platform ?? process.platform;
+  if (options.spawn === undefined && platform !== "win32") {
     throw new Error(
-      `The Windows screen text reader requires win32; this process reports ${process.platform}.`,
+      `The Windows screen text reader requires win32; this process reports ${platform}.`,
     );
   }
 

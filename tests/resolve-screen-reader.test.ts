@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveScreenReader } from "../src/resolve-screen-reader.js";
+import { resolveScreenReader, type ScreenReaderKind } from "../src/resolve-screen-reader.js";
 
 /**
  * Backend selection is validated here rather than inside the source, because the
@@ -11,8 +11,35 @@ import { resolveScreenReader } from "../src/resolve-screen-reader.js";
  * demo frames instead is indistinguishable from one that works.
  */
 describe("resolveScreenReader", () => {
-  it("defaults to the synthetic demo reader with no environment set", async () => {
-    const resolved = await resolveScreenReader({ env: {}, platform: "linux" });
+  it("reads the host's own screen when nobody says otherwise", async () => {
+    // The default used to be `synthetic`, which is not "off" but *fake*: an
+    // unconfigured run replayed demo frames and every consumer treated them as
+    // observations of this machine. A host with a real backend now gets it.
+    const hosts: ReadonlyArray<readonly [NodeJS.Platform, ScreenReaderKind]> = [
+      ["darwin", "darwin"],
+      ["linux", "linux"],
+      ["win32", "windows"],
+    ];
+    for (const [platform, expected] of hosts) {
+      const resolved = await resolveScreenReader({ env: {}, platform });
+      if ("configError" in resolved) throw new Error(resolved.configError);
+      expect(resolved.readerKind).toBe(expected);
+    }
+  });
+
+  it("falls back to the demo reader only where there is no real backend", async () => {
+    const resolved = await resolveScreenReader({ env: {}, platform: "freebsd" });
+    if ("configError" in resolved) throw new Error(resolved.configError);
+    expect(resolved.readerKind).toBe("synthetic");
+  });
+
+  it("still takes the demo reader when it is asked for by name", async () => {
+    // Asking for it is a different act from not asking at all, and the tests and
+    // the offline demo are the callers that do ask.
+    const resolved = await resolveScreenReader({
+      env: { SQUID_SCREEN_READER: "synthetic" },
+      platform: "win32",
+    });
     if ("configError" in resolved) throw new Error(resolved.configError);
     expect(resolved.readerKind).toBe("synthetic");
   });
@@ -71,7 +98,7 @@ describe("resolveScreenReader", () => {
   it("rejects a poll interval that is not a positive integer", async () => {
     for (const value of ["0", "-1", "1.5", "abc", ""]) {
       const resolved = await resolveScreenReader({
-        env: { SQUID_SCREEN_POLL_MS: value },
+        env: { SQUID_SCREEN_READER: "synthetic", SQUID_SCREEN_POLL_MS: value },
         platform: "linux",
       });
       expect("configError" in resolved).toBe(true);
@@ -90,7 +117,7 @@ describe("resolveScreenReader", () => {
 
   it("accepts a valid poll interval for the synthetic backend", async () => {
     const resolved = await resolveScreenReader({
-      env: { SQUID_SCREEN_POLL_MS: "500" },
+      env: { SQUID_SCREEN_READER: "synthetic", SQUID_SCREEN_POLL_MS: "500" },
       platform: "linux",
     });
     expect("configError" in resolved).toBe(false);
@@ -101,7 +128,7 @@ describe("resolveScreenReader", () => {
     const path = join(directory, "frames.json");
     await writeFile(path, JSON.stringify([{ applicationId: "vscode" }]), "utf8");
 
-    const resolved = await resolveScreenReader({ framesPath: path, env: {}, platform: "linux" });
+    const resolved = await resolveScreenReader({ framesPath: path, env: { SQUID_SCREEN_READER: "synthetic" }, platform: "linux" });
     if ("configError" in resolved) throw new Error(resolved.configError);
     expect(resolved.readerKind).toBe("synthetic");
   });
@@ -110,7 +137,7 @@ describe("resolveScreenReader", () => {
     const directory = await mkdtemp(join(tmpdir(), "squid-frames-"));
     const missing = await resolveScreenReader({
       framesPath: join(directory, "absent.json"),
-      env: {},
+      env: { SQUID_SCREEN_READER: "synthetic" },
       platform: "linux",
     });
     expect("configError" in missing && missing.configError).toContain("Could not read frames");
@@ -119,7 +146,7 @@ describe("resolveScreenReader", () => {
     await writeFile(notArray, JSON.stringify({ applicationId: "vscode" }), "utf8");
     const wrongShape = await resolveScreenReader({
       framesPath: notArray,
-      env: {},
+      env: { SQUID_SCREEN_READER: "synthetic" },
       platform: "linux",
     });
     expect("configError" in wrongShape && wrongShape.configError).toContain("JSON array");

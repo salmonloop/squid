@@ -76,11 +76,48 @@ export function resolveAppPanel(
  * Where the panel binary should sit: next to the app binary, in the release
  * zip. The `.exe` follows the *target*, not the host — a Windows zip unpacked
  * on a non-Windows host still names its panel `squid-ui.exe`.
+ *
+ * Two candidates, in order, because a packaged run and a from-source run put the
+ * binary in different places and neither should need a variable to say so. The
+ * packaged layout is first and is the only one that exists in a release: the panel
+ * travels beside the app. The second is `ui/target/release` under the project
+ * root, which is where `cargo build --release` leaves it — so `bun run start` in a
+ * checkout finds the panel it just built instead of reporting that a window is
+ * missing next to `bun.exe`.
+ *
+ * A search rather than another setting, deliberately. "Where did the build put
+ * the panel" is a question the machine can answer, and a variable for it would be
+ * one more thing to get wrong in the one place where getting it wrong means no
+ * window at all.
+ */
+export function panelExecutableCandidates(
+  target: "windows" | "other",
+  execPath: string = process.execPath,
+  projectRoot?: string,
+): readonly string[] {
+  const name = target === "windows" ? "squid-ui.exe" : "squid-ui";
+  const candidates = [join(dirname(execPath), name)];
+  if (projectRoot !== undefined) {
+    candidates.push(join(projectRoot, "ui", "target", "release", name));
+  }
+  return candidates;
+}
+
+/**
+ * The first candidate that exists, or the packaged path when none does — so a
+ * diagnostic names the place a release is supposed to have it rather than the last
+ * place something looked.
  */
 export function panelExecutablePath(
   target: "windows" | "other",
   execPath: string = process.execPath,
+  options: {
+    readonly projectRoot?: string;
+    readonly exists?: (path: string) => boolean;
+  } = {},
 ): string {
-  const name = target === "windows" ? "squid-ui.exe" : "squid-ui";
-  return join(dirname(execPath), name);
+  const candidates = panelExecutableCandidates(target, execPath, options.projectRoot);
+  const exists = options.exists;
+  if (exists === undefined) return candidates[0] ?? "";
+  return candidates.find((candidate) => exists(candidate)) ?? candidates[0] ?? "";
 }

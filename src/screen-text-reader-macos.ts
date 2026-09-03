@@ -73,6 +73,15 @@ return output
 export interface MacosScreenTextReaderOptions {
   /** Poll interval. Default 1000ms. */
   readonly pollMs?: number;
+  /**
+   * The host to judge against. Defaults to this process.
+   *
+   * Injected so the seam is connected the whole way down: `resolveScreenReader`
+   * already takes a platform, and a factory that read `process.platform` instead
+   * left that option deciding the validation but not the construction — so a test
+   * asking what a macOS host defaults to could only be run on macOS.
+   */
+  readonly platform?: NodeJS.Platform;
 }
 
 /**
@@ -93,9 +102,10 @@ export interface MacosScreenTextReaderOptions {
 export function createMacosScreenTextReader(
   options: MacosScreenTextReaderOptions = {},
 ): ScreenTextReaderFactory {
-  if (process.platform !== "darwin") {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "darwin") {
     throw new Error(
-      `The macOS screen text reader requires darwin; this process reports ${process.platform}.`,
+      `The macOS screen text reader requires darwin; this process reports ${platform}.`,
     );
   }
 

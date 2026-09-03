@@ -73,6 +73,28 @@ describe("panelExecutablePath", () => {
     expect(basename(panelExecutablePath("other", binary))).toBe("squid-ui");
     expect(dirname(panelExecutablePath("windows", binary))).toBe(dirname(binary));
   });
+
+  it("prefers the packaged path, and finds a from-source build when that is what exists", () => {
+    // Two layouts, no setting between them. A release puts the panel beside the
+    // app; a checkout leaves it where cargo does. Asking the filesystem which one
+    // is there beats asking the person to say.
+    const binary = join("/opt", "squid", "squid");
+    const root = join("/home", "you", "squid");
+    const packaged = join(dirname(binary), "squid-ui");
+    const built = join(root, "ui", "target", "release", "squid-ui");
+
+    expect(panelExecutablePath("other", binary, { projectRoot: root, exists: (path) => path === built }))
+      .toBe(built);
+    // Both present is the packaged one: a release must not be overridden by a
+    // stale build tree that happens to sit under it.
+    expect(panelExecutablePath("other", binary, { projectRoot: root, exists: () => true }))
+      .toBe(packaged);
+    // Neither present names the packaged path, so the diagnostic points at where
+    // a release is supposed to have it rather than at the last place something
+    // looked.
+    expect(panelExecutablePath("other", binary, { projectRoot: root, exists: () => false }))
+      .toBe(packaged);
+  });
 });
 
 describe("modelConfigurationStatus", () => {

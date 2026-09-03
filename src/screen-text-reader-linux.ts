@@ -30,6 +30,8 @@ printf '%s\\x1f%s\\x1f%s\\n' "$pid" "$name" "$title"
 export interface LinuxScreenTextReaderOptions {
   /** Poll interval. Default 1000ms. */
   readonly pollMs?: number;
+  /** The host to judge against. Defaults to this process; see the macOS reader. */
+  readonly platform?: NodeJS.Platform;
 }
 
 /**
@@ -44,9 +46,10 @@ export interface LinuxScreenTextReaderOptions {
 export function createLinuxScreenTextReader(
   options: LinuxScreenTextReaderOptions = {},
 ): ScreenTextReaderFactory {
-  if (process.platform !== "linux") {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "linux") {
     throw new Error(
-      `The Linux screen text reader requires linux; this process reports ${process.platform}.`,
+      `The Linux screen text reader requires linux; this process reports ${platform}.`,
     );
   }
 

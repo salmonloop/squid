@@ -1,4 +1,6 @@
 import { existsSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as readline from "node:readline/promises";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
@@ -190,6 +192,8 @@ export function spawnPanelProcess(options: {
   readonly execPath: string;
   readonly logError: (line: string) => void;
   readonly exists?: (path: string) => boolean;
+  /** Checkout root, when this run has one; lets a from-source run find its build. */
+  readonly projectRoot?: string;
 }): void {
   if (options.socketPath.length === 0) return;
   // A supervised run was started *by* a panel, which is already attached and
@@ -199,11 +203,12 @@ export function spawnPanelProcess(options: {
   // owns the panel's lifetime in that direction; this branch is what keeps the
   // ownership one-way.
   if (options.env.SQUID_SUPERVISED === "1") return;
+  const exists = options.exists ?? existsSync;
   const exe = panelExecutablePath(
     options.platform === "win32" ? "windows" : "other",
     options.execPath,
+    { exists, ...(options.projectRoot === undefined ? {} : { projectRoot: options.projectRoot }) },
   );
-  const exists = options.exists ?? existsSync;
   if (!exists(exe)) {
     // A diagnostic, not an error: the session runs, only the window is absent.
     options.logError(
@@ -325,6 +330,12 @@ if (import.meta.main) {
     env: prepared.ready.env,
     platform,
     execPath: process.execPath,
+    // The checkout this module is running out of, when there is one. In a release
+    // this resolves inside the unpacked zip and the `ui/target/release` candidate
+    // simply does not exist, so the packaged path still wins by being the only one
+    // there. From source it is what lets `bun run start` find the panel that
+    // `cargo build --release` produced, rather than looking beside `bun.exe`.
+    projectRoot: resolve(dirname(fileURLToPath(new URL(import.meta.url))), ".."),
     logError: (line) => console.error(line),
   });
 }

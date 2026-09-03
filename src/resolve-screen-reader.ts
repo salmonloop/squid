@@ -23,6 +23,33 @@ import type { ScreenTextFrame, ScreenTextReaderFactory } from "./screen-text-sou
  * a run that asked for the real accessibility reader and quietly replayed demo
  * frames instead looks identical to one that works.
  */
+/**
+ * The backend a host reads its own screen with, when nobody says otherwise.
+ *
+ * `synthetic` used to be the default, and that was the wrong kind of default: not
+ * "off", but *fake*. A run that nobody configured replayed demo frames — a
+ * scripted editor, a scripted window title — and the projection, the agent, and
+ * the panel all treated them as observations of this machine. That is the failure
+ * this module's own comment warns about, one layer up from where it was looking:
+ * the run that "asked for the real accessibility reader and quietly replayed demo
+ * frames" is bad, and so is the run that never asked and got them anyway.
+ *
+ * Every platform with a real backend now gets it. Nothing is guessed — the host
+ * reports what it is, and the mismatch check below still refuses a backend asked
+ * for on the wrong one — and nothing is silently degraded: a host whose
+ * accessibility permission is missing produces read errors the source reports,
+ * which is a fixable state a person can be told about, where demo frames are a
+ * lie nobody can see through.
+ *
+ * `synthetic` stays reachable by name. It is what the tests and the offline demo
+ * want, and asking for it is a different act from not asking at all.
+ */
+const HOST_READER: Partial<Record<NodeJS.Platform, ScreenReaderKind>> = {
+  darwin: "darwin",
+  linux: "linux",
+  win32: "windows",
+};
+
 export type ScreenReaderKind = "darwin" | "linux" | "windows" | "synthetic";
 
 export type ScreenReaderResolution =
@@ -52,7 +79,7 @@ export async function resolveScreenReader(
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
 
-  const readerKind = env.SQUID_SCREEN_READER ?? "synthetic";
+  const readerKind = env.SQUID_SCREEN_READER ?? HOST_READER[platform] ?? "synthetic";
   if (readerKind !== "darwin" && readerKind !== "linux" && readerKind !== "windows" && readerKind !== "synthetic") {
     return {
       configError:
@@ -77,22 +104,26 @@ export async function resolveScreenReader(
     };
   }
 
+  // The platform travels with the choice, so the option decides construction as
+  // well as validation. A factory left to read `process.platform` would make this
+  // seam half-connected: it would pick the backend for the host named here and
+  // then refuse to build it unless the process happened to be running there.
   if (readerKind === "darwin") {
     return {
       readerKind,
-      readerFactory: createMacosScreenTextReader(pollMs === undefined ? {} : { pollMs }),
+      readerFactory: createMacosScreenTextReader({ platform, ...(pollMs === undefined ? {} : { pollMs }) }),
     };
   }
   if (readerKind === "linux") {
     return {
       readerKind,
-      readerFactory: createLinuxScreenTextReader(pollMs === undefined ? {} : { pollMs }),
+      readerFactory: createLinuxScreenTextReader({ platform, ...(pollMs === undefined ? {} : { pollMs }) }),
     };
   }
   if (readerKind === "windows") {
     return {
       readerKind,
-      readerFactory: createWindowsScreenTextReader(pollMs === undefined ? {} : { pollMs }),
+      readerFactory: createWindowsScreenTextReader({ platform, ...(pollMs === undefined ? {} : { pollMs }) }),
     };
   }
 
