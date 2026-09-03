@@ -32,9 +32,19 @@ component EvidenceRow inherits HorizontalLayout {
         vertical-alignment: top;
     }
     Text {
-        // Never a bare dash. "Nothing seen yet" is a real state and saying so is
-        // shorter to understand than a punctuation mark the reader has to decode.
-        text: root.value == "" ? "Nothing seen yet" : root.value;
+        // Never a bare dash: naming the state is shorter to understand than a
+        // punctuation mark the reader has to decode. But it names only what this
+        // window can vouch for. "Nothing seen yet" used to sit here, and it is a
+        // claim — that Squid looked and found nothing — which is false in every
+        // state that empties this field for another reason: the capability that
+        // feeds the row is switched off or unsupported, the session has not been
+        // reached at all, or an episode boundary reset the projection. The row
+        // cannot tell those apart, and it must not guess: which capability owns
+        // which row is the brain's schema, and the panel deliberately holds none
+        // of it. So the empty state reports the panel's own position — there is
+        // nothing here to show — and leaves why to the cards above, which say it
+        // per capability in their own words.
+        text: root.value == "" ? "Nothing to show" : root.value;
         color: root.value == "" ? Theme.text-muted : Theme.text;
         font-size: 13px;
         wrap: word-wrap;
@@ -264,7 +274,7 @@ export component PanelWindow inherits Window {
                                     ? "Paused. Nothing new is being recorded."
                                     : (root.gate == "open"
                                         ? "Recording what happens on this machine."
-                                        : "The session has not said whether it is recording.");
+                                        : "The session has not said whether it is recording. Pause control may not be set up — until it is, recording cannot be stopped from here.");
                                 color: Theme.text;
                                 font-size: 13px;
                                 wrap: word-wrap;
@@ -285,9 +295,18 @@ export component PanelWindow inherits Window {
                                     accessible-description: "Start recording activity again.";
                                     clicked => { root.resume(); }
                                 }
+                                // Named for what it actually does. It used to say
+                                // it would ask whether Squid is recording, and
+                                // `refresh` cannot: it sends only `config_get`
+                                // and `source_get`, and no V1 request makes the
+                                // session re-send its world state. Re-reading the
+                                // settings is still the useful move here, because
+                                // pause control being configured is what would
+                                // end this state — so the button keeps its place
+                                // and drops the promise it could not keep.
                                 if root.gate != "open" && root.gate != "paused": Button {
-                                    text: "Ask again";
-                                    accessible-description: "Ask the session whether it is recording.";
+                                    text: "Re-read settings";
+                                    accessible-description: "Ask the session for its settings and senses again.";
                                     clicked => { root.refresh(); }
                                 }
                                 if root.supervised && root.service-state == "failed": Button {
@@ -325,9 +344,21 @@ export component PanelWindow inherits Window {
                             EvidenceRow { label: "Recently"; value: root.recent-actions; }
                             EvidenceRow {
                                 label: "Squid last said";
+                                // Both known outcomes matched by name, and a
+                                // token this build has not met reported as one.
+                                // The else arm used to be "It replied", so an
+                                // unknown status was announced as a successful
+                                // turn — the optimistic direction, and the wrong
+                                // one: `status` is carried as the string the
+                                // brain sent precisely so this side never folds
+                                // it onto a local enum.
                                 value: root.agent-status == ""
                                     ? ""
-                                    : (root.agent-status == "failed" ? "It could not finish" : "It replied")
+                                    : (root.agent-status == "replied"
+                                        ? "It replied"
+                                        : root.agent-status == "failed"
+                                            ? "It could not finish"
+                                            : "It ended in a way this window does not know")
                                       + (root.agent-at == "" ? "" : " at " + root.agent-at);
                             }
                             if root.agent-text != "": Text {

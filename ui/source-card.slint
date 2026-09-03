@@ -24,12 +24,41 @@ export component SourceCard inherits Rectangle {
     callback configure(string);
     callback open(string);
 
+    // Whether the catalog row says something this build can read.
+    //
+    // `state` is a free string the whole way here: the parser takes whatever the
+    // brain sent (`ui/src/protocol.rs`) and Rust copies it through untouched
+    // (`ui/src/main.rs`), which is the same deliberate refusal to flatten a
+    // brain's word onto a local enum that `agentState` gets. So a token this
+    // build has never met is a line the wire can really deliver, and it used to
+    // land in one `else` arm that answered it with "Off": a muted line, an
+    // unchecked switch, and — because `repairable` was false — an enabled one.
+    // Together those said the person had switched this capability off
+    // themselves, a claim nothing on the wire made.
+    //
+    // An unread token therefore gets the words and nothing else. No switch, and
+    // no offer to repair it either: `repairable` stays an exact match on
+    // `unsupported`, because "I cannot read this" is not a promise that a
+    // setting would fix it. The settings door is the one thing that stays, since
+    // a door makes no claim about what is behind it. It is quiet rather than
+    // alarming — the tint below stays a three-way choice — because a token this
+    // panel has not met is a gap in what it can say, not a fault it has found.
+    // Do not fold any of this back into a default arm, and do not restore the
+    // switch on the grounds that a disabled one looks harmless: an unchecked
+    // switch says off.
+    out property <bool> state-known:
+        root.source.state == "running"
+        || root.source.state == "stopped"
+        || root.source.state == "unsupported";
+
     // Plain language, never the wire's own word. `running`, `stopped`, and
-    // `unsupported` are protocol tokens; a person reads none of them.
+    // `unsupported` are protocol tokens; a person reads none of them. The fourth
+    // reading names the gap instead of guessing which of the three it is nearest.
     out property <string> state-text:
         root.source.state == "running" ? "Watching"
         : root.source.state == "unsupported" ? "Not set up"
-        : "Off";
+        : root.source.state == "stopped" ? "Off"
+        : "Not recognised";
 
     out property <brush> state-tint:
         root.source.state == "running" ? Theme.calm
@@ -76,13 +105,30 @@ export component SourceCard inherits Rectangle {
             // Disabled only when there is genuinely nothing to toggle; the
             // last-observer case stays enabled so the explanation below is what
             // the person reads, not a control that silently does nothing.
-            Switch {
+            //
+            // Absent, not disabled, for a state this build cannot read. A switch
+            // has two positions and both of them are assertions: unchecked says
+            // the capability is off, and greying that out only adds that the
+            // person may not change it. There is no third position for "unread",
+            // so the honest control is no control, with the sentence below in
+            // its place.
+            if root.state-known: Switch {
                 checked: root.source.state == "running";
                 enabled: !root.repairable && !root.only-observer;
                 accessible-label: root.source.label;
                 accessible-description: root.source.label + " is " + root.state-text;
                 toggled => { root.toggle(root.source.id, self.checked); }
             }
+        }
+
+        // The missing switch, explained. A card whose status nobody can read and
+        // whose control quietly vanished is its own small mystery, and the reason
+        // is worth more to a person than the switch was.
+        if !root.state-known: Text {
+            text: "The session described this sense in words this window does not know, so nothing here can say whether it is on. This window may be older than the session it is watching.";
+            color: Theme.text-muted;
+            font-size: 12px;
+            wrap: word-wrap;
         }
 
         if root.only-observer && root.source.state == "running": Text {
