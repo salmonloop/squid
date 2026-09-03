@@ -569,7 +569,10 @@ fn show_settings(window: &PanelWindow, rows: Vec<ConfigLine>, count: i64) {
 ///
 /// Everything optional collapses to a value that reads as "not stated" rather
 /// than as a claim: an absent `group` puts the setting in no capability's door,
-/// and an absent `secretPresent` reads as no stored credential. Anything but an
+/// and an absent `secretPresent` says only that no credential could be read —
+/// which is weaker than "none was ever set", because the brain's read cannot
+/// tell an empty store from one it may not open, and `ui/settings.slint` is
+/// where that distinction has to survive into words. Anything but an
 /// explicit `1` on either flag is treated as false, because both are disclosures
 /// and asserting one from a malformed field is worse than leaving it off.
 fn setting_row(row: &ConfigLine) -> SettingRow {

@@ -89,8 +89,29 @@ export component SettingEditor inherits Rectangle {
                 // field. The value is structurally absent from every dump, so an
                 // empty box used to be the only thing a saved key looked like —
                 // indistinguishable from never having entered one.
+                //
+                // The other branch says only what the brain can know. The flag
+                // rides the wire when Pi's auth store yields a credential and is
+                // omitted otherwise, and "otherwise" covers a store that could
+                // not be read at all: Pi's read catches every error and answers
+                // the same nothing for a missing file, one this process may not
+                // open, and a half-written one. So the absence means "nothing
+                // Squid can use", never "you have not set one" — and "Not set
+                // yet" was the second claim, in the field where a wrong belief is
+                // least recoverable: a person told they had never entered a key
+                // enters one, over a key that was stored and merely unreachable.
+                //
+                // Naming the consequence holds in every state this row can reach,
+                // a brain too old to send the flag included, and it needs no
+                // third state on the wire: a credential the panel cannot be told
+                // about is one no session can use either, because the agent reads
+                // that same file through that same catch. Do not "improve" this
+                // back into a statement about what the user has or has not done —
+                // nothing on either side of the wire can see that.
                 placeholder-text: root.setting.kind == "secret"
-                    ? (root.setting.secret-present ? "Saved. Type to replace it." : "Not set yet")
+                    ? (root.setting.secret-present
+                        ? "Saved. Type to replace it."
+                        : "No key Squid can use. Type one to save it.")
                     : "";
                 input-type: root.setting.kind == "secret" ? InputType.password : InputType.text;
                 horizontal-stretch: 1;

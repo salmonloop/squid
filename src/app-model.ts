@@ -108,13 +108,25 @@ export function readModelEntry(agentDir: string, provider: string): ModelEntryVa
 }
 
 /**
- * Whether a credential exists for the provider, without ever exposing its
+ * Whether a credential for the provider can be *read*, never exposing its
  * value: the key's content stays inside Pi's auth file and this module. Callers
  * that need the value to restate it (an endpoint rewrite that also rewrote
  * auth.json) are the reason `writeModelEndpoint` exists instead — an endpoint
  * edit must not need the key at all.
+ *
+ * Readable, not stored, and the name says so on purpose. Pi's
+ * `readStoredCredential` catches every error and answers the same `undefined`
+ * for a missing file, a file this process may not open, and a truncated or
+ * hand-broken one — so a `false` here cannot tell "none was ever set" from "one
+ * is set and unreachable". That is still the right answer for every caller: the
+ * status check above reads through the same call, and Pi's own store keeps its
+ * last snapshot when a reload throws, so a credential this cannot read is one no
+ * session can use either. What it is not is a claim about what the *user* has
+ * done, and the settings form once made it exactly that ("Not set yet") in the
+ * one field where acting on the mistake overwrites something nobody can get
+ * back. Do not restore a name, or a comment, that says this reports existence.
  */
-export function hasStoredCredential(agentDir: string, provider: string): boolean {
+export function hasReadableCredential(agentDir: string, provider: string): boolean {
   return readStoredCredential(provider, join(agentDir, "auth.json")) !== undefined;
 }
 

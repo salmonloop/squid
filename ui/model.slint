@@ -43,8 +43,11 @@ export struct SettingRow {
     // explain a retention window or a poll interval to someone who has not read
     // the source.
     description: string,
-    // Whether a credential is already stored. The value itself is structurally
+    // Whether a credential could be read here. The value itself is structurally
     // absent from every dump, so without this an empty box is the only thing a
     // saved key can look like — indistinguishable from never having set one.
+    // False is the weaker half of that pair on purpose: it says the brain found
+    // nothing it could read, which a store it may not open answers too. The
+    // form must not turn it back into a claim that the user never set a key.
     secret-present: bool,
 }

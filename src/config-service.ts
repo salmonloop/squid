@@ -7,7 +7,7 @@ import {
 import { readConfigFile, updateConfigFile } from "./config-file.js";
 import {
   DEFAULT_BASE_URL,
-  hasStoredCredential,
+  hasReadableCredential,
   readModelEntry,
   writeModelConfiguration,
   writeModelEndpoint,
@@ -30,12 +30,16 @@ import {
  * why an endpoint edit goes through `writeModelEndpoint` (models.json only):
  * the credential half is simply not touched.
  *
- * What the dump does say is whether a credential *exists*, as `secretPresent`.
+ * What the dump does say is whether a credential can be *read*, as
+ * `secretPresent` — deliberately weaker than whether one is stored, because an
+ * unreadable store answers no.
  * That is the one fact the rule above accidentally hid: two very different
  * states — a key is stored, or none ever was — both render as an empty field,
  * so the only way to distinguish them was to save nothing and read the refusal.
- * A yes/no is not the secret, and it is derived from `hasStoredCredential`,
- * which is the only question this module asks about a stored key.
+ * A yes/no is not the secret, and it is derived from `hasReadableCredential`,
+ * which is the only question this module asks about a stored key. Its absence
+ * is therefore never evidence about what the user has done, and no surface
+ * downstream may narrate it that way.
  *
  * Applies is per key, not global: file-backed settings are read once at
  * startup by the resolvers, so any write to them can only land after a
@@ -72,19 +76,23 @@ export interface ConfigDumpEntry {
   readonly overridden: boolean;
   readonly values?: readonly string[];
   /**
-   * A credential is stored for this row — the existence of one, never any part
+   * A credential for this row can be read — that it is reachable, never any part
    * of it. Only a `secret` kind carries this, and only when there is one to
-   * report, so an absent flag reads as "nothing stored" without a second
-   * spelling for it.
+   * report, so an absent flag reads as "nothing readable" without a second
+   * spelling for it. Readable, not stored: `hasReadableCredential` answers no
+   * for a store it cannot open or parse just as it does for one with no entry,
+   * so this absence must never be rendered as "not set yet" — that tells a user
+   * they never entered a key that may well be sitting there, in the one field
+   * where acting on the belief overwrites something unrecoverable.
    *
    * It exists because the secret rule left one honest question unanswerable. A
    * secret's value is always the empty string here, so a stored key and no key
    * at all render identically, and the only way to tell them apart was to save
-   * an empty field and read back either "kept" or "no API key is stored yet" —
+   * an empty field and read back either "kept" or a refusal —
    * a probe, in the one field where a mistaken save is least recoverable.
    * Reporting presence is not reporting the secret: nothing in this module
    * reads a stored key back, and this flag is derived from
-   * `hasStoredCredential`, which answers only yes or no.
+   * `hasReadableCredential`, which answers only yes or no.
    */
   readonly secretPresent?: boolean;
 }
@@ -187,7 +195,7 @@ export function configDumpEntries(options: ConfigServiceOptions): ConfigDump {
   const applies = (): "now" | "restart" => (options.agentLive() ? "restart" : "now");
   // Asked once for the whole dump rather than per row: it reads Pi's auth store,
   // and only the one secret row has any use for the answer.
-  const storedCredential = hasStoredCredential(options.agentDir, options.provider);
+  const readableCredential = hasReadableCredential(options.agentDir, options.provider);
 
   for (const key of MODEL_CONFIG_KEYS) {
     entries.push({
@@ -208,7 +216,10 @@ export function configDumpEntries(options: ConfigServiceOptions): ConfigDump {
       overridden: key.id === "modelId" ? overriddenEnv("PI_MODEL_ID") : false,
       // Keyed off the kind, not off the id: whichever row is the secret one is
       // the row that can say whether a credential is behind its empty field.
-      ...(key.kind === "secret" && storedCredential ? { secretPresent: true } : {}),
+      // Whether one can be *read*, which is all `hasReadableCredential` knows:
+      // absent is "nothing Squid can use", not "nothing was ever set", and the
+      // form is required to keep those two apart.
+      ...(key.kind === "secret" && readableCredential ? { secretPresent: true } : {}),
     });
   }
 
@@ -278,10 +289,12 @@ function applyModelSet(
   if (key.kind === "secret") {
     // Empty means "keep the stored credential" — the only meaning an empty
     // field can carry when the value is never displayed back. Refusing when
-    // there is none stored keeps the two cases ("nothing entered" and "no
-    // key exists") from being mistaken for each other.
+    // none can be read keeps the two cases ("nothing entered" and "nothing
+    // here works") from being mistaken for each other. The refusal names what
+    // Squid can do rather than what the user did: a store this process cannot
+    // open must not be reported back as a key they never entered.
     if (trimmed.length === 0) {
-      return hasStoredCredential(options.agentDir, options.provider)
+      return hasReadableCredential(options.agentDir, options.provider)
         ? { ok: true, applies: appliesForModel(options) }
         : { ok: false, error: "No API key is stored yet; enter one to save." };
     }
@@ -300,7 +313,7 @@ function applyModelSet(
   // An endpoint is worthless without the credential half beside it, and this
   // layer has no way to prompt for one — so the gate is here, before the
   // write, where the refusal can name what is missing.
-  if (!hasStoredCredential(options.agentDir, options.provider)) {
+  if (!hasReadableCredential(options.agentDir, options.provider)) {
     return {
       ok: false,
       error: "An API key is required before this can be saved; set the API key first.",
