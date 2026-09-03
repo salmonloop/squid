@@ -86,28 +86,41 @@ export async function startDesktopWatch(
     return { configError: "SQUID_DB must be an absolute path." };
   }
 
-  const reader = await resolveScreenReader(
-    options.framesPath === undefined ? {} : { framesPath: options.framesPath },
-  );
+  // Every reader resolves against the *merged* env, not `process.env`.
+  //
+  // `loadConfiguredEnvironment` returns a merged object and deliberately does not
+  // touch `process.env`, so a resolver called with no env reads the raw
+  // environment and never sees the config file at all. These four used to be
+  // called that way, which made `screenReader`, `browser`, `terminal`, and
+  // `editorSaves` settings that saved, reported "takes effect on restart", and
+  // then did nothing — the settings form offering switches wired to nothing. The
+  // gate, retention, panel, and turn watchdog were already resolved from the
+  // merged env one layer down; this is the same env reaching the other half of the
+  // capabilities. A new reader added here must be passed it too.
+  const reader = await resolveScreenReader({
+    env,
+    ...(options.framesPath === undefined ? {} : { framesPath: options.framesPath }),
+  });
   if ("configError" in reader) {
     return { configError: reader.configError };
   }
 
-  const browser = await resolveBrowserReader(
-    options.browserFramesPath === undefined
+  const browser = await resolveBrowserReader({
+    env,
+    ...(options.browserFramesPath === undefined
       ? {}
-      : { framesPath: options.browserFramesPath },
-  );
+      : { framesPath: options.browserFramesPath }),
+  });
   if ("configError" in browser) {
     return { configError: browser.configError };
   }
 
-  const terminal = resolveTerminalReader();
+  const terminal = resolveTerminalReader({ env });
   if ("configError" in terminal) {
     return { configError: terminal.configError };
   }
 
-  const editorSaves = resolveEditorSaveReader();
+  const editorSaves = resolveEditorSaveReader({ env });
   if ("configError" in editorSaves) {
     return { configError: editorSaves.configError };
   }
