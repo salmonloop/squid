@@ -29,6 +29,7 @@ bun install --frozen-lockfile
 bun run typecheck
 bun test
 bun run build
+bun run start
 bun run dev
 bun run history:delete -- /absolute/path/events.db <from> <until>
 bun run watch:desktop -- /absolute/project/root
@@ -36,12 +37,24 @@ bun run watch:files -- /absolute/project/root
 bun run watch:screen
 ```
 
+`bun run start` is the app: it watches the home directory, computes the platform
+panel endpoint, finds the panel binary — beside the executable in a release, in
+`ui/target/release` from a checkout — and needs no environment. `bun run dev` is a
+forty-line demo that ingests three invented events and prints the world state they
+build up; it starts no sensors and no agent.
+
+The screen backend defaults to whatever the host can actually read: UI Automation on
+Windows, `xdotool` on Linux, the accessibility API on macOS. `SQUID_SCREEN_READER=synthetic`
+asks for the built-in demo script by name, which is what the tests and an offline
+demo want — it is deliberately no longer what an unconfigured run gets, because demo
+frames presented as observations of this machine are a lie nothing downstream can
+see through.
+
 ### Visual panel smoke harness
 
-`bun run ui:smoke` runs the real release `ui/target/release/squid-ui` under an
-isolated Xvfb display, attaches it to an in-process Unix-socket fixture, waits
-for a mapped X11 window, saves PNGs, and sends a real xdotool interaction. Build
-the binary first:
+`bun run ui:smoke` runs the real release panel against an in-process fixture
+speaking the production wire, waits for its window, saves PNGs, and drives its
+buttons with real clicks. Build the binary first:
 
 ```bash
 cargo build --release --manifest-path ui/Cargo.toml
@@ -50,23 +63,43 @@ bun run ui:smoke
 bun run ui:smoke -- /absolute/path/to/squid-ui
 ```
 
-The harness requires Linux/Unix sockets plus `Xvfb`, `xdotool`, `xwininfo`
-(`x11-utils`), and `ffmpeg` — the last one grabs and crops the window from the
-same `xwininfo` geometry that proved it viewable. It detects missing commands and
-exits with an actionable error rather than assuming CI installed them. Output goes
-to a unique `/tmp/squid-ui-smoke-*` directory and every screenshot path is
-printed. It polls for the fixture subscription, mapped window, and reply instead
-of using fixed startup sleeps; cleanup terminates the panel and Xvfb and closes
-the socket on both success and failure.
+The assertions are the test and they are platform-free; what the machine has to
+provide — where a fixture can listen, how a window is found, how a control is
+pressed, how the result is photographed — is a `SmokeHost`, one file per platform.
+A host it has none for is refused rather than approximated.
+
+**Linux** (`ui-smoke-host-x11.ts`) starts an isolated Xvfb and needs `Xvfb`,
+`xdotool`, `xwininfo` (`x11-utils`), and `ffmpeg` — the last grabs and crops the
+window from the same `xwininfo` geometry that proved it viewable. Missing commands
+are detected up front with an actionable error rather than assumed present. Because
+the display is private to the run, no other Squid window can exist on it.
+
+**Windows** (`ui-smoke-host-windows.ts`) works the interactive desktop, since there
+is no Xvfb equivalent a compiled winit window will draw into. It needs no measured
+coordinates: controls are found by accessible name through UI Automation and clicked
+at the rectangle it reports for them, which exercises the accessibility tree and
+keeps hit-testing in the test in a way `InvokePattern.Invoke` would not. Sharing a
+desktop costs three guards Xvfb makes unnecessary — the window is matched by process
+id so a leaked window from an earlier run cannot be tested instead, every click and
+screenshot raises the panel and then verifies the pixel under the cursor still
+belongs to it, and the run refuses a non-interactive session outright. It also reads
+the status header's own words, so the header's claims are asserted rather than left
+to the screenshots.
+
+Output goes to a unique temporary directory; every screenshot path is printed, and
+the panel's own stdout and stderr land in `panel.log` beside them. The run polls for
+the fixture subscription, the window, and each reply instead of sleeping; cleanup
+terminates the panel, releases the host, and closes the endpoint on both success and
+failure.
 
 The run asserts three things about a confirmation: **Later** does not answer, a
 deferred decision can be brought back, and a settled prompt refuses a second
-answer. It drives the buttons with clicks at window-relative coordinates, and the
-reason is measured rather than preferred: under a bare Xvfb there is no window
-manager to give the window focus, so a synthetic `Return` is delivered to nothing.
-Each coordinate asserts *which* answer it produced, so a layout change that moves
-a button makes the expected answer wrong or absent instead of silently hitting a
-neighbour.
+answer. On Linux it drives the buttons with clicks at window-relative coordinates,
+and the reason is measured rather than preferred: under a bare Xvfb there is no
+window manager to give the window focus, so a synthetic `Return` is delivered to
+nothing. Each coordinate asserts *which* answer it produced, so a layout change that
+moves a button makes the expected answer wrong or absent instead of silently hitting
+a neighbour.
 
 Two things the harness therefore cannot claim. It does not verify the
 no-default-button rule — a `Return` that produces no answer here proves only that
@@ -180,7 +213,11 @@ against a type that no longer existed and still pass.
 - `src/screen-text-reader-synthetic.ts` — scripted frame replay plus the built-in demo
   script. Zero OS calls, so the screen-text path is reproducible anywhere.
 - `src/resolve-screen-reader.ts` — chooses a backend from `SQUID_SCREEN_READER` /
-  `SQUID_SCREEN_POLL_MS`.
+  `SQUID_SCREEN_POLL_MS`, defaulting to whichever real backend the host has and
+  falling back to the demo script only where there is none.
+- `src/screen-text-reader-linux.ts` — `xdotool` backend; window identity only.
+- `src/screen-text-reader-windows.ts` — UI Automation backend over a long-lived
+  PowerShell child: focused control type, element name, and selection.
 - `src/terminal-command-source.ts` — the `TerminalCommandReader` seam and the adapter
   projecting completed shell commands onto `terminal_command_completed`.
   `classifyCommand` reduces a raw command line to one of a closed set of classes, and
@@ -490,10 +527,16 @@ panel owns its short-lived double-click console.
   `query_recent_events` sensory-history tool; `ToolSummary` is the shape a run would
   describe extras in, and the catalog renders a stated absence when none arrive.
 - Browser page reading is darwin-only; the synthetic backend covers the path anywhere.
-  Screen text reads on all three platforms — the poll loop is shared
-  (`screen-text-reader-subprocess.ts`), with Linux on `xdotool` and Windows on
-  PowerShell/Win32 — but both report window identity only: focus roles and selection
-  text wait for an AT-SPI or full UIA backend.
+  Screen text reads on all three platforms, and no longer reads the same amount on
+  each. Windows runs full UI Automation — focused control type, element name, and
+  selected text where the element exposes a text pattern — from one long-lived
+  PowerShell child (`streamingScreenTextReaderFactory`), because a per-sample spawn
+  costs twenty times the automation query it wraps. macOS and Linux still share the
+  poll loop (`screen-text-reader-subprocess.ts`), and Linux on `xdotool` still
+  reports window identity only: its focus roles and selection text wait for an
+  AT-SPI backend. What a Windows selection actually yields depends on the
+  application — a native edit control answers fully, Chromium exposes the pattern
+  and ignores a programmatic selection.
 - The evaluation corpus (`eval/corpus.ts`) is a start, not an endpoint: five scenarios
   with a deterministic CI consumer and a live runner (`bun run eval:agent`) that prints
   a real agent's reading beside each expected one. What no run has yet measured is a
