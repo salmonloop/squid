@@ -132,11 +132,16 @@ DISPLAY=:77 dbus-run-session -- bash -c 'dunst & sleep 1; <send a notice>; \
 name on the developer's own session. Kill the `Xvfb` explicitly — a trap on the
 outer shell does not always get there.
 
-**Desktop notices exist on Linux only, and the other hosts say why.** Windows routes
-a toast by an AppUserModelID that a Start Menu shortcut carries, and Squid ships no
-installer to write one; macOS attributes a notice to the bundle that sent it, and the
-panel ships no bundle. `resolve-desktop-notice.ts` refuses on those hosts with the
-prerequisite named, rather than resolving to `off` — a run that asked to be
+**Desktop notices speak on Linux and Windows; macOS is refused, with the reason
+named.** Linux goes through `notify-send`; Windows through a `Shell_NotifyIcon`
+balloon shown by a Windows PowerShell helper (`src/desktop-notice-windows.ts`),
+which needs no installer and no AppUserModelID — the transient tray icon is its
+own identity, and the toast is attributed to the messenger. The helper must
+outlive the system's ten-second balloon floor before removing its icon, which is
+why the Windows delivery deadline is 15s against the shared loop's Linux 5s
+default. macOS attributes a notice to the bundle that sent it, and the panel
+ships no bundle, so `resolve-desktop-notice.ts` refuses there with the
+prerequisite named rather than resolving to `off` — a run that asked to be
 interrupted and silently was not looks exactly like one whose daemon is asleep.
 
 ## The tray, and what Slint 1.17 will and will not tell you

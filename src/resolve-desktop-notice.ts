@@ -1,4 +1,5 @@
 import { createLinuxDesktopNotifier } from "./desktop-notice-linux.js";
+import { createWindowsDesktopNotifier } from "./desktop-notice-windows.js";
 import type { DesktopNotifierFactory } from "./desktop-notice.js";
 
 /**
@@ -14,10 +15,11 @@ import type { DesktopNotifierFactory } from "./desktop-notice.js";
  * stays quiet outside the panel, the exact string `desktop` uses the host's own
  * notification mechanism, and anything else is a startup configuration error.
  *
- * There is one backend, because there is one host this can be verified on. The
- * refusals below say what each of the others is actually missing rather than
- * quietly resolving to nothing, which is the shape the browser reader has for
- * the two platforms it never got: a capability that names its own absence can be
+ * There are two backends — `notify-send` on a freedesktop desktop, and a
+ * `Shell_NotifyIcon` balloon through Windows PowerShell on win32. The refusals
+ * below say what each of the *others* is actually missing rather than quietly
+ * resolving to nothing, which is the shape the browser reader has for the
+ * platforms it never got: a capability that names its own absence can be
  * fixed, and one that answers "off" to a run that asked for it cannot.
  */
 export type DesktopNoticeResolution =
@@ -59,9 +61,13 @@ export function resolveDesktopNotice(
   }
   if (platform === "win32") {
     return {
-      configError:
-        "SQUID_NOTIFY=desktop has no Windows backend yet; leave it unset. Windows routes a toast by " +
-        "an AppUserModelID that a Start Menu shortcut carries, and Squid ships no installer to write one.",
+      enabled: true,
+      noticeKind: "desktop",
+      // Same seam, same reason as the Linux arm: the platform travels with the
+      // choice rather than being read again inside the backend, so the resolver
+      // decides construction as well as validation — and the suite can assert
+      // that from any host.
+      notifierFactory: createWindowsDesktopNotifier({ platform }),
     };
   }
   if (platform === "darwin") {
