@@ -462,19 +462,20 @@ fn main() {
     // holds every later candidate behind it. Shutting the panel should not cost
     // the next suggestion its turn.
     {
-        let pending = Arc::clone(&pending);
-        let outgoing = outgoing.clone();
-        let handle = window.as_weak();
-        window.window().on_close_requested(move || {
-            answer(&pending, &outgoing, &handle, Answer::Declined);
-            // Ending the run is now explicit, because the tray would otherwise keep
-            // the loop alive and turn this into "put away". See `ui/tray.slint` for
-            // why that is not the trade taken: the tray's menu is empty on Linux in
-            // this Slint version, so a hidden window would be a process with no way
-            // out of its own interface.
-            let _ = slint::quit_event_loop();
-            slint::CloseRequestResponse::HideWindow
-        });
+        {
+            // Closing is "put away", not "end". The tray menu is measured to
+            // export on Linux (see `ui/tray.slint`), so a hidden window still has
+            // a way back and a way out of its own interface. Nothing here answers
+            // a pending prompt: hiding changes nothing about the conversation,
+            // the same way walking away from an open window does not, and the
+            // engine's confirmation timeout is what an unanswered prompt meets.
+            // On a desktop with no tray host the loop dies with the hidden
+            // window — the pre-tray behavior, needing no code here. (Kept by
+            // Slint's keepalive counter: `Window::hide` releases it, and a
+            // live tray handle acquired one. See `AGENTS.md`'s tray section
+            // for what this box can and cannot measure of that chain.)
+            window.window().on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+        }
     }
 
     {
@@ -574,10 +575,22 @@ fn main() {
             tray.set_icon_image(tray_icon());
             tray.set_hover_text(tray_tooltip(&window.get_status_title()).into());
             {
+                let handle = window.as_weak();
+                // The way back in. The window exists for the whole run — hiding
+                // it never drops it — so showing again is all "put away" needs
+                // to be undone. Fails only if the loop is already ending, which
+                // is not a state worth reporting.
+                tray.on_show(move || {
+                    if let Some(window) = handle.upgrade() {
+                        let _ = window.window().show();
+                    }
+                });
+            }
+            {
                 let pending = Arc::clone(&pending);
                 let outgoing = outgoing.clone();
                 let handle = window.as_weak();
-                // Leaving is a refusal, exactly as closing the window is. The
+                // Leaving is a refusal, exactly as a declined prompt is. The
                 // engine hears `declined` rather than waiting out a deadline for
                 // an answer nobody is left to give.
                 tray.on_quit(move || {

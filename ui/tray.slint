@@ -1,28 +1,31 @@
-// The one surface that is visible when the panel window is not in front.
+// The one surface that stays while the panel window is away.
 //
-// It answers a question the window cannot answer while it is buried under other
-// windows: is Squid running, and what is it doing? The icon says the first, the
-// hover text says the second in the status line's own words.
+// It answers a question the window cannot answer while it is hidden: is Squid
+// running, and what is it doing? The icon says the first, the hover text says
+// the second in the status line's own words. It is also what "put away" runs
+// on: closing the window hides it, and the tray's menu is how the person gets
+// it back or ends the run from there.
 //
-// **It deliberately does not turn "close" into "put away".** A visible
-// `SystemTrayIcon` keeps Slint's event loop alive by itself, so hiding the window
-// could have meant the process survives — which is what a tray is usually for. It
-// does not here, and the reason is measured rather than cautious: on Linux, Slint
-// 1.17.1 publishes the tray's dbusmenu object path and then exports an *empty*
-// menu. A fake `org.kde.StatusNotifierWatcher` pointed at the running panel read
-// `GetLayout` back as `(0, (0, {}, []))`, with `AboutToShow` answering `false`,
-// and it stayed empty with the simplest possible two-item menu. So on the platform
-// this is developed on, a menu entry is not a way out — and a hidden window plus a
-// live tray whose menu is empty is a process a person cannot quit from its own
-// interface. Closing the window still ends the run, exactly as it did before.
+// **The menu is verified to export on Linux, and the lifecycle leans on that.**
+// The opposite was measured once and believed for a while: a stand-in
+// `org.kde.StatusNotifierWatcher` read `GetLayout` back as `(0, (0, {}, []))`
+// with `AboutToShow` answering `false`, and Slint 1.17.1 got blamed for an
+// empty menu. The stand-in was the culprit — while it was busy reading the
+// menu back, it swallowed ksni's `IsStatusNotifierHostRegistered` query
+// (jeepney's blocking reply wait drops non-matching inbound messages), so the
+// tray's spawn failed, the menu was never exported, and the same stand-in then
+// reported the empty menu it had caused. With the stand-in answering before
+// reading, the same measurement on the same panel returns both entries below.
+// The lesson generalizes: a fake host must answer like a real one first —
+// register, respond to the property query — and only then read back.
 //
-// That leaves `Quit Squid` as the menu's only entry, and it earns its place on the
-// host where the menu works: quitting without first hunting for a window that is
-// behind six others. `Show Squid` is absent for the same reason it would be
-// pointless — the window is never hidden while this process lives — and a
-// permanently disabled entry is worse than no entry.
+// The menu carries exactly two entries and nothing conditional. **Show Squid**
+// is the way back in: the window is never dropped by hiding, so showing it
+// again is all "put away" takes to undo. **Quit Squid** is the way out, and
+// earns its place by not requiring the window first: quitting without hunting
+// for a window behind six others.
 //
-// Two things also deliberately absent. **Pause** stays in the panel's Recording
+// Two things deliberately absent. **Pause** stays in the panel's Recording
 // section, which owns the prose that goes with it: pause control is FIFO-backed, so
 // it is unconfigured on most runs and unavailable on Windows entirely. **A count**
 // belongs to the desktop notice — only "Waiting for you" earns a badge in this
@@ -46,9 +49,14 @@ export component SquidTray inherits SystemTrayIcon {
     // way to find this icon at all.
     title: "Squid";
 
+    callback show();
     callback quit();
 
     Menu {
+        MenuItem {
+            title: "Show Squid";
+            activated => { root.show(); }
+        }
         MenuItem {
             title: "Quit Squid";
             activated => { root.quit(); }

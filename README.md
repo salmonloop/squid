@@ -330,21 +330,21 @@ different conclusions. The icon is drawn in Rust rather than shipped as a file: 
 repository has no asset pipeline, and a dome with three tapering tentacles is small
 enough that the code is the source.
 
-**Closing the window still ends the run.** A visible tray icon keeps Slint's event
-loop alive by itself, so that is now an explicit `quit_event_loop()` rather than a
-side effect — and the reason it is not the other way round is measured. On Linux,
-Slint 1.17.1 publishes the tray's dbusmenu object path and then exports an empty
-menu: a stand-in `org.kde.StatusNotifierWatcher` pointed at the running panel read
-`GetLayout` back as `(0, (0, {}, []))`, and it stayed empty with the simplest
-possible two-item menu. A hidden window plus a menu with nothing in it is a process
-a person cannot quit from its own interface, so "put away" waits for a version where
-the menu is there.
+**Closing the window is putting it away, not ending the run.** A visible tray icon
+keeps Slint's event loop alive by itself, so a hidden window is still a live panel
+with a way back and a way out: the tray menu carries **Show Squid** and **Quit
+Squid**. The menu was measured to export on Linux — an earlier "the menu is empty
+on Linux" verdict turned out to be the test stand-in's own doing (it answered the
+panel's handshake so late that the tray never finished spawning, then reported the
+empty menu it had caused), and once the stand-in answered first, the same panel
+returned both entries. The whole chain was then measured end to end on a stand-in
+host: real `Window::hide()` unmaps the panel while the process stays alive, a
+dbusmenu click on "Show Squid" brings the window back, and a click on "Quit Squid"
+ends the run — quitting without first hunting for a window behind six others.
 
-That leaves `Quit Squid` as the menu's only entry, which earns its place on the hosts
-where the menu works — quitting without first hunting for a window behind six others.
-Pause is not offered: it stays in the panel's Recording section, which owns the prose
-that goes with it, because pause control is FIFO-backed and unavailable on Windows
-entirely.
+Pause is not offered in the tray: it stays in the panel's Recording section, which
+owns the prose that goes with it, because pause control is FIFO-backed and
+unavailable on Windows entirely.
 
 ### Entry points
 
