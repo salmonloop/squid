@@ -93,6 +93,52 @@ observation, or editor saves at all. Making them work means named-pipe support i
 **Browser page reading is macOS-only.** There is no Windows or Linux
 implementation; the synthetic backend covers the code path anywhere.
 
+## Linux: things that are not obvious
+
+**A missing notification daemon does not fail fast — it hangs for two minutes.**
+Measured: with nothing owning `org.freedesktop.Notifications`, `notify-send` asks
+D-Bus to activate the service and waits out `service_start_timeout=120000ms` before
+exiting 1. Anything that spawns a desktop helper therefore needs its own deadline,
+which is why `desktop-notice-command.ts` owns one for every backend rather than
+leaving it to the platform files. A headless dev box has no daemon at all, so this
+is the *default* experience here, not an edge case.
+
+**`notify-send` needs `--` before any text.** `notify-send "-weird" "x"` fails with
+`Error parsing option -r`: the summary was read as the short flags `-w -e -i -r -d`.
+An agent reply routinely starts with a dash, because a list is how a model
+summarises what it did, so the notices most worth reading are exactly the ones that
+fail without the terminator.
+
+**Placement is not the client's decision.** The notification spec describes passive
+popups and says nothing about position; the daemon decides, per desktop and per user
+preference, and it is also what honours do-not-disturb and keeps a missed notice in a
+history. Drawing our own window instead gives up all three, and under Wayland it is
+not even possible: Slint's own `Window::set_position` documents that "on some
+windowing systems, such as Wayland, this functionality is not available", and Slint
+1.17 exposes no monitor geometry to compute a corner from anyway. A bottom-right
+popup is a Windows convention, not a portable one.
+
+**Seeing a real notification on a headless box** takes a display, a private bus, and
+a daemon — all installable, none present by default:
+
+```bash
+sudo apt-get install -y libnotify-bin dunst   # notify-send, and something to render it
+Xvfb :77 -screen 0 900x300x24 -nolisten tcp &
+DISPLAY=:77 dbus-run-session -- bash -c 'dunst & sleep 1; <send a notice>; \
+  ffmpeg -y -f x11grab -video_size 900x300 -i :77 -frames:v 1 /tmp/notice.png'
+```
+
+`dbus-run-session` rather than the login bus, so a test never claims a well-known
+name on the developer's own session. Kill the `Xvfb` explicitly — a trap on the
+outer shell does not always get there.
+
+**Desktop notices exist on Linux only, and the other hosts say why.** Windows routes
+a toast by an AppUserModelID that a Start Menu shortcut carries, and Squid ships no
+installer to write one; macOS attributes a notice to the bundle that sent it, and the
+panel ships no bundle. `resolve-desktop-notice.ts` refuses on those hosts with the
+prerequisite named, rather than resolving to `off` — a run that asked to be
+interrupted and silently was not looks exactly like one whose daemon is asleep.
+
 ## Rust and the panel on Windows
 
 **`cargo` needs an MSVC environment.** Run it from a shell that has sourced

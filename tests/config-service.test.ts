@@ -129,7 +129,7 @@ describe("configDumpEntries", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("carries a group and a description for every one of the 22 settings", () => {
+  it("carries a group and a description for every one of the 23 settings", () => {
     // The panel groups by what the wire tells it, so an entry that reached the
     // form without a group would be a row the user has to place themselves. The
     // count is asserted too: the two tables are joined here, and a setting that
@@ -138,7 +138,7 @@ describe("configDumpEntries", () => {
     const dir = tempDir("dump");
     const result = configDumpEntries(options(dir));
     if (!result.ok) throw new Error(result.error);
-    expect(result.entries).toHaveLength(22);
+    expect(result.entries).toHaveLength(23);
     for (const entry of result.entries) {
       expect(entry.group.length).toBeGreaterThan(0);
       expect(entry.group).not.toBe("Advanced");

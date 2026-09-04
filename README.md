@@ -50,6 +50,13 @@ demo want — it is deliberately no longer what an unconfigured run gets, becaus
 frames presented as observations of this machine are a lie nothing downstream can
 see through.
 
+Squid is silent outside the panel unless asked otherwise. `SQUID_NOTIFY=desktop`
+(or `"notify": "desktop"` in the config file) sends what the agent said to the
+host's own notification mechanism, so a person who closed the window still learns
+it spoke. Off by default — what a notice spends is attention — and Linux-only for
+now: the refusals in `resolve-desktop-notice.ts` name what each other host is
+missing rather than resolving to silence.
+
 ### Visual panel smoke harness
 
 `bun run ui:smoke` runs the real release panel against an in-process fixture
@@ -268,6 +275,37 @@ against a type that no longer existed and still pass.
   controlled.
 - `src/path-containment.ts` — whether a path resolves inside a root.
 - `src/project-detect.ts` — what a project declares it can run, read from its manifest.
+
+### Speaking up
+
+The senses are inputs; this is the one capability that talks. It exists because the
+panel was the only surface Squid had, so an agent reply reached a row in a window
+nobody had open and stopped there.
+
+- `src/desktop-notice.ts` — the `DesktopNotifier` seam and the `DesktopNotice`
+  shape. A notice carries no action and no button on purpose: a consequential
+  answer belongs on the confirmation surface, which has one-answer-per-prompt
+  correlation, an expiry, and a decline on close. Delivery failure is a diagnostic,
+  never an exception — the turn's work is already done and recorded.
+- `src/desktop-notice-command.ts` — the shared loop for every host that can be
+  asked from a child process: one delivery at a time with the newest notice winning
+  the slot, one diagnostic per failure transition, and a deadline on each delivery.
+  The deadline is not defensive: with no notification daemon, `notify-send` waits
+  out D-Bus's 120-second activation timeout before failing, which would otherwise
+  hold the slot through hundreds of turns and present as silence.
+- `src/desktop-notice-linux.ts` — the `notify-send` arguments. `--` terminates the
+  options before any text, because a summary beginning with a dash is otherwise
+  parsed as short flags, and a model summarising its work routinely starts with one.
+- `src/resolve-desktop-notice.ts` — resolves `SQUID_NOTIFY`. Off by default, and
+  refuses on a host with no backend rather than resolving to off: a run that asked
+  to be interrupted and silently was not is indistinguishable from a sleeping
+  daemon.
+
+Where the popup appears is the desktop's decision, not Squid's. The notification
+spec describes passive popups and says nothing about placement — the daemon decides,
+and it is also what honours do-not-disturb and keeps a missed notice in a history.
+Drawing our own window in a chosen corner would give up all three, and on Wayland a
+client cannot position its own window at all.
 
 ### Entry points
 

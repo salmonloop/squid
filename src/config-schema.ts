@@ -99,14 +99,16 @@ export type ConfigValueKind = "text" | "int" | "enum";
  * into a type error.
  *
  * Listed in the order the form is expected to read, which is also first
- * appearance in a dump (the model rows lead it): what answers, where it looks,
- * what it keeps, what it never touches. That ordering rides no wire field —
- * the panel can recover it from the dump — so this list stays advice about
- * presentation rather than a second protocol.
+ * appearance in a dump (the model rows lead it): what answers, how it reaches
+ * you, where it looks, what it keeps, what it never touches. That ordering rides
+ * no wire field — the panel can recover it from the dump — so this list stays
+ * advice about presentation rather than a second protocol.
  */
 export type ConfigGroup =
   /** Which model answers, under which login, and how long it may take. */
   | "Model"
+  /** Whether Squid can reach you with the panel closed. */
+  | "Notifications"
   /** Which part of the filesystem is watched. */
   | "Files"
   /** Reading the words on screen. */
@@ -230,6 +232,16 @@ const CONFIG_KEY_TABLE: readonly Omit<ConfigKey, "validate">[] = [
       /^[A-Za-z0-9_-]+$/.test(raw)
         ? { ok: true }
         : { ok: false, error: "Model provider must be letters, digits, dashes, or underscores." },
+  },
+  {
+    id: "notify",
+    env: "SQUID_NOTIFY",
+    label: "Desktop notices",
+    group: "Notifications",
+    description:
+      "Whether Squid interrupts you on the desktop. Left empty, it only speaks inside this window.",
+    kind: "enum",
+    values: ["desktop"],
   },
   {
     id: "watchRoot",

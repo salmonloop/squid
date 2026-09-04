@@ -31,6 +31,7 @@ import { sqliteWatchExclusions } from "./sqlite-event-store.js";
 import type { ToolSummary } from "./tool-catalog.js";
 import { resolvePanel } from "./resolve-panel.js";
 import { startPanelServer, type PanelServer } from "./panel-server.js";
+import type { DesktopNotifierFactory } from "./desktop-notice.js";
 import { PanelConfirmationSurface } from "./panel-confirmation-surface.js";
 import {
   panelAgentLine,
@@ -110,6 +111,15 @@ export interface WatchSessionOptions {
   readonly tools?: readonly ToolSummary[];
   /** Entry-point-specific fields merged into the startup line. */
   readonly banner?: Record<string, string | number | boolean | null>;
+  /**
+   * How this run reaches the person when the panel is closed. Omitted means it
+   * does not, which is the default: see `resolve-desktop-notice.ts`.
+   *
+   * Resolved by the caller, like the sensor factories, so this file never reads
+   * `SQUID_NOTIFY` and a test can hand it a notifier that records instead of
+   * interrupting whoever is running the suite.
+   */
+  readonly notifierFactory?: DesktopNotifierFactory;
   /** Injected in tests. */
   readonly env?: Record<string, string | undefined>;
   readonly log?: (line: string) => void;
@@ -551,6 +561,16 @@ export async function startWatchSession(
   const agentTurns = new Set<Promise<void>>();
   let turnTail: Promise<void> = Promise.resolve();
 
+  // Squid's one voice outside the panel window. Absent unless this run asked for
+  // it, and its failures are diagnostics on the same channel a sensor's are: a
+  // desktop that could not be reached is worth a line in the log and must never
+  // be worth a lost turn.
+  const notifier = options.notifierFactory?.({
+    onDiagnostic: (diagnostic) => {
+      logError(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
+    },
+  });
+
   const promptAgent = (): void => {
     // A captured `let` does not narrow inside the closures below, so the guard
     // lands once here and `live` carries the certainty down into the turn.
@@ -565,7 +585,20 @@ export async function startWatchSession(
       // otherwise silent.
       if (reply !== undefined && reply.trim().length > 0) {
         log(JSON.stringify({ agent: "replied", text: reply }));
-        panelServer?.broadcast(panelAgentLine({ status: "replied", text: reply }));
+        const line = panelAgentLine({ status: "replied", text: reply });
+        panelServer?.broadcast(line);
+        // The same sanitized string the panel gets, not the raw reply: one
+        // sanitizer, one ceiling, and two surfaces that cannot disagree about
+        // what the agent said. `panelAgentLine` caps and redacts it and strips
+        // the control characters, which is also why the body is safely one line.
+        //
+        // Replies only. A failed turn broadcasts an agent line too, and
+        // announcing those would turn one misconfigured model into a popup every
+        // few seconds — a loud way to say something the log already said. The
+        // panel and the log stay the place a failure is read.
+        if (line.text !== undefined && line.text.length > 0) {
+          notifier?.notify({ title: "Squid replied", body: line.text });
+        }
       }
     };
     const turn = turnTail.then(async () => {
@@ -786,6 +819,11 @@ export async function startWatchSession(
       // agent itself, and only then the store — an in-flight ingest still needs
       // somewhere to land.
       await drainAgentTurns();
+      // After the drain, beside the panel: a turn that settled during shutdown
+      // has already been announced, and closing first would have swallowed it.
+      // What close() does not do is flush — a notice is an interruption, and a
+      // run that is over has nothing left for the person to interrupt.
+      await notifier?.close();
       // Withdraw before tearing down the transport. An answered or cancelled
       // panel request is spent; a stop never leaves a live-looking prompt.
       await panelConfirmation.close();

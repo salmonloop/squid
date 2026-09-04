@@ -205,6 +205,7 @@ describe("config schema", () => {
     const EXPECTED = new Map<string, string>([
       ["modelProvider", "Model"],
       ["agentTurnTimeoutMs", "Model"],
+      ["notify", "Notifications"],
       ["watchRoot", "Files"],
       ["screenReader", "Screen"],
       ["screenPollMs", "Screen"],

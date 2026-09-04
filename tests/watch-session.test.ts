@@ -13,6 +13,7 @@ import type {
 import { createActivityEvent, type ActivityEvent } from "../src/protocol.js";
 import { startWatchSession, type WatchSourceContext } from "../src/watch-session.js";
 import { SqliteEventStore } from "../src/sqlite-event-store.js";
+import type { DesktopNotice, DesktopNotifierFactory } from "../src/desktop-notice.js";
 import type { ResidentSession, ResidentSessionFactory } from "../src/resident-agent.js";
 import { CONFIG_KEYS } from "../src/config-schema.js";
 import { MODEL_CONFIG_KEYS } from "../src/config-service.js";
@@ -204,6 +205,8 @@ async function startSession(options: {
   readonly defaultBaseUrl?: string;
   /** The restart handoff; tests inject a spy instead of ending the process. */
   readonly restartExit?: () => void;
+  /** A notifier that records instead of interrupting whoever runs the suite. */
+  readonly notifierFactory?: DesktopNotifierFactory;
 }) {
   const seenContexts: WatchSourceContext[] = [];
   const agentLog = options.agentLog ?? emptyAgentLog();
@@ -220,6 +223,7 @@ async function startSession(options: {
     ...(options.defaultModelId === undefined ? {} : { defaultModelId: options.defaultModelId }),
     ...(options.defaultBaseUrl === undefined ? {} : { defaultBaseUrl: options.defaultBaseUrl }),
     ...(options.restartExit === undefined ? {} : { restartExit: options.restartExit }),
+    ...(options.notifierFactory === undefined ? {} : { notifierFactory: options.notifierFactory }),
     createSources: async (context) => {
       seenContexts.push(context);
       if (options.sourceEntries !== undefined) return options.sourceEntries;
@@ -909,6 +913,71 @@ describe("the control panel on a watch session", () => {
     } finally {
       await result.session.stop();
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The one surface that reaches a person who closed the window.
+   *
+   * Asserted on the *sanitized* text rather than the reply, because the notice
+   * and the panel line are built from one string on purpose: two surfaces
+   * quoting the same agent must not be able to disagree about what it said, and
+   * the sanitizer is also what guarantees the body is a single line.
+   */
+  it("interrupts the desktop with the same words it puts on the panel", async () => {
+    const notices: DesktopNotice[] = [];
+    const source = new ScriptedSource("alpha", []);
+    const { result } = await startSession({
+      sources: [source],
+      agentOptions: { reply: "ran the tests; they pass" },
+      notifierFactory: () => ({
+        notify: (notice) => notices.push(notice),
+        close: async () => undefined,
+      }),
+    });
+    if ("configError" in result) throw new Error(result.configError);
+    try {
+      await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
+      const notice = await waitForLine(() => notices[0] as Record<string, unknown> | undefined);
+      expect(notice.title).toBe("Squid replied");
+      expect(notice.body).toBe("ran the tests; they pass");
+      expect(notices).toHaveLength(1);
+    } finally {
+      await result.session.stop();
+    }
+  });
+
+  /**
+   * A failed turn reaches the panel and the log, and stops there.
+   *
+   * A misconfigured model fails every turn, and announcing those would put a
+   * popup on the desktop every few seconds to repeat something already written
+   * down twice. The panel row and the log line are where a failure is read.
+   */
+  it("stays quiet on the desktop when the turn failed", async () => {
+    const notices: DesktopNotice[] = [];
+    const diagnostics: string[] = [];
+    const source = new ScriptedSource("alpha", []);
+    const { result } = await startSession({
+      sources: [source],
+      logError: (line) => diagnostics.push(line),
+      agentOptions: { promptError: new Error("the model refused") },
+      notifierFactory: () => ({
+        notify: (notice) => notices.push(notice),
+        close: async () => undefined,
+      }),
+    });
+    if ("configError" in result) throw new Error(result.configError);
+    try {
+      await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
+      // Waiting for the failure to be recorded is what makes the silence below
+      // an assertion rather than a race the notifier happened to lose.
+      await waitForLine(() =>
+        diagnostics.some((line) => line.includes("the model refused")) ? { seen: true } : undefined,
+      );
+      expect(notices).toEqual([]);
+    } finally {
+      await result.session.stop();
     }
   });
 

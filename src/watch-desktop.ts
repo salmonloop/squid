@@ -7,6 +7,7 @@ import { EditorSaveActivitySource } from "./editor-save-source.js";
 import { FilesystemActivitySource } from "./filesystem-source.js";
 import type { SourceEntry } from "./activity-source.js";
 import type { FilePayload } from "./protocol.js";
+import { resolveDesktopNotice } from "./resolve-desktop-notice.js";
 import { resolveBrowserReader } from "./resolve-browser-reader.js";
 import { resolveEditorSaveReader } from "./resolve-editor-save-reader.js";
 import { resolveScreenReader } from "./resolve-screen-reader.js";
@@ -125,6 +126,15 @@ export async function startDesktopWatch(
     return { configError: editorSaves.configError };
   }
 
+  // Not a reader — the one capability here that talks instead of listening — but
+  // it resolves in the same place and against the same merged env, because the
+  // alternative is the asymmetry above: a settings field that saves, reports
+  // "takes effect on restart", and changes nothing.
+  const notice = resolveDesktopNotice({ env });
+  if ("configError" in notice) {
+    return { configError: notice.configError };
+  }
+
   const root = options.root;
   const canonicalRoot = await realpath(root);
 
@@ -136,6 +146,7 @@ export async function startDesktopWatch(
       ? {}
       : { createAgentSession: options.createAgentSession }),
     ...(databasePath === undefined ? {} : { databasePath }),
+    ...(notice.enabled ? { notifierFactory: notice.notifierFactory } : {}),
     // Settings sets write back to the same file step zero read, so a form edit
     // and the next startup agree about what "saved" means.
     configPath: loaded.configPath,
@@ -148,6 +159,7 @@ export async function startDesktopWatch(
       browser: browser.enabled ? browser.readerKind : "off",
       terminal: terminal.enabled ? terminal.readerKind : "off",
       editorSaves: editorSaves.enabled ? editorSaves.readerKind : "off",
+      notify: notice.enabled ? notice.noticeKind : "off",
     },
     createSources: async (context) => {
       // Only the filesystem source needs exclusions: neither a screen reader nor a
