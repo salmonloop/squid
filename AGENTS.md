@@ -4,8 +4,25 @@ Platform-specific traps, written down because each one cost real time to find. T
 repository ships to Windows and is developed on Linux, so the asymmetries below are
 not trivia — they are the shape of the project.
 
-This file is for the *traps*. What Squid is and how to run it belongs in
-`README.md`; the wire between brain and panel belongs in `docs/panel-protocol.md`.
+This file is for the *traps*, and for the standing rules the traps produced. What
+Squid is and how to run it belongs in `README.md`; the wire between brain and panel
+belongs in `docs/panel-protocol.md`.
+
+## How a feature gets switched on
+
+**Default on, switch in the panel.** A feature ships in the state most people want
+most of the time, and the way to change that state is the panel's settings form —
+every feature gets a control there. Whoever double-clicks the binary gets the whole
+product without reading anything first.
+
+**An environment variable is the fallback, not the front door.** Reach for a
+`SQUID_*` variable only when something genuinely cannot wait for a switch — a value
+the brain needs before any panel exists, or a feature the default would be unsafe
+to sit inside (the browser reader observes, so its default-off is a consent
+decision, not an oversight). And even then the panel control is still owed: the
+variable is how a feature is rescued when the GUI cannot reach it, not how it is
+shipped. When in doubt, the direction is on-by-default with a visible way to turn
+it off.
 
 ## Read this first if you are picking up after Windows work
 
