@@ -71,9 +71,48 @@ describe("startDesktopWatch capability resolution", () => {
       expect(started.session.banner.browser).toBe("synthetic");
       expect(started.session.banner.terminal).toBe("off");
       expect(started.session.banner.editorSaves).toBe("off");
+      // The one capability here that speaks rather than listens, reported by the
+      // same banner and unset by the same file.
+      expect(started.session.banner.notify).toBe("off");
     } finally {
       await started.session.stop();
       rmSync(directory, { recursive: true, force: true });
     }
   });
+
+  /**
+   * The merged env reaching the one capability whose backend is host-specific.
+   *
+   * Linux-only because Linux is the only host with a backend: elsewhere
+   * `SQUID_NOTIFY=desktop` is a startup refusal naming what the platform is
+   * missing, and a test that asserted the banner would be asserting which machine
+   * ran it. `silentAgent` never produces a reply, so nothing here spawns
+   * `notify-send` — the wiring is what is under test, not the desktop.
+   */
+  it.skipIf(process.platform !== "linux")(
+    "resolves desktop notices against the merged config file too",
+    async () => {
+      const directory = mkdtempSync(join(tmpdir(), "squid-desktop-notify-"));
+      const configPath = join(directory, "config.json");
+      writeFileSync(configPath, JSON.stringify({ notify: "desktop" }), "utf8");
+
+      const started = await startDesktopWatch({
+        root: directory,
+        env: { SQUID_CONFIG: configPath },
+        log: () => {},
+        logError: () => {},
+        createAgentSession: async () => silentAgent(),
+      });
+
+      if ("configError" in started) {
+        throw new Error(`startup refused: ${started.configError}`);
+      }
+      try {
+        expect(started.session.banner.notify).toBe("desktop");
+      } finally {
+        await started.session.stop();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
 });

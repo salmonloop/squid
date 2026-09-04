@@ -83,7 +83,7 @@ Two consequences bind the panel's design:
   shows that the capability exists and that this run cannot use it.
 - **The last running sense cannot be stopped** (`src/source-manager.ts`). A
   session with no observer at all is refused.
-- 22 settings reach the panel as a schema-carrying wire dump. The panel holds no
+- 23 settings reach the panel as a schema-carrying wire dump. The panel holds no
   list of setting names and no notion of which ones need a restart.
 
 ## Capabilities and Constraints
@@ -116,7 +116,7 @@ Real, in the repository:
 
 - `docs/panel-protocol.md` — the wire contract, with measured platform behaviour
   (socket mode defaults, named-pipe DACL, the write-connection feedback loop).
-- `src/config-schema.ts`, `src/config-service.ts` — the 22 settings with their
+- `src/config-schema.ts`, `src/config-service.ts` — the 23 settings with their
   real labels, kinds, enum values, and validation messages.
 - `ui/src/supervisor.rs` — the real service-state labels and the sentences the
   panel shows when supervision fails.
