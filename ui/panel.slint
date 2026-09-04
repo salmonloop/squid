@@ -9,6 +9,12 @@ import { ConfirmationCard, DeferredNotice } from "confirmation.slint";
 // Re-exported for the generated Rust bindings, which build these rows.
 export { SourceRow, SettingRow }
 
+// The tray lives in its own file and is re-exported here because `build.rs`
+// compiles this one document: a component the root file does not export is not
+// generated, and Rust would have nothing to construct. It is a *top-level*
+// component, not an element inside the window — the icon has no window of its own.
+export { SquidTray } from "tray.slint";
+
 // A section heading. More space above than below, so a heading belongs to what
 // follows it rather than floating between two groups.
 component Heading inherits Text {
@@ -133,6 +139,16 @@ export component PanelWindow inherits Window {
     // about which sources are up.
     in property <int> running-sources: 0;
 
+    // The status line's own headline, published so the tray can use it.
+    //
+    // Read from the component that computes it rather than recomputed: the state
+    // machine in `status.slint` is deliberately the only place that decides what
+    // Squid is doing, and a tooltip with its own opinion would be the second
+    // projection this panel exists not to have. The consequence sentence is not
+    // published — nothing outside the card needs it, and a property nobody reads
+    // is a claim that something does.
+    out property <string> status-title: status.title;
+
     title: "Squid";
     always-on-top: false;
     preferred-width: 640px;
@@ -166,7 +182,7 @@ export component PanelWindow inherits Window {
         }
 
         // State, always. Never scrolls out of reach, never waits behind content.
-        StatusSummary {
+        status := StatusSummary {
             agent-state: root.agent-state;
             service-state: root.service-state;
             gate: root.gate;

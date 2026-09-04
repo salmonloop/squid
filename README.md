@@ -307,6 +307,37 @@ and it is also what honours do-not-disturb and keeps a missed notice in a histor
 Drawing our own window in a chosen corner would give up all three, and on Wayland a
 client cannot position its own window at all.
 
+### The tray
+
+`ui/tray.slint` puts a `SystemTrayIcon` beside the panel window — a Slint 1.17
+element with real backends on all three platforms (`Shell_NotifyIcon` on Windows,
+`NSStatusItem` on macOS, `StatusNotifierItem` over D-Bus on Linux), which is why it
+costs no new crate on the ship target.
+
+It answers what the window cannot while it is buried under other windows: whether
+Squid is running, and what it is doing. The hover text is the status card's own
+sentence, published by `panel.slint` as `status-title` from the one expression in
+`status.slint` that decides what Squid is doing, so the two surfaces cannot come to
+different conclusions. The icon is drawn in Rust rather than shipped as a file: the
+repository has no asset pipeline, and a dome with three tapering tentacles is small
+enough that the code is the source.
+
+**Closing the window still ends the run.** A visible tray icon keeps Slint's event
+loop alive by itself, so that is now an explicit `quit_event_loop()` rather than a
+side effect — and the reason it is not the other way round is measured. On Linux,
+Slint 1.17.1 publishes the tray's dbusmenu object path and then exports an empty
+menu: a stand-in `org.kde.StatusNotifierWatcher` pointed at the running panel read
+`GetLayout` back as `(0, (0, {}, []))`, and it stayed empty with the simplest
+possible two-item menu. A hidden window plus a menu with nothing in it is a process
+a person cannot quit from its own interface, so "put away" waits for a version where
+the menu is there.
+
+That leaves `Quit Squid` as the menu's only entry, which earns its place on the hosts
+where the menu works — quitting without first hunting for a window behind six others.
+Pause is not offered: it stays in the panel's Recording section, which owns the prose
+that goes with it, because pause control is FIFO-backed and unavailable on Windows
+entirely.
+
 ### Entry points
 
 - `src/watch-desktop.ts` — the only entry point observing more than one part of the

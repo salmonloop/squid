@@ -15,12 +15,20 @@ path = "src/main.rs"
 # a software path that looks like a window but is not one — the decision on
 # issue #5 was fully native rendering, and the feature list is where that is
 # actually enforced.
+# `system-tray` is the one addition to this list that costs a crate, and only on
+# one platform. On Windows — the ship target — it costs nothing: `Shell_NotifyIcon`
+# lives in `Win32_UI_Shell`, which i-slint-core already links unconditionally. On
+# Linux it pulls `ksni` for `StatusNotifierItem`, on top of a D-Bus stack the
+# `accessibility` feature already brought in through AccessKit's AT-SPI backend.
+# It is enabled because a tray icon is the only surface that exists when the
+# window does not, which is exactly the gap the panel had.
 slint = { version = "1.17.1", default-features = false, features = [
     "compat-1-2",
     "accessibility",
     "std",
     "backend-winit",
     "renderer-femtovg",
+    "system-tray",
 ] }
 # No other dependencies, on purpose. The wire format is one flat object of five
 # scalar fields, and `src/protocol.rs` reads it with a hand-written structural

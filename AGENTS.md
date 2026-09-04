@@ -139,6 +139,67 @@ panel ships no bundle. `resolve-desktop-notice.ts` refuses on those hosts with t
 prerequisite named, rather than resolving to `off` — a run that asked to be
 interrupted and silently was not looks exactly like one whose daemon is asleep.
 
+## The tray, and what Slint 1.17 will and will not tell you
+
+**The feature is off by default in this repository, and on by default in Slint.**
+`ui/Cargo.toml` uses `default-features = false`, and `system-tray` is one of the
+features that drops out — enabling it is a line in that list. The cost is asymmetric
+and worth knowing before arguing about it: on Windows it is zero new crates, because
+i-slint-core already links `windows` with `Win32_UI_Shell`, where `Shell_NotifyIcon`
+lives. On Linux it adds `ksni`, on top of a D-Bus stack the `accessibility` feature
+already pulled in through AccessKit's AT-SPI backend.
+
+**Inherited properties get no Rust setter.** Slint generates accessors only for what
+the *exported* component declares, so `SystemTrayIcon`'s own `icon`, `tooltip` and
+`clicked` are invisible from Rust on a component that merely inherits them. Declare a
+property with a different name and bind the inherited one to it — a re-declaration
+collides with the base rather than overriding it. The compile error is
+`no method named set_icon found for struct SquidTray`, which reads like a missing
+feature rather than a naming rule.
+
+**A healthy run prints one tray failure line.** `PlatformTray::new` starts with
+`image_to_argb_icon(params.icon)?`, so an empty icon is an error, and the icon tracker
+that fires before Rust has assigned an image logs
+`Slint: Failed to create system tray icon: 0` and returns. The tracker fires again
+when the image lands and the icon appears normally. So that line is **not** a failure
+signal on startup, and the real signal is whether a `StatusNotifierItem` shows up on
+the session bus. Slint 1.18 changes this — its changelog adds "report an error when no
+system tray backend is available" — but 1.17.1 reports the same way for both cases.
+
+**A headless box can host a tray well enough to verify one.** No desktop shell is
+needed: `org.kde.StatusNotifierWatcher` is a handful of D-Bus methods, and `jeepney`
+(pure Python, no build step) is enough to own the name, answer
+`RegisterStatusNotifierItem`, and then read the registered item's own properties back.
+That is a stronger check than a screenshot — it sees the tooltip string, the pixmap's
+dimensions and byte count, the published `Title`, and the menu object path:
+
+```
+REGISTERED: org.kde.StatusNotifierItem-<pid>-1
+Title: 'Squid'
+ToolTip: ('', [], 'Squid — Nothing reported yet', '')
+Menu: '/MenuBar'
+IconPixmap: 1 variant(s); 64x64 16384 bytes
+```
+
+Run it under `Xvfb` and `dbus-run-session` the same way as the notification recipe
+above. The empty `Title` in the first run of this is what made it worth writing: the
+property is what accessibility tools read on Linux, and nothing else would have
+noticed it was unset.
+
+**The tray menu is empty on Linux, and that is Slint's, not yours.** Measured with
+the stand-in host above: the item publishes `Menu: '/MenuBar'`, and
+`com.canonical.dbusmenu.GetLayout(0, -1, [])` on it returns `(0, (0, {}, []))` with
+`AboutToShow` answering `false`. It stays empty with the simplest possible two-item
+menu, so it is not a separator, a conditional `enabled`, or anything about how the
+menu is declared. `i-slint-core/items/system_tray/ksni.rs` does wire a menu — the
+entries just never arrive from the Slint side.
+
+This is what keeps `on_close_requested` calling `quit_event_loop()`. A visible tray
+keeps the loop alive by itself, so hiding the window *could* mean "put away" — but on
+the platform this is developed on, the menu that would be the only way out has
+nothing in it. Revisit when the menu is verified on a host: that is the one change
+that makes the lifecycle safe to invert.
+
 ## Rust and the panel on Windows
 
 **`cargo` needs an MSVC environment.** Run it from a shell that has sourced
