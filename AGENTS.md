@@ -196,7 +196,12 @@ from the changelog: when it appears, something really failed — no tray host (k
 `RegisterStatusNotifierItem` returns `ServiceUnknown` immediately) or an unusable
 icon. The real signal for "is the icon up" is whether a `StatusNotifierItem` shows
 up on the session bus. Slint 1.18 adds "report an error when no system tray backend
-is available"; 1.17.1 reports both failure shapes the same way.
+is available"; 1.17.1 reports both failure shapes the same way. And the `: 0` suffix
+is itself a bug: 1.17.1's error enum spells the inner-error reference as
+`#[display("{}", 0)]`, which derive_more reads as the literal `0` instead of the
+field (`{_0}`) — the actual cause, e.g. ksni's `ServiceUnknown`, never reaches the
+log. Master spells it `{_0}` and ships the `Unsupported` variant, so both fix with
+the next release.
 
 **A headless box can host a tray well enough to verify one.** No desktop shell is
 needed: `org.kde.StatusNotifierWatcher` is a handful of D-Bus methods, and `jeepney`
