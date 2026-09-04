@@ -5,15 +5,23 @@ import type { DesktopNotifierFactory } from "./desktop-notice.js";
 /**
  * Chooses how Squid speaks up, from the environment.
  *
- * The default is **off**, and for a different reason than the browser reader's.
- * Nothing here observes anything, so there is no capture to consent to; what a
- * notice spends is the person's attention, and every desktop already has more
- * things asking for it than anyone wanted. A run interrupts because it was asked
- * to.
+ * The default is **on**, wherever a backend exists. Nothing here observes
+ * anything, so there is no capture to consent to; a notice repeats on the
+ * desktop what the panel already showed, and the run that would have been
+ * interrupted by a panel left open is interrupted the same way with it closed.
+ * The setting exists to turn that off, and `SQUID_NOTIFY=off` is how — spelled
+ * out rather than implied by an unset variable, because a default that lives in
+ * someone's memory of a variable name is not a default, it is a trap.
  *
- * `SQUID_NOTIFY` has three outcomes, matching `SQUID_BROWSER`: unset means Squid
- * stays quiet outside the panel, the exact string `desktop` uses the host's own
- * notification mechanism, and anything else is a startup configuration error.
+ * Three outcomes: unset (or `off`) with a backend means Squid speaks through
+ * it, the exact string `desktop` is the same thing said explicitly, and
+ * anything else is a startup configuration error. On a host with no backend the
+ * two paths split: unasked, the run starts quiet — a default has to be
+ * livable on every host, and one that exits a machine it never observed is
+ * the value-a-form-cannot-satisfy defect, not strictness. Asked for by name,
+ * the resolution is a refusal naming what is missing rather than a silent
+ * fallback to quiet — a run that expected to interrupt and did not looks
+ * exactly like a run whose daemon is asleep.
  *
  * There are two backends — `notify-send` on a freedesktop desktop, and a
  * `Shell_NotifyIcon` balloon through Windows PowerShell on win32. The refusals
@@ -36,6 +44,9 @@ export interface ResolveDesktopNoticeOptions {
   readonly platform?: NodeJS.Platform;
 }
 
+/** The one spelling that silences a backend the host actually has. */
+export const DESKTOP_NOTICE_OFF = "off";
+
 export function resolveDesktopNotice(
   options: ResolveDesktopNoticeOptions = {},
 ): DesktopNoticeResolution {
@@ -43,11 +54,35 @@ export function resolveDesktopNotice(
   const platform = options.platform ?? process.platform;
 
   const kind = env.SQUID_NOTIFY;
-  if (kind === undefined) return { enabled: false };
-  if (kind !== "desktop") {
-    return { configError: 'SQUID_NOTIFY must be unset (quiet) or exactly "desktop".' };
+  if (kind === DESKTOP_NOTICE_OFF) {
+    // Spelled out, so it wins over everything, on every host: the one value
+    // that means "quiet" rather than "whatever the host and the default say".
+    return { enabled: false };
   }
+  if (kind === undefined) {
+    return resolveDefault(platform, { asked: false });
+  }
+  if (kind !== "desktop") {
+    return {
+      configError: 'SQUID_NOTIFY must be unset, "off", or exactly "desktop".',
+    };
+  }
+  return resolveDefault(platform, { asked: true });
+}
 
+/**
+ * Backend by host, shared by the explicit and the default path so the two can
+ * never disagree about what a host supports.
+ *
+ * `asked` is what separates a silent off from a refusal: unset on a host with
+ * no backend starts the run quiet (a default that exited the machines it never
+ * observed would be a trap set by the installer), while `desktop` spelled out
+ * on that same host is a request, and a request names what it is missing.
+ */
+function resolveDefault(
+  platform: NodeJS.Platform,
+  asked: { readonly asked: boolean },
+): DesktopNoticeResolution {
   if (platform === "linux") {
     return {
       enabled: true,
@@ -71,11 +106,15 @@ export function resolveDesktopNotice(
     };
   }
   if (platform === "darwin") {
-    return {
-      configError:
-        "SQUID_NOTIFY=desktop has no macOS backend yet; leave it unset. Notification Center attributes " +
-        "a notice to the bundle that sent it, and the panel ships no bundle.",
-    };
+    return asked.asked
+      ? {
+          configError:
+            "SQUID_NOTIFY=desktop has no macOS backend yet; set SQUID_NOTIFY=off to run without one. Notification Center attributes " +
+            "a notice to the bundle that sent it, and the panel ships no bundle.",
+        }
+      : { enabled: false };
   }
-  return { configError: `SQUID_NOTIFY=desktop has no backend for ${platform}.` };
+  return asked.asked
+    ? { configError: `SQUID_NOTIFY=desktop has no backend for ${platform}.` }
+    : { enabled: false };
 }

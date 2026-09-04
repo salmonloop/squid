@@ -71,9 +71,11 @@ describe("startDesktopWatch capability resolution", () => {
       expect(started.session.banner.browser).toBe("synthetic");
       expect(started.session.banner.terminal).toBe("off");
       expect(started.session.banner.editorSaves).toBe("off");
-      // The one capability here that speaks rather than listens, reported by the
-      // same banner and unset by the same file.
-      expect(started.session.banner.notify).toBe("off");
+      // The one capability that speaks rather than listens, and the one whose
+      // file-says-nothing answer is *on*: speaking up is the default wherever a
+      // backend exists, so an empty config still resolves it and the banner
+      // says so rather than reading absence as "off".
+      expect(started.session.banner.notify).toBe("desktop");
     } finally {
       await started.session.stop();
       rmSync(directory, { recursive: true, force: true });

@@ -2,13 +2,39 @@ import { describe, expect, it } from "bun:test";
 import { resolveDesktopNotice } from "../src/resolve-desktop-notice.js";
 
 /**
- * Speaking up defaults to off, and for its own reason. The browser reader is off
- * by default because observing costs privacy; this is off by default because
- * interrupting costs attention, and a run earns that by asking.
+ * Speaking up defaults to on, wherever the host has a backend. The browser
+ * reader is off by default because observing costs privacy; a notice observes
+ * nothing — it repeats on the desktop what the panel already showed. What a
+ * notice spends is attention, and the setting exists so the person can decline
+ * to spend it, by naming `off` rather than by knowing that empty means quiet.
  */
 describe("resolveDesktopNotice", () => {
-  it("is quiet when the variable is unset", () => {
-    expect(resolveDesktopNotice({ env: {}, platform: "linux" })).toEqual({ enabled: false });
+  it("speaks by default on every host with a backend", () => {
+    for (const platform of ["linux", "win32"] as const) {
+      const resolved = resolveDesktopNotice({ env: {}, platform });
+      if ("configError" in resolved) throw new Error(resolved.configError);
+      if (!resolved.enabled) throw new Error(`expected the default to speak on ${platform}`);
+      expect(resolved.noticeKind).toBe("desktop");
+      expect(typeof resolved.notifierFactory).toBe("function");
+    }
+  });
+
+  it("is quiet by default where no backend exists, without a refusal", () => {
+    // A default has to be livable on every host: unset on macOS starts the run,
+    // silent. One machine's missing backend must not turn a default into an
+    // exit — that is the value-a-form-cannot-satisfy defect, reached through
+    // the resolver instead of the form.
+    for (const platform of ["darwin", "freebsd"] as const) {
+      expect(resolveDesktopNotice({ env: {}, platform })).toEqual({ enabled: false });
+    }
+  });
+
+  it("treats off as the explicit way to decline a backend the host has", () => {
+    for (const platform of ["linux", "win32"] as const) {
+      expect(resolveDesktopNotice({ env: { SQUID_NOTIFY: "off" }, platform })).toEqual({
+        enabled: false,
+      });
+    }
   });
 
   it("uses the host mechanism on the exact value", () => {
@@ -27,25 +53,23 @@ describe("resolveDesktopNotice", () => {
     for (const value of ["on", "true", "toast", "DESKTOP", "desktop "]) {
       const resolved = resolveDesktopNotice({ env: { SQUID_NOTIFY: value }, platform: "linux" });
       expect("configError" in resolved && resolved.configError).toContain(
-        'must be unset (quiet) or exactly "desktop"',
+        'must be unset, "off", or exactly "desktop"',
       );
     }
   });
 
   /**
-   * A host without a backend refuses and says what is missing, rather than
-   * resolving to `off`.
+   * A host without a backend refuses an *asked-for* backend and says what is
+   * missing, rather than resolving to `off`.
    *
-   * This is the whole reason the platform arm exists. A run that asked to be
-   * interrupted and silently was not looks exactly like a run on a desktop whose
-   * daemon is asleep, and the person has no way to tell which they have. The
-   * refusal names the prerequisite instead, which is the difference between a
-   * gap someone can close and one nobody can see.
-   *
-   * Windows is a backend now, so it is asserted in the pairing test below; the
-   * refusals here are the hosts that still lack one.
+   * This is the other half of the split the default introduced: unset is the
+   * quiet arm asserted above, and `desktop` spelled out is a request. The
+   * refusal names the prerequisite, which is the difference between a gap
+   * someone can close and one nobody can see — a run that asked to be
+   * interrupted and silently was not looks exactly like a run whose daemon is
+   * asleep.
    */
-  it("names what each host without a backend is missing", () => {
+  it("names what each host without a backend is missing when asked for one", () => {
     const macos = resolveDesktopNotice({ env: { SQUID_NOTIFY: "desktop" }, platform: "darwin" });
     expect("configError" in macos && macos.configError).toContain("bundle");
 

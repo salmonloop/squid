@@ -238,10 +238,14 @@ const CONFIG_KEY_TABLE: readonly Omit<ConfigKey, "validate">[] = [
     env: "SQUID_NOTIFY",
     label: "Desktop notices",
     group: "Notifications",
+    // Unset means on: speaking up is the default wherever the host has a
+    // backend, and `off` is the explicit way to decline it — offered as a value
+    // so turning the feature off is a choice the form can show, not an empty
+    // box a person has to know means anything.
     description:
-      "Whether Squid interrupts you on the desktop. Left empty, it only speaks inside this window.",
+      "Whether Squid interrupts you on the desktop when a reply lands. Left empty, it does wherever your system can show a notice.",
     kind: "enum",
-    values: ["desktop"],
+    values: ["off", "desktop"],
   },
   {
     id: "watchRoot",
