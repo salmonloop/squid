@@ -53,9 +53,12 @@ see through.
 Squid is silent outside the panel unless asked otherwise. `SQUID_NOTIFY=desktop`
 (or `"notify": "desktop"` in the config file) sends what the agent said to the
 host's own notification mechanism, so a person who closed the window still learns
-it spoke. Off by default — what a notice spends is attention — and Linux-only for
-now: the refusals in `resolve-desktop-notice.ts` name what each other host is
-missing rather than resolving to silence.
+it spoke. Off by default — what a notice spends is attention. Linux speaks through
+`notify-send`; Windows speaks through a `Shell_NotifyIcon` balloon shown by a
+Windows PowerShell helper, which needs no installer and no AppUserModelID — the
+transient tray icon is its own identity, and the toast is attributed to the
+messenger. On the hosts with no backend, the refusals in `resolve-desktop-notice.ts`
+name what is missing rather than resolving to silence.
 
 ### Visual panel smoke harness
 
@@ -296,6 +299,11 @@ nobody had open and stopped there.
 - `src/desktop-notice-linux.ts` — the `notify-send` arguments. `--` terminates the
   options before any text, because a summary beginning with a dash is otherwise
   parsed as short flags, and a model summarising its work routinely starts with one.
+- `src/desktop-notice-windows.ts` — the Windows balloon, shown by a PowerShell
+  helper the seam resolves from `%SystemRoot%`. The script is a constant and the
+  notice travels on stdin as one JSON line decoded as UTF-8 — no user text reaches
+  the PowerShell parser, and none of it is decoded in the OEM code page. The
+  helper outlives the system's ten-second balloon floor, then removes its icon.
 - `src/resolve-desktop-notice.ts` — resolves `SQUID_NOTIFY`. Off by default, and
   refuses on a host with no backend rather than resolving to off: a run that asked
   to be interrupted and silently was not is indistinguishable from a sleeping
