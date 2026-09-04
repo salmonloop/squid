@@ -184,14 +184,19 @@ collides with the base rather than overriding it. The compile error is
 `no method named set_icon found for struct SquidTray`, which reads like a missing
 feature rather than a naming rule.
 
-**A healthy run prints one tray failure line.** `PlatformTray::new` starts with
-`image_to_argb_icon(params.icon)?`, so an empty icon is an error, and the icon tracker
-that fires before Rust has assigned an image logs
-`Slint: Failed to create system tray icon: 0` and returns. The tracker fires again
-when the image lands and the icon appears normally. So that line is **not** a failure
-signal on startup, and the real signal is whether a `StatusNotifierItem` shows up on
-the session bus. Slint 1.18 changes this — its changelog adds "report an error when no
-system tray backend is available" — but 1.17.1 reports the same way for both cases.
+**A healthy run prints nothing, and the constructor never probes the host.**
+`SquidTray::new()` on Linux always succeeds — building the component touches no
+D-Bus — so the `Err` arm that reports "no system tray on this desktop" is dead code
+here; the host is probed later, on the first event-loop iteration, when the icon
+tracker calls `SystemTrayIconHandle::new` and ksni's spawn talks to the bus. The
+icon image is assigned before `window.run()`, so by the time the tracker fires it is
+already there and `image_to_argb_icon` succeeds. That means the line
+`Slint: Failed to create system tray icon: 0` is the opposite of what it looks like
+from the changelog: when it appears, something really failed — no tray host (ksni's
+`RegisterStatusNotifierItem` returns `ServiceUnknown` immediately) or an unusable
+icon. The real signal for "is the icon up" is whether a `StatusNotifierItem` shows
+up on the session bus. Slint 1.18 adds "report an error when no system tray backend
+is available"; 1.17.1 reports both failure shapes the same way.
 
 **A headless box can host a tray well enough to verify one.** No desktop shell is
 needed: `org.kde.StatusNotifierWatcher` is a handful of D-Bus methods, and `jeepney`
@@ -211,21 +216,44 @@ IconPixmap: 1 variant(s); 64x64 16384 bytes
 Run it under `Xvfb` and `dbus-run-session` the same way as the notification recipe
 above. The empty `Title` in the first run of this is what made it worth writing: the
 property is what accessibility tools read on Linux, and nothing else would have
-noticed it was unset.
+noticed it was unset. **The host must answer before it reads.** While it is making
+its own outbound `GetLayout` call, a jeepney blocking connection drops any inbound
+message that is not the awaited reply — if the panel is still mid-handshake, the
+swallowed `IsStatusNotifierHostRegistered` kills the tray's spawn and the readback
+then reports a menu the readback itself destroyed. Gate the readback on the panel
+being registered (and give it a beat), or you are measuring the stand-in, not the
+panel.
 
-**The tray menu is empty on Linux, and that is Slint's, not yours.** Measured with
-the stand-in host above: the item publishes `Menu: '/MenuBar'`, and
-`com.canonical.dbusmenu.GetLayout(0, -1, [])` on it returns `(0, (0, {}, []))` with
-`AboutToShow` answering `false`. It stays empty with the simplest possible two-item
-menu, so it is not a separator, a conditional `enabled`, or anything about how the
-menu is declared. `i-slint-core/items/system_tray/ksni.rs` does wire a menu — the
-entries just never arrive from the Slint side.
+**The tray menu exports on Linux; the "empty menu" was the stand-in host's own
+doing.** The first measurement through the host above read
+`GetLayout` as `(0, (0, {}, []))` with `AboutToShow` answering `false`, and Slint
+got blamed. The stand-in was the culprit: while it was busy reading the menu back,
+it swallowed ksni's `IsStatusNotifierHostRegistered` query (jeepney's blocking reply
+wait drops non-matching inbound messages), so the tray's spawn failed and the menu
+was never exported — and the same stand-in then reported the emptiness it had
+caused. A fake host must answer like a real one first (register, respond to the
+property query) and only then read back; with that ordering, the same measurement on
+the same panel returns both menu entries.
 
-This is what keeps `on_close_requested` calling `quit_event_loop()`. A visible tray
-keeps the loop alive by itself, so hiding the window *could* mean "put away" — but on
-the platform this is developed on, the menu that would be the only way out has
-nothing in it. Revisit when the menu is verified on a host: that is the one change
-that makes the lifecycle safe to invert.
+**Closing is "put away", and the whole lifecycle is measured.** The window handles
+close with `CloseRequestResponse::HideWindow` (`ui/src/main.rs`), and the tray's
+keepalive takes over: i-slint-core acquires a keepalive for a tray that has a
+platform handle and is visible (`items/system_tray.rs` `update_keepalive`), so
+`Window::hide()` releasing the window's one does not zero the count and quit the
+loop. Measured end-to-end on the stand-in host, with the app calling the same
+`Window::hide()` a close delivers: the window unmaps, the process stays alive, a
+dbusmenu `Event` for "Show Squid" re-maps it (`Window::show()` runs
+`set_visible(true)` unconditionally, and winit re-maps because its own visibility
+state moved), and an `Event` for "Quit Squid" ends the process.
+
+**What this box cannot measure: close delivery itself.** Under `Xvfb` — with or
+without a WM — `xdotool windowclose` destroys the X window without
+`on_close_requested` ever firing, so the WM_DELETE_WINDOW → Slint link is verified
+by reading `i-slint-backend-winit/event_loop.rs` (CloseRequested →
+`try_dispatch_event`), not by running it. Related trap: `windowunmap` is not a hide
+test — it bypasses Slint, whose state still says "visible", so a later
+`Window::show()` dedupes in winit's `set_visibility` (`shown.get()` unchanged) and
+no-ops. Only a Slint-side hide makes the show path real.
 
 ## Rust and the panel on Windows
 
