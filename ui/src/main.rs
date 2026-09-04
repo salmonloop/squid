@@ -13,8 +13,15 @@
 //! hid itself on answer — its presence *was* the message, so it ran an event loop
 //! with no window in it and showed one on demand. A resident panel that behaved
 //! that way would fight every other window all day for a foreground it does not
-//! need, so this one is not on top, is visible from launch, stays visible, and is
-//! an ordinary `window.run()`.
+//! need, so this one is not on top and is visible from launch.
+//!
+//! There is now a tray icon beside it (`ui/tray.slint`), which answers what the
+//! window cannot while it is buried: whether Squid is running, and what it is
+//! doing. It does *not* change what closing means. A visible `SystemTrayIcon`
+//! keeps the event loop alive by itself, so the close request ends the loop
+//! explicitly — the reasoning, and the measurement behind it, is in that file.
+//! Closing still declines anything pending either way: that rule is about refusing
+//! to leave a live-looking question behind.
 //!
 //! The two threads and why they exist: connecting and reading block, and
 //! blocking the Slint event loop would freeze the window. So a reader thread owns
@@ -43,7 +50,7 @@ use protocol::{
     source_toggle_line, AgentLine, Answer, ConfigLine, ConfigResultLine, Control, Incoming, Prompt,
     SourceLine, SourceResultLine, WorldState,
 };
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 use startup::Startup;
 use transport::Outgoing;
 
@@ -97,6 +104,15 @@ struct Dumps {
 struct ViewState {
     settings: RefCell<Vec<ConfigLine>>,
     sources: RefCell<Vec<SourceLine>>,
+    /// The tray icon, once it exists.
+    ///
+    /// Here rather than passed around because the reader thread is spawned before
+    /// the icon is created, so no parameter could reach it, and because everything
+    /// that touches the tray already runs on this thread: the window's callbacks,
+    /// and the closures `apply` posts. Empty until the tray is built, and empty
+    /// forever on a desktop that has no tray host — both of which make every
+    /// update below a no-op rather than a branch at each call site.
+    tray: RefCell<Option<slint::Weak<SquidTray>>>,
 }
 
 thread_local! {
@@ -106,6 +122,116 @@ thread_local! {
 /// Runs `body` against the UI thread's view state.
 fn with_view<T>(body: impl FnOnce(&ViewState) -> T) -> T {
     VIEW.with(|state| body(state))
+}
+
+/// Puts the status line's own words on the tray icon.
+///
+/// Read from the window rather than recomputed. `status-title` is published by
+/// `panel.slint` from the one expression in `status.slint` that decides what Squid
+/// is doing, so the hover text cannot come to a different conclusion than the card
+/// four pixels away — which is exactly the failure that expression was last
+/// repaired for.
+fn refresh_tray(window: &PanelWindow) {
+    with_view(|state| {
+        if let Some(icon) = state.tray.borrow().as_ref().and_then(slint::Weak::upgrade) {
+            icon.set_hover_text(tray_tooltip(&window.get_status_title()).into());
+        }
+    });
+}
+
+/// The hover text: who this is, then what it is doing.
+///
+/// The name alone when there is no state to report, rather than a dash with
+/// nothing after it. An empty title is only reachable before the first binding
+/// evaluates, but a tooltip reading "Squid — " would be the window admitting it
+/// had lost its own sentence.
+fn tray_tooltip(title: &str) -> String {
+    if title.is_empty() {
+        "Squid".to_string()
+    } else {
+        format!("Squid — {title}")
+    }
+}
+
+/// The mark's ink, and the one colour in this binary chosen without asking the
+/// theme.
+///
+/// `theme.slint` answers `Palette.color-scheme` for every other colour, because a
+/// panel that stayed light on a dark desktop would be the only window that did. A
+/// tray icon cannot: it has no window, so it has no scheme to read, and the
+/// taskbar it lands on is light on some systems and dark on others. A single
+/// mid-luminance fill is the only value that survives both, so this is picked for
+/// luminance rather than for taste.
+const TRAY_INK: (u8, u8, u8) = (0x3f, 0xa0, 0x7a);
+
+/// Rendered at 64px and left to the platform to scale down.
+///
+/// Every host asks for a different size — 16 and 32 on Windows depending on DPI,
+/// 22-ish on Linux, a menu-bar height on macOS — and Slint's own documentation
+/// says the image is scaled by the platform. One buffer larger than any of them
+/// scales down cleanly; the reverse does not.
+const TRAY_ICON_SIZE: u32 = 64;
+
+/// The tray mark, drawn rather than shipped.
+///
+/// No image file, for two reasons. The repository has no asset pipeline and no
+/// binary in it, so a PNG would be a blob whose source lived nowhere. And the
+/// shape is small enough that code *is* the source: a dome and three tapering
+/// tentacles, which is what a squid reduces to at sixteen pixels.
+///
+/// Supersampled rather than hard-edged, because the platform scales this down and
+/// an aliased 64px mark resamples into a smudge.
+fn tray_mark(size: u32) -> SharedPixelBuffer<Rgba8Pixel> {
+    const SAMPLES: u32 = 4;
+    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(size, size);
+    let pixels = buffer.make_mut_slice();
+    for y in 0..size {
+        for x in 0..size {
+            let mut covered = 0_u32;
+            for sub_y in 0..SAMPLES {
+                for sub_x in 0..SAMPLES {
+                    let fx = tray_sample(x, sub_x, size, SAMPLES);
+                    let fy = tray_sample(y, sub_y, size, SAMPLES);
+                    if in_tray_mark(fx, fy) {
+                        covered += 1;
+                    }
+                }
+            }
+            pixels[(y * size + x) as usize] = Rgba8Pixel {
+                r: TRAY_INK.0,
+                g: TRAY_INK.1,
+                b: TRAY_INK.2,
+                a: (covered * 255 / (SAMPLES * SAMPLES)) as u8,
+            };
+        }
+    }
+    buffer
+}
+
+/// One subsample's position, in a square that runs -1 to 1 in both directions.
+fn tray_sample(pixel: u32, sub: u32, size: u32, samples: u32) -> f32 {
+    ((pixel * samples + sub) as f32 + 0.5) / (size * samples) as f32 * 2.0 - 1.0
+}
+
+/// Whether a point is inside the mark.
+fn in_tray_mark(x: f32, y: f32) -> bool {
+    // The dome, wider than tall so it reads as a head rather than a ball.
+    if (x / 0.60).powi(2) + ((y + 0.22) / 0.52).powi(2) <= 1.0 {
+        return true;
+    }
+    // Three tentacles, starting inside the dome so they join it rather than
+    // hanging under it, and tapering so the silhouette is not a comb.
+    if !(0.10..=0.86).contains(&y) {
+        return false;
+    }
+    let half_width = 0.115 * (1.0 - (y - 0.10) / 0.76 * 0.75);
+    [-0.34_f32, 0.0, 0.34]
+        .into_iter()
+        .any(|centre| (x - centre).abs() <= half_width)
+}
+
+fn tray_icon() -> slint::Image {
+    slint::Image::from_rgba8(tray_mark(TRAY_ICON_SIZE))
 }
 
 /// The one line `--version` prints, and the only place the binary names itself.
@@ -341,6 +467,12 @@ fn main() {
         let handle = window.as_weak();
         window.window().on_close_requested(move || {
             answer(&pending, &outgoing, &handle, Answer::Declined);
+            // Ending the run is now explicit, because the tray would otherwise keep
+            // the loop alive and turn this into "put away". See `ui/tray.slint` for
+            // why that is not the trade taken: the tray's menu is empty on Linux in
+            // this Slint version, so a hidden window would be a process with no way
+            // out of its own interface.
+            let _ = slint::quit_event_loop();
             slint::CloseRequestResponse::HideWindow
         });
     }
@@ -375,6 +507,11 @@ fn main() {
                 move |connected| {
                     let _ = link_handle.upgrade_in_event_loop(move |window| {
                         window.set_link_lost(!connected);
+                        // Refreshed here as well as in `apply`, because losing the
+                        // link is the one state change no message follows — that
+                        // is what it means — and it is also the one a person with
+                        // the window closed most needs the tooltip to admit.
+                        refresh_tray(&window);
                     });
                 },
             )
@@ -424,9 +561,43 @@ fn main() {
         });
     }
 
-    // An ordinary `run()`: the window is up from launch and stays up. The old
-    // `run_event_loop_until_quit` existed only to keep a *hidden* window's
-    // process alive between prompts, which is a shape this panel does not have.
+    // The tray, and with it the process's new lifetime.
+    //
+    // Created after every window callback is wired, because it can end the loop:
+    // `Quit Squid` must find a panel that can already answer a pending prompt.
+    // Held in a binding rather than dropped — the icon exists exactly as long as
+    // this value does — and its failure is the same class as a window that would
+    // not open, except that it must not be fatal: a desktop with no tray host is
+    // a desktop where the panel still works.
+    let _tray = match SquidTray::new() {
+        Ok(tray) => {
+            tray.set_icon_image(tray_icon());
+            tray.set_hover_text(tray_tooltip(&window.get_status_title()).into());
+            {
+                let pending = Arc::clone(&pending);
+                let outgoing = outgoing.clone();
+                let handle = window.as_weak();
+                // Leaving is a refusal, exactly as closing the window is. The
+                // engine hears `declined` rather than waiting out a deadline for
+                // an answer nobody is left to give.
+                tray.on_quit(move || {
+                    answer(&pending, &outgoing, &handle, Answer::Declined);
+                    let _ = slint::quit_event_loop();
+                });
+            }
+            with_view(|state| *state.tray.borrow_mut() = Some(tray.as_weak()));
+            Some(tray)
+        }
+        Err(error) => {
+            eprintln!("squid-ui: no system tray on this desktop: {error}");
+            None
+        }
+    };
+
+    // Not an ordinary `run()` any more: with a visible tray, hiding the window no
+    // longer ends the loop. That is the point — the old note here said a hidden
+    // window keeping the process alive "is a shape this panel does not have", and
+    // adding the tray is precisely the decision to have it.
     //
     // A failure here is the same class as a failure to create the window — the
     // display went away, or the loop could not start — and reaches a
@@ -542,6 +713,13 @@ fn apply(
             }
         }
     }
+
+    // One more hop, after whatever the branch above posted. Posted closures run
+    // in order, so this reads the window the user is now looking at rather than
+    // the one before the message landed. Cheap enough to do unconditionally:
+    // working out which messages can move the status line would be a second copy
+    // of the state machine's inputs, kept in agreement by hand.
+    let _ = window.upgrade_in_event_loop(|window| refresh_tray(&window));
 }
 
 /// Replaces the settings form with a dump.
@@ -831,8 +1009,35 @@ fn clear_prompt(window: PanelWindow) {
 
 #[cfg(test)]
 mod tests {
-    use super::{config_verdict, dump_note, source_verdict, version_line};
+    use super::{config_verdict, dump_note, source_verdict, tray_mark, tray_tooltip, version_line};
     use crate::protocol::{ConfigResultLine, SourceResultLine};
+
+    /// The mark is drawn, so the drawing is what a test can hold.
+    ///
+    /// Four pixels, and the fourth is the one that matters: the gap between two
+    /// tentacles. Without it every assertion here would still pass for a solid
+    /// square, which is what a rasteriser degrades into when a taper or a bound
+    /// goes wrong.
+    #[test]
+    fn the_tray_mark_is_a_dome_over_three_separate_tentacles() {
+        let mark = tray_mark(64);
+        assert_eq!((mark.width(), mark.height()), (64, 64));
+        let alpha = |x: u32, y: u32| mark.as_slice()[(y * 64 + x) as usize].a;
+        assert_eq!(alpha(32, 24), 255, "the dome's centre must be solid");
+        assert_eq!(alpha(0, 0), 0, "the corner must be clear");
+        assert_eq!(alpha(32, 47), 255, "the middle tentacle must be solid");
+        assert_eq!(alpha(37, 47), 0, "the gap between tentacles must be clear");
+    }
+
+    /// The hover text names the app first, because a tooltip with only a state in
+    /// it is a sentence about nothing.
+    #[test]
+    fn the_tray_tooltip_names_squid_and_then_what_it_is_doing() {
+        assert_eq!(tray_tooltip("Watching"), "Squid — Watching");
+        // Before the first binding evaluates there is no state to report, and
+        // "Squid — " would read as a lost sentence.
+        assert_eq!(tray_tooltip(""), "Squid");
+    }
 
     /// The line is a name plus a version, from the crate's own compiled-in
     /// constant — the same reasoning as the placeholder check in `startup.rs`:

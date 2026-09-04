@@ -1,0 +1,57 @@
+// The one surface that is visible when the panel window is not in front.
+//
+// It answers a question the window cannot answer while it is buried under other
+// windows: is Squid running, and what is it doing? The icon says the first, the
+// hover text says the second in the status line's own words.
+//
+// **It deliberately does not turn "close" into "put away".** A visible
+// `SystemTrayIcon` keeps Slint's event loop alive by itself, so hiding the window
+// could have meant the process survives — which is what a tray is usually for. It
+// does not here, and the reason is measured rather than cautious: on Linux, Slint
+// 1.17.1 publishes the tray's dbusmenu object path and then exports an *empty*
+// menu. A fake `org.kde.StatusNotifierWatcher` pointed at the running panel read
+// `GetLayout` back as `(0, (0, {}, []))`, with `AboutToShow` answering `false`,
+// and it stayed empty with the simplest possible two-item menu. So on the platform
+// this is developed on, a menu entry is not a way out — and a hidden window plus a
+// live tray whose menu is empty is a process a person cannot quit from its own
+// interface. Closing the window still ends the run, exactly as it did before.
+//
+// That leaves `Quit Squid` as the menu's only entry, and it earns its place on the
+// host where the menu works: quitting without first hunting for a window that is
+// behind six others. `Show Squid` is absent for the same reason it would be
+// pointless — the window is never hidden while this process lives — and a
+// permanently disabled entry is worse than no entry.
+//
+// Two things also deliberately absent. **Pause** stays in the panel's Recording
+// section, which owns the prose that goes with it: pause control is FIFO-backed, so
+// it is unconfigured on most runs and unavailable on Windows entirely. **A count**
+// belongs to the desktop notice — only "Waiting for you" earns a badge in this
+// design, and a Windows tray icon cannot carry one.
+export component SquidTray inherits SystemTrayIcon {
+    // `icon` and `tooltip` belong to `SystemTrayIcon`, and Slint generates Rust
+    // accessors only for what the exported component declares — an inherited
+    // property has no setter on the binding. So each one gets a declared property
+    // here and the inherited one is bound to it. The names differ because they
+    // must: a re-declaration would collide with the base rather than override it.
+    in property <image> icon-image;
+    in property <string> hover-text;
+    icon: root.icon-image;
+    tooltip: root.hover-text;
+
+    // A literal, unlike the tooltip, because this one is not state: `title` is what
+    // accessibility tools read and what some desktops show when they list tray
+    // icons. It was empty until a fake StatusNotifier host read the properties back
+    // off the running panel. Windows renders only the icon and ignores it; that is
+    // no reason to publish nothing on the host where a screen reader is the only
+    // way to find this icon at all.
+    title: "Squid";
+
+    callback quit();
+
+    Menu {
+        MenuItem {
+            title: "Quit Squid";
+            activated => { root.quit(); }
+        }
+    }
+}

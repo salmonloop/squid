@@ -106,9 +106,13 @@ Binding constraints:
   warnings`, `cargo test` on the panel; `typecheck`, `bun test`, `bun run build`
   on the TypeScript side.
 
-Deliberately undecided: whether the resident form is a strip, a tray presence, or
-both, and whether approval arrives in its own window. New windows and forms are
-permitted; which ones exist is a design decision, not a settled fact.
+Decided since: the resident form is the window **and** a tray presence. Slint 1.17
+ships `SystemTrayIcon` with native backends on all three platforms, and on Windows it
+costs no dependency at all. The tray reports presence and state; it does not yet make
+closing the window mean "put away", because Slint 1.17.1 exports an empty tray menu on
+Linux and a hidden window with no reachable way out is worse than no hiding. Still
+undecided: whether approval arrives in its own window. New windows and forms are permitted; which ones exist is a design decision,
+not a settled fact.
 
 ## Evidence on Hand
 
