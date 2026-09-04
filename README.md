@@ -50,15 +50,16 @@ demo want — it is deliberately no longer what an unconfigured run gets, becaus
 frames presented as observations of this machine are a lie nothing downstream can
 see through.
 
-Squid is silent outside the panel unless asked otherwise. `SQUID_NOTIFY=desktop`
-(or `"notify": "desktop"` in the config file) sends what the agent said to the
-host's own notification mechanism, so a person who closed the window still learns
-it spoke. Off by default — what a notice spends is attention. Linux speaks through
-`notify-send`; Windows speaks through a `Shell_NotifyIcon` balloon shown by a
-Windows PowerShell helper, which needs no installer and no AppUserModelID — the
-transient tray icon is its own identity, and the toast is attributed to the
-messenger. On the hosts with no backend, the refusals in `resolve-desktop-notice.ts`
-name what is missing rather than resolving to silence.
+Squid speaks up wherever the host can show a notice. When a reply lands, what the
+agent said also goes to the host's own notification mechanism, so a person who
+closed the window still learns it spoke. `SQUID_NOTIFY=off` (or `"notify": "off"`
+in the config file — the settings form's switch) declines it; `desktop` says the
+default out loud. Linux speaks through `notify-send`; Windows speaks through a
+`Shell_NotifyIcon` balloon shown by a Windows PowerShell helper, which needs no
+installer and no AppUserModelID — the transient tray icon is its own identity, and
+the toast is attributed to the messenger. A host with no backend starts quiet when
+nothing was asked, and the refusals in `resolve-desktop-notice.ts` name what is
+missing when `desktop` is asked for by name.
 
 ### Visual panel smoke harness
 
@@ -304,10 +305,11 @@ nobody had open and stopped there.
   notice travels on stdin as one JSON line decoded as UTF-8 — no user text reaches
   the PowerShell parser, and none of it is decoded in the OEM code page. The
   helper outlives the system's ten-second balloon floor, then removes its icon.
-- `src/resolve-desktop-notice.ts` — resolves `SQUID_NOTIFY`. Off by default, and
-  refuses on a host with no backend rather than resolving to off: a run that asked
-  to be interrupted and silently was not is indistinguishable from a sleeping
-  daemon.
+- `src/resolve-desktop-notice.ts` — resolves `SQUID_NOTIFY`. On by default wherever
+  the host has a backend, `off` the explicit decline on every host; unset on a host
+  with no backend starts quiet, while `desktop` asked for by name there refuses
+  rather than resolving to off: a run that asked to be interrupted and silently
+  was not is indistinguishable from a sleeping daemon.
 
 Where the popup appears is the desktop's decision, not Squid's. The notification
 spec describes passive popups and says nothing about placement — the daemon decides,

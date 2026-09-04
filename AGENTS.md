@@ -149,17 +149,21 @@ DISPLAY=:77 dbus-run-session -- bash -c 'dunst & sleep 1; <send a notice>; \
 name on the developer's own session. Kill the `Xvfb` explicitly — a trap on the
 outer shell does not always get there.
 
-**Desktop notices speak on Linux and Windows; macOS is refused, with the reason
-named.** Linux goes through `notify-send`; Windows through a `Shell_NotifyIcon`
-balloon shown by a Windows PowerShell helper (`src/desktop-notice-windows.ts`),
-which needs no installer and no AppUserModelID — the transient tray icon is its
-own identity, and the toast is attributed to the messenger. The helper must
-outlive the system's ten-second balloon floor before removing its icon, which is
-why the Windows delivery deadline is 15s against the shared loop's Linux 5s
-default. macOS attributes a notice to the bundle that sent it, and the panel
-ships no bundle, so `resolve-desktop-notice.ts` refuses there with the
-prerequisite named rather than resolving to `off` — a run that asked to be
-interrupted and silently was not looks exactly like one whose daemon is asleep.
+**Desktop notices speak on Linux and Windows by default; macOS is the one host
+they stay quiet on.** Linux goes through `notify-send`; Windows through a
+`Shell_NotifyIcon` balloon shown by a Windows PowerShell helper
+(`src/desktop-notice-windows.ts`), which needs no installer and no
+AppUserModelID — the transient tray icon is its own identity, and the toast is
+attributed to the messenger. The helper must outlive the system's ten-second
+balloon floor before removing its icon, which is why the Windows delivery
+deadline is 15s against the shared loop's Linux 5s default. The default-on is
+what splits the macOS behaviour in two: unset there starts the run silent,
+because a default that exited every machine it never observed would be a trap —
+while `SQUID_NOTIFY=desktop` asked for by name still refuses with the reason
+named (Notification Center attributes a notice to the bundle that sent it, and
+the panel ships no bundle), because a run that asked to be interrupted and
+silently was not looks exactly like one whose daemon is asleep. `off` is the
+explicit decline, and it wins on every host.
 
 ## The tray, and what Slint 1.17 will and will not tell you
 
