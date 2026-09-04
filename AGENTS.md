@@ -52,15 +52,16 @@ split was on a headless aarch64 Ubuntu box with `Xvfb`, `xdotool`, `xwininfo`,
 answers came back, and the screenshots show a correctly rendered window. No seam
 needed repair. Two things worth knowing anyway:
 
-- **It skips the header assertions.** Reading text on screen is an optional
-  `SmokeHost` capability — `readStatus?` — and the X11 host omits it, so the run
-  says out loud that it skipped rather than quietly passing. That is the
-  assertion the Windows host added *because* the header once claimed the wrong
-  thing, which means the platform this project is developed on cannot catch that
-  defect class. The panel compiles Slint's `accessibility` feature and a plain
-  Ubuntu session runs `org.a11y.Bus`, so AT-SPI is the obvious route; nobody has
-  tried it, and AccessKit's Linux adapter may only publish a tree while an
-  assistive technology is listening.
+- **It reads the header over AT-SPI now.** Reading text on screen is an optional
+  `SmokeHost` capability — `readStatus?` — and the X11 host implements it: it
+  starts a private session bus, flips `org.a11y.Status.IsEnabled` before the
+  panel launches (the order does not matter — the switch is the latch, and the
+  tree publishes either way), and reads the header's description from the
+  panel's AT-SPI cache. Two measured facts: the a11y side of `dbus-run-session`
+  arrives by D-Bus activation, so nothing extra has to be started; and
+  `busctl --json=short` wraps the method's one out parameter in a `data` field —
+  the node list is `reply.data[0]`, not `reply.data`, and missing that layer
+  looks exactly like a panel that never published a tree.
 - **The button coordinates are still the measured ones**, and they were measured
   elsewhere. They worked unchanged, so the layout has not moved — but a Slint change
   that moves a button will show up here as a wrong or missing answer, not as a
