@@ -4,6 +4,7 @@ import {
   type StreamingChild,
 } from "./screen-text-reader-subprocess.js";
 import type { ScreenTextFocusRole, ScreenTextFrame, ScreenTextReaderFactory } from "./screen-text-source.js";
+import { windowsPowerShellPath } from "./windows-powershell.js";
 
 const DEFAULT_POLL_MS = 1_000;
 const DEFAULT_RESTART_MS = 2_000;
@@ -217,23 +218,9 @@ export function parseWindowsFocusFrame(line: string, occurredAt: string): Screen
   };
 }
 
-/**
- * Windows PowerShell, by absolute path.
- *
- * `powershell.exe` is not reliably on `PATH` — a POSIX-flavoured parent process
- * hands this one an environment whose `PATH` often omits the System32
- * subdirectory it lives in — and `%SystemRoot%` is the variable Windows itself
- * guarantees. It must be Windows PowerShell rather than `pwsh`: the UI Automation
- * client is a .NET Framework assembly, which `pwsh` does not load.
- */
-function powershellPath(env: Record<string, string | undefined>): string {
-  const root = env.SystemRoot ?? env.SYSTEMROOT ?? "C:\\Windows";
-  return `${root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
-}
-
 /** Adapts one `Bun.spawn` child to the streaming loop's view of it. */
 function spawnSampler(script: string): StreamingChild {
-  const child = Bun.spawn([powershellPath(process.env), "-NoProfile", "-NonInteractive", "-Command", script], {
+  const child = Bun.spawn([windowsPowerShellPath(), "-NoProfile", "-NonInteractive", "-Command", script], {
     stdout: "pipe",
     stderr: "pipe",
     stdin: "ignore",

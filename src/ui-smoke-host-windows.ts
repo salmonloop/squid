@@ -1,4 +1,3 @@
-import { join } from "node:path";
 import {
   eventually,
   run,
@@ -7,6 +6,7 @@ import {
   type SmokeHost,
   type SmokeWindow,
 } from "./ui-smoke-host.js";
+import { windowsPowerShellPath } from "./windows-powershell.js";
 
 /**
  * The Windows smoke host: the interactive desktop, UI Automation for the window
@@ -259,25 +259,11 @@ for ($i = 0; $i -lt $lines.Count; $i++) {
 }
 
 /**
- * Windows PowerShell, by absolute path rather than by name.
- *
- * `powershell.exe` is not reliably on `PATH` — a POSIX-flavoured shell (Git Bash,
- * MSYS) hands this process a `PATH` that often omits the System32 subdirectory it
- * lives in, and the harness then fails to start a program that is definitely
- * installed. `%SystemRoot%` is the variable Windows itself guarantees, and the
- * location under it has been fixed since PowerShell 1.0.
- *
- * Resolving it here also means the interpreter cannot be shadowed by something
- * earlier on `PATH` calling itself `powershell.exe`, which for a check that loads
- * .NET assemblies and clicks the desktop is worth being deliberate about.
+ * Windows PowerShell, by absolute path rather than by name — the one resolver
+ * every PowerShell spawn in this repository answers to. The reasoning behind it
+ * lives on the resolver, not here.
  */
-const POWERSHELL = join(
-  process.env.SystemRoot ?? "C:\\Windows",
-  "System32",
-  "WindowsPowerShell",
-  "v1.0",
-  "powershell.exe",
-);
+const POWERSHELL = windowsPowerShellPath();
 
 const POWERSHELL_ARGUMENTS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"];
 
