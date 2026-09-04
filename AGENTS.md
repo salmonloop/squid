@@ -29,13 +29,25 @@ three invented events and prints them; it is not Squid. `start` runs
 `src/squid-app.ts`, which defaults the watch root, the panel endpoint, and the panel
 binary path, and needs no environment.
 
-**The X11 smoke host is moved but unrun.** `src/ui-smoke.ts` was split into a
-platform-free harness plus one host per platform (`ui-smoke-host-x11.ts`,
-`ui-smoke-host-windows.ts`). The X11 implementation was moved *verbatim* — same
-commands, same flags, same measured button coordinates — but it has not been
-executed since the move, because the move happened on a Windows machine. You will be
-the first to run it. If it fails, suspect the seam (`prepare`, `panelEnvironment`,
-`awaitWindow`, `activate`, `screenshot`), not the X11 mechanics.
+**The X11 smoke host has now been run, and it passes.** First execution after the
+split was on a headless aarch64 Ubuntu box with `Xvfb`, `xdotool`, `xwininfo`,
+`ffmpeg` and Mesa's software rasterizer; the panel opened, the clicks landed, the
+answers came back, and the screenshots show a correctly rendered window. No seam
+needed repair. Two things worth knowing anyway:
+
+- **It skips the header assertions.** Reading text on screen is an optional
+  `SmokeHost` capability — `readStatus?` — and the X11 host omits it, so the run
+  says out loud that it skipped rather than quietly passing. That is the
+  assertion the Windows host added *because* the header once claimed the wrong
+  thing, which means the platform this project is developed on cannot catch that
+  defect class. The panel compiles Slint's `accessibility` feature and a plain
+  Ubuntu session runs `org.a11y.Bus`, so AT-SPI is the obvious route; nobody has
+  tried it, and AccessKit's Linux adapter may only publish a tree while an
+  assistive technology is listening.
+- **The button coordinates are still the measured ones**, and they were measured
+  elsewhere. They worked unchanged, so the layout has not moved — but a Slint change
+  that moves a button will show up here as a wrong or missing answer, not as a
+  layout diff.
 
 ## Windows: things that are not obvious
 

@@ -101,8 +101,13 @@ nothing. Each coordinate asserts *which* answer it produced, so a layout change 
 moves a button makes the expected answer wrong or absent instead of silently hitting
 a neighbour.
 
-Two things the harness therefore cannot claim. It does not verify the
-no-default-button rule — a `Return` that produces no answer here proves only that
+Three things the harness therefore cannot claim. On Linux it cannot read text on
+screen, so the header assertions the Windows host makes are skipped there and the
+words are left to the screenshots — which means the dev platform cannot catch a
+header that claims the wrong thing, the defect class the status expression was last
+repaired for. The panel does compile Slint's `accessibility` feature, and a plain
+Ubuntu session runs `org.a11y.Bus`, so AT-SPI is the route to closing that gap; it
+has not been tried. It also does not verify the no-default-button rule — a `Return` that produces no answer here proves only that
 no key arrived — so that rule is enforced in `ui/confirmation.slint`, where no
 button is `primary` and none is given focus. And it renders in whatever colour
 scheme the display reports, which under Xvfb is the light one: there is no desktop
