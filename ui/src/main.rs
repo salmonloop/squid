@@ -474,7 +474,9 @@ fn main() {
             // Slint's keepalive counter: `Window::hide` releases it, and a
             // live tray handle acquired one. See `AGENTS.md`'s tray section
             // for what this box can and cannot measure of that chain.)
-            window.window().on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+            window
+                .window()
+                .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
         }
     }
 
