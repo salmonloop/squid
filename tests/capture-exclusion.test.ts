@@ -8,6 +8,10 @@ import { RedactingCapturePolicy, type CapturePolicy } from "../src/capture-polic
 import { InMemoryEventStore } from "../src/event-store.js";
 import { createActivityEvent, type ActivityEvent } from "../src/protocol.js";
 import { PredictionRuntime } from "../src/prediction-runtime.js";
+import {
+  ScreenTextActivitySource,
+  type ScreenTextFrame,
+} from "../src/screen-text-source.js";
 import { SquidCore } from "../src/squid-core.js";
 
 function activated(name: string): ActivityEvent {
@@ -60,6 +64,16 @@ describe("ExcludingCapturePolicy", () => {
     const p = policy("banking");
     expect(p.capture(activated("MyBankingApp"))).toBeNull();
     expect(p.capture(activated("Editor"))).not.toBeNull();
+  });
+
+  it("continues excluding id-only events after the app activation", () => {
+    const p = policy("vault");
+    expect(p.capture(activated("Vault"))).toBeNull();
+    expect(p.capture(windowTitled("secret window"))).toBeNull();
+    expect(p.capture(createActivityEvent({
+      kind: "focus_changed",
+      payload: { applicationId: "1", windowTitle: "secret", role: "unknown", label: null },
+    }))).toBeNull();
   });
 
   it("treats regex metacharacters in names literally", () => {
@@ -167,5 +181,65 @@ describe("exclusion through the live runtime", () => {
     );
     expect(kept.ingest).not.toBeNull();
     expect(await store.all()).toHaveLength(1);
+  });
+
+  it("keeps everything an excluded foreground produces out of the store", async () => {
+    // The leak this test exists for: one sample of a vault window becomes four
+    // events, and only the first of them says the word "Vault". Judging them one
+    // at a time dropped that one and stored the window title, the focused
+    // control's label, and the selected text — the whole of what the user asked
+    // to hide, minus the name of the application hiding it.
+    const rules = parseExclusionList("vault") as Exclude<
+      ReturnType<typeof parseExclusionList>,
+      string
+    >;
+    const policy = new ExcludingCapturePolicy(rules, new RedactingCapturePolicy());
+    const { runtime, store } = await runtimeWith(policy);
+
+    const reader: { onFrame: ((frame: ScreenTextFrame) => void) | null } = { onFrame: null };
+    const source = new ScreenTextActivitySource({
+      readerFactory: (input) => {
+        reader.onFrame = input.onFrame;
+        return { close: () => undefined };
+      },
+      debounceMs: 1,
+    });
+    await source.start(async (event) => {
+      await runtime.ingest(event);
+    });
+
+    reader.onFrame?.({
+      applicationId: "77",
+      applicationName: "Vault",
+      windowTitle: "Personal — Vault",
+      focusedRole: "text_input",
+      focusedLabel: "Recovery phrase",
+      textContext: { prefix: "", suffix: "", selection: "Our door code is 8342", language: null },
+      occurredAt: "2026-09-05T10:00:00.000Z",
+    });
+    // The next application releases the latch, which is what proves exclusion is
+    // scoped to the foreground rather than latched on for the rest of the run.
+    reader.onFrame?.({
+      applicationId: "78",
+      applicationName: "Code",
+      windowTitle: "capture-exclusion.ts",
+      focusedRole: "editor",
+      focusedLabel: null,
+      textContext: { prefix: "", suffix: "", selection: "", language: null },
+      occurredAt: "2026-09-05T10:00:01.000Z",
+    });
+    await source.stop();
+
+    const stored = await store.all();
+    const serialized = JSON.stringify(stored);
+    expect(serialized).not.toContain("8342");
+    expect(serialized).not.toContain("Vault");
+    expect(serialized).not.toContain("Recovery phrase");
+    expect(stored.map((event) => event.kind)).toEqual([
+      "application_activated",
+      "window_changed",
+      "focus_changed",
+      "text_context_changed",
+    ]);
   });
 });

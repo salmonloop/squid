@@ -187,9 +187,13 @@ against a type that no longer existed and still pass.
   content before an event reaches the store. Capture is irreversible, so this narrows
   what is *persisted*.
 - `src/capture-exclusion.ts` — `ExcludingCapturePolicy`, per-application exclusion at
-  the ingress boundary, wrapping redaction. A matched event is dropped outright and
-  diagnostics carry counts only: recording "excluded app X" would recreate exactly what
-  the user asked to hide. `resolveCaptureExclusion` fails closed on a malformed list.
+  the ingress boundary, wrapping redaction. The unit of exclusion is the **foreground**:
+  only `application_activated` carries a name, so an activation latches the answer and
+  every later event describing the foreground — window title, focused control, selection,
+  page, keyframe — is dropped until another activation says otherwise. Facts from watching
+  a path or a pipe pass through. A matched event is dropped outright and diagnostics carry
+  counts only: recording "excluded app X" would recreate exactly what the user asked to
+  hide. `resolveCaptureExclusion` fails closed on a malformed list.
 - `src/prediction-runtime.ts` — the capture boundary in front of the core: apply the
   policy, then ingest. Nothing more. It used to own prediction requests, attempt
   records, and an `admitAndClaim` linearization point, all of which assumed Squid
@@ -456,7 +460,7 @@ Three independent controls, resolved before any sink opens so a typo fails start
 than silently running a session whose policy was never applied:
 
 ```bash
-# Drop every event from named applications at the ingress boundary, before the store.
+# Drop everything observed while a named application is in front, before the store.
 SQUID_EXCLUDE='1Password,Vault' bun run watch:desktop -- /absolute/project/root
 
 # Let the run be paused and resumed through a FIFO a shell alias appends to.
