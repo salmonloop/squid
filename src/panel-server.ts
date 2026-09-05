@@ -36,12 +36,12 @@ import { isPanelNamedPipe } from "./resolve-panel.js";
  *
  * ## The bind path is cleared, not blindly overwritten — on Unix only
  *
- * `stop()` does not remove the socket file, so a crashed run leaves one behind
- * and it must be unlinked before re-binding. But measured: `Bun.listen({ unix })`
- * also binds over a **regular file** and destroys its contents with no error, so
- * a mistyped `SQUID_PANEL_SOCKET` naming real data would be silently lost.
- * `startPanelServer` therefore refuses to start when the path holds something
- * that is not a socket.
+ * A killed run leaves its socket file behind — `stop()` unlinks it, `SIGKILL` runs
+ * no `stop()` — and `bind()` refuses a path that already exists, so the leftover
+ * must be unlinked before re-binding. Two things that unlink must *not* do:
+ * destroy a regular file the path names by mistake, and take the endpoint away
+ * from a session that is still listening on it. `startPanelServer` refuses both,
+ * which is why `clearBindPath` stats and then probes instead of unlinking.
  *
  * A named pipe has no filesystem entry at all: nothing to stat, nothing to
  * unlink, nothing to chmod. Every one of those three steps is gated on the
@@ -95,7 +95,7 @@ export interface PanelServer {
 export interface PanelServerOptions {
   readonly socketPath: string;
   readonly onControl: (op: "pause" | "resume", requestId?: string) => void;
-  readonly onServiceControl?: (op: "restart", requestId?: string) => void;
+  readonly onServiceControl?: (op: "restart" | "stop", requestId?: string) => void;
   readonly onAnswer?: (promptId: number, answer: "approved" | "declined", requestId?: string) => void;
   readonly onConfigGet?: (requestId?: string) => void;
   readonly onConfigSet?: (id: string, value: string, requestId?: string) => void;
@@ -126,12 +126,49 @@ const HAS_CONTROL_CHAR = /[\u0000-\u001F\u007F]/;
  */
 const MAX_LINE_BYTES = 64 * 1024;
 
+/** The framing byte, looked for in the wire bytes rather than the decoded text. */
+const NEWLINE_BYTE = 0x0a;
+
+const encoder = new TextEncoder();
+
+/**
+ * Appends to a client's pending write buffer.
+ *
+ * Bytes rather than a string, because `flush` slices what it could not write by
+ * the count `write` returns and that count is in **bytes**. Slicing a JS string
+ * by a byte count truncates mid-character the moment a line carries anything
+ * outside ASCII — one Chinese path in a config line — and the framing never
+ * recovers, because the next flush resends the tail of a character.
+ */
+function appendBytes(pending: Uint8Array, addition: Uint8Array): Uint8Array {
+  const joined = new Uint8Array(pending.length + addition.length);
+  joined.set(pending);
+  joined.set(addition, pending.length);
+  return joined;
+}
+
 interface Client {
   readonly socket: Socket<undefined>;
-  /** Bytes received since the last newline, awaiting a complete line. */
+  /** Text received since the last newline, awaiting a complete line. */
   buffer: string;
+  /**
+   * How many **bytes** arrived since the last newline.
+   *
+   * Kept alongside `buffer` because the limit is a wire limit and `buffer` holds
+   * characters: a client sending 64KB of three-byte characters with no newline
+   * would pass a `buffer.length` check, and re-encoding the buffer on every chunk
+   * to find out would make an ordinary line cost quadratic work.
+   */
+  bufferBytes: number;
+  /**
+   * Carries an incomplete UTF-8 sequence across chunk boundaries. A per-chunk
+   * decode would replace the split character with U+FFFD in each half, and the
+   * JSON around it still parses — so the corruption reaches the config file
+   * instead of being reported.
+   */
+  readonly decoder: TextDecoder;
   /** Frames still owed to a socket that applied backpressure. */
-  outbound: string;
+  outbound: Uint8Array;
   /** Set once the client is gone, so a queued drain does not resurrect it. */
   dropped: boolean;
   /**
@@ -155,7 +192,7 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
   // The spelling decides, not `process.platform`: it is what Bun itself reads to
   // choose a transport, so a value that is a pipe here is a pipe there.
   const isNamedPipe = isPanelNamedPipe(socketPath);
-  if (!isNamedPipe) clearBindPath(socketPath);
+  if (!isNamedPipe) await clearBindPath(socketPath);
 
   const clients = new Set<Client>();
   const clientOf = new WeakMap<Socket<undefined>, Client>();
@@ -185,10 +222,12 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
   };
 
   /**
-   * Writes as much of a client's outbound text as the socket accepts and keeps
+   * Writes as many of a client's outbound bytes as the socket accepts and keeps
    * the rest for `drain`. Bun's `write` returns a short count under
    * backpressure — measured at ~214KB per write — so a caller that ignores the
    * return value silently truncates a line and desynchronizes the framing.
+   *
+   * Bytes, not a string, because that count is a byte count: see `appendBytes`.
    */
   const flush = (client: Client): void => {
     if (client.dropped || client.outbound.length === 0) return;
@@ -205,6 +244,12 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
       return;
     }
     client.outbound = client.outbound.slice(written);
+  };
+
+  /** Queues one framed line for a client and writes what the socket accepts. */
+  const send = (client: Client, text: string): void => {
+    client.outbound = appendBytes(client.outbound, encoder.encode(text));
+    flush(client);
   };
 
   const handleLine = (client: Client, line: string): void => {
@@ -243,15 +288,16 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
       // it must reach that client.
       onSubscribe?.(clients.size, client.protocolVersion);
       if (client.protocolVersion === 2) {
-        client.outbound += JSON.stringify({ type: "snapshot", protocolVersion: 2, state: {
-          connection: { status: "connected" }, session: {}, activity: {}, sources: [], config: [], prompts: [] } }) + "\n";
-        flush(client);
+        send(client, JSON.stringify({ type: "snapshot", protocolVersion: 2, state: {
+          connection: { status: "connected" }, session: {}, activity: {}, sources: [], config: [], prompts: [] } }) + "\n");
       }
       return;
     }
     if (record.type === "control") {
       const op = record.op;
-      if (op === "restart") {
+      // The two that end this process, routed apart from the gate ops: pause and
+      // resume change what is captured, these change whether anything is.
+      if (op === "restart" || op === "stop") {
         if (onServiceControl === undefined) {
           diagnostic("Panel control refused: no service-control handler is wired.");
           return;
@@ -260,7 +306,7 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
         return;
       }
       if (op !== "pause" && op !== "resume") {
-        diagnostic("Panel control refused: op must be exactly pause, resume, or restart.");
+        diagnostic("Panel control refused: op must be exactly pause, resume, restart, or stop.");
         return;
       }
       onControl(op, requestIdOf(record));
@@ -364,7 +410,9 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
       const client: Client = {
         socket,
         buffer: "",
-        outbound: "",
+        bufferBytes: 0,
+        outbound: new Uint8Array(),
+        decoder: new TextDecoder(),
         dropped: false,
         subscribed: false,
         protocolVersion: 1,
@@ -374,10 +422,17 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
     data: (socket: Socket<undefined>, chunk: Uint8Array) => {
       const client = clientOf.get(socket);
       if (client === undefined || client.dropped) return;
-      client.buffer += chunk.toString();
+      // Counted from the wire bytes: everything before the last newline belongs to
+      // lines that are about to be handled, and only the tail after it is still
+      // pending. A chunk with no newline extends the pending line instead.
+      const lastNewline = chunk.lastIndexOf(NEWLINE_BYTE);
+      client.bufferBytes = lastNewline === -1
+        ? client.bufferBytes + chunk.byteLength
+        : chunk.byteLength - lastNewline - 1;
+      client.buffer += client.decoder.decode(chunk, { stream: true });
       // Bound first, then split: a client that never sends a newline must be
-      // dropped rather than allowed to grow this string without limit.
-      if (client.buffer.length > MAX_LINE_BYTES) {
+      // dropped rather than allowed to grow this buffer without limit.
+      if (client.bufferBytes > MAX_LINE_BYTES) {
         drop(client, `line exceeded ${MAX_LINE_BYTES} bytes without a newline`);
         return;
       }
@@ -439,17 +494,14 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
         return;
       }
       for (const client of [...clients]) {
-        const outgoing = client.protocolVersion === 2 ? `${JSON.stringify(panelV2Event(message))}\n` : line;
-        client.outbound += outgoing;
-        flush(client);
+        send(client, client.protocolVersion === 2 ? `${JSON.stringify(panelV2Event(message))}\n` : line);
       }
     },
     broadcastV2: (message: PanelV2Message): void => {
       const line = `${JSON.stringify(message)}\n`;
       for (const client of [...clients]) {
         if (client.protocolVersion !== 2) continue;
-        client.outbound += line;
-        flush(client);
+        send(client, line);
       }
     },
     get clientCount(): number {
@@ -473,8 +525,6 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
       // `true` closes live connections. Without it a panel holding the socket
       // keeps the listener's handles alive and the process will not exit.
       server.stop(true);
-      // Measured: `stop()` does not remove the Unix socket file. Leaving it
-      // behind makes the next run look like a server is already listening.
       if (!isNamedPipe) removeOwnSocket(socketPath);
       await Promise.resolve();
     },
@@ -482,17 +532,25 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
 }
 
 /**
- * Clears the bind path of a stale socket, refusing outright if what sits there
- * is not one.
+ * Clears the bind path of a stale socket, refusing outright if what sits there is
+ * not one — or is one somebody is still listening on.
  *
- * Measured, and the reason this is not a bare unlink: `Bun.listen({ unix })`
- * binds over a **regular file** and destroys its contents without an error. So a
- * mistyped `SQUID_PANEL_SOCKET` naming real data would be silently overwritten
- * whether or not we unlinked it first. The only safe posture is to refuse the
- * bind, which also means the refusal names the path instead of the user
- * discovering the loss later.
+ * Two refusals, for two different losses.
+ *
+ * A **regular file** at the path: measured, `Bun.listen({ unix })` binds over one
+ * and destroys its contents without an error, so a mistyped `SQUID_PANEL_SOCKET`
+ * naming real data would be silently overwritten whether or not we unlinked it
+ * first. The refusal names the path instead of the user discovering the loss
+ * later.
+ *
+ * A **live socket** at the path: measured, `Bun.listen({ unix })` does not report
+ * `EADDRINUSE` on Unix, so an unconditional unlink lets a second session take the
+ * endpoint from a running one. The running session keeps listening on an inode no
+ * panel can reach, both sessions keep observing, and both keep calling the model —
+ * a silent duplicate. Probing costs one connection and turns that into a startup
+ * error naming the endpoint.
  */
-function clearBindPath(socketPath: string): void {
+async function clearBindPath(socketPath: string): Promise<void> {
   if (!existsSync(socketPath)) return;
   let isSocket: boolean;
   try {
@@ -507,9 +565,15 @@ function clearBindPath(socketPath: string): void {
       + "Binding would destroy that file, so refusing to start.",
     );
   }
+  if (await endpointAccepts(socketPath)) {
+    throw new Error(
+      `A session is already listening on ${socketPath}. `
+      + "Two sessions on one endpoint would both observe and both prompt the model, "
+      + "so refusing to start. Stop the running session, or point SQUID_PANEL_SOCKET elsewhere.",
+    );
+  }
   try {
-    // Measured: `stop()` does not remove the socket file, so a crashed run
-    // leaves one behind. Re-binding over it succeeds, but only after the unlink.
+    // `bind()` refuses an existing path, so re-binding needs the leftover gone.
     unlinkSync(socketPath);
   } catch {
     // Raced with another process removing it; the bind below reports anything
@@ -517,7 +581,38 @@ function clearBindPath(socketPath: string): void {
   }
 }
 
-/** Removes the socket file this server created. Never touches a non-socket. */
+/**
+ * Whether anything is accepting connections on this endpoint.
+ *
+ * A connect attempt rather than a lock file: the question is "is a peer serving
+ * this endpoint", and a lock file answers a different one — it goes stale on
+ * SIGKILL and would then refuse every later start for a session that no longer
+ * exists. A refused connection is the kernel's own answer about a socket nobody
+ * holds.
+ */
+async function endpointAccepts(socketPath: string): Promise<boolean> {
+  try {
+    const socket = await Bun.connect<undefined>({
+      unix: socketPath,
+      socket: { data: () => undefined, open: () => undefined, close: () => undefined, error: () => undefined },
+    });
+    // Nothing is sent: an unsubscribed connection that opens and closes is the
+    // shape the server already expects from the supervisor's own liveness probe.
+    socket.end();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Removes the socket file, if `stop()` has not already.
+ *
+ * Measured on Bun 1.4.2: `stop()` unlinks the socket path itself, so in practice
+ * this finds nothing. It stays as the belt for a runtime that does not — the
+ * behavior changed once already — and it never touches a non-socket, for the same
+ * reason the bind refuses one.
+ */
 function removeOwnSocket(socketPath: string): void {
   try {
     if (existsSync(socketPath) && statSync(socketPath).isSocket()) {
