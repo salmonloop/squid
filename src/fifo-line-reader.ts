@@ -124,6 +124,19 @@ export function startFifoLineReader(
   const ensurePipeOpen = async (): Promise<void> => {
     if (pipeHandle !== undefined) return;
     pipeHandle = await open(options.path, constants.O_RDONLY | constants.O_NONBLOCK);
+    // `close()` can land while the open above is in flight — it saw no handle
+    // to close, because the assignment had not happened yet. Retire the fresh
+    // handle here instead of leaving it to the garbage collector, which Bun
+    // 1.4.2 treats as an error rather than a warning.
+    if (closed) shutdownPipe();
+  };
+
+  /** Retires the held pipe fd, whatever stage the reader reached. */
+  const shutdownPipe = (): void => {
+    if (pipeHandle === undefined) return;
+    const handle = pipeHandle;
+    pipeHandle = undefined;
+    void handle.close().catch(() => undefined);
   };
 
   /**
@@ -156,10 +169,7 @@ export function startFifoLineReader(
     close: () => {
       closed = true;
       clearInterval(timer);
-      if (pipeHandle !== undefined) {
-        void pipeHandle.close().catch(() => undefined);
-        pipeHandle = undefined;
-      }
+      shutdownPipe();
     },
   };
 }
