@@ -205,8 +205,8 @@ class PrunedTreeWatcher implements FilesystemWatcher {
   private async reconcile(relativePath: string): Promise<void> {
     if (this.closed) return;
     // A rename invalidates the path↔inode mapping of every watcher keyed under
-    // this name: its directory may have moved elsewhere, and Bun 1.3.11 reports
-    // renames without a MOVED_FROM the old name could reconcile against.
+    // this name: its directory may have moved elsewhere, and the rename event
+    // carries no MOVED_FROM context the old name could reconcile against.
     // Release first; a directory that still lives at this name — re-created or
     // otherwise — is registered fresh below. `lstat` over `stat` keeps a
     // symlink from pulling an out-of-root directory into the watched tree.
