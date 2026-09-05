@@ -51,13 +51,14 @@ function fakeChild(): FakeChild {
 const parseLine = (line: string, occurredAt: string): ScreenTextFrame | null =>
   line === "quiet" ? null : { applicationId: line, occurredAt };
 
-function harness(restartMs = 5) {
+function harness(restartMs = 5, stallMs?: number) {
   const children: FakeChild[] = [];
   const frames: ScreenTextFrame[] = [];
   const errors: string[] = [];
   const factory = streamingScreenTextReaderFactory({
     program: "fake",
     restartMs,
+    ...(stallMs === undefined ? {} : { stallMs }),
     parse: parseLine,
     spawn: () => {
       const child = fakeChild();
@@ -174,5 +175,35 @@ describe("streamingScreenTextReaderFactory", () => {
     reader.close();
     children[0]?.emit("too-late\n");
     expect(frames.length).toBe(0);
+  });
+
+  it("restarts a living child that stopped writing records", async () => {
+    // The gap the exit handler cannot see: the child prints one record per
+    // interval whether or not anything changed, so silence is a sampler that
+    // stopped sampling rather than a quiet desktop. Nothing restarts it, because
+    // the process is still there.
+    const { children, frames, errors, reader } = harness(5, 20);
+    children[0]?.emit("before\n");
+
+    await settle();
+
+    expect(children[0]?.killed()).toBe(true);
+    expect(errors.some((message) => message.includes("wrote no record for 20ms"))).toBe(true);
+    expect(children.length).toBe(2);
+    children[1]?.emit("after\n");
+    expect(frames.map((frame) => frame.applicationId)).toEqual(["before", "after"]);
+    reader.close();
+  });
+
+  it("does not restart a child that keeps writing", async () => {
+    const { children, reader } = harness(5, 60);
+    for (let tick = 0; tick < 4; tick += 1) {
+      children[0]?.emit(`tick-${tick}\n`);
+      await new Promise((done) => setTimeout(done, 20));
+    }
+
+    expect(children[0]?.killed()).toBe(false);
+    expect(children.length).toBe(1);
+    reader.close();
   });
 });

@@ -43,14 +43,16 @@ describe("parseWindowsFocusFrame", () => {
   it("omits the fields the sample could not read, and keeps the ones it read as empty", () => {
     const frame = parseWindowsFocusFrame(record("explorer", "9001", "", "ControlType.Pane", "", ""), AT);
 
-    // No window title and no selection: absent, because the backend has nothing
-    // to report. A control type with an empty name: present as null, because the
-    // element genuinely exposes no name — `projectFrame` tells those apart.
+    // No window title: absent, because the backend has nothing to report. A
+    // control type with an empty name, and an empty selection: present, because
+    // the element genuinely exposes neither and a reading of "none" is a reading
+    // — `projectFrame` tells absence and emptiness apart.
     expect(frame).toEqual({
       applicationId: "9001",
       applicationName: "explorer",
       focusedRole: "unknown",
       focusedLabel: null,
+      textContext: { prefix: "", suffix: "", selection: "", language: null },
       occurredAt: AT,
     });
   });
@@ -77,13 +79,22 @@ describe("parseWindowsFocusFrame", () => {
     expect(frame?.textContext?.selection.length).toBe(4_096);
   });
 
-  it("omits the text context when nothing is selected", () => {
+  it("reports an empty selection rather than omitting the text context", () => {
+    // Releasing a selection is an observation. Omitting the field here would make
+    // the frame after a selection differ from it only by an absence, which
+    // `projectFrame` cannot emit — and the world model would keep serving the
+    // released selection as the current one.
     const frame = parseWindowsFocusFrame(
       record("code", "42", "main.ts", "ControlType.Edit", "Editor", ""),
       AT,
     );
 
-    expect(frame?.textContext).toBeUndefined();
+    expect(frame?.textContext).toEqual({
+      prefix: "",
+      suffix: "",
+      selection: "",
+      language: null,
+    });
   });
 });
 

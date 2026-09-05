@@ -46,7 +46,28 @@ export interface PollingScreenTextReaderOptions {
   readonly run: ScreenTextSampler;
   /** Turns one invocation's stdout into a frame, or null for a quiet observation. */
   readonly parse: (stdout: string, occurredAt: string) => ScreenTextFrame | null;
+  /**
+   * How long one invocation may run before the loop stops waiting for it and kills
+   * it. Defaults to [`SAMPLE_TIMEOUT_INTERVALS`] intervals, never below
+   * [`MIN_SAMPLE_TIMEOUT_MS`].
+   */
+  readonly timeoutMs?: number;
 }
+
+/**
+ * How many intervals one query may take before the loop abandons it.
+ *
+ * Five, not one: a healthy accessibility query on a loaded desktop can overrun its
+ * interval, and abandoning it at the first miss would report a slow host as a
+ * broken one. Five consecutive misses is no longer slowness.
+ */
+const SAMPLE_TIMEOUT_INTERVALS = 5;
+
+/**
+ * The floor under the computed deadline, so a short interval cannot make the
+ * deadline shorter than a slow-but-healthy query takes.
+ */
+const MIN_SAMPLE_TIMEOUT_MS = 5_000;
 
 /**
  * Builds a `ScreenTextReaderFactory` from a poll loop and a platform sampler.
@@ -61,6 +82,8 @@ export function pollingScreenTextReaderFactory(
   options: PollingScreenTextReaderOptions,
 ): ScreenTextReaderFactory {
   const { program, pollMs, run, parse } = options;
+  const timeoutMs = options.timeoutMs
+    ?? Math.max(pollMs * SAMPLE_TIMEOUT_INTERVALS, MIN_SAMPLE_TIMEOUT_MS);
 
   return ({ onFrame, onError }) => {
     let closed = false;
@@ -85,11 +108,29 @@ export function pollingScreenTextReaderFactory(
       sampling = true;
       const occurredAt = new Date().toISOString();
 
+      // The deadline is what makes `sampling` recoverable. On its own that flag
+      // only prevents overlap: a query that never answers — a wedged
+      // accessibility service, a permission dialog nobody will click — leaves it
+      // true forever, and every later interval then returns at the first line. The
+      // reader stays alive, reports nothing, and says nothing about why. So the
+      // query is abandoned on a deadline, its process killed, and the next
+      // interval starts a fresh one.
+      let abandoned = false;
+      const deadline = setTimeout(() => {
+        abandoned = true;
+        activeProcess?.kill();
+        activeProcess = null;
+        sampling = false;
+        reportError(`${program} did not answer within ${timeoutMs}ms; abandoned the query`);
+      }, timeoutMs);
+
       try {
         const result = await run((child) => {
           activeProcess = child;
         });
-        if (closed) return;
+        // An abandoned query's late answer describes a screen this loop already
+        // gave up on, and a newer sample may be in flight behind it.
+        if (closed || abandoned) return;
 
         if (result.exitCode !== 0) {
           reportError(
@@ -104,10 +145,16 @@ export function pollingScreenTextReaderFactory(
         lastErrorMessage = null;
         if (frame !== null) onFrame(frame);
       } catch (error) {
-        reportError(describeErrorForAudit(error));
+        // The kill above is what made this throw; the deadline already said why.
+        if (!abandoned) reportError(describeErrorForAudit(error));
       } finally {
-        activeProcess = null;
-        sampling = false;
+        clearTimeout(deadline);
+        // Only the sample that still owns the slot may release it: after
+        // abandonment the flag belongs to whichever query started next.
+        if (!abandoned) {
+          activeProcess = null;
+          sampling = false;
+        }
       }
     };
 
@@ -166,6 +213,11 @@ export interface StreamingScreenTextReaderOptions {
   readonly parse: (line: string, occurredAt: string) => ScreenTextFrame | null;
   /** How long to wait before restarting a sampler that exited on its own. */
   readonly restartMs: number;
+  /**
+   * How long the loop waits for a record before treating a living child as a
+   * stopped one. Omitted means no stall detection.
+   */
+  readonly stallMs?: number;
 }
 
 /**
@@ -194,12 +246,13 @@ export interface StreamingScreenTextReaderOptions {
 export function streamingScreenTextReaderFactory(
   options: StreamingScreenTextReaderOptions,
 ): ScreenTextReaderFactory {
-  const { program, spawn, parse, restartMs } = options;
+  const { program, spawn, parse, restartMs, stallMs } = options;
 
   return ({ onFrame, onError }) => {
     let closed = false;
     let child: StreamingChild | null = null;
     let restartTimer: ReturnType<typeof setTimeout> | null = null;
+    let stallTimer: ReturnType<typeof setTimeout> | null = null;
     let lastErrorMessage: string | null = null;
     let buffer = "";
 
@@ -209,8 +262,33 @@ export function streamingScreenTextReaderFactory(
       onError(new Error(message));
     };
 
+    /**
+     * Restarts the deadline for the next record.
+     *
+     * The child prints one line per interval whether or not anything changed, so
+     * silence is not quiet observation — it is a sampler that stopped sampling. A
+     * wedged automation call inside a living process was otherwise terminal: the
+     * exit handler is the only thing that restarts a child, and this one never
+     * exits.
+     */
+    const armStall = (): void => {
+      if (stallMs === undefined || closed) return;
+      if (stallTimer !== null) clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => {
+        stallTimer = null;
+        const stalled = child;
+        if (closed || stalled === null) return;
+        reportError(`${program} wrote no record for ${stallMs}ms; restarting the screen reader`);
+        // Killed rather than restarted here: its exit is what the restart path
+        // already listens for, and two paths racing to replace one child is how a
+        // reader ends up with two.
+        stalled.kill();
+      }, stallMs);
+    };
+
     const consume = (chunk: string): void => {
       if (closed) return;
+      armStall();
       buffer += chunk;
       const parts = buffer.split(RECORD_TERMINATOR);
       // The tail is an incomplete record, and it waits for the next chunk rather
@@ -249,6 +327,7 @@ export function streamingScreenTextReaderFactory(
         return;
       }
       child = started;
+      armStall();
       started.onStdout(consume);
       // Stderr is a diagnostic, never a record: a script that complains while
       // still sampling must not have its complaint parsed as a frame.
@@ -273,6 +352,8 @@ export function streamingScreenTextReaderFactory(
         closed = true;
         if (restartTimer !== null) clearTimeout(restartTimer);
         restartTimer = null;
+        if (stallTimer !== null) clearTimeout(stallTimer);
+        stallTimer = null;
         const running = child;
         child = null;
         running?.kill();
