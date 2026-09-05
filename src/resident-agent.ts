@@ -183,11 +183,12 @@ export function senseExtension(buffer: SenseBuffer): InlineExtension {
     name: "squid-senses",
     hidden: true,
     factory: (pi) => {
-      pi.on("context", () => {
+      pi.on("context", (event) => {
         if (buffer.state === null) return;
         const lines = sensePromptLines(buffer.state, buffer.tools);
         return {
           messages: [
+            ...event.messages,
             {
               role: "custom",
               customType: "sense",

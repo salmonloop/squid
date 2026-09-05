@@ -14,7 +14,7 @@ import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-ag
  * Spelled locally because these tests call the handler directly rather than
  * through a live Pi, and the handler's contract is the thing being asserted.
  */
-type ContextHandler = () => { messages?: unknown[] } | undefined;
+type ContextHandler = (event?: { messages: unknown[] }) => { messages?: unknown[] } | undefined;
 
 /**
  * The factory out of an `InlineExtension`.
@@ -241,7 +241,7 @@ describe("senseExtension", () => {
     };
     extensionFactory(ext)(fakePi as never);
     expect(contextHandler).toBeDefined();
-    expect(contextHandler!()).toBeUndefined();
+    expect(contextHandler!({ messages: [] })).toBeUndefined();
   });
 
   it("injects a custom sense message once state is present", () => {
@@ -262,7 +262,7 @@ describe("senseExtension", () => {
     };
     extensionFactory(ext)(fakePi as never);
 
-    const result = contextHandler!();
+    const result = contextHandler!({ messages: [] });
     expect(result).toBeDefined();
     expect(result!.messages).toHaveLength(1);
     const msg = result!.messages![0] as {
@@ -276,5 +276,22 @@ describe("senseExtension", () => {
     expect(msg.display).toBe(false);
     expect(msg.content).toContain("# Current world state");
     expect(msg.content).toContain("focus_changed");
+  });
+
+  it("appends senses without erasing the existing conversation", () => {
+    const buffer: SenseBuffer = {
+      state: { ...emptyWorldState(), lastEventKind: "focus_changed" },
+      tools: [],
+    };
+    let contextHandler: ContextHandler | undefined;
+    extensionFactory(senseExtension(buffer))({
+      on(event: string, handler: ContextHandler): void {
+        if (event === "context") contextHandler = handler;
+      },
+    } as never);
+    const existing = [{ role: "user", content: "remember me" }];
+    const result = contextHandler!({ messages: existing });
+    expect(result!.messages![0]).toBe(existing[0]);
+    expect(result!.messages).toHaveLength(2);
   });
 });
