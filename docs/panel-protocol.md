@@ -430,6 +430,7 @@ explanation costs a line of the dialog and never the ability to answer.
 {"type":"control","op":"pause"}
 {"type":"control","op":"resume"}
 {"type":"control","op":"restart"}
+{"type":"control","op":"stop"}
 {"type":"config_get"}
 {"type":"config_set","id":"watchRoot","value":"/home/me"}
 {"type":"source_get"}
@@ -437,8 +438,8 @@ explanation costs a line of the dialog and never the ability to answer.
 {"type":"answer","promptId":1,"answer":"approved"}
 ```
 
-`op` is exactly `pause`, `resume`, or `restart`. `answer` is exactly `approved`
-or `declined`. An unrecognized value is dropped, not guessed at.
+`op` is exactly `pause`, `resume`, `restart`, or `stop`. `answer` is exactly
+`approved` or `declined`. An unrecognized value is dropped, not guessed at.
 
 **`subscribe` is the first line a reading connection sends, and the server writes
 nothing to a connection that has not sent it.** Accepting a connection and having
@@ -500,7 +501,7 @@ order, so a start and a stop cannot interleave; distinct sources are
 independent. Starting an already-running source and stopping one that is not
 running are honest refusals, not silent no-ops.
 
-## Restart and the process contract
+## Restart, stop, and the process contract
 
 A `control` op of `restart` asks the brain to stop cleanly and be respawned
 with the configuration as it now stands. It is **refused unless the run is
@@ -509,6 +510,18 @@ unsupervised exit would just be a crash to whoever started the process by
 hand. The refusal is a diagnostic, not silence — and the panel learns nothing
 from the silence either way, which is why the diagnostic is logged on the
 brain's own error stream in this phase.
+
+A `control` op of `stop` is the same teardown without the coming back, and it
+carries **no supervision condition**: a session asked to stop and stopping is
+never a lie about itself, whatever started it, and refusing the request is the
+failure this op exists to remove — a panel that quits while its session keeps
+observing. It exits **0**, which every launcher already reads as "asked to stop,
+do not respawn".
+
+The supervising panel sends `stop` when its tray's *Quit Squid* is chosen, then
+waits a short grace for the exit and kills the child if it does not come. It
+sends nothing when it merely attached: a session it did not start is not its to
+stop.
 
 Exit codes a launcher can tell apart:
 
@@ -680,7 +693,7 @@ export interface PanelServer {
 export function startPanelServer(options: {
   readonly socketPath: string;
   readonly onControl: (op: "pause" | "resume") => void;
-  readonly onServiceControl?: (op: "restart") => void;
+  readonly onServiceControl?: (op: "restart" | "stop") => void;
   readonly onAnswer?: (promptId: number, answer: "approved" | "declined") => void;
   readonly onConfigGet?: () => void;
   readonly onConfigSet?: (id: string, value: string) => void;

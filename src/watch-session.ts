@@ -157,6 +157,12 @@ export interface WatchSessionOptions {
    * and tests inject a spy instead of ending the process.
    */
   readonly restartExit?: () => void;
+  /**
+   * What a requested stop does once the session has stopped. Production exits 0,
+   * which every supervisor already reads as "asked to stop, do not respawn";
+   * tests inject a spy instead of ending the process.
+   */
+  readonly stopExit?: () => void;
 }
 
 export interface WatchSession {
@@ -189,6 +195,9 @@ export async function startWatchSession(
   // bring me back with the configuration as it now stands." Exit 2 stays the
   // terminal code for a config error, so a launcher can tell the two apart.
   const restartExit = options.restartExit ?? (() => process.exit(3));
+  // Zero, and nothing new: a clean exit is already the supervisor's "the session
+  // stopped" — the one decision it makes that does not respawn.
+  const stopExit = options.stopExit ?? (() => process.exit(0));
 
   // The capture gate resolves with the other capabilities, before any sink
   // opens: a typo in SQUID_CONTROL must fail startup rather than silently
@@ -502,10 +511,15 @@ export async function startWatchSession(
           });
         },
         onServiceControl: (op) => {
-          // Only a supervised run may restart: the supervisor is what respawns
+          // Only a supervised run may *restart*: the supervisor is what respawns
           // the process, and an unsupervised exit would look like a crash to
           // whoever started it by hand. Refused with a diagnostic, not silence.
-          if (env.SQUID_SUPERVISED !== "1") {
+          //
+          // `stop` carries no such condition. It needs nothing to respawn it, and
+          // a process asked to stop and stopping is never a lie about itself —
+          // whereas ignoring the request is exactly the failure this op exists to
+          // remove: a panel that quits while its session keeps observing.
+          if (op === "restart" && env.SQUID_SUPERVISED !== "1") {
             logError(JSON.stringify({ panelControl: op, error: "Restart requires a supervised run (SQUID_SUPERVISED=1)." }));
             return;
           }
@@ -514,14 +528,16 @@ export async function startWatchSession(
             return;
           }
           // Stop in the ordinary order — sources, turns, panel, agent, store —
-          // then exit with the code the supervisor reads as "respawn me". The
-          // exit code, not a callback, is the handoff: this process cannot
-          // start its own replacement.
+          // then exit with the code the supervisor reads for this op. The exit
+          // code, not a callback, is the handoff: this process cannot start its
+          // own replacement, and it is the only thing that tells a supervisor
+          // "asked to stop" apart from "died".
+          const exit = op === "stop" ? stopExit : restartExit;
           void sessionRef.session.stop().then(
-            () => restartExit(),
+            () => exit(),
             (error: unknown) => {
-              logError(JSON.stringify({ restartStopError: describeErrorForAudit(error) }));
-              restartExit();
+              logError(JSON.stringify({ [`${op}StopError`]: describeErrorForAudit(error) }));
+              exit();
             },
           );
         },

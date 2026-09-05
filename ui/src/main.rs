@@ -44,6 +44,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use protocol::{
     answer_line, config_get_line, config_set_line, control_line, source_get_line,
@@ -68,6 +69,16 @@ type Pending = Arc<Mutex<Option<i64>>>;
 /// pending id can no longer be trusted to name the plan on screen. Answering
 /// anyway is the one outcome worse than not answering.
 const POISONED: &str = "pending prompt lock poisoned; refusing to answer";
+
+/// How long a session gets to shut itself down before the panel kills it.
+///
+/// Two seconds is what an ordinary stop needs — closing sources, draining a turn,
+/// closing the store — and it is short enough that a user who clicked "Quit Squid"
+/// does not conclude nothing happened. The bound matters more than the number: a
+/// session that will not stop must not be able to keep the panel open, because the
+/// alternative is a window that refuses to close and a user reaching for the task
+/// manager, which is where an orphaned brain comes from in the first place.
+const STOP_GRACE: Duration = Duration::from_secs(2);
 
 /// Rows collected between a dump's first line and its terminator.
 ///
@@ -529,14 +540,29 @@ fn main() {
     // brain should not be restarted again, having reported why, and the panel
     // stays up showing that. A window that vanished with its child would be the
     // failure supervising mode exists to prevent.
+    // The grip on that brain, shared with the tray so leaving can end it. `None`
+    // for an attached panel: a session this run did not start is not its to stop.
+    let supervision: Option<Arc<supervisor::Supervision>> = launch
+        .brain()
+        .map(|_| Arc::new(supervisor::Supervision::default()));
     if let Some(brain) = launch.brain() {
         let brain = brain.to_path_buf();
         let endpoint = endpoint_text.clone();
+        let supervising = Arc::clone(
+            supervision
+                .as_ref()
+                .expect("a run with a brain has a supervision handle"),
+        );
         // Idle until the first spawn reports: the window opens before the child
         // exists, and "running" written optimistically here would be a claim about
         // a process that has not been created yet.
         window.set_service_state(supervisor::ServiceState::Idle.label().into());
-        start_supervision(window.as_weak(), brain.clone(), endpoint.clone());
+        start_supervision(
+            window.as_weak(),
+            brain.clone(),
+            endpoint.clone(),
+            Arc::clone(&supervising),
+        );
 
         // Recovering from a tripped crash guard. `supervise` returns once it will
         // not spawn again, which left the panel showing `failed` with no way
@@ -560,7 +586,12 @@ fn main() {
             }
             window.set_service_state(supervisor::ServiceState::Idle.label().into());
             window.set_service_detail(SharedString::new());
-            start_supervision(window.as_weak(), brain.clone(), endpoint.clone());
+            start_supervision(
+                window.as_weak(),
+                brain.clone(),
+                endpoint.clone(),
+                Arc::clone(&supervising),
+            );
         });
     }
 
@@ -592,11 +623,26 @@ fn main() {
                 let pending = Arc::clone(&pending);
                 let outgoing = outgoing.clone();
                 let handle = window.as_weak();
+                let supervision = supervision.clone();
                 // Leaving is a refusal, exactly as a declined prompt is. The
                 // engine hears `declined` rather than waiting out a deadline for
                 // an answer nobody is left to give.
+                //
+                // And leaving ends the session this run started. "Quit Squid" used
+                // to end only the window: the brain kept observing the desktop and
+                // kept calling a model, with no window and no tray icon left to
+                // say it was there. Asked over the wire first, because the brain
+                // closes its store and its session history on its own shutdown
+                // path; killed after the grace, because a wedged session must not
+                // be able to keep the panel open. An attached panel has no handle
+                // here and sends nothing — that session belongs to whoever started
+                // it.
                 tray.on_quit(move || {
                     answer(&pending, &outgoing, &handle, Answer::Declined);
+                    if let Some(supervision) = supervision.as_ref() {
+                        outgoing.send(&control_line(Control::Stop));
+                        supervision.stop_within(STOP_GRACE);
+                    }
                     let _ = slint::quit_event_loop();
                 });
             }
@@ -636,9 +682,14 @@ fn main() {
 /// stays up showing it. Starting a second round is how the user says "I have
 /// looked at it, try again", which is exactly the signal the guard was holding
 /// out for.
-fn start_supervision(handle: slint::Weak<PanelWindow>, brain: PathBuf, endpoint: String) {
+fn start_supervision(
+    handle: slint::Weak<PanelWindow>,
+    brain: PathBuf,
+    endpoint: String,
+    supervision: Arc<supervisor::Supervision>,
+) {
     thread::spawn(move || {
-        supervisor::supervise(&brain, &endpoint, |state| {
+        supervisor::supervise(&brain, &endpoint, &supervision, |state| {
             let label = state.label().to_owned();
             let detail = state.detail();
             let _ = handle.upgrade_in_event_loop(move |window| {
