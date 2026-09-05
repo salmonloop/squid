@@ -1,4 +1,4 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync, renameSync, statSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -43,7 +43,7 @@ interface Harness {
   onSubscribe?: (clientCount: number) => void;
   start(options?: {
     readonly onControl?: (op: "pause" | "resume") => void;
-    readonly onServiceControl?: (op: "restart") => void;
+    readonly onServiceControl?: (op: "restart" | "stop") => void;
     readonly onAnswer?: (promptId: number, answer: "approved" | "declined") => void;
     readonly onConfigGet?: () => void;
     readonly onConfigSet?: (id: string, value: string) => void;
@@ -199,32 +199,52 @@ describe.skipIf(process.platform === "win32")("startPanelServer transport", () =
 
   it("binds over a stale socket file left by an earlier run", async () => {
     await withHarness(async (harness) => {
-      // A previous server's file: `stop()` does not remove it, so a crashed run
-      // leaves one behind and a fresh start must not be blocked by it.
-      const stale = await harness.start();
-      await stale.close();
-      const orphan = await startPanelServer({
-        socketPath: harness.socketPath,
-        onControl: () => undefined,
+      // What a killed process leaves behind: a socket file with nothing listening
+      // on it. Bun 1.4.2 unlinks the path inside `stop()`, so the file is moved
+      // out of the way first and moved back after — the listener dies with its
+      // inode, and the inode keeps the name.
+      const parked = `${harness.socketPath}.parked`;
+      const abandoned = Bun.listen<undefined>({
+        unix: harness.socketPath,
+        socket: {
+          data: () => undefined,
+          open: () => undefined,
+          close: () => undefined,
+          error: () => undefined,
+        },
       });
-      // Leave the file on disk, exactly as a killed process would.
-      expect(existsSync(harness.socketPath)).toBe(true);
+      renameSync(harness.socketPath, parked);
+      abandoned.stop(true);
+      renameSync(parked, harness.socketPath);
+      expect(statSync(harness.socketPath).isSocket()).toBe(true);
 
       const server = await harness.start();
-      try {
-        const client = await harness.connect();
-        // Subscribing is a round trip, so "connected" is not yet "registered" —
-        // the same wait every other broadcast test here does.
-        await until(() => server.clientCount === 1, "the client to register");
-        server.broadcast(WORLD_LINE);
-        await client.waitFor(1);
+      const client = await harness.connect();
+      // Subscribing is a round trip, so "connected" is not yet "registered" —
+      // the same wait every other broadcast test here does.
+      await until(() => server.clientCount === 1, "the client to register");
+      server.broadcast(WORLD_LINE);
+      await client.waitFor(1);
 
-        expect(client.lines[0]).toContain('"type":"world_state"');
-      } finally {
-        await orphan.close();
-      }
+      expect(client.lines[0]).toContain('"type":"world_state"');
     });
   });
+
+  it("refuses the endpoint a live session is already listening on", async () => {
+    await withHarness(async (harness) => {
+      // Measured: `Bun.listen({ unix })` does not report EADDRINUSE on Unix, so
+      // this probe is the whole of what stands between a second start and a
+      // running session's endpoint. Taking it leaves the first session listening
+      // on an inode no panel can reach while it keeps observing and keeps calling
+      // the model — two sessions, one desktop, silently.
+      await harness.start();
+
+      await expect(
+        startPanelServer({ socketPath: harness.socketPath, onControl: () => undefined }),
+      ).rejects.toThrow("already listening");
+    });
+  });
+
 
   it("leaves a non-socket file at the path alone rather than destroying it", async () => {
     await withHarness(async (harness) => {
@@ -509,6 +529,22 @@ describe("startPanelServer incoming control", () => {
     });
   });
 
+  it("invokes onServiceControl with stop", async () => {
+    await withHarness(async (harness) => {
+      const ops: string[] = [];
+      const server = await harness.start({ onServiceControl: (op) => ops.push(op) });
+      const client = await harness.connect();
+      await until(() => server.clientCount === 1, "the client to register");
+
+      client.socket.write('{"type":"control","op":"stop"}\n');
+      await until(() => ops.length === 1, "the stop op to arrive");
+
+      // Same handler as restart, because both end this process, and neither is
+      // the capture gate's pause.
+      expect(ops).toEqual(["stop"]);
+    });
+  });
+
   it("refuses restart when no service-control handler is wired", async () => {
     await withHarness(async (harness) => {
       const diagnostics: string[] = [];
@@ -542,6 +578,34 @@ describe("startPanelServer incoming control", () => {
 
       expect(gotDump).toBe(1);
       expect(sets).toEqual([["watchRoot", "/new"]]);
+    });
+  });
+
+  it("keeps a value whose character is split across two chunks intact", async () => {
+    await withHarness(async (harness) => {
+      // A path the user typed in the settings form, arriving in two writes with a
+      // three-byte character straddling the boundary. Decoding each chunk on its
+      // own replaces both halves with U+FFFD and the surrounding JSON still parses
+      // — so the corruption is not refused anywhere, it is *saved*, and the config
+      // file ends up naming a directory that does not exist.
+      const sets: (readonly [string, string])[] = [];
+      const server = await harness.start({
+        onConfigSet: (id, value) => sets.push([id, value]),
+      });
+      const client = await harness.connect();
+      await until(() => server.clientCount === 1, "the client to register");
+
+      const line = Buffer.from('{"type":"config_set","id":"watchRoot","value":"/tmp/\u4e2d\u6587"}\n', "utf8");
+      const split = line.indexOf(Buffer.from("\u4e2d", "utf8")) + 1;
+      client.socket.write(line.subarray(0, split));
+      // The bounded settle is the split: two back-to-back writes coalesce into one
+      // chunk, and a test that never delivered them separately would pass against
+      // the per-chunk decode it exists to catch.
+      await settle();
+      client.socket.write(line.subarray(split));
+      await until(() => sets.length === 1, "the split config line to arrive");
+
+      expect(sets).toEqual([["watchRoot", "/tmp/\u4e2d\u6587"]]);
     });
   });
 
