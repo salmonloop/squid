@@ -15,7 +15,7 @@ verification happen on Linux. -->
 
 ## Stack
 
-Answered by the existing codebase. Watch session: TypeScript on Bun 1.3.11.
+Answered by the existing codebase. Watch session: TypeScript on Bun 1.4.2.
 Panel: Rust 2021 + Slint 1.17.1 with `default-features = false` and features
 `compat-1-2`, `std`, `backend-winit`, `renderer-femtovg` — native rendering
 only, enforced in `ui/Cargo.toml` so the binary cannot silently fall back to a

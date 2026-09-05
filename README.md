@@ -18,7 +18,7 @@ testable offline. Everything except the agent's own turns runs without one.
 
 ## Requirements
 
-- Bun `1.3.11` or later
+- Bun `1.4.2` or later
 - A configured Pi model, for anything that starts a resident agent. The store, the
   projection, and the whole test suite are offline.
 

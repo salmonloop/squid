@@ -728,10 +728,11 @@ describe.skipIf(process.platform !== "win32")("startPanelServer named pipe", () 
    * `expect(...).rejects` never sees anything, and every later test in this file
    * dies with the process.
    *
-   * The fix landed 2026-04-18 and first shipped in Bun 1.3.13; this repo pins
-   * 1.3.11 (2026-03-18), a month older. Gating on the version rather than
-   * deleting the test keeps the assertion — and this reasoning — in the file,
-   * and hands it back the day the pin moves past 1.3.13.
+   * The fix landed 2026-04-18 and first shipped in Bun 1.3.13; the repo pinned
+   * 1.3.11 (2026-03-18) at the time, a month older, and moved to 1.4.2 on
+   * 2026-09-05 — the day the gate below started running this suite again. The
+   * gate stays rather than the unconditional call so a future downgrade keeps
+   * the assertion and this reasoning in the file instead of a crash.
    */
   const BUN_WITH_NAMED_PIPE_LISTEN_ERROR_FIX = "1.3.13";
   const bunPanicsOnFailedPipeListen = ((): boolean => {
