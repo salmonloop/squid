@@ -1,29 +1,17 @@
-import { watch } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ActivityEventEmitter, ActivitySource, ActivitySourceDiagnostic } from "./activity-source.js";
 import { describeErrorForAudit } from "./audit-text.js";
 import { createActivityEvent, type ActivityEvent, type FilePayload } from "./protocol.js";
+import {
+  defaultWatcherFactory,
+  isDefaultIncluded,
+  type FilesystemWatchEvent,
+  type FilesystemWatcher,
+  type FilesystemWatcherFactory,
+} from "./filesystem-watcher.js";
 
 const DEFAULT_DEBOUNCE_MS = 25;
-const DEFAULT_EXCLUDED_SEGMENTS = new Set([".git", "node_modules", "dist", "build", ".cache"]);
-const DEFAULT_EXCLUDED_FILES = new Set([".DS_Store"]);
-
-/** A single raw watcher notification, normalized across watcher backends. */
-export interface FilesystemWatchEvent {
-  eventType: "rename" | "change";
-  filename: string | null;
-}
-
-export interface FilesystemWatcher {
-  close(): void;
-}
-
-export type FilesystemWatcherFactory = (input: {
-  root: string;
-  onEvent: (event: FilesystemWatchEvent) => void;
-  onError: (error: Error) => void;
-}) => FilesystemWatcher;
 
 export interface FilesystemActivitySourceOptions {
   /** Absolute directory to observe. Canonicalized at start. */
@@ -35,7 +23,7 @@ export interface FilesystemActivitySourceOptions {
   include?: (relativePath: string) => boolean;
   debounceMs?: number;
   onDiagnostic?: (diagnostic: ActivitySourceDiagnostic) => void;
-  /** Injection seam for tests; defaults to a recursive `node:fs` watcher. */
+  /** Injection seam for tests; defaults to the platform backend in `filesystem-watcher`. */
   watcherFactory?: FilesystemWatcherFactory;
   /** Injection seam for tests; resolves whether a path is a regular file. */
   probeFile?: (absolutePath: string) => Promise<boolean>;
@@ -112,14 +100,23 @@ export class FilesystemActivitySource implements ActivitySource {
       throw new Error(`Filesystem source root must be a directory: ${canonicalRoot}`);
     }
 
-    this.canonicalRoot = canonicalRoot;
-    this.emit = emit;
-    this.lifecycle = "started";
-    this.watcher = this.watcherFactory({
-      root: canonicalRoot,
-      onEvent: (event) => this.handleWatchEvent(event),
-      onError: (error) => this.record("watcher_error", error),
-    });
+    try {
+      const watcher = this.watcherFactory({
+        root: canonicalRoot,
+        onEvent: (event) => this.handleWatchEvent(event),
+        onError: (error) => this.record("watcher_error", error),
+      });
+      this.canonicalRoot = canonicalRoot;
+      this.emit = emit;
+      this.watcher = watcher;
+      this.lifecycle = "started";
+      // A backend that registers lazily reports its walk through `ready`; the
+      // events it raises meanwhile flow through the already-attached pipeline.
+      await watcher.ready;
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
   }
 
   public async stop(): Promise<void> {
@@ -141,6 +138,18 @@ export class FilesystemActivitySource implements ActivitySource {
 
     await this.deliveryTail;
     this.emit = null;
+  }
+
+  /** Undoes a failed start so the source can attempt it again from `idle`. */
+  private rollback(): void {
+    this.watcher?.close();
+    this.watcher = null;
+    for (const [, pending] of [...this.pendingChanges]) clearTimeout(pending.timer);
+    this.pendingChanges.clear();
+    this.knownFiles.clear();
+    this.canonicalRoot = null;
+    this.emit = null;
+    this.lifecycle = "idle";
   }
 
   private handleWatchEvent(event: FilesystemWatchEvent): void {
@@ -228,25 +237,6 @@ export class FilesystemActivitySource implements ActivitySource {
     this.onDiagnostic?.(diagnostic);
   }
 }
-
-export function isDefaultIncluded(relativePosixPath: string): boolean {
-  const segments = relativePosixPath.split("/");
-  const filename = segments.at(-1) ?? "";
-  if (DEFAULT_EXCLUDED_FILES.has(filename)) return false;
-  return !segments.some((segment) => DEFAULT_EXCLUDED_SEGMENTS.has(segment));
-}
-
-const defaultWatcherFactory: FilesystemWatcherFactory = ({ root, onEvent, onError }) => {
-  const watcher = watch(root, { recursive: true, persistent: true });
-  watcher.on("change", (eventType, filename) => {
-    onEvent({
-      eventType: eventType === "rename" ? "rename" : "change",
-      filename: typeof filename === "string" ? filename : filename?.toString() ?? null,
-    });
-  });
-  watcher.on("error", (error) => onError(error instanceof Error ? error : new Error(String(error))));
-  return { close: () => watcher.close() };
-};
 
 async function defaultProbeFile(absolutePath: string): Promise<boolean> {
   try {
