@@ -1,6 +1,6 @@
 import type { CapturePolicy } from "./capture-policy.js";
 import { RedactingCapturePolicy } from "./capture-policy.js";
-import type { ActivityEvent } from "./protocol.js";
+import type { ActivityEvent, ActivityKind, ApplicationActivatedPayload } from "./protocol.js";
 
 /**
  * Resolves `SQUID_EXCLUDE` into a capture policy, failing closed.
@@ -35,6 +35,18 @@ export function resolveCaptureExclusion(
  * rule against a number that changes every launch; the name ("1Password",
  * "Banking") is the field that describes what an application is, which is why
  * admission's coding-application check reads names too.
+ *
+ * The unit of exclusion is the **foreground**, not the single event. Only
+ * `application_activated` carries a name; every event that carries the content a
+ * user asked to hide — a window title, a focused control's label, a selection —
+ * carries an id at most. Judging each event on its own was therefore the leak:
+ * excluding "1Password" removed the line saying 1Password came forward and kept
+ * every line saying what was inside it. So an activation latches whether the
+ * foreground is excluded, and each later event that describes the foreground is
+ * dropped until another activation says otherwise. The latch is one per policy
+ * rather than one per source: a desktop has a single foreground, and a browser
+ * reader reporting a page while a vault is in front is reporting a page nobody
+ * is looking at.
  *
  * A matched event leaves nothing: not a stub, not a marker. The event *is* the
  * fact that something happened in that application, and the user asked for the
@@ -78,8 +90,40 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
 
+/**
+ * The activity kinds that survive an excluded foreground, because none of them
+ * describes it.
+ *
+ * Stated as what passes rather than what is dropped, so the default for a kind
+ * nobody has considered yet is exclusion. That is the same fail-closed posture
+ * as the parser above: a future event kind that turns out to observe the
+ * foreground must not start leaking an excluded application the day it is added,
+ * and the cost of the opposite mistake is a gap in history rather than a
+ * disclosure.
+ *
+ * What earns a place: facts produced by watching a path or a pipe instead of the
+ * screen, and the two lifecycle signals whose whole job is to explain a gap.
+ * Dropping `capture_gate_changed` in particular would erase the record of *why*
+ * the timeline is silent, which is the ambiguity that event exists to remove.
+ */
+const KINDS_INDEPENDENT_OF_FOREGROUND: ReadonlySet<ActivityKind> = new Set([
+  "file_opened",
+  "file_saved",
+  "terminal_command_completed",
+  "idle_state_changed",
+  "capture_gate_changed",
+]);
+
 export class ExcludingCapturePolicy implements CapturePolicy {
   public readonly id: string;
+  /**
+   * Whether the last application seen to activate is one the rules exclude.
+   *
+   * Starts false: a policy that has observed no activation has no grounds to
+   * withhold anything, and a source that never reports one (a filesystem
+   * watcher on its own) is unaffected by exclusion exactly as before.
+   */
+  private foregroundExcluded = false;
 
   public constructor(
     private readonly rules: readonly ExclusionRule[],
@@ -98,8 +142,13 @@ export class ExcludingCapturePolicy implements CapturePolicy {
    * policy.
    */
   public capture(event: ActivityEvent): ActivityEvent | null {
-    const name = applicationNameOf(event);
-    if (name !== null && this.rules.some((rule) => rule.applicationNamePattern.test(name))) {
+    // An activation is the only event that can change the answer, so the latch
+    // moves here — and the activation is then judged by the value it just set,
+    // which is what keeps an excluded application's arrival absent too.
+    if (event.kind === "application_activated") {
+      this.foregroundExcluded = this.excludes(activatedApplicationName(event));
+    }
+    if (this.foregroundExcluded && !KINDS_INDEPENDENT_OF_FOREGROUND.has(event.kind)) {
       // Counted, never named: the diagnostic channel must not become a record
       // of exactly what the user asked to hide.
       this.onExcluded?.(1);
@@ -107,26 +156,23 @@ export class ExcludingCapturePolicy implements CapturePolicy {
     }
     return this.inner.capture(event);
   }
+
+  private excludes(applicationName: string | null): boolean {
+    return applicationName !== null
+      && this.rules.some((rule) => rule.applicationNamePattern.test(applicationName));
+  }
 }
 
 /**
- * The application a capture decision can even be about. Only events that carry
- * an application identity are excludable; a filesystem save with a null owner
- * belongs to no application and passes through to the inner policy.
+ * The name an activation reports, or null when the event is not an activation.
+ *
+ * Deliberately the only payload read in this module. Every other kind is judged
+ * by the foreground latch rather than by its own fields, because no other kind
+ * says which application it belongs to by name — and a policy that guessed from
+ * an id would be matching a macOS pid against a rule a person wrote.
  */
-function applicationNameOf(event: ActivityEvent): string | null {
-  switch (event.kind) {
-    case "application_activated":
-      return (event.payload as { applicationName: string }).applicationName;
-    case "window_changed":
-    case "focus_changed": {
-      // Neither payload carries a name, only the id. The projection pairs them;
-      // capture-time exclusion can only see what the event itself says, so an
-      // id-only event is not excludable here — the activated event that named
-      // the application is.
-      return null;
-    }
-    default:
-      return null;
-  }
+function activatedApplicationName(event: ActivityEvent): string | null {
+  if (event.kind !== "application_activated") return null;
+  const { applicationName } = event.payload as ApplicationActivatedPayload;
+  return applicationName.length > 0 ? applicationName : null;
 }
