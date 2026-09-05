@@ -5,12 +5,8 @@ import { afterEach, describe, expect, it } from "bun:test";
 import type { ActivitySourceDiagnostic } from "../src/activity-source.js";
 import { InMemoryEventStore } from "../src/event-store.js";
 import { SqliteEventStore } from "../src/sqlite-event-store.js";
-import {
-  FilesystemActivitySource,
-  isDefaultIncluded,
-  type FilesystemWatchEvent,
-  type FilesystemWatcherFactory,
-} from "../src/filesystem-source.js";
+import { type FilesystemWatchEvent, type FilesystemWatcherFactory } from "../src/filesystem-watcher.js";
+import { FilesystemActivitySource } from "../src/filesystem-source.js";
 import type { ActivityEvent, FilePayload } from "../src/protocol.js";
 import { SquidCore } from "../src/squid-core.js";
 
@@ -81,18 +77,42 @@ function recordingEmitter(delayMs = 0) {
   };
 }
 
-describe("isDefaultIncluded", () => {
-  it("excludes build and VCS artifacts at any depth", () => {
-    expect(isDefaultIncluded("src/main.ts")).toBe(true);
-    expect(isDefaultIncluded(".git/HEAD")).toBe(false);
-    expect(isDefaultIncluded("packages/app/node_modules/x/index.js")).toBe(false);
-    expect(isDefaultIncluded("dist/main.js")).toBe(false);
-    expect(isDefaultIncluded("src/.DS_Store")).toBe(false);
-  });
-});
+/** A lazy backend whose `ready` can be failed once the source awaits it. Retries get a working backend. */
+function lazyWatcher(onSetup?: (input: Parameters<FilesystemWatcherFactory>[0]) => void) {
+  const state: { reject: ((error: Error) => void) | null; closes: number } = { reject: null, closes: 0 };
+  let first = true;
+  return {
+    factory: ((input) => {
+      if (first) {
+        first = false;
+        onSetup?.(input);
+        return {
+          close: () => {
+            state.closes += 1;
+          },
+          ready: new Promise<void>((_resolve, reject) => {
+            state.reject = reject;
+          }),
+        };
+      }
+      return { close: () => undefined };
+    }) satisfies FilesystemWatcherFactory,
+    closeCount: () => state.closes,
+    /** Waits until the factory has run (start awaits its own setup first), then rejects `ready`. */
+    async fail(error: Error): Promise<void> {
+      const deadline = Date.now() + 2_000;
+      while (state.reject === null) {
+        if (Date.now() > deadline) throw new Error("watcher factory never ran");
+        await Bun.sleep(1);
+      }
+      state.reject(error);
+    },
+  };
+}
 
 describe("FilesystemActivitySource startup validation", () => {
   it("rejects a relative root", async () => {
+    const root = await temporaryRoot();
     const source = new FilesystemActivitySource({ root: "relative/path" });
     await expect(source.start(async () => undefined)).rejects.toThrow("must be an absolute path");
   });
@@ -129,6 +149,58 @@ describe("FilesystemActivitySource startup validation", () => {
     await source.start(async () => undefined);
     await source.stop();
     await expect(source.start(async () => undefined)).rejects.toThrow("cannot start from lifecycle state stopped");
+  });
+
+  it("rolls back to idle when the watcher factory fails, so a retry can succeed", async () => {
+    const root = await temporaryRoot();
+    let attempts = 0;
+    const source = new FilesystemActivitySource({
+      root,
+      watcherFactory: () => {
+        attempts += 1;
+        if (attempts === 1) throw Object.assign(new Error("no watch slots left"), { code: "ENOSPC" });
+        return { close: () => undefined };
+      },
+    });
+
+    await expect(source.start(async () => undefined)).rejects.toThrow("no watch slots left");
+    expect(attempts).toBe(1);
+
+    await source.start(async () => undefined);
+    expect(attempts).toBe(2);
+    await source.stop();
+  });
+
+  it("rolls back to idle when a lazy backend rejects its ready promise", async () => {
+    const root = await temporaryRoot();
+    const watcher = lazyWatcher();
+    const source = new FilesystemActivitySource({ root, watcherFactory: watcher.factory });
+
+    const started = source.start(async () => undefined);
+    await watcher.fail(new Error("walk failed"));
+    await expect(started).rejects.toThrow("walk failed");
+    expect(watcher.closeCount()).toBe(1);
+    // The source must be idle again, not wedged in `started`.
+    await source.start(async () => undefined);
+    await source.stop();
+  });
+
+  it("does not report events from a failed start after rollback", async () => {
+    const root = await temporaryRoot();
+    const emitter = recordingEmitter();
+    const captured: { onEvent: ((event: FilesystemWatchEvent) => void) | null } = { onEvent: null };
+    const watcher = lazyWatcher((input) => {
+      captured.onEvent = input.onEvent;
+    });
+    const source = new FilesystemActivitySource({ root, watcherFactory: watcher.factory });
+
+    const started = source.start(emitter.emit);
+    await watcher.fail(new Error("walk failed"));
+    await expect(started).rejects.toThrow("walk failed");
+    captured.onEvent?.({ eventType: "change", filename: "late.ts" });
+    await source.stop();
+
+    expect(emitter.events).toEqual([]);
   });
 });
 
