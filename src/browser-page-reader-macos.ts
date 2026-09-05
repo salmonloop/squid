@@ -37,34 +37,56 @@ const FIELD_COUNT = 3;
  * browser still yields the foreground facts; the owner fields matter on their
  * own, because `admitSearch` attributes a selection to the window that made it
  * and a frame without an owner is dropped by the reducer anyway.
+ *
+ * Which browser is asked is decided by the **foreground** application's name, and
+ * that is the correction to a real defect rather than a refinement. Both `tell`
+ * blocks used to run on every poll, with Safari's answer written over Chrome's
+ * because it came second — so a page open in a background Safari window was
+ * reported as the current page while the user was in Chrome, in an IDE, or in
+ * anything else. The reducer then bound that URL to whichever window was actually
+ * in front, since the owner fields were read from the real foreground.
+ *
+ * The foreground read is deliberately **not** wrapped in a `try`. Reading the
+ * frontmost process is the one thing this script cannot do without an Automation
+ * grant, and swallowing that error left the field empty — indistinguishable from
+ * "no browser is open", which is how a user who never granted the permission would
+ * be told nothing at all, once per second, forever. Letting it escape makes
+ * `osascript` exit non-zero, which the poll loop reports once per transition. The
+ * inner reads stay guarded, because a window with no title is absence, not failure.
  */
 const BROWSER_PAGE_SCRIPT = `
 set fields to {"", "", ""}
+set frontAppName to ""
+tell application "System Events"
+  set frontProcess to first application process whose frontmost is true
+  try
+    set frontAppName to (name of frontProcess) as text
+  end try
+  try
+    set item 1 of fields to (unix id of frontProcess) as text
+  end try
+  try
+    set frontWindow to front window of frontProcess
+    try
+      set item 2 of fields to (title of frontWindow) as text
+    end try
+  end try
+end tell
 try
-  tell application "System Events"
-    set frontProcess to first application process whose frontmost is true
-    try
-      set item 1 of fields to (unix id of frontProcess) as text
-    end try
-    try
-      set frontWindow to front window of frontProcess
-      try
-        set item 2 of fields to (title of frontWindow) as text
-      end try
-    end try
-  end tell
+  if frontAppName is "Google Chrome" then
+    using terms from application "Google Chrome"
+      tell application "Google Chrome" to if (front window exists) then \\
+        set item 3 of fields to (URL of active tab of front window) as text
+    end using terms from
+  end if
 end try
 try
-  using terms from application "Google Chrome"
-    tell application "Google Chrome" to if (front window exists) then \\
-      set item 3 of fields to (URL of active tab of front window) as text
-  end using terms from
-end try
-try
-  using terms from application "Safari"
-    tell application "Safari" to if (front document exists) then \\
-      set item 3 of fields to (URL of front document) as text
-  end using terms from
+  if frontAppName is "Safari" then
+    using terms from application "Safari"
+      tell application "Safari" to if (front document exists) then \\
+        set item 3 of fields to (URL of front document) as text
+    end using terms from
+  end if
 end try
 set output to item 1 of fields
 repeat with fieldIndex from 2 to 3
