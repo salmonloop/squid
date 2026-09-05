@@ -76,10 +76,11 @@ afterEach(() => {
 /**
  * Counts this process's inotify watch slots by reading `/proc/self/fdinfo`.
  *
- * Bun keeps every inotify fd of a process on one fd and — measured on Bun
- * 1.3.11 — does not remove kernel watch descriptors on `watcher.close()`, so
- * these counts are meaningful only as registration deltas while watchers are
- * alive, never as a release measurement.
+ * Bun keeps every inotify fd of a process on one fd; on Bun 1.4.2 a
+ * `watcher.close()` retires its kernel watch descriptors, but releases are
+ * still asynchronous relative to the call, so these counts are meaningful as
+ * registration deltas while watchers are alive, never as a release
+ * measurement.
  */
 async function inotifyWatchCount(): Promise<number> {
   if (process.platform !== "linux") return -1;
@@ -209,7 +210,7 @@ describe.skipIf(process.platform !== "linux")("PrunedTreeWatcher on Linux", () =
     await mkdir(join(root, "project", "deep"));
     const harness = await startWatcher(root);
 
-    // Bun 1.3.11 keeps kernel slots on close, so the release itself is not
+    // Releases land asynchronously after close, so the release itself is not
     // measurable via fdinfo here; what is measurable is that reconciliation
     // ran: a directory re-created under the freed prefix is watched again.
     await rename(join(root, "project"), join(root, "moved-away"));
