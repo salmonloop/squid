@@ -548,18 +548,34 @@ export async function startWatchSession(
   }
 
   /**
-   * Turns the agent's observations into turns, one at a time.
+   * Turns the agent's observations into turns — one at a time, and one per quiet
+   * moment rather than one per event.
    *
    * Serialized deliberately. Two prompts overlapping on one session is not two
    * opinions — it is one conversation with interleaved turns, and the agent would
    * be reasoning about a half-written history. So each observation waits for the
-   * previous turn to settle. Events keep arriving during that wait and land in the
-   * sense buffer, which means a busy agent sees the *latest* world when it next
-   * thinks rather than a queue of stale ones. That is the correct trade for a
-   * sensor stream: the newest observation is the useful one.
+   * previous turn to settle.
+   *
+   * Coalesced for the same reason the sense buffer holds only the newest world:
+   * observations that arrive while a turn runs do not each earn a turn of their
+   * own. They raise one flag, and the single turn that follows reads the newest
+   * projection — which is the only one any of them was ever going to be answered
+   * from. Queueing them instead made the loop diverge, and measurably: a screen
+   * sampled once a second projects roughly two events per changed frame, while a
+   * turn costs seconds to tens of seconds, so a chain that grew by one turn per
+   * event could never drain. Each queued turn would then wake to the same newest
+   * world and think the same thought. The flag bounds the chain at one pending
+   * successor no matter how long the burst.
+   *
+   * What coalescing never touches is what the agent *saw*: every event is still
+   * ingested, still projected, and still observed into the session history. This
+   * is how often it thinks, not how much it knows.
    */
   const agentTurns = new Set<Promise<void>>();
-  let turnTail: Promise<void> = Promise.resolve();
+  /** True while a turn is in flight; a further observation coalesces into `turnPending`. */
+  let turnRunning = false;
+  /** True when an observation arrived that the running turn cannot already have read. */
+  let turnPending = false;
 
   // Squid's one voice outside the panel window. Absent unless this run asked for
   // it, and its failures are diagnostics on the same channel a sensor's are: a
@@ -601,7 +617,12 @@ export async function startWatchSession(
         }
       }
     };
-    const turn = turnTail.then(async () => {
+    /**
+     * One bounded turn: the watchdog race around `runTurn`, and nothing else.
+     * Extracted from the chain below so the coalescing loop has a single thing to
+     * call — the loop decides *how often* a turn happens, this decides what one is.
+     */
+    const runGuardedTurn = async (): Promise<void> => {
       const running = runTurn();
       // A turn that fails after the watchdog fired must not surface as an
       // unhandled rejection: the race below already reported the turn as lost.
@@ -648,20 +669,41 @@ export async function startWatchSession(
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }
-    }).catch((error: unknown) => {
-      // One failed turn must not end the ingest loop: the next observation gets
-      // a fresh attempt, and the agent's session survives a rejected prompt.
-      const described = describeErrorForAudit(error);
-      logError(JSON.stringify({ agentTurnError: described }));
-      panelServer?.broadcast(panelAgentLine({ status: "failed", text: described }));
-    });
-    // The tail advances even on failure, so a rejected turn cannot wedge the
-    // chain — every later observation would otherwise inherit the rejection.
-    turnTail = turn;
-    agentTurns.add(turn);
-    void turn.then(
-      () => agentTurns.delete(turn),
-      () => agentTurns.delete(turn),
+    };
+
+    // Every observation raises the flag; only the one that finds no turn running
+    // starts the loop. A turn already in flight drains the flag when it settles,
+    // so a burst of observations costs one further turn rather than one per event.
+    turnPending = true;
+    if (turnRunning) return;
+    turnRunning = true;
+    const chain = (async () => {
+      try {
+        while (turnPending) {
+          // Cleared before the turn, not after: an observation that arrives while
+          // this one runs must raise the flag again, and clearing afterwards would
+          // erase it.
+          turnPending = false;
+          await runGuardedTurn().catch((error: unknown) => {
+            // One failed turn must not end the loop: the next observation gets a
+            // fresh attempt, and the agent's session survives a rejected prompt.
+            const described = describeErrorForAudit(error);
+            logError(JSON.stringify({ agentTurnError: described }));
+            panelServer?.broadcast(panelAgentLine({ status: "failed", text: described }));
+          });
+        }
+      } finally {
+        // Nothing awaits between the loop's last test of `turnPending` and this
+        // assignment, so an observation cannot arrive in the gap and find both
+        // flags clear — a wake-up raised there would be lost with no turn to
+        // serve it and no later turn obliged to start.
+        turnRunning = false;
+      }
+    })();
+    agentTurns.add(chain);
+    void chain.then(
+      () => agentTurns.delete(chain),
+      () => agentTurns.delete(chain),
     );
   };
 

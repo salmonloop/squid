@@ -63,20 +63,33 @@ interface AgentLog {
   disposed: number;
 }
 
+/**
+ * How the fake session should behave, if not plainly. Named rather than restated
+ * at each use: `startSession` forwards it verbatim, and two copies of this shape
+ * is how one of them ends up missing an option the other has.
+ */
+interface FakeAgentOptions {
+  readonly promptError?: Error;
+  readonly reply?: string;
+  /** A session whose turn never settles — the wedge the watchdog exists to break. */
+  readonly neverIdle?: boolean;
+  /**
+   * Awaited inside `waitForIdle`, so a test can hold one turn open on purpose.
+   * `neverIdle` cannot serve that: a turn that only ends by abort never reaches
+   * the turn *after* it, which is the whole subject of the coalescing test.
+   */
+  readonly beforeIdle?: () => Promise<void>;
+  /**
+   * A factory that cannot open a session at all — the shape an unconfigured
+   * model produces. A session that starts anyway proves creation was skipped,
+   * not that this factory is special.
+   */
+  readonly factoryError?: Error;
+}
+
 function fakeAgentFactory(
   log: AgentLog,
-  options: {
-    readonly promptError?: Error;
-    readonly reply?: string;
-    /** A session whose turn never settles — the wedge the watchdog exists to break. */
-    readonly neverIdle?: boolean;
-    /**
-     * A factory that cannot open a session at all — the shape an unconfigured
-     * model produces. A session that starts anyway proves creation was skipped,
-     * not that this factory is special.
-     */
-    readonly factoryError?: Error;
-  } = {},
+  options: FakeAgentOptions = {},
 ): ResidentSessionFactory {
   return async (): Promise<ResidentSession> => {
     if (options.factoryError !== undefined) throw options.factoryError;
@@ -94,6 +107,7 @@ function fakeAgentFactory(
       },
       async waitForIdle(): Promise<void> {
         log.calls.push("waitForIdle");
+        if (options.beforeIdle !== undefined) await options.beforeIdle();
         // A wedged turn settles only when aborted — and once aborted, the
         // session is idle for good: a real session falls back to idle the
         // moment its abort lands, so any later waitForIdle (the watchdog's
@@ -178,12 +192,7 @@ async function startSession(options: {
   readonly log?: (line: string) => void;
   readonly logError?: (line: string) => void;
   readonly agentLog?: AgentLog;
-  readonly agentOptions?: {
-    readonly promptError?: Error;
-    readonly reply?: string;
-    readonly neverIdle?: boolean;
-    readonly factoryError?: Error;
-  };
+  readonly agentOptions?: FakeAgentOptions;
   /** Overrides the model-configuration probe, for the headless-needs-config tests. */
   readonly agentConfigured?: boolean;
   /**
@@ -580,6 +589,46 @@ describe("the resident agent in the ingest loop", () => {
     // conversation with interleaved turns.
     const turnCalls = agentLog.calls.filter((call) => call === "prompt" || call === "waitForIdle");
     expect(turnCalls).toEqual(["prompt", "waitForIdle", "prompt", "waitForIdle"]);
+  });
+
+  it("collapses a burst of observations into one further turn", async () => {
+    const lifecycle: string[] = [];
+    const source = new ScriptedSource("alpha", lifecycle);
+    let release: (() => void) | undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let firstTurn = true;
+    const { result, agentLog } = await startSession({
+      sources: [source],
+      agentOptions: {
+        beforeIdle: async () => {
+          if (!firstTurn) return;
+          firstTurn = false;
+          await held;
+        },
+      },
+    });
+    if ("configError" in result) throw new Error(result.configError);
+
+    // The first save's turn parks inside `waitForIdle`, so the three that follow
+    // all land while it runs — the burst this test exists to collapse.
+    await source.emit!(fileSaved("fs-1", "a.ts"));
+    await source.emit!(fileSaved("fs-2", "b.ts"));
+    await source.emit!(fileSaved("fs-3", "c.ts"));
+    await source.emit!(fileSaved("fs-4", "d.ts"));
+    release?.();
+    await result.session.stop();
+
+    // Four events, two turns: the one that was running, and one that reads the
+    // newest world the other three produced. Queueing instead bought four turns
+    // that would each wake to that same projection and think the same thought —
+    // and at sensor rates a chain that grows per event never drains.
+    expect(agentLog.calls.filter((call) => call === "prompt")).toHaveLength(2);
+    // Coalescing is about how often the agent thinks, never about what it saw:
+    // every event still reached its senses, its history, and the store.
+    expect(agentLog.calls.filter((call) => call === "observe")).toHaveLength(4);
+    expect(await result.session.runtime.store.all()).toHaveLength(4);
   });
 
   it("logs what the agent said", async () => {
