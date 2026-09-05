@@ -35,7 +35,12 @@ export interface ScreenTextFrame {
   readonly windowTitle?: string;
   readonly focusedRole?: ScreenTextFocusRole;
   readonly focusedLabel?: string | null;
-  /** Absent when the backend has no caret or selection information at all. */
+  /**
+   * Absent only when the backend cannot read text at all — the `xdotool` reader,
+   * which sees window identity and nothing inside it. A backend that *can* read
+   * reports this on every frame, empty selection included, because that is what
+   * makes releasing a selection an observation rather than a silence.
+   */
   readonly textContext?: {
     readonly prefix: string;
     readonly suffix: string;

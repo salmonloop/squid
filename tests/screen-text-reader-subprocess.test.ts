@@ -51,6 +51,7 @@ function identitySample(stdout: string, exitCode = 0, stderr = ""): SubprocessSa
 function collect(
   pollMs: number,
   run: ScreenTextSampler,
+  timeoutMs?: number,
 ): { frames: ScreenTextFrame[]; errors: string[]; close: () => void } {
   const frames: ScreenTextFrame[] = [];
   const errors: string[] = [];
@@ -59,6 +60,7 @@ function collect(
     pollMs,
     run,
     parse: parseIdentityFrame,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
   })({
     onFrame: (frame) => frames.push(frame),
     onError: (error) => errors.push(error.message),
@@ -116,6 +118,42 @@ describe("pollingScreenTextReaderFactory", () => {
     await Bun.sleep(10);
     expect(frames).toEqual([]);
     expect(errors).toEqual([]);
+  });
+
+  test("abandons a query that never answers, and keeps sampling", async () => {
+    // The failure this exists for: `sampling` prevents overlap, and a query that
+    // never resolves leaves it set. Every later interval then returns at that
+    // guard, so the reader stays alive and observes nothing, forever, without
+    // saying why.
+    const deferred = deferredSampler();
+    const { errors, close } = collect(5, deferred.run, 15);
+    try {
+      await Bun.sleep(60);
+
+      expect(deferred.killed()).toBe(true);
+      // A fresh query after the deadline is the whole point: the slot came back.
+      expect(deferred.calls()).toBeGreaterThan(1);
+      expect(errors.some((message) => message.includes("did not answer within 15ms"))).toBe(true);
+    } finally {
+      close();
+      deferred.release(identitySample("\n"));
+    }
+  });
+
+  test("an abandoned query's late answer is dropped", async () => {
+    // It describes a screen the loop already gave up on, and a newer query owns
+    // the slot by now.
+    const deferred = deferredSampler();
+    const { frames, close } = collect(1_000, deferred.run, 10);
+    try {
+      await Bun.sleep(40);
+      deferred.release(identitySample(`999${SEPARATOR}Ghost${SEPARATOR}late\n`));
+      await Bun.sleep(10);
+
+      expect(frames).toEqual([]);
+    } finally {
+      close();
+    }
   });
 
   test("polls do not overlap while a sample is in flight", async () => {

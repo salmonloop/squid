@@ -172,12 +172,16 @@ function parseFrame(stdout: string, occurredAt: string): ScreenTextFrame | null 
     ...(role.length > 0 ? { focusedRole: mapRole(role) } : {}),
     ...(label.length > 0 ? { focusedLabel: label } : {}),
     // Honest scope: osascript exposes no stable caret position, so prefix and
-    // suffix stay empty and this backend only reports text context when the user
-    // has a selection — which is exactly what the `search_selection` heuristic
-    // reads. Full caret context waits for an IDE or OCR backend.
-    ...(selection.length > 0
-      ? { textContext: { prefix: "", suffix: "", selection, language: null } }
-      : {}),
+    // suffix stay empty and the selection is the whole of what this backend can
+    // say — which is exactly what the `search_selection` heuristic reads. Full
+    // caret context waits for an IDE or OCR backend.
+    //
+    // Reported whether or not anything is selected. Absence is reserved for a
+    // backend with no text capability at all, and spending it on "nothing is
+    // selected right now" made a *de*selection invisible: the next frame differed
+    // from the selected one only by the missing field, so `projectFrame` emitted
+    // nothing and the world model kept offering the old selection as current.
+    textContext: { prefix: "", suffix: "", selection, language: null },
   };
 }
 

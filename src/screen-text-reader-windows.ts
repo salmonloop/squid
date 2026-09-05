@@ -7,6 +7,8 @@ import type { ScreenTextFocusRole, ScreenTextFrame, ScreenTextReaderFactory } fr
 import { windowsPowerShellPath } from "./windows-powershell.js";
 
 const DEFAULT_POLL_MS = 1_000;
+/** Missed intervals that mean the child stopped sampling rather than ran slowly. */
+const STALL_INTERVALS = 5;
 const DEFAULT_RESTART_MS = 2_000;
 
 /**
@@ -47,15 +49,21 @@ const FIELD_COUNT = 6;
  * this file. UIA's text pattern is optional, and implementations differ in how much
  * of it they honour: a native edit control answers fully, while Chromium exposes
  * the pattern on its document and ignores a programmatic selection — measured, not
- * assumed. So an absent `textContext` means "nothing selected, or nothing this
- * application will tell us", and the frame says so by omitting it rather than by
- * reporting an empty selection.
+ * assumed. So an empty `selection` means "nothing selected, or nothing this
+ * application will tell us" — and the field is reported either way. Absence is
+ * reserved for a backend that cannot read text at all; using it for "not selected
+ * right now" is what made a deselection unobservable.
  */
 export interface WindowsScreenTextReaderOptions {
   /** Sample interval inside the child. Default 1000ms. */
   readonly pollMs?: number;
   /** How long to wait before restarting a child that exited. Default 2000ms. */
   readonly restartMs?: number;
+  /**
+   * How long a living child may write nothing before it is restarted. Defaults to
+   * five sample intervals.
+   */
+  readonly stallMs?: number;
   /** The host to judge against. Defaults to this process; see the macOS reader. */
   readonly platform?: NodeJS.Platform;
   /** Injected in tests so no suite starts a real interpreter. */
@@ -210,11 +218,11 @@ export function parseWindowsFocusFrame(line: string, occurredAt: string): Screen
     ...(controlType.length > 0 ? { focusedLabel: label.length > 0 ? label : null } : {}),
     // Honest scope, matching macOS: UIA exposes a caret through the same text
     // pattern, but nothing here reads it, so prefix and suffix stay empty and the
-    // field is present only to say that something is selected — which is what the
-    // selection heuristics actually ask.
-    ...(selection.length > 0
-      ? { textContext: { prefix: "", suffix: "", selection, language: null } }
-      : {}),
+    // selection is all the field carries — which is what the selection heuristics
+    // actually ask. Present-but-empty for the same reason `focusedLabel` is: a
+    // reading of "nothing selected" is a reading, and only a backend with no text
+    // capability at all omits the field.
+    textContext: { prefix: "", suffix: "", selection, language: null },
   };
 }
 
@@ -270,6 +278,12 @@ export function createWindowsScreenTextReader(
   return streamingScreenTextReaderFactory({
     program: "powershell",
     restartMs: options.restartMs ?? DEFAULT_RESTART_MS,
+    // The script prints a record every interval regardless of what it found, so a
+    // gap this long is a UIA call that stopped answering inside a process that is
+    // still running — the one failure the exit-driven restart cannot see. Five
+    // intervals for the same reason the polling loop waits five: a loaded desktop
+    // is slow, not wedged.
+    stallMs: options.stallMs ?? pollMs * STALL_INTERVALS,
     parse: parseWindowsFocusFrame,
     spawn: options.spawn ?? (() => spawnSampler(script)),
   });

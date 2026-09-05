@@ -475,6 +475,38 @@ describe("ScreenTextActivitySource with SquidCore", () => {
     expect((await store.all()).every((event) => event.source.kind === "host")).toBe(true);
     expect(await core.restore()).toEqual(state);
   });
+
+  it("stops offering a released selection as the current one", async () => {
+    // The leak this exists to prevent: releasing a selection changes nothing else
+    // about the frame, so every other emission dedupes away. If the backend
+    // answered a released selection with absence instead of an empty reading,
+    // there would be no event at all and the agent would keep being told the
+    // user has that text selected.
+    const reader = fakeReader();
+    const core = new SquidCore(new InMemoryEventStore());
+    const source = new ScreenTextActivitySource({
+      readerFactory: reader.factory,
+      debounceMs: 1,
+    });
+
+    await source.start(async (event) => {
+      await core.ingest(event);
+    });
+    reader.emit(fullFrame);
+    await waitFor(() => core.currentState.textContext?.selection === "value");
+
+    reader.emit({ ...fullFrame, textContext: { ...fullFrame.textContext!, selection: "" } });
+    await source.stop();
+
+    const state = core.currentState;
+    expect(state.textContext?.selection).toBe("");
+    // The owner is still known: nothing about the focus changed, so the empty
+    // reading belongs to the same window the selection did.
+    expect(state.textContext?.owner).toEqual({
+      applicationId: "501",
+      windowTitle: "bash — squid",
+    });
+  });
 });
 
 describe("ScreenTextActivitySource frame projection failures", () => {
