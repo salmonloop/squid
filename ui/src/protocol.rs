@@ -330,11 +330,20 @@ pub fn control_line(op: Control) -> String {
 /// supervised run, because a brain that exited with no supervisor to respawn it
 /// would look like a crash to whoever started it by hand — so a panel that is not
 /// the supervisor can send this and correctly get nothing back.
+///
+/// `Stop` is `Restart` without the coming back, and it carries no such condition:
+/// a session asked to stop and stopping is never a lie about itself, whatever
+/// started it. The panel sends it on the way out so the brain closes its store and
+/// its session history on its own shutdown path — a kill would skip both, and
+/// leaving the process alive would be worse still: the tray item says "Quit
+/// Squid", and before this the desktop kept being observed with nothing left on
+/// screen to say so.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Control {
     Pause,
     Resume,
     Restart,
+    Stop,
 }
 
 impl Control {
@@ -343,6 +352,7 @@ impl Control {
             Control::Pause => "pause",
             Control::Resume => "resume",
             Control::Restart => "restart",
+            Control::Stop => "stop",
         }
     }
 }
@@ -1380,6 +1390,10 @@ mod tests {
         assert_eq!(
             control_line(Control::Restart),
             "{\"type\":\"control\",\"op\":\"restart\"}\n"
+        );
+        assert_eq!(
+            control_line(Control::Stop),
+            "{\"type\":\"control\",\"op\":\"stop\"}\n"
         );
     }
 

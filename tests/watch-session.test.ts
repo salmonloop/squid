@@ -214,6 +214,8 @@ async function startSession(options: {
   readonly defaultBaseUrl?: string;
   /** The restart handoff; tests inject a spy instead of ending the process. */
   readonly restartExit?: () => void;
+  /** The stop handoff; a spy for the same reason. */
+  readonly stopExit?: () => void;
   /** A notifier that records instead of interrupting whoever runs the suite. */
   readonly notifierFactory?: DesktopNotifierFactory;
 }) {
@@ -232,6 +234,7 @@ async function startSession(options: {
     ...(options.defaultModelId === undefined ? {} : { defaultModelId: options.defaultModelId }),
     ...(options.defaultBaseUrl === undefined ? {} : { defaultBaseUrl: options.defaultBaseUrl }),
     ...(options.restartExit === undefined ? {} : { restartExit: options.restartExit }),
+    ...(options.stopExit === undefined ? {} : { stopExit: options.stopExit }),
     ...(options.notifierFactory === undefined ? {} : { notifierFactory: options.notifierFactory }),
     createSources: async (context) => {
       seenContexts.push(context);
@@ -1583,6 +1586,7 @@ describe("the control panel on a watch session", () => {
       readonly agentDir: string;
       readonly diagnostics: string[];
       readonly restartCalls: number[];
+      readonly stopCalls: number[];
       readonly session: { stop(): Promise<void> };
       readonly client: PanelTestClient;
       readonly close: () => Promise<void>;
@@ -1598,6 +1602,7 @@ describe("the control panel on a watch session", () => {
       const socketPath = panelEndpoint(dir);
       const diagnostics: string[] = [];
       const restartCalls: number[] = [];
+      const stopCalls: number[] = [];
       const source = new ScriptedSource("alpha", []);
       const { result } = await startSession({
         sources: [source],
@@ -1613,6 +1618,9 @@ describe("the control panel on a watch session", () => {
         restartExit: () => {
           restartCalls.push(1);
         },
+        stopExit: () => {
+          stopCalls.push(1);
+        },
         logError: (line) => diagnostics.push(line),
       });
       if ("configError" in result) throw new Error(result.configError);
@@ -1624,6 +1632,7 @@ describe("the control panel on a watch session", () => {
         agentDir: join(dir, "agent"),
         diagnostics,
         restartCalls,
+        stopCalls,
         session: result.session,
         client,
         close: async () => {
@@ -1807,6 +1816,35 @@ describe("the control panel on a watch session", () => {
         await awaitConfigEnd(h.client);
       } finally {
         await h.close();
+      }
+    });
+
+    it("stops an unsupervised run on request, where a restart would be refused", async () => {
+      // The asymmetry is the point. A restart needs a supervisor to respawn it, so
+      // an unsupervised one is refused; a stop needs nothing, and refusing it is
+      // the failure the op exists to remove — a panel that quits while its session
+      // keeps observing the desktop.
+      const h = await startSettingsSession(false);
+      let closed = false;
+      try {
+        h.client.send(JSON.stringify({ type: "control", op: "stop" }));
+        const deadline = Date.now() + 2000;
+        for (;;) {
+          if (h.stopCalls.length > 0) break;
+          if (Date.now() > deadline) throw new Error("stop was not honored");
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+
+        expect(h.stopCalls).toEqual([1]);
+        // Exit 0, not the restart handoff: nothing is meant to bring this back.
+        expect(h.restartCalls).toEqual([]);
+        // The session really stopped rather than only reporting it, so the
+        // harness's own teardown must not stop it twice.
+        await h.client.close();
+        await rm(h.dir, { recursive: true, force: true });
+        closed = true;
+      } finally {
+        if (!closed) await h.close();
       }
     });
 

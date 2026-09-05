@@ -50,6 +50,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// The exit code the brain uses for "I stopped cleanly because the panel asked
@@ -362,6 +364,16 @@ fn probe_until(endpoint: &Path, budget: Duration) -> bool {
 /// location; the XDG pair names the same locations the TS config resolver uses.
 /// Missing values stay missing — inventing one here would be a new default
 /// separate from the brain's.
+///
+/// The last four are how a brain reaches the desktop it is supposed to observe,
+/// and their absence was measured as a silent capability loss rather than an
+/// error: the X11 backend shells out to `xdotool`, which needs `DISPLAY` (and
+/// `XAUTHORITY` where the cookie is not in the default place) to find a display at
+/// all, and the desktop notice needs the session bus. `env_clear()` removed them,
+/// so a panel-started brain on Linux reported read errors forever while the same
+/// binary started from a terminal worked — the difference being four variables
+/// nobody had listed. They are locations, like the rest of this list: none of them
+/// selects any Squid behavior, they name where this session's display and bus are.
 pub const INHERITED_ENV: &[&str] = &[
     "HOME",
     "USERPROFILE",
@@ -374,6 +386,10 @@ pub const INHERITED_ENV: &[&str] = &[
     "WINDIR",
     "TEMP",
     "TMP",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
 ];
 
 /// The exact environment a supervised brain is given, as data.
@@ -425,6 +441,148 @@ pub fn spawn_brain(brain: &Path, endpoint: &str) -> io::Result<Child> {
         .spawn()
 }
 
+/// How often the loop asks a living child whether it has exited.
+///
+/// A poll rather than a blocking `wait()`, and the whole reason this module has a
+/// [`Supervision`] handle at all. `wait()` cannot be interrupted, so a panel that
+/// blocked in it could not honor "stop now" until the child chose to exit — which
+/// for a healthy brain is never. A quarter-second is invisible next to a process
+/// lifetime and costs four wakeups a second on a thread that would otherwise be
+/// parked.
+const CHILD_POLL: Duration = Duration::from_millis(250);
+
+/// How often [`Supervision::stop_within`] re-checks a child it asked to stop.
+const STOP_POLL: Duration = Duration::from_millis(20);
+
+/// The panel's grip on the brain it started.
+///
+/// Exists because quitting the panel must not leave the session running. The tray
+/// item says "Quit Squid", and before this the brain outlived it: the supervisor
+/// thread owned the child, blocked in `wait()`, and had no way to be told the user
+/// was done. Observation and model calls continued with no window and no tray icon
+/// to say so, which is the worst shape this program can take — invisible and still
+/// watching.
+///
+/// Two facts, shared with the supervising thread: whether a stop was asked for, and
+/// which child is alive. Both are needed. Killing without the flag races the loop
+/// into spawning a replacement; the flag without the kill waits for a process that
+/// has no reason to exit.
+///
+/// An *attached* panel has none of this. A session it did not start is not its to
+/// stop, so the handle is created only when this run owns a brain.
+#[derive(Default)]
+pub struct Supervision {
+    stopping: AtomicBool,
+    /// `None` before the first spawn, between a child's exit and the next spawn,
+    /// and after a stop. Held only for as long as one decision takes: a lock held
+    /// across a blocking `wait()` would be the deadlock this design exists to
+    /// avoid.
+    child: Mutex<Option<Child>>,
+}
+
+impl Supervision {
+    /// Whether a stop has been asked for, so no further child is started.
+    pub fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    /// Spawns the next child, unless a stop has been asked for.
+    ///
+    /// One step under one lock rather than a check and then a spawn. Between those
+    /// two a stop could arrive, find nothing running, and return satisfied — and
+    /// this loop would then start a child with nobody left to stop it, which is the
+    /// original bug wearing a smaller window.
+    ///
+    /// `None` is the refusal; `Some(Err)` is a spawn that failed.
+    fn start(&self, spawn: impl FnOnce() -> io::Result<Child>) -> Option<io::Result<()>> {
+        let mut slot = self.lock();
+        if self.stopping() {
+            return None;
+        }
+        match spawn() {
+            Ok(child) => {
+                *slot = Some(child);
+                Some(Ok(()))
+            }
+            Err(error) => Some(Err(error)),
+        }
+    }
+
+    /// Reaps the child if it has exited, leaving it in place if it has not.
+    ///
+    /// `None` means there is nothing to wait for any more — either it exited (and
+    /// the status is returned) or a stop already reaped it, which the caller tells
+    /// apart by having asked.
+    fn poll_exit(&self) -> Option<io::Result<std::process::ExitStatus>> {
+        let mut slot = self.lock();
+        let child = slot.as_mut()?;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                *slot = None;
+                Some(Ok(status))
+            }
+            Ok(None) => None,
+            Err(error) => {
+                *slot = None;
+                Some(Err(error))
+            }
+        }
+    }
+
+    /// Stops the session and does not let it come back.
+    ///
+    /// Asked first, killed second, and `grace` is the whole difference between the
+    /// two: the brain closes its store and its session history on its own shutdown
+    /// path, and a kill skips that. The caller sends the stop request over the
+    /// panel wire; this waits for the exit that request produces, and kills only a
+    /// child that did not take it. Returns when nothing of ours is running.
+    ///
+    /// Bounded on purpose. A wedged brain must not be able to keep the panel from
+    /// closing — a program that will not quit is the failure this method exists
+    /// inside, not one it may cause.
+    pub fn stop_within(&self, grace: Duration) {
+        self.stopping.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + grace;
+        loop {
+            {
+                let mut slot = self.lock();
+                let Some(child) = slot.as_mut() else { return };
+                match child.try_wait() {
+                    // It took the request, or the supervising thread reaped it
+                    // first. Either way there is nothing of ours left.
+                    Ok(Some(_)) => {
+                        *slot = None;
+                        return;
+                    }
+                    Ok(None) if Instant::now() < deadline => {}
+                    // Out of grace, or unwaitable. `kill` is SIGKILL, which is
+                    // what makes this bounded; the `wait` after it is what keeps
+                    // the process from becoming a zombie this panel leaves behind.
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        *slot = None;
+                        return;
+                    }
+                }
+            }
+            std::thread::sleep(STOP_POLL);
+        }
+    }
+
+    /// The lock, past a poisoned mutex.
+    ///
+    /// A panic while holding it would leave the child unreachable and the session
+    /// unstoppable, which is a worse outcome than acting on the state a panicking
+    /// thread left. Nothing here is an invariant a panic can break: it is one
+    /// `Option<Child>`.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Child>> {
+        self.child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// Keeps a brain alive on `endpoint` until the process ends.
 ///
 /// Runs on its own thread, like the transport reader and for the same reason:
@@ -441,31 +599,54 @@ pub fn spawn_brain(brain: &Path, endpoint: &str) -> io::Result<Child> {
 /// startup, or a tripped crash guard. It does not exit the process: the panel
 /// stays up, showing why, because a window that vanishes when its child dies is
 /// the failure mode the whole supervising mode was added to avoid.
-pub fn supervise(brain: &Path, endpoint: &str, mut report: impl FnMut(ServiceState)) {
+pub fn supervise(
+    brain: &Path,
+    endpoint: &str,
+    supervision: &Supervision,
+    mut report: impl FnMut(ServiceState),
+) {
     let mut crashes = CrashLog::new();
     let mut backoff = first_backoff();
     loop {
-        let mut child = match spawn_brain(brain, endpoint) {
-            Ok(child) => child,
-            Err(error) => {
-                // Spawning failed rather than the brain failing: a missing
-                // binary, a permission bit. Terminal, because the next attempt
-                // runs the same `execve` against the same path.
+        match supervision.start(|| spawn_brain(brain, endpoint)) {
+            // A stop arrived — before the first spawn, or while a backoff was
+            // being waited out. Either way this round is over and no child of ours
+            // is running, which is exactly `Idle`.
+            None => {
+                report(ServiceState::Idle);
+                return;
+            }
+            // Spawning failed rather than the brain failing: a missing binary, a
+            // permission bit. Terminal, because the next attempt runs the same
+            // `execve` against the same path.
+            Some(Err(error)) => {
                 report(ServiceState::Failed {
                     reason: format!("could not start {}: {error}", brain.display()),
                 });
                 return;
             }
-        };
+            Some(Ok(())) => {}
+        }
         report(ServiceState::Running);
 
-        let status = match child.wait() {
-            Ok(status) => status,
-            Err(error) => {
-                report(ServiceState::Failed {
-                    reason: format!("lost track of the session: {error}"),
-                });
-                return;
+        let status = loop {
+            match supervision.poll_exit() {
+                Some(Ok(status)) => break status,
+                Some(Err(error)) => {
+                    report(ServiceState::Failed {
+                        reason: format!("lost track of the session: {error}"),
+                    });
+                    return;
+                }
+                // Still alive — unless a stop took it out from under this loop,
+                // which is the one case where there is nothing left to wait for
+                // and nothing to report: the panel is on its way out.
+                None => {
+                    if supervision.stopping() {
+                        return;
+                    }
+                    std::thread::sleep(CHILD_POLL);
+                }
             }
         };
 
@@ -782,6 +963,13 @@ mod tests {
                 "HOME" => Some("/home/me".to_owned()),
                 "PATH" => Some("/usr/bin".to_owned()),
                 "SQUID_CONFIG" => Some("/home/me/squid.json".to_owned()),
+                // Where this login session's display and bus are. Without them a
+                // panel-started brain on Linux cannot reach the desktop it exists
+                // to observe, and says so once per poll forever.
+                "DISPLAY" => Some(":0".to_owned()),
+                "XAUTHORITY" => Some("/home/me/.Xauthority".to_owned()),
+                "WAYLAND_DISPLAY" => Some("wayland-0".to_owned()),
+                "DBUS_SESSION_BUS_ADDRESS" => Some("unix:path=/run/user/1000/bus".to_owned()),
                 // Every one of these selects a behavior the form owns.
                 "SQUID_BROWSER" => Some("darwin".to_owned()),
                 "SQUID_WATCH_ROOT" => Some("/somewhere/else".to_owned()),
@@ -798,6 +986,17 @@ mod tests {
 
         assert!(names.contains(&"HOME"));
         assert!(names.contains(&"PATH"));
+        for reachable in [
+            "DISPLAY",
+            "XAUTHORITY",
+            "WAYLAND_DISPLAY",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ] {
+            assert!(
+                names.contains(&reachable),
+                "{reachable} did not reach the child, so it cannot see the desktop"
+            );
+        }
         // The locator travels because it points at the file rather than
         // selecting a behavior; a panel opened with it must not edit one file
         // while its brain starts from another.
@@ -890,9 +1089,12 @@ mod tests {
         let brain = fake_brain(&dir, &log, "exit 2");
 
         let mut states: Vec<String> = Vec::new();
-        supervise(&brain, "unused-endpoint", |state| {
-            states.push(state.label().to_owned())
-        });
+        supervise(
+            &brain,
+            "unused-endpoint",
+            &Supervision::default(),
+            |state| states.push(state.label().to_owned()),
+        );
 
         assert_eq!(
             runs_recorded(&log),
@@ -920,9 +1122,12 @@ mod tests {
         let brain = fake_brain(&dir, &log, "exit 1");
 
         let mut states: Vec<String> = Vec::new();
-        supervise(&brain, "unused-endpoint", |state| {
-            states.push(state.label().to_owned())
-        });
+        supervise(
+            &brain,
+            "unused-endpoint",
+            &Supervision::default(),
+            |state| states.push(state.label().to_owned()),
+        );
 
         // Exactly the guard's limit: the run that trips it is the last one.
         assert_eq!(runs_recorded(&log), CRASH_LIMIT);
@@ -937,6 +1142,82 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_stop_ends_the_session_and_the_round_with_it() {
+        // The bug this is here for: "Quit Squid" ended the panel's event loop and
+        // left the brain running. No window, no tray icon, and a process still
+        // observing the desktop and still calling a model.
+        let dir = std::env::temp_dir().join(format!("squid-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let log = dir.join("runs");
+        // A brain that does not exit on its own, which is what a healthy one looks
+        // like: nothing but the stop can end this.
+        let brain = fake_brain(&dir, &log, "exec sleep 30");
+
+        let supervision = std::sync::Arc::new(Supervision::default());
+        let watcher = std::sync::Arc::clone(&supervision);
+        let running = std::sync::Arc::new(AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&running);
+        let brain_path = brain.clone();
+        let thread = std::thread::spawn(move || {
+            supervise(&brain_path, "unused-endpoint", &watcher, |state| {
+                if state == ServiceState::Running {
+                    seen.store(true, Ordering::SeqCst);
+                }
+            });
+        });
+
+        // Waited for, not slept past: the stop has to arrive while a child is
+        // actually alive, or the test would pass against a panel that quit before
+        // the brain existed.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !running.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the brain never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // No grace: this fake brain has no wire to be asked over, so the kill path
+        // is the one under test — and the kill path is what has to be bounded.
+        supervision.stop_within(Duration::ZERO);
+        thread.join().expect("the supervising thread ended");
+
+        assert!(supervision.stopping());
+        assert_eq!(
+            runs_recorded(&log),
+            1,
+            "a stopped session must not be respawned"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_before_the_first_spawn_starts_nothing() {
+        // The race the spawn-under-lock closes: a stop that lands between the
+        // check and the spawn used to produce a child with nobody left to stop it.
+        let dir = std::env::temp_dir().join(format!("squid-nostart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let log = dir.join("runs");
+        let brain = fake_brain(&dir, &log, "exec sleep 30");
+
+        let supervision = Supervision::default();
+        supervision.stop_within(Duration::ZERO);
+
+        let mut states: Vec<String> = Vec::new();
+        supervise(&brain, "unused-endpoint", &supervision, |state| {
+            states.push(state.label().to_owned())
+        });
+
+        assert_eq!(
+            runs_recorded(&log),
+            0,
+            "nothing may be spawned after a stop"
+        );
+        assert_eq!(states, vec!["idle".to_owned()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn supervise_reports_a_missing_binary_instead_of_spinning_on_it() {
         // Spawning failed rather than the brain failing. Terminal, because the
         // next attempt runs the same execve against the same path -- and the
@@ -944,7 +1225,12 @@ mod tests {
         // user has to go on.
         let missing = Path::new("/nonexistent/squid-brain-that-is-not-there");
         let mut reported: Vec<ServiceState> = Vec::new();
-        supervise(missing, "unused-endpoint", |state| reported.push(state));
+        supervise(
+            missing,
+            "unused-endpoint",
+            &Supervision::default(),
+            |state| reported.push(state),
+        );
 
         assert_eq!(reported.len(), 1, "a failed spawn must not report running");
         match reported.first() {
