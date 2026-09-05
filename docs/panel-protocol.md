@@ -86,10 +86,9 @@ one:
   blocks the measurement is the pinned Bun: before oven-sh/bun#29422 a *failed*
   named-pipe listen aborts the process instead of throwing, because the tagged
   union's tag is written before the payload and the `errdefer` cleanup then trips
-  `bun.assert(this.listener == .none)`. The fix first shipped in Bun 1.3.13; this
-  repo pins 1.3.11. The assertion lives in the Windows-only suite in
-  `tests/panel-server.test.ts`, gated on that version, and runs itself the day the
-  pin moves.)
+  `bun.assert(this.listener == .none)`. The fix first shipped in Bun 1.3.13; the
+  repo now pins 1.4.2, so the assertion runs. It lives in the Windows-only suite
+  in `tests/panel-server.test.ts`, gated on that version.)
 - `stop()` alone leaves connected sockets writable and their handles alive, so the
   process will not exit while a panel is attached. Close with `stop(true)`.
 
