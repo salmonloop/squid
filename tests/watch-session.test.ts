@@ -1,9 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Socket } from "bun";
 import { describe, expect, it } from "bun:test";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type {
   ActivityEventEmitter,
   ActivitySource,
@@ -11,7 +12,11 @@ import type {
   SourceEntry,
 } from "../src/activity-source.js";
 import { createActivityEvent, type ActivityEvent } from "../src/protocol.js";
-import { startWatchSession, type WatchSourceContext } from "../src/watch-session.js";
+import {
+  startWatchSession,
+  watchedSinkExclusions,
+  type WatchSourceContext,
+} from "../src/watch-session.js";
 import { SqliteEventStore } from "../src/sqlite-event-store.js";
 import type { DesktopNotice, DesktopNotifierFactory } from "../src/desktop-notice.js";
 import type { ResidentSession, ResidentSessionFactory } from "../src/resident-agent.js";
@@ -339,6 +344,10 @@ describe("startWatchSession", () => {
     // In-memory run: no sink path, which is what keeps a filesystem source from
     // computing exclusions it does not need.
     expect(context.databasePath).toBeUndefined();
+    // Uninjected run: the session still answers "where does Pi live" — Pi's own
+    // default, the same fallback the settings service uses. This fallback is why
+    // every suite that mounts the panel injects an `agentDir` instead.
+    expect(context.agentDir).toBe(getAgentDir());
 
     const diagnostic: ActivitySourceDiagnostic = {
       kind: "watcher_error",
@@ -354,6 +363,25 @@ describe("startWatchSession", () => {
   it("refuses a session with no sources instead of running a blind core", async () => {
     const { result } = await startSession({ sources: [] });
     expect("configError" in result && result.configError).toContain("at least one activity source");
+  });
+
+  it("hands the source factories the same agent directory the settings service uses", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "squid-agent-dir-"));
+    try {
+      const lifecycle: string[] = [];
+      const source = new ScriptedSource("alpha", lifecycle);
+      const { result, seenContexts } = await startSession({ sources: [source], agentDir: dir });
+      if ("configError" in result) throw new Error(result.configError);
+
+      // One answer to "where does Pi live", for both consumers: if the factories
+      // and the settings service resolved it separately, they could disagree —
+      // and a disagreement is the self-triggering loop again.
+      expect(seenContexts[0]!.agentDir).toBe(dir);
+
+      await settle(result.session);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("stops already-started sources when a later one fails to start", async () => {
@@ -1944,6 +1972,144 @@ describe("the control panel and the capture policy's redaction", () => {
     } finally {
       await result.session.stop();
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * The self-triggering loop's breaker, as a predicate.
+ *
+ * A filesystem source reports paths relative to the canonical root, and the
+ * exclusion must name every path Squid's own sinks write through that source:
+ * the event database (four files) and Pi's agent directory (a whole subtree —
+ * session appends, auth refreshes, models.json). Each test here walks one side
+ * of the boundary the predicate draws, because the boundary is exactly where
+ * the loop lived: `<agentDir>/sessions/...` under a watched `$HOME`.
+ */
+describe("watchedSinkExclusions", () => {
+  /** A root the way a source canonicalizes it — realpath'd, per the 8.3 note above. */
+  const sinkRoot = async (): Promise<string> => realpath(await mkdtemp(join(tmpdir(), "squid-sink-excl-")));
+
+  it("excludes the agent subtree and the database files, and admits ordinary files", async () => {
+    const root = await sinkRoot();
+    try {
+      const agentDir = join(root, ".pi", "agent");
+      await mkdir(agentDir, { recursive: true });
+      await mkdir(join(root, ".squid"), { recursive: true });
+      await writeFile(join(root, ".squid", "events.db"), "");
+      const context: WatchSourceContext = {
+        databasePath: join(root, ".squid", "events.db"),
+        agentDir,
+        onDiagnostic: () => {},
+      };
+
+      const isSinkPath = await watchedSinkExclusions(context, root);
+
+      // The whole agent subtree, not a named list of files: the next thing Pi
+      // writes there must not reopen the loop.
+      expect(isSinkPath(".pi/agent")).toBe(true);
+      expect(isSinkPath(".pi/agent/sessions/--home--user/session.jsonl")).toBe(true);
+      expect(isSinkPath(".pi/agent/auth.json")).toBe(true);
+      expect(isSinkPath(".pi/agent/models.json")).toBe(true);
+      // A sibling that shares the prefix by spelling but not by path.
+      expect(isSinkPath(".pi/agent-other/notes.txt")).toBe(false);
+      expect(isSinkPath(".pi")).toBe(false);
+      // The user's own files pass.
+      expect(isSinkPath("src/main.ts")).toBe(false);
+      // The database sink keeps its exact-file exclusions.
+      expect(isSinkPath(".squid/events.db")).toBe(true);
+      expect(isSinkPath(".squid/events.db-wal")).toBe(true);
+      expect(isSinkPath(".squid/events.db-shm")).toBe(true);
+      expect(isSinkPath(".squid/events.db-journal")).toBe(true);
+      expect(isSinkPath(".squid/other.txt")).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("excludes an in-memory run's agent subtree even without a database", async () => {
+    const root = await sinkRoot();
+    try {
+      const agentDir = join(root, ".pi", "agent");
+      await mkdir(agentDir, { recursive: true });
+      const context: WatchSourceContext = {
+        databasePath: undefined,
+        agentDir,
+        onDiagnostic: () => {},
+      };
+
+      const isSinkPath = await watchedSinkExclusions(context, root);
+
+      // The regression this pins: an earlier shape built its exclusion list from
+      // the database path alone and returned nothing for an in-memory run, which
+      // would let the session history feed a filesystem source right back.
+      expect(isSinkPath(".pi/agent/sessions/x/session.jsonl")).toBe(true);
+      expect(isSinkPath("src/main.ts")).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("excludes nothing for an agent directory outside the watched root", async () => {
+    const root = await sinkRoot();
+    const outside = await mkdtemp(join(tmpdir(), "squid-agent-outside-"));
+    try {
+      const context: WatchSourceContext = {
+        databasePath: undefined,
+        agentDir: outside,
+        onDiagnostic: () => {},
+      };
+
+      const isSinkPath = await watchedSinkExclusions(context, root);
+
+      // A sink outside the root can never be reported by this source; naming it
+      // here would silently swallow a user file.
+      expect(isSinkPath(".pi/agent/sessions/x/session.jsonl")).toBe(false);
+      expect(isSinkPath("src/main.ts")).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("excludes no agent paths on a first run, before Pi has written anything", async () => {
+    const root = await sinkRoot();
+    try {
+      const context: WatchSourceContext = {
+        databasePath: undefined,
+        // Canonical location, never created — the state a first run is in when
+        // the sources assemble.
+        agentDir: join(root, ".pi", "agent"),
+        onDiagnostic: () => {},
+      };
+
+      const isSinkPath = await watchedSinkExclusions(context, root);
+
+      expect(isSinkPath(".pi/agent/sessions/x/session.jsonl")).toBe(false);
+      expect(isSinkPath("src/main.ts")).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("excludes no agent paths when the root is the agent directory itself", async () => {
+    const root = await sinkRoot();
+    try {
+      const context: WatchSourceContext = {
+        databasePath: undefined,
+        agentDir: root,
+        onDiagnostic: () => {},
+      };
+
+      const isSinkPath = await watchedSinkExclusions(context, root);
+
+      // Excluding the whole root would silence the source entirely — honest
+      // observation of nothing is worse than a loop, because at least a loop
+      // says something is wrong.
+      expect(isSinkPath("sessions/x/session.jsonl")).toBe(false);
+      expect(isSinkPath("src/main.ts")).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 });

@@ -1,4 +1,5 @@
 import { realpath } from "node:fs/promises";
+import { relative, sep } from "node:path";
 import { createWatchRuntime, type WatchRuntime } from "./create-watch-runtime.js";
 import { agentCustomTools } from "./agent-tools.js";
 import { describeErrorForAudit } from "./audit-text.js";
@@ -74,6 +75,14 @@ import { appendGateCommand } from "./panel-control.js";
 export interface WatchSourceContext {
   /** Absolute path of the event database, or undefined when in memory. */
   readonly databasePath: string | undefined;
+  /**
+   * Pi's agent directory — where the resident agent's session history, auth, and
+   * model catalog are written. `watchedSinkExclusions` needs it to keep those
+   * writes out of a filesystem source's timeline; production sets it from the
+   * same value the config service uses, so the two cannot disagree about where
+   * Pi lives.
+   */
+  readonly agentDir: string | undefined;
   /** Pass to every source so diagnostics reach the same sink. */
   readonly onDiagnostic: (diagnostic: ActivitySourceDiagnostic) => void;
 }
@@ -282,6 +291,14 @@ export async function startWatchSession(
     ?? (options.createAgentSession !== undefined || residentAgentConfigured());
   const needsConfig = panel.enabled && !agentConfigured();
 
+  // One answer to "where does Pi live", computed once and handed to both
+  // consumers — the settings service (which reads and writes Pi's own files)
+  // and the source factories (which must not observe them). Computing it in
+  // each consumer instead would let the two disagree about where Pi lives, and
+  // a disagreement there is exactly the self-triggering loop the exclusion
+  // exists to break.
+  const agentDir = options.agentDir ?? getAgentDir();
+
   /**
    * The settings service the panel talks to. Built once, after the env is
    * resolved and before the panel server wires its hooks; every read and write
@@ -291,7 +308,7 @@ export async function startWatchSession(
   const configService: ConfigServiceOptions = {
     configPath: options.configPath,
     env,
-    agentDir: options.agentDir ?? getAgentDir(),
+    agentDir,
     // `env` here is the merged one — config file under process env — so a
     // file-backed `modelProvider` reaches this the same way every resolver's
     // setting does. Reading `process.env` instead would make the row writable
@@ -732,6 +749,7 @@ export async function startWatchSession(
 
   const entries = [...await options.createSources({
     databasePath: watch.databasePath,
+    agentDir,
     onDiagnostic: (diagnostic) => {
       logError(JSON.stringify({ diagnostic: diagnostic.kind, message: diagnostic.message }));
     },
@@ -917,28 +935,89 @@ const AGENT_TURN_PROMPT =
 const ABORT_GRACE_MS = 5_000;
 
 /**
- * Paths a filesystem source must ignore because Squid's own sink lives there.
+ * Whether a root-relative POSIX path may enter the timeline.
  *
- * A database inside the watched root feeds its own writes back into the
- * timeline: every append updates `-wal`, the watcher reports that write, and
- * ingesting it appends again. Both sides must be canonical — the source reports
- * paths relative to `realpath(root)`, so comparing against a symlinked spelling
- * would silently match nothing and let the loop back in.
+ * A predicate rather than a set because the exclusions are two different shapes:
+ * the SQLite sink is four exact files, while the agent directory is a whole
+ * subtree — every conversation append, auth refresh, and models.json write lands
+ * somewhere under it, and naming them individually is how the next Pi file
+ * reopens the loop.
+ */
+export type SinkExclusion = (relativePath: string) => boolean;
+
+/**
+ * Builds the exclusion predicate a filesystem source must apply, because Squid's
+ * own sinks live inside the watched tree.
  *
- * Returns an empty set for an in-memory run, and `sqliteWatchExclusions` returns
- * nothing when the sink lives outside the root, so an unrelated sibling path can
- * never be excluded by accident.
+ * Two sinks, both feed their own writes back into the timeline if left visible:
+ *
+ * - The event database. Every ingest appends, the watcher reports the append,
+ *   ingesting it appends again.
+ * - Pi's agent directory (`~/.pi/agent` by default). The resident agent's
+   `cwd` *is* the watched root, so `SessionManager.create(cwd)` files the
+   conversation under `<agentDir>/sessions/<encoded-cwd>/` — inside the root the
+   packaged app watches by default (`$HOME`). Each turn appends the session file,
+ *   the watcher reports `file_saved`, the observation triggers another turn: the
+ *   self-triggering loop. `auth.json` refreshes and `models.json` writes ignite
+ *   the same way, so the whole subtree is excluded, not just sessions.
+ *
+ * Both sides must be canonical — the source reports paths relative to
+ * `realpath(root)`, so comparing against a symlinked spelling would silently
+ * match nothing and let a loop back in. A sink outside the root contributes
+ * nothing (`sqliteWatchExclusions` returns empty; a relative escape means
+ * outside), so an unrelated sibling path is never excluded by accident. An
+ * in-memory run has no database, and a filesystem source has nothing to say
+ * about the agent directory in the first place, so neither entry excludes when
+ * absent.
  */
 export async function watchedSinkExclusions(
   context: WatchSourceContext,
   canonicalRoot: string,
-): Promise<ReadonlySet<string>> {
-  const excluded = new Set<string>();
-  if (context.databasePath === undefined) return excluded;
-  for (const path of sqliteWatchExclusions(canonicalRoot, await realpath(context.databasePath))) {
-    excluded.add(path);
+): Promise<SinkExclusion> {
+  const exact = new Set<string>();
+  if (context.databasePath !== undefined) {
+    for (const path of sqliteWatchExclusions(canonicalRoot, await realpath(context.databasePath))) {
+      exact.add(path);
+    }
   }
-  return excluded;
+
+  const agentPrefix = await agentDirPrefixUnder(canonicalRoot, context.agentDir);
+  if (agentPrefix === null) {
+    return (relativePath) => exact.has(relativePath);
+  }
+  return (relativePath) =>
+    exact.has(relativePath) || relativePath === agentPrefix || relativePath.startsWith(`${agentPrefix}/`);
+}
+
+/**
+ * The agent directory as a root-relative POSIX prefix, or null when it lies
+ * outside the root or cannot be resolved.
+ *
+ * `getAgentDir()` reads the process environment (`PI_CODING_AGENT_DIR`) or
+ * defaults under `$HOME`; canonicalizing it matches it against the canonical
+ * root the same way `sqliteWatchExclusions` matches the database. A test
+ * injects its own `agentDir` through the context, so no suite reads the
+ * developer machine's Pi files.
+ */
+async function agentDirPrefixUnder(
+  canonicalRoot: string,
+  agentDir: string | undefined,
+): Promise<string | null> {
+  if (agentDir === undefined) return null;
+  let canonical: string;
+  try {
+    canonical = await realpath(agentDir);
+  } catch {
+    // Not there yet — a first run has no agent directory until Pi writes one.
+    // A missing directory cannot feed a loop, and the exclusion has nothing to
+    // name; when Pi creates it, the next session start picks it up.
+    return null;
+  }
+  const relativePath = relative(canonicalRoot, canonical);
+  if (relativePath === "" || relativePath === ".." || relativePath.startsWith(`..${sep}`)) {
+    return null;
+  }
+  return relativePath.split(sep).join("/");
 }
 
 /**

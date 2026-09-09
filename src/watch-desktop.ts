@@ -165,14 +165,14 @@ export async function startDesktopWatch(
       // Only the filesystem source needs exclusions: neither a screen reader nor a
       // browser reader observes the tree the store writes into, so they cannot
       // feed themselves.
-      const excludedPaths = await watchedSinkExclusions(context, canonicalRoot);
+      const isSinkPath = await watchedSinkExclusions(context, canonicalRoot);
       const entries: SourceEntry[] = [
         {
           id: "filesystem-local",
           label: "Files",
           create: () => new FilesystemActivitySource({
             root,
-            include: (relativePath) => !excludedPaths.has(relativePath),
+            include: (relativePath) => !isSinkPath(relativePath),
             onDiagnostic: context.onDiagnostic,
           }),
         },
