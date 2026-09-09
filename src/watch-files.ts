@@ -27,13 +27,13 @@ const started = await startWatchSession({
   workingDirectory: canonicalRoot,
   banner: { watching: root },
   createSources: async (context) => {
-    const excludedPaths = await watchedSinkExclusions(context, canonicalRoot);
+    const isSinkPath = await watchedSinkExclusions(context, canonicalRoot);
     return [{
       id: "filesystem-local",
       label: "Files",
       create: () => new FilesystemActivitySource({
         root,
-        include: (relativePath) => !excludedPaths.has(relativePath),
+        include: (relativePath) => !isSinkPath(relativePath),
         onDiagnostic: context.onDiagnostic,
       }),
     }];
