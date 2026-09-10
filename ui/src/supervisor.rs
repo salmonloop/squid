@@ -513,7 +513,10 @@ impl StderrTail {
             .name("brain-stderr".to_owned())
             .spawn(move || drain_stderr(stderr, state))
             .expect("spawn the stderr drain thread");
-        Self { shared, _drain: drain }
+        Self {
+            shared,
+            _drain: drain,
+        }
     }
 
     /// The last non-empty line, once the drain has finished.
@@ -574,7 +577,9 @@ fn drain_stderr(stderr: ChildStderr, state: Arc<Mutex<TailState>>) {
     use std::io::{BufRead, Write};
     let reader = io::BufReader::new(stderr);
     let mut own = io::stderr();
-    let mut guard = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for line in reader.lines() {
         let Ok(line) = line else { break };
         if guard.lines.len() == STDERR_TAIL_LINES {
