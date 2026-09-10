@@ -131,6 +131,21 @@ export component SourceCard inherits Rectangle {
             wrap: word-wrap;
         }
 
+        // "Watching" told half the truth. A sense can be running and still blind:
+        // a screen reader without its accessibility permission keeps polling and
+        // keeps being refused, and its newest diagnostic is the one sentence a
+        // person can act on. The brain records it on stderr — where the person
+        // who double-clicked this panel reads nothing — so it travels with the
+        // catalog row instead, and the card that says "Watching" carries the
+        // sentence that qualifies it. Caution because the row is a complaint,
+        // not a status; the switch stays on because the sense *is* running.
+        if root.source.state == "running" && root.source.detail != "": Text {
+            text: root.source.detail;
+            color: Theme.caution;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+
         if root.only-observer && root.source.state == "running": Text {
             text: "This is the only thing Squid is watching. Turn on another before switching this one off.";
             color: Theme.text-muted;

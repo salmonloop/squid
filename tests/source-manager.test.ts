@@ -24,12 +24,19 @@ class FakeSource implements ActivitySource {
   public readonly buffered: ActivityEvent[] = [];
   /** Resolved when `stop` has fully drained; tests await it for the drain contract. */
   public drained: Promise<void> = Promise.resolve();
+  /** What `diagnostics` hands back; the snapshot's `detail` reads its last item. */
+  public recordedDiagnostics: { readonly message: string }[] | undefined = undefined;
   private drainedNotify: (() => void) | undefined = undefined;
 
   public constructor(
     public readonly id: string,
     private readonly failOnStart: Error | undefined = undefined,
   ) {}
+
+  /** The optional property the snapshot reads; undefined means "never records". */
+  public get diagnostics(): { readonly message: string }[] | undefined {
+    return this.recordedDiagnostics;
+  }
 
   public async start(emit: ActivityEventEmitter): Promise<void> {
     if (this.failOnStart !== undefined) throw this.failOnStart;
@@ -143,6 +150,64 @@ describe("SourceManager", () => {
     expect(await manager.start("alpha")).toEqual({ ok: true, state: "running" });
     expect(builds.get("alpha")).toBe(2);
     expect(second.started).toBe(true);
+  });
+
+  /**
+   * The snapshot's `detail` is how a source that runs but cannot observe
+   * becomes visible to the panel. A screen reader without its accessibility
+   * permission keeps polling and keeps being refused: the state says
+   * `running` because it is, and the newest diagnostic is the one sentence
+   * separating "watching" from "running but blind". Three properties matter:
+   * it is the *newest* message (a description of now, not a history), it is
+   * absent for stopped and unsupported entries (whose reasons the card
+   * already carries), and a source that never records diagnostics reads as
+   * absent rather than as an empty string — the wire omits what it lacks.
+   */
+  it("carries the newest diagnostic of a running source into the snapshot", async () => {
+    const screen = new FakeSource("screen-text-host");
+    screen.recordedDiagnostics = [
+      { message: "first refusal" },
+      { message: "xdotool exited 1: no DISPLAY" },
+    ];
+    const manager = new SourceManager({
+      entries: [
+        { id: "screen-text-host", label: "Screen", create: () => screen },
+        { id: "ghost", label: "G" },
+      ],
+      emit,
+      log: () => undefined,
+      logError: () => undefined,
+    });
+    await manager.startAll();
+    expect(manager.snapshot()).toEqual([
+      // The last diagnostic, verbatim; a healthy sibling stays lean.
+      { id: "screen-text-host", label: "Screen", state: "running", detail: "xdotool exited 1: no DISPLAY" },
+      { id: "ghost", label: "G", state: "unsupported" },
+    ]);
+  });
+
+  it("drops the detail when the source stops, and a fresh start begins clean", async () => {
+    const first = new FakeSource("alpha");
+    first.recordedDiagnostics = [{ message: "extension disconnected" }];
+    const manager = new SourceManager({
+      entries: [
+        { id: "alpha", label: "A", create: () => first },
+        { id: "beta", label: "B", create: () => new FakeSource("beta") },
+      ],
+      emit,
+      log: () => undefined,
+      logError: () => undefined,
+    });
+    await manager.startAll();
+    expect(manager.snapshot().find((entry) => entry.id === "alpha")?.detail).toBe("extension disconnected");
+    await manager.stop("alpha");
+    // Stopped means stopped: an entry that observes nothing by choice carries
+    // no explanation, or the card would narrate a failure the person ended.
+    expect(manager.snapshot().find((entry) => entry.id === "alpha")).toEqual({
+      id: "alpha",
+      label: "A",
+      state: "stopped",
+    });
   });
 
   it("refuses to start an unknown id", async () => {

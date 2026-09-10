@@ -204,6 +204,11 @@ pub struct SourceLine {
     pub id: String,
     pub label: String,
     pub state: String,
+    /// The newest diagnostic a running source has recorded, when it has one —
+    /// the sentence separating "watching" from "running but blind" (a screen
+    /// reader without its accessibility permission). Absent for stopped and
+    /// unsupported rows, whose reasons the card already carries.
+    pub detail: Option<String>,
 }
 
 /// The verdict on one toggle.
@@ -297,6 +302,7 @@ pub fn parse_incoming(line: &str) -> Option<Incoming> {
             id: text_field(&fields, "id")?,
             label: text_field(&fields, "label")?,
             state: text_field(&fields, "state")?,
+            detail: optional_text_field(&fields, "detail"),
         })),
         "source_end" => Some(Incoming::SourceEnd {
             count: int_field(&fields, "count")?,
@@ -1312,6 +1318,7 @@ mod tests {
                     id: "filesystem-local".to_owned(),
                     label: "Filesystem".to_owned(),
                     state: state.to_owned(),
+                    detail: None,
                 }))
             );
         }
@@ -1322,6 +1329,40 @@ mod tests {
         ] {
             assert_eq!(parse_incoming(line), None, "should reject: {line}");
         }
+    }
+
+    #[test]
+    fn parses_the_optional_detail_on_a_source_row() {
+        // The detail is how "running but blind" reaches the card: the source is
+        // running, its reader keeps being refused, and the newest diagnostic is
+        // the one sentence a person can act on. Absent means absent — the wire
+        // omits what it does not have, and a stopped or unsupported row carries
+        // no detail because the card already has words for those states.
+        assert_eq!(
+            parse_incoming(
+                "{\"type\":\"source\",\"id\":\"screen-text-host\",\"label\":\"Screen\",\"state\":\"running\",\"detail\":\"xdotool exited 1: no DISPLAY\"}",
+            ),
+            Some(Incoming::Source(SourceLine {
+                id: "screen-text-host".to_owned(),
+                label: "Screen".to_owned(),
+                state: "running".to_owned(),
+                detail: Some("xdotool exited 1: no DISPLAY".to_owned()),
+            }))
+        );
+        // A null reads as absent for the same reason every optional text field
+        // does: display text, not a decision — see `optional_text_field`.
+        assert_eq!(
+            parse_incoming(
+                "{\"type\":\"source\",\"id\":\"screen-text-host\",\"label\":\"Screen\",\"state\":\"running\",\"detail\":null}",
+            )
+            .expect("recognized"),
+            Incoming::Source(SourceLine {
+                id: "screen-text-host".to_owned(),
+                label: "Screen".to_owned(),
+                state: "running".to_owned(),
+                detail: None,
+            })
+        );
     }
 
     #[test]

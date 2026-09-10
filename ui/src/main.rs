@@ -893,6 +893,10 @@ fn show_sources(window: &PanelWindow, rows: Vec<SourceLine>, count: i64) {
             id: row.id.clone().into(),
             label: row.label.clone().into(),
             state: row.state.clone().into(),
+            // None reads as empty on purpose: the card treats an empty detail
+            // as "nothing to report" and renders nothing, which is exactly the
+            // claim an absent field makes.
+            detail: row.detail.clone().unwrap_or_default().into(),
         })
         .collect();
     with_view(|state| *state.sources.borrow_mut() = rows);

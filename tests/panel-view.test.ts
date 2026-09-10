@@ -6,6 +6,7 @@ import {
   panelConfigResult,
   panelLine,
   panelServiceLine,
+  panelSourceLine,
   panelWorldState,
 } from "../src/panel-view.js";
 import { emptyWorldState } from "../src/protocol.js";
@@ -551,5 +552,52 @@ describe("panelConfigResult", () => {
     const result = panelConfigResult({ id: "key\u0007", ok: false, error: "bad\u0007" });
     expect(result.id).not.toContain("\u0007");
     expect(result.error).not.toContain("\u0007");
+  });
+});
+
+describe("panelSourceLine", () => {
+  it("states the catalog row without a detail when the source has none", () => {
+    expect(panelSourceLine({ id: "filesystem-local", label: "Files", state: "running" })).toEqual({
+      type: "source",
+      id: "filesystem-local",
+      label: "Files",
+      state: "running",
+    });
+  });
+
+  /**
+   * The detail is how "running but blind" reaches the card: a screen reader
+   * without its accessibility permission keeps polling and keeps being refused,
+   * and the state stays `running` because it is. Omitted rather than empty when
+   * absent — the wire omits what it does not have.
+   */
+  it("carries the newest diagnostic verbatim when the running source has one", () => {
+    expect(
+      panelSourceLine({
+        id: "screen-text-host",
+        label: "Screen",
+        state: "running",
+        detail: "xdotool exited 1: no DISPLAY",
+      }),
+    ).toEqual({
+      type: "source",
+      id: "screen-text-host",
+      label: "Screen",
+      state: "running",
+      detail: "xdotool exited 1: no DISPLAY",
+    });
+  });
+
+  it("sanitizes the detail like every diagnostic on the wire", () => {
+    // A reader's refusal can quote what it saw — a window title holding a
+    // credential, control bytes from a hostile file. The detail is a diagnostic
+    // and passes the same choke point as the id and label beside it.
+    const line = panelSourceLine({
+      id: "screen-text-host",
+      label: "Screen",
+      state: "running",
+      detail: "bad\u0007 title\u0007",
+    });
+    expect(line.detail).not.toContain("\u0007");
   });
 });
