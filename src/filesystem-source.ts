@@ -1,7 +1,7 @@
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ActivityEventEmitter, ActivitySource, ActivitySourceDiagnostic } from "./activity-source.js";
-import { describeErrorForAudit } from "./audit-text.js";
+import { SourceDiagnosticLog } from "./source-diagnostics.js";
 import { createActivityEvent, type ActivityEvent, type FilePayload } from "./protocol.js";
 import {
   defaultWatcherFactory,
@@ -53,10 +53,9 @@ export class FilesystemActivitySource implements ActivitySource {
   private readonly include: (relativePath: string) => boolean;
   private readonly watcherFactory: FilesystemWatcherFactory;
   private readonly probeFile: (absolutePath: string) => Promise<boolean>;
-  private readonly onDiagnostic: ((diagnostic: ActivitySourceDiagnostic) => void) | undefined;
   private readonly configuredRoot: string;
 
-  private readonly recordedDiagnostics: ActivitySourceDiagnostic[] = [];
+  private readonly diagnosticsLog: SourceDiagnosticLog;
   private readonly pendingChanges = new Map<string, PendingChange>();
   private readonly knownFiles = new Set<string>();
 
@@ -79,11 +78,11 @@ export class FilesystemActivitySource implements ActivitySource {
     this.include = options.include ?? (() => true);
     this.watcherFactory = options.watcherFactory ?? defaultWatcherFactory;
     this.probeFile = options.probeFile ?? defaultProbeFile;
-    this.onDiagnostic = options.onDiagnostic;
+    this.diagnosticsLog = new SourceDiagnosticLog(options.onDiagnostic);
   }
 
   public get diagnostics(): readonly ActivitySourceDiagnostic[] {
-    return this.recordedDiagnostics.map((diagnostic) => ({ ...diagnostic }));
+    return this.diagnosticsLog.diagnostics;
   }
 
   public async start(emit: ActivityEventEmitter): Promise<void> {
@@ -228,13 +227,7 @@ export class FilesystemActivitySource implements ActivitySource {
   }
 
   private record(kind: ActivitySourceDiagnostic["kind"], error: unknown): void {
-    const diagnostic: ActivitySourceDiagnostic = {
-      kind,
-      message: describeErrorForAudit(error),
-      occurredAt: new Date().toISOString(),
-    };
-    this.recordedDiagnostics.push(diagnostic);
-    this.onDiagnostic?.(diagnostic);
+    this.diagnosticsLog.record(kind, error);
   }
 }
 

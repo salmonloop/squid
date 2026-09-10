@@ -3,7 +3,7 @@ import type {
   ActivitySource,
   ActivitySourceDiagnostic,
 } from "./activity-source.js";
-import { describeErrorForAudit } from "./audit-text.js";
+import { SourceDiagnosticLog } from "./source-diagnostics.js";
 import {
   createActivityEvent,
   type ActivityEvent,
@@ -145,8 +145,7 @@ export class TerminalCommandActivitySource implements ActivitySource {
   public readonly sessionId: string;
 
   private readonly readerFactory: TerminalCommandReaderFactory;
-  private readonly onDiagnostic: ((diagnostic: ActivitySourceDiagnostic) => void) | undefined;
-  private readonly recordedDiagnostics: ActivitySourceDiagnostic[] = [];
+  private readonly diagnosticsLog: SourceDiagnosticLog;
 
   private lifecycle: SourceLifecycle = "idle";
   private reader: TerminalCommandReader | null = null;
@@ -160,11 +159,11 @@ export class TerminalCommandActivitySource implements ActivitySource {
     // `sequence` restarts at 0 for every instance, so the session must be the
     // part of the identity tuple that changes; see the other sources.
     this.sessionId = options.sessionId ?? `terminal-command-${crypto.randomUUID()}`;
-    this.onDiagnostic = options.onDiagnostic;
+    this.diagnosticsLog = new SourceDiagnosticLog(options.onDiagnostic);
   }
 
   public get diagnostics(): readonly ActivitySourceDiagnostic[] {
-    return this.recordedDiagnostics.map((diagnostic) => ({ ...diagnostic }));
+    return this.diagnosticsLog.diagnostics;
   }
 
   public async start(emit: ActivityEventEmitter): Promise<void> {
@@ -244,12 +243,6 @@ export class TerminalCommandActivitySource implements ActivitySource {
   }
 
   private record(kind: ActivitySourceDiagnostic["kind"], error: unknown): void {
-    const diagnostic: ActivitySourceDiagnostic = {
-      kind,
-      message: describeErrorForAudit(error),
-      occurredAt: new Date().toISOString(),
-    };
-    this.recordedDiagnostics.push(diagnostic);
-    this.onDiagnostic?.(diagnostic);
+    this.diagnosticsLog.record(kind, error);
   }
 }

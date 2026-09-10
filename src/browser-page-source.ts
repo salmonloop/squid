@@ -3,7 +3,7 @@ import type {
   ActivitySource,
   ActivitySourceDiagnostic,
 } from "./activity-source.js";
-import { describeErrorForAudit } from "./audit-text.js";
+import { SourceDiagnosticLog } from "./source-diagnostics.js";
 import {
   createActivityEvent,
   type ActivityEvent,
@@ -124,9 +124,8 @@ export class BrowserPageActivitySource implements ActivitySource {
 
   private readonly readerFactory: BrowserPageReaderFactory;
   private readonly debounceMs: number;
-  private readonly onDiagnostic: ((diagnostic: ActivitySourceDiagnostic) => void) | undefined;
 
-  private readonly recordedDiagnostics: ActivitySourceDiagnostic[] = [];
+  private readonly diagnosticsLog: SourceDiagnosticLog;
   /**
    * Fingerprint of the last payload emitted. The payload is the dedupe key, so a
    * backend polling an unchanged tab emits once rather than once per tick and
@@ -153,11 +152,11 @@ export class BrowserPageActivitySource implements ActivitySource {
     // history in any store that enforces source-local identity.
     this.sessionId = options.sessionId ?? `browser-page-${crypto.randomUUID()}`;
     this.debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS;
-    this.onDiagnostic = options.onDiagnostic;
+    this.diagnosticsLog = new SourceDiagnosticLog(options.onDiagnostic);
   }
 
   public get diagnostics(): readonly ActivitySourceDiagnostic[] {
-    return this.recordedDiagnostics.map((diagnostic) => ({ ...diagnostic }));
+    return this.diagnosticsLog.diagnostics;
   }
 
   public async start(emit: ActivityEventEmitter): Promise<void> {
@@ -275,12 +274,6 @@ export class BrowserPageActivitySource implements ActivitySource {
   }
 
   private record(kind: ActivitySourceDiagnostic["kind"], error: unknown): void {
-    const diagnostic: ActivitySourceDiagnostic = {
-      kind,
-      message: describeErrorForAudit(error),
-      occurredAt: new Date().toISOString(),
-    };
-    this.recordedDiagnostics.push(diagnostic);
-    this.onDiagnostic?.(diagnostic);
+    this.diagnosticsLog.record(kind, error);
   }
 }
