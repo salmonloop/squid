@@ -143,6 +143,15 @@ to 8 seconds; three within 60 seconds stop the loop and leave the panel visible
 with the reason. A restart requested by the user is not a crash and clears the
 crash history.
 
+A supervised brain's stderr is teed, not inherited: a drain thread reads it
+alongside the child, forwards every line to the panel's own stderr (so a
+developer in a terminal still sees the brain's diagnostics live), and keeps the
+last few lines. On exit 2 the brain's final sentence is appended to the failure
+the panel shows. The person who double-clicked the panel has no console to read
+stderr from, and the sentence names the setting and the file — the one fact the
+generic refusal cannot. stdout stays inherited: the brain's ordinary logging is
+not this contract's business.
+
 The panel's SERVICE area shows two separate facts when it supervises: the process
 state (`idle`, `running`, `restarting`, or `failed`) and the brain's own `service`
 line (`ready` or `needs_config`). A process that is alive but has no configured
