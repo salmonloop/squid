@@ -135,6 +135,8 @@ export interface PanelSourceLine {
   readonly id: string;
   readonly label: string;
   readonly state: "running" | "stopped" | "unsupported";
+  /** The newest diagnostic a running source has recorded, when it has one. */
+  readonly detail?: string;
 }
 
 /**
@@ -380,17 +382,29 @@ export function panelConfigResult(result: {
  * stopped, or unsupported — so the form shows the whole truth about this run;
  * a capability this process cannot start must be visible as un-toggleable, not
  * hidden. Id and label sanitize as diagnostics like every wire string.
+ *
+ * `detail`, when present, is the newest diagnostic a *running* source has
+ * recorded — the sentence that separates "watching" from "running but blind".
+ * A screen reader whose accessibility permission is missing keeps polling and
+ * keeps refusing; without this field the card reads "Watching" in calm green
+ * while nothing is being observed, and the only person who could learn why is
+ * the one reading the session's stderr — which in the panel-first flow has no
+ * reader at all. The state still says `running`, because it does: the source
+ * is up, its reader is looping, only its observations are refused. Absent
+ * for `stopped` and `unsupported`, whose reasons the card already carries.
  */
 export function panelSourceLine(input: {
   readonly id: string;
   readonly label: string;
   readonly state: "running" | "stopped" | "unsupported";
+  readonly detail?: string;
 }): PanelSourceLine {
   return {
     type: "source",
     id: sanitizeAuditText(input.id, "diagnostic").text,
     label: sanitizeAuditText(input.label, "diagnostic").text,
     state: input.state,
+    ...(input.detail === undefined ? {} : { detail: sanitizeAuditText(input.detail, "diagnostic").text }),
   };
 }
 

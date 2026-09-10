@@ -14,6 +14,10 @@ export struct SourceRow {
     id: string,
     label: string,
     state: string,
+    // The newest diagnostic a running source has recorded, when it has one —
+    // the sentence separating "watching" from "running but blind". Empty means
+    // the wire had nothing to say: absent and null both map here.
+    detail: string,
 }
 
 export struct SettingRow {

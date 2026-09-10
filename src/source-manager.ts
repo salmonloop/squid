@@ -44,13 +44,26 @@ import { describeErrorForAudit } from "./audit-text.js";
  * for that field. When the source restarts, fresh events resume the update.
  */
 
-/** The wire-facing state of one catalog entry. */
+/**
+ * The wire-facing state of one catalog entry.
+ *
+ * `detail` is the newest diagnostic a *running* source has recorded — the
+ * sentence a person needs when a source runs but cannot observe: a screen
+ * reader without its accessibility permission keeps polling, keeps reporting
+ * the same refusal, and the card that says "Watching" is the only place the
+ * person would look. Absent for `stopped` (it observes nothing by choice) and
+ * for `unsupported` (the settings gap already has its own words and its own
+ * button on the card). Undefined rather than empty-string, because the wire
+ * omits what it does not have; an empty field would be a different claim than
+ * "nothing to report".
+ */
 export type SourceState = "running" | "stopped" | "unsupported";
 
 export interface SourceSnapshotEntry {
   readonly id: string;
   readonly label: string;
   readonly state: SourceState;
+  readonly detail?: string;
 }
 
 export interface SourceManagerOptions {
@@ -99,17 +112,39 @@ export class SourceManager {
 
   /** Every catalog entry with its current state, catalog order preserved. */
   public snapshot(): readonly SourceSnapshotEntry[] {
-    return [...this.entries.values()].map((entry) => ({
-      id: entry.id,
-      label: entry.label,
-      state: this.stateOf(entry),
-    }));
+    return [...this.entries.values()].map((entry) => {
+      const state = this.stateOf(entry);
+      return {
+        id: entry.id,
+        label: entry.label,
+        state,
+        // Only a running source has a diagnostic worth showing, and only the
+        // newest one: the message is a description of *now*, not a history. A
+        // source whose reader keeps failing logs every transition to the
+        // session's stderr; the card carries the one a person needs to act on.
+        ...(state === "running" ? this.detailOf(entry.id) : {}),
+      };
+    });
   }
 
   private stateOf(entry: SourceEntry): SourceState {
     if (entry.create === undefined) return "unsupported";
     if (this.running.has(entry.id)) return "running";
     return "stopped";
+  }
+
+  /**
+   * The newest diagnostic a running source has recorded, if it has recorded
+   * any. Read through an optional property rather than a second interface so
+   * a fake source in a test needs nothing but a `diagnostics` getter to be
+   * believed — and so a source that never records diagnostics pays nothing.
+   */
+  private detailOf(id: string): { readonly detail?: string } {
+    const source = this.running.get(id) as { readonly diagnostics?: readonly { readonly message: string }[] } | undefined;
+    if (source === undefined) return {};
+    const diagnostics = source.diagnostics;
+    if (diagnostics === undefined || diagnostics.length === 0) return {};
+    return { detail: diagnostics[diagnostics.length - 1]!.message };
   }
 
   /**

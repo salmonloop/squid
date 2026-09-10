@@ -348,6 +348,7 @@ toggle the schema knows about.
 
 ```jsonc
 {"type":"source","id":"filesystem-local","label":"Files","state":"running"}
+{"type":"source","id":"screen-text-host","label":"Screen","state":"running","detail":"xdotool exited 1: no DISPLAY"}
 {"type":"source","id":"browser-page-host","label":"Browser","state":"unsupported"}
 {"type":"source_end","count":5}
 ```
@@ -358,6 +359,7 @@ toggle the schema knows about.
 | `id` | string | yes | the id a `source_toggle` echoes back |
 | `label` | string | yes | what the form shows, **sanitized** |
 | `state` | `"running"` \| `"stopped"` \| `"unsupported"` | yes | `unsupported` = the capability exists but this run cannot start it; toggles are refused |
+| `detail` | string | no | the newest diagnostic a *running* source has recorded — the sentence separating "watching" from "running but blind" (a screen reader without its accessibility permission). Absent for `stopped` and `unsupported` rows, whose reasons the card already carries. Omitted, never empty-string: the wire omits what it does not have. **Sanitized** like the label beside it |
 
 `count` on `source_end` tells the panel how many rows to expect — the same
 sizing contract as `config_end`.
