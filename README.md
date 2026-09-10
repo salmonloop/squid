@@ -57,7 +57,9 @@ in the config file — the settings form's switch) declines it; `desktop` says t
 default out loud. Linux speaks through `notify-send`; Windows speaks through a
 `Shell_NotifyIcon` balloon shown by a Windows PowerShell helper, which needs no
 installer and no AppUserModelID — the transient tray icon is its own identity, and
-the toast is attributed to the messenger. A host with no backend starts quiet when
+the toast is attributed to the messenger; macOS speaks through `osascript`, whose
+bundle the notice is attributed to — the same visible-messenger trade, taken for the
+same no-installer reason. A host with no backend starts quiet when
 nothing was asked, and the refusals in `resolve-desktop-notice.ts` name what is
 missing when `desktop` is asked for by name.
 
@@ -307,6 +309,11 @@ nobody had open and stopped there.
 - `src/desktop-notice-linux.ts` — the `notify-send` arguments. `--` terminates the
   options before any text, because a summary beginning with a dash is otherwise
   parsed as short flags, and a model summarising its work routinely starts with one.
+- `src/desktop-notice-macos.ts` — the `osascript` notice. The script is a constant
+  run handler and the notice arrives as two argv values after `--`, as data — no
+  user text ever reaches the AppleScript parser. Notification Center attributes
+  the notice to osascript's own bundle; the same visible-messenger trade the
+  Windows balloon took, for the same no-installer reason.
 - `src/desktop-notice-windows.ts` — the Windows balloon, shown by a PowerShell
   helper the seam resolves from `%SystemRoot%`. The script is a constant and the
   notice travels on stdin as one JSON line decoded as UTF-8 — no user text reaches

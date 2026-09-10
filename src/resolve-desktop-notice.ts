@@ -1,4 +1,5 @@
 import { createLinuxDesktopNotifier } from "./desktop-notice-linux.js";
+import { createMacosDesktopNotifier } from "./desktop-notice-macos.js";
 import { createWindowsDesktopNotifier } from "./desktop-notice-windows.js";
 import type { DesktopNotifierFactory } from "./desktop-notice.js";
 
@@ -23,8 +24,9 @@ import type { DesktopNotifierFactory } from "./desktop-notice.js";
  * fallback to quiet — a run that expected to interrupt and did not looks
  * exactly like a run whose daemon is asleep.
  *
- * There are two backends — `notify-send` on a freedesktop desktop, and a
- * `Shell_NotifyIcon` balloon through Windows PowerShell on win32. The refusals
+ * There are three backends — `notify-send` on a freedesktop desktop, a
+ * `Shell_NotifyIcon` balloon through Windows PowerShell on win32, and
+ * Notification Center through `osascript` on darwin. The refusals
  * below say what each of the *others* is actually missing rather than quietly
  * resolving to nothing, which is the shape the browser reader has for the
  * platforms it never got: a capability that names its own absence can be
@@ -106,13 +108,15 @@ function resolveDefault(
     };
   }
   if (platform === "darwin") {
-    return asked.asked
-      ? {
-          configError:
-            "SQUID_NOTIFY=desktop has no macOS backend yet; set SQUID_NOTIFY=off to run without one. Notification Center attributes " +
-            "a notice to the bundle that sent it, and the panel ships no bundle.",
-        }
-      : { enabled: false };
+    // The messenger is visible — Notification Center attributes the notice to
+    // osascript's own bundle, not to Squid — and the Windows balloon accepted
+    // the same visible-messenger trade for the same no-installer reason, so
+    // the two agree rather than one platform silently staying quiet.
+    return {
+      enabled: true,
+      noticeKind: "desktop",
+      notifierFactory: createMacosDesktopNotifier({ platform }),
+    };
   }
   return asked.asked
     ? { configError: `SQUID_NOTIFY=desktop has no backend for ${platform}.` }
