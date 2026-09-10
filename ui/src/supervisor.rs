@@ -45,13 +45,17 @@
 //! Exit `2` skips even the first retry. It is the brain's "startup refused" code —
 //! a config error, a relative watch root, a malformed `models.json` — and none of
 //! those get better by being run again. Respawning a typo is the crash loop the
-//! guard exists to prevent, just faster.
+//! guard exists to prevent, just faster. What the brain said on its way out — the
+//! one sentence naming the broken setting — is carried into the failure the panel
+//! shows, because the person who double-clicked this window has no console to
+//! read it from.
 
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The exit code the brain uses for "I stopped cleanly because the panel asked
@@ -340,23 +344,6 @@ fn probe_until(endpoint: &Path, budget: Duration) -> bool {
     }
 }
 
-/// Spawns the brain, marked supervised.
-///
-/// The child does **not** inherit the panel's whole environment. That is the
-/// point of the config file: a stray `SQUID_WATCH_ROOT` or `SQUID_BROWSER` in the
-/// parent must not silently outrank the values the settings form writes. The
-/// child receives only the operating-system variables needed to find a home,
-/// runtime directory, temporary files, and system libraries — plus `SQUID_CONFIG`
-/// when a person deliberately chose a non-default *location* for the config file.
-/// The location is not a business setting; it is the pointer to the one authority
-/// for them. Every other `SQUID_*` value is deliberately absent.
-///
-/// The two variables the panel itself owns are then added: the endpoint it should
-/// listen on and the supervised flag. Nothing else is injected.
-///
-/// stdout and stderr are inherited so the brain's diagnostics land wherever the
-/// panel's own do — a supervised run's log is the panel's console, and swallowing
-/// it would make a failing session unexplainable.
 /// The location and runtime variables a child is allowed to inherit.
 ///
 /// All are location/runtime, not Squid behavior. Windows needs SYSTEMROOT/WINDIR
@@ -426,7 +413,43 @@ pub fn child_env(
     env
 }
 
-pub fn spawn_brain(brain: &Path, endpoint: &str) -> io::Result<Child> {
+/// Spawns the brain, marked supervised.
+///
+/// The child does **not** inherit the panel's whole environment. That is the
+/// point of the config file: a stray `SQUID_WATCH_ROOT` or `SQUID_BROWSER` in the
+/// parent must not silently outrank the values the settings form writes. The
+/// child receives only the operating-system variables needed to find a home,
+/// runtime directory, temporary files, and system libraries — plus `SQUID_CONFIG`
+/// when a person deliberately chose a non-default *location* for the config file.
+/// The location is not a business setting; it is the pointer to the one authority
+/// for them. Every other `SQUID_*` value is deliberately absent.
+///
+/// The two variables the panel itself owns are then added: the endpoint it should
+/// listen on and the supervised flag. Nothing else is injected.
+///
+/// stderr is a pipe rather than inherited, drained and kept as a tail by
+/// [`StderrTail`] — see that type for why capturing it costs the brain nothing
+/// on its way to a person. stdout stays inherited so the brain's ordinary
+/// logging lands wherever the panel's own does.
+/// What [`spawn_brain`] hands back besides the child: a reader that is already
+/// draining the brain's stderr into memory, and from which the last lines can be
+/// taken once the child is gone.
+///
+/// The split is the whole design. A pipe nobody reads fills its kernel buffer
+/// and then *blocks the brain's next write to stderr* — a chatty failure wedging
+/// itself into a hang — so the drain cannot wait for an exit the panel cares
+/// about. But the decision needs the tail only after the exit, so that is when
+/// it joins: the reader thread ends on its own once the child's stderr closes,
+/// and the tail is read from what it left behind. Nobody waits on the thread;
+/// the [`Supervision`] handle remains the only thing that can be asked to stop.
+pub struct SpawnedBrain {
+    /// The child, for the supervision loop's `try_wait`/`kill`.
+    pub child: Child,
+    /// stderr, as the reader thread left it once the pipe hit EOF.
+    pub stderr_tail: StderrTail,
+}
+
+pub fn spawn_brain(brain: &Path, endpoint: &str) -> io::Result<SpawnedBrain> {
     let mut command = Command::new(brain);
     command.env_clear();
     for (name, value) in child_env(endpoint, |name| {
@@ -434,11 +457,144 @@ pub fn spawn_brain(brain: &Path, endpoint: &str) -> io::Result<Child> {
     }) {
         command.env(name, value);
     }
-    command
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Taken before the child is returned, so this function's caller can never
+    // hold a live pipe on a child it does not own.
+    let stderr = child.stderr.take().expect("stderr was just piped");
+    Ok(SpawnedBrain {
+        stderr_tail: StderrTail::spawn(stderr),
+        child,
+    })
+}
+
+/// How many trailing stderr lines are kept, per child.
+///
+/// The config error is a single sentence on the last line, and the brain is
+/// chatty only when something is already wrong; the tail exists to be read by a
+/// person, and four lines is the whole of what a person reads of a stack trace.
+const STDERR_TAIL_LINES: usize = 4;
+
+/// The tail of one brain's stderr, kept by a thread that drains it from the
+/// first byte to EOF.
+///
+/// The reader exists to keep the pipe from filling: stderr is a pipe now, and a
+/// pipe nobody reads blocks its writer once the kernel buffer is full. A brain
+/// that fails loudly (a stack trace, a flood of warnings) would otherwise hang
+/// itself mid-complaint. The tail is kept so that when the exit arrives, the
+/// sentence that explains it is still around.
+pub struct StderrTail {
+    shared: Arc<Mutex<TailState>>,
+    /// The drain thread, held but never joined. It ends when the pipe hits EOF
+    /// — which happens when the child exits, or when `kill` closes its end — so
+    /// its lifetime is already bounded by the child's.
+    _drain: std::thread::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct TailState {
+    /// The kept lines, oldest first; never longer than [`STDERR_TAIL_LINES`].
+    lines: VecDeque<String>,
+    /// Set when the drain reached EOF. The difference between "nothing left"
+    /// and "not read yet", which is the difference between a finished sentence
+    /// and half of one.
+    eof: bool,
+}
+
+impl StderrTail {
+    /// Starts draining `stderr`, keeping the last lines.
+    fn spawn(stderr: ChildStderr) -> Self {
+        let shared = Arc::new(Mutex::new(TailState::default()));
+        let state = Arc::clone(&shared);
+        let drain = std::thread::Builder::new()
+            .name("brain-stderr".to_owned())
+            .spawn(move || drain_stderr(stderr, state))
+            .expect("spawn the stderr drain thread");
+        Self { shared, _drain: drain }
+    }
+
+    /// The last non-empty line, once the drain has finished.
+    ///
+    /// The config error is one sentence on stderr's last line; everything above
+    /// it is noise the sentence does not need. Empty lines are skipped because
+    /// a trailing newline is spelling, not content.
+    ///
+    /// Waits for EOF rather than reading early, because a child can be reaped
+    /// before the drain thread has read its final line — a race that turns the
+    /// sentence into silence. Bounded, because EOF needs every writer closed
+    /// and a grandchild that inherited stderr can hold the pipe open past its
+    /// parent's death; on timeout this returns the best tail it has, which for
+    /// a refused startup is at worst the lines before the last. The caller only
+    /// asks after the child is gone, so the wait is short in every case that
+    /// happens in practice.
+    pub fn last_words(&self) -> Option<String> {
+        let deadline = Instant::now() + STDERR_EOF_WAIT;
+        loop {
+            let guard = self
+                .shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.eof || Instant::now() >= deadline {
+                return guard
+                    .lines
+                    .iter()
+                    .rev()
+                    .find(|line| !line.trim().is_empty())
+                    .cloned();
+            }
+            drop(guard);
+            std::thread::sleep(STDERR_EOF_POLL);
+        }
+    }
+}
+
+/// How long [`StderrTail::last_words`] will wait for the drain to reach EOF.
+///
+/// Generous next to the microseconds a closed pipe needs, and short next to the
+/// quarter-second the supervision loop already tolerates — its job is to
+/// outlast a scheduler hiccup, not a process that refuses to die.
+const STDERR_EOF_WAIT: Duration = Duration::from_secs(2);
+
+/// How often that wait re-checks the drain.
+const STDERR_EOF_POLL: Duration = Duration::from_millis(2);
+
+/// Reads `stderr` to EOF, keeping the last [`STDERR_TAIL_LINES`] lines in `state`
+/// and passing every line through to this process's own stderr.
+///
+/// The pass-through is the tee that keeps the old inherited-stderr contract
+/// alive: capturing the stream must not cost the brain its console. A developer
+/// running the panel from a terminal still sees the brain's diagnostics live,
+/// exactly as when stderr was inherited; the tail is a second reader on the
+/// same stream, not a replacement for the first. (Line-buffered rather than a
+/// raw byte copy, so a line split across two reads is still forwarded whole.)
+fn drain_stderr(stderr: ChildStderr, state: Arc<Mutex<TailState>>) {
+    use std::io::{BufRead, Write};
+    let reader = io::BufReader::new(stderr);
+    let mut own = io::stderr();
+    let mut guard = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        if guard.lines.len() == STDERR_TAIL_LINES {
+            guard.lines.pop_front();
+        }
+        guard.lines.push_back(line.clone());
+        let _ = writeln!(own, "{line}");
+    }
+    guard.eof = true;
+}
+
+/// Refuses-to-start reasons get the brain's own sentence appended, when it has
+/// one. The generic refusal named no setting and no file; the sentence names
+/// both.
+fn refused_reason(tail: &Option<String>) -> String {
+    let base = "the session refused to start; its configuration needs fixing".to_owned();
+    match tail {
+        Some(sentence) => format!("{base}: {sentence}"),
+        None => base,
+    }
 }
 
 /// How often the loop asks a living child whether it has exited.
@@ -490,19 +646,25 @@ impl Supervision {
     ///
     /// One step under one lock rather than a check and then a spawn. Between those
     /// two a stop could arrive, find nothing running, and return satisfied — and
-    /// this loop would then start a child with nobody left to stop it, which is the
-    /// original bug wearing a smaller window.
+    /// this loop would then start a child with nobody left to stop it, which is
+    /// the original bug wearing a smaller window.
     ///
-    /// `None` is the refusal; `Some(Err)` is a spawn that failed.
-    fn start(&self, spawn: impl FnOnce() -> io::Result<Child>) -> Option<io::Result<()>> {
+    /// `None` is the refusal; `Some(Err)` is a spawn that failed. On success the
+    /// caller also receives the child's stderr tail, because the spawn handed it
+    /// back alongside the child and the decision that needs it belongs to this
+    /// loop, not to the lock.
+    fn start(
+        &self,
+        spawn: impl FnOnce() -> io::Result<SpawnedBrain>,
+    ) -> Option<io::Result<StderrTail>> {
         let mut slot = self.lock();
         if self.stopping() {
             return None;
         }
         match spawn() {
-            Ok(child) => {
-                *slot = Some(child);
-                Some(Ok(()))
+            Ok(spawned) => {
+                *slot = Some(spawned.child);
+                Some(Ok(spawned.stderr_tail))
             }
             Err(error) => Some(Err(error)),
         }
@@ -608,7 +770,7 @@ pub fn supervise(
     let mut crashes = CrashLog::new();
     let mut backoff = first_backoff();
     loop {
-        match supervision.start(|| spawn_brain(brain, endpoint)) {
+        let stderr_tail = match supervision.start(|| spawn_brain(brain, endpoint)) {
             // A stop arrived — before the first spawn, or while a backoff was
             // being waited out. Either way this round is over and no child of ours
             // is running, which is exactly `Idle`.
@@ -625,8 +787,8 @@ pub fn supervise(
                 });
                 return;
             }
-            Some(Ok(())) => {}
-        }
+            Some(Ok(tail)) => tail,
+        };
         report(ServiceState::Running);
 
         let status = loop {
@@ -662,6 +824,21 @@ pub fn supervise(
 
         match decide_after_exit(code, recent, backoff) {
             ExitDecision::Stop { reason } => {
+                // The one refusal a retry cannot fix is also the one whose
+                // explanation the brain prints on stderr — the config error's
+                // sentence names the setting and the file, and a person facing
+                // the "Start Squid again" button needs exactly that sentence to
+                // know the button is not the fix. The drain thread has usually
+                // finished by now (the child is gone, so its stderr is closed),
+                // but "usually" is not a contract, so the tail is read under the
+                // drain's own lock: a line the brain wrote is either already in
+                // the tail or not yet visible to anyone, and either way this
+                // reads a consistent prefix rather than racing a writer.
+                let reason = if code == Some(EXIT_STARTUP_REFUSED) {
+                    refused_reason(&stderr_tail.last_words())
+                } else {
+                    reason
+                };
                 report(ServiceState::Failed { reason });
                 return;
             }
@@ -684,6 +861,36 @@ pub fn supervise(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn drained_last_words(script: &str) -> Option<String> {
+        // A real child with a real stderr pipe, because the part worth testing
+        // is the drain's lifecycle: it must settle to EOF on its own once the
+        // child is gone, without anyone joining the thread.
+        use std::process::Command;
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn the writer");
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let tail = StderrTail::spawn(stderr);
+        child.wait().expect("the writer exits");
+        // The drain ends when the pipe hits EOF, which the child's exit has
+        // just caused. Waited for rather than slept past, so the tail is
+        // settled by the time it is read.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let words = tail.last_words();
+            if words.is_some() || Instant::now() >= deadline {
+                return words;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     #[test]
     fn the_default_endpoint_matches_its_typescript_mirror() {
@@ -772,6 +979,53 @@ mod tests {
             decide_after_exit(Some(0), 0, FIRST_BACKOFF),
             ExitDecision::Stop { .. }
         ));
+    }
+
+    #[test]
+    fn refused_reason_carries_the_brains_sentence_when_it_has_one() {
+        // The generic refusal names no setting and no file. The sentence the
+        // brain printed names both, and appending it is the whole fix: the
+        // person facing the failed panel is the one person guaranteed not to
+        // have the console it was printed on.
+        assert_eq!(
+            refused_reason(&Some("a sentence".to_owned())),
+            "the session refused to start; its configuration needs fixing: a sentence"
+        );
+        // A brain that exited 2 without saying anything still gets the generic
+        // refusal — an invented sentence would be worse than a vague one.
+        assert_eq!(
+            refused_reason(&None),
+            "the session refused to start; its configuration needs fixing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_stderr_tail_keeps_the_last_line_and_skips_empty_ones() {
+        // The config error is the last line the brain writes. A trailing blank
+        // line is spelling, not content, and must not blank the sentence.
+        assert_eq!(
+            drained_last_words("echo 'first noise' >&2; echo 'the real sentence' >&2; echo >&2"),
+            Some("the real sentence".to_owned())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_stderr_tail_drops_what_it_cannot_keep_rather_than_blocking_the_writer() {
+        // More lines than the tail keeps: the drain's job is to keep the pipe
+        // empty and the last few lines; a writer that floods stderr must never
+        // block on a full buffer because the keeper kept too much.
+        let script = "for i in 1 2 3 4 5 6 7 8; do echo \"line $i\" >&2; done";
+        assert_eq!(drained_last_words(script), Some("line 8".to_owned()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_stderr_tails_to_nothing() {
+        // Nothing on stderr means nothing to say; `None` is what keeps the
+        // generic refusal honest rather than inventing a sentence.
+        assert_eq!(drained_last_words("exit 0"), None);
     }
 
     #[test]
@@ -1051,18 +1305,24 @@ mod tests {
     /// Writes an executable that exits with `code`, and records each run by
     /// appending a line to `log`. Unix-only: the point is a real `spawn`/`wait`
     /// round trip, and a portable shim would test the shim.
+    ///
+    /// Written under a private name and `rename`d into place, because this
+    /// suite runs its children in parallel and an `execve` racing the last
+    /// write of a just-closed file is answered with `ETXTBSY` on Linux — the
+    /// child that never runs, the run count that reads zero, and a suite that
+    /// flakes about one round in six (issue #28). A rename is atomic and the
+    /// file it publishes is held open by nobody.
     #[cfg(unix)]
     fn fake_brain(dir: &Path, log: &Path, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-brain");
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\necho run >> {}\n{script}\n", log.display()),
-        )
-        .expect("write the fake brain");
-        let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+        let staging = dir.join("fake-brain.staging");
+        let body = format!("#!/bin/sh\necho run >> {}\n{script}\n", log.display());
+        std::fs::write(&staging, body).expect("write the fake brain");
+        let mut perms = std::fs::metadata(&staging).expect("stat").permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).expect("chmod");
+        std::fs::set_permissions(&staging, perms).expect("chmod");
+        std::fs::rename(&staging, &path).expect("publish the fake brain");
         path
     }
 
@@ -1085,26 +1345,37 @@ mod tests {
         let log = dir.join("runs");
         // Exit 2 is "startup refused": a config error a retry cannot fix. One
         // run, then a terminal stop -- respawning a typo is the crash loop the
-        // guard exists to prevent, just faster.
-        let brain = fake_brain(&dir, &log, "exit 2");
+        // guard exists to prevent, just faster. The brain prints its config
+        // error on stderr before exiting, exactly as the real one does, and the
+        // failure must carry that sentence: it names the setting and the file,
+        // and the person facing the "Start Squid again" button is the one
+        // person guaranteed not to have a console to read it from.
+        let brain = fake_brain(
+            &dir,
+            &log,
+            "echo 'The config file at /tmp/squid/settings.json is not valid JSON: unexpected token' >&2\nexit 2",
+        );
 
-        let mut states: Vec<String> = Vec::new();
+        let mut states: Vec<ServiceState> = Vec::new();
         supervise(
             &brain,
             "unused-endpoint",
             &Supervision::default(),
-            |state| states.push(state.label().to_owned()),
+            |state| states.push(state),
         );
 
         assert_eq!(
             runs_recorded(&log),
             1,
-            "a refused startup must not be retried"
+            "a refused startup must not be retried; states: {states:?}"
         );
-        assert_eq!(states.first().map(String::as_str), Some("running"));
-        assert_eq!(
-            states.last().map(String::as_str),
-            Some(ServiceState::FAILED_LABEL)
+        assert_eq!(states.first().map(|s| s.label()), Some("running"));
+        let last = states.last().expect("a terminal state was reported");
+        assert_eq!(last.label(), ServiceState::FAILED_LABEL);
+        let detail = last.detail();
+        assert!(
+            detail.contains("not valid JSON"),
+            "the brain's own sentence must reach the failure detail: {detail}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
