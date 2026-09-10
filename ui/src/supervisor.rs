@@ -1443,10 +1443,12 @@ mod tests {
         });
 
         // Waited for, not slept past: the stop has to arrive while a child is
-        // actually alive, or the test would pass against a panel that quit before
-        // the brain existed.
+        // not merely alive but past its own first line — `Running` is reported
+        // at spawn, and a child killed between `execve` and its `echo run` (an
+        // easy window on a loaded CI runner) would leave the ledger at zero and
+        // fail the count below for a reason that is not the respawn it pins.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !running.load(Ordering::SeqCst) {
+        while !running.load(Ordering::SeqCst) || runs_recorded(&log) == 0 {
             assert!(Instant::now() < deadline, "the brain never started");
             std::thread::sleep(Duration::from_millis(10));
         }
