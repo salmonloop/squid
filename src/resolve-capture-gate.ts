@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { parsePipeEndpoint } from "./endpoint-transport.js";
 import { createFifoCaptureGateReader } from "./capture-gate-reader-fifo.js";
 import type { CaptureGateReaderFactory } from "./capture-gate-source.js";
 
@@ -17,7 +18,7 @@ export type CaptureGateResolution =
   | { readonly enabled: false }
   | {
       readonly enabled: true;
-      readonly readerKind: "fifo";
+      readonly readerKind: "file" | "pipe";
       readonly readerFactory: CaptureGateReaderFactory;
     }
   | { readonly configError: string };
@@ -42,8 +43,9 @@ export function resolveCaptureGate(
       configError: "SQUID_CONTROL=fifo requires SQUID_CONTROL_FIFO to name a path.",
     };
   }
-  if (!isAbsolute(path)) {
-    return { configError: "SQUID_CONTROL_FIFO must be an absolute path." };
+  const pipeEndpoint = parsePipeEndpoint(path);
+  if (pipeEndpoint === undefined && !isAbsolute(path)) {
+    return { configError: "SQUID_CONTROL_FIFO must be an absolute path or a named pipe (\\\\.\\pipe\\<name>)." };
   }
 
   const rawPollMs = env.SQUID_CONTROL_POLL_MS;
@@ -56,7 +58,7 @@ export function resolveCaptureGate(
 
   return {
     enabled: true,
-    readerKind: "fifo",
+    readerKind: pipeEndpoint === undefined ? "file" : "pipe",
     readerFactory: createFifoCaptureGateReader({
       path,
       ...(pollMs === undefined ? {} : { pollMs }),

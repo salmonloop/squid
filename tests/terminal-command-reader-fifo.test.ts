@@ -29,7 +29,7 @@ describe("createFifoTerminalCommandReader", () => {
     // A relative path would resolve against whatever directory the process
     // happened to start in, which is not a property a capability should have.
     expect(() => createFifoTerminalCommandReader({ path: "relative/fifo" }))
-      .toThrow("must be absolute");
+      .toThrow("must be an absolute path or a named pipe");
   });
 
   it("reads one completion per line", async () => {
@@ -210,5 +210,22 @@ describe("resolveTerminalReader", () => {
     expect(resolveTerminalReader({
       env: { SQUID_TERMINAL_FIFO: "relative", SQUID_TERMINAL_POLL_MS: "0" },
     })).toEqual({ enabled: false });
+  });
+
+  it("serves a named-pipe endpoint with the pipe transport", () => {
+    // The Windows dialect: mkfifo does not exist there, so the pipe spelling is
+    // the only endpoint a Windows run can create. The spelling selects the
+    // transport, and the resolution reports which one it got.
+    const resolved = resolveTerminalReader({
+      env: { SQUID_TERMINAL: "fifo", SQUID_TERMINAL_FIFO: "\\\\.\\pipe\\squid-control" },
+    });
+    expect(resolved).toMatchObject({ enabled: true, readerKind: "pipe" });
+  });
+
+  it("normalizes the slash spelling of a pipe endpoint", () => {
+    const resolved = resolveTerminalReader({
+      env: { SQUID_TERMINAL: "fifo", SQUID_TERMINAL_FIFO: "//./pipe/squid-control" },
+    });
+    expect(resolved).toMatchObject({ enabled: true, readerKind: "pipe" });
   });
 });

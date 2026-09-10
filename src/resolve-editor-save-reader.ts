@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { parsePipeEndpoint } from "./endpoint-transport.js";
 import { createFifoEditorSaveReader } from "./editor-save-reader-fifo.js";
 import type {
   EditorSaveReaderFactory,
@@ -20,7 +21,7 @@ export type EditorSaveReaderResolution =
   | { readonly enabled: false }
   | {
       readonly enabled: true;
-      readonly readerKind: "fifo";
+      readonly readerKind: "file" | "pipe";
       readonly readerFactory: EditorSaveReaderFactory;
     }
   | { readonly configError: string };
@@ -45,8 +46,9 @@ export function resolveEditorSaveReader(
       configError: "SQUID_EDITOR_SAVES=fifo requires SQUID_EDITOR_FIFO to name a path.",
     };
   }
-  if (!isAbsolute(path)) {
-    return { configError: "SQUID_EDITOR_FIFO must be an absolute path." };
+  const pipeEndpoint = parsePipeEndpoint(path);
+  if (pipeEndpoint === undefined && !isAbsolute(path)) {
+    return { configError: "SQUID_EDITOR_FIFO must be an absolute path or a named pipe (\\\\.\\pipe\\<name>)." };
   }
 
   const rawPollMs = env.SQUID_EDITOR_POLL_MS;
@@ -59,7 +61,7 @@ export function resolveEditorSaveReader(
 
   return {
     enabled: true,
-    readerKind: "fifo",
+    readerKind: pipeEndpoint === undefined ? "file" : "pipe",
     readerFactory: createFifoEditorSaveReader({
       path,
       ...(pollMs === undefined ? {} : { pollMs }),

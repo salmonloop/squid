@@ -84,6 +84,8 @@
  * this process reads is ordinary configuration, unlike the socket it serves.
  */
 
+import { parsePipeEndpoint } from "./endpoint-transport.js";
+
 /** The value shapes a setting can take, as the panel renders them. */
 export type ConfigValueKind = "text" | "int" | "enum";
 
@@ -186,23 +188,28 @@ function validateText(raw: string): ConfigValidation {
 }
 
 /**
- * A FIFO path must be absolute, and the settings form is where saying so is
- * useful: the resolver refuses a relative path at startup, which for a
- * supervised brain means exit 2 and no form left to fix it in. Same rule as
- * each resolver's own `isAbsolute` check, stated here in the layer that can
- * still refuse the value while a brain is running.
+ * A source endpoint must be absolute — POSIX-absolute or the Windows named-pipe
+ * spelling — and the settings form is where saying so is useful: the resolver
+ * refuses a relative path at startup, which for a supervised brain means exit 2
+ * and no form left to fix it in. Same rule as each resolver's own check, stated
+ * here in the layer that can still refuse the value while a brain is running.
  *
  * `isAbsolute` is deliberately not imported: this validator runs in the brain
- * and in the panel's dump alike, and POSIX is the dialect the config file is
- * written in — a Windows host would otherwise accept `C:\\pipe` here and
- * reject it in a resolver that judged by POSIX rules.
+ * and in the panel's dump alike, and the pipe spelling is judged by the same
+ * parser the panel endpoint uses rather than by the host, because the config
+ * file is written in one dialect on every platform — a Windows host must not
+ * accept `C:\\fifo` here when the resolvers refuse it there. A pipe spelling
+ * is accepted *because the resolvers now read it* (see
+ * `endpoint-transport.ts`): refusing it here would offer a legal enum value
+ * the same form could not satisfy, the exact trap the enum/path pairing test
+ * exists to prevent.
  */
 function validateFifoPath(label: string, raw: string): ConfigValidation {
   const whitespace = validateText(raw);
   if (!whitespace.ok) return whitespace;
-  return raw.startsWith("/")
+  return raw.startsWith("/") || parsePipeEndpoint(raw) !== undefined
     ? { ok: true }
-    : { ok: false, error: `${label} must be an absolute path.` };
+    : { ok: false, error: `${label} must be an absolute path or a named pipe (\\\\.\\pipe\\<name>).` };
 }
 
 function validatorFor(key: Omit<ConfigKey, "validate">): ConfigKey["validate"] {

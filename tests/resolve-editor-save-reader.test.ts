@@ -14,7 +14,7 @@ describe("resolveEditorSaveReader", () => {
     const resolved = resolveEditorSaveReader({
       env: { SQUID_EDITOR_SAVES: "fifo", SQUID_EDITOR_FIFO: "/tmp/saves.fifo" },
     });
-    expect(resolved).toMatchObject({ enabled: true, readerKind: "fifo" });
+    expect(resolved).toMatchObject({ enabled: true, readerKind: "file" });
   });
 
   it("rejects a near-miss value as a config error rather than defaulting", () => {
@@ -51,5 +51,22 @@ describe("resolveEditorSaveReader", () => {
   it("ignores a poll interval when the source is off", () => {
     const resolved = resolveEditorSaveReader({ env: { SQUID_EDITOR_POLL_MS: "bogus" } });
     expect(resolved).toEqual({ enabled: false });
+  });
+
+  it("serves a named-pipe endpoint with the pipe transport", () => {
+    // The Windows dialect: mkfifo does not exist there, so the pipe spelling is
+    // the only endpoint a Windows run can create. The spelling selects the
+    // transport, and the resolution reports which one it got.
+    const resolved = resolveEditorSaveReader({
+      env: { SQUID_EDITOR_SAVES: "fifo", SQUID_EDITOR_FIFO: "\\\\.\\pipe\\squid-control" },
+    });
+    expect(resolved).toMatchObject({ enabled: true, readerKind: "pipe" });
+  });
+
+  it("normalizes the slash spelling of a pipe endpoint", () => {
+    const resolved = resolveEditorSaveReader({
+      env: { SQUID_EDITOR_SAVES: "fifo", SQUID_EDITOR_FIFO: "//./pipe/squid-control" },
+    });
+    expect(resolved).toMatchObject({ enabled: true, readerKind: "pipe" });
   });
 });

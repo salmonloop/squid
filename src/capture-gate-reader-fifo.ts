@@ -1,6 +1,6 @@
-import { open } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import type { CaptureGateFrame, CaptureGateReaderFactory } from "./capture-gate-source.js";
+import { parsePipeEndpoint, startEndpointLineReader } from "./endpoint-transport.js";
 
 /**
  * Reads gate commands a control script appends, one JSON object per line.
@@ -36,70 +36,17 @@ export interface FifoCaptureGateReaderOptions {
   readonly pollMs?: number;
 }
 
-const DEFAULT_POLL_MS = 250;
-
 export function createFifoCaptureGateReader(
   options: FifoCaptureGateReaderOptions,
 ): CaptureGateReaderFactory {
-  if (!isAbsolute(options.path)) {
-    throw new Error("Capture gate FIFO path must be absolute.");
+  if (parsePipeEndpoint(options.path) === undefined && !isAbsolute(options.path)) {
+    throw new Error("Capture gate FIFO path must be an absolute path or a named pipe (\\\\.\\pipe\\<name>).");
   }
-  const pollMs = options.pollMs ?? DEFAULT_POLL_MS;
-
-  return ({ onFrame, onError }) => {
-    let closed = false;
-    let offset = 0;
-    let carry = "";
-    let reading = false;
-
-    const readAvailable = async (): Promise<void> => {
-      // One read at a time: pause/resume are ordered facts, and interleaved
-      // reads could deliver a resume before the pause it follows.
-      if (reading || closed) return;
-      reading = true;
-      try {
-        const handle = await open(options.path, "r");
-        try {
-          const stats = await handle.stat();
-          if (stats.size < offset) {
-            // Truncated or replaced. Start over rather than reading from a
-            // stale offset, which would slice mid-line and produce garbage.
-            offset = 0;
-            carry = "";
-          }
-          if (stats.size > offset) {
-            const length = stats.size - offset;
-            const buffer = Buffer.alloc(length);
-            const { bytesRead } = await handle.read(buffer, 0, length, offset);
-            offset += bytesRead;
-            carry += buffer.subarray(0, bytesRead).toString("utf8");
-          }
-        } finally {
-          await handle.close();
-        }
-      } catch (error) {
-        // A missing file is the normal state before anything has been written,
-        // so it is not worth reporting on every tick.
-        if (!isMissingFile(error)) {
-          onError(error instanceof Error ? error : new Error(String(error)));
-        }
-        reading = false;
-        return;
-      }
-
-      // Re-checked after the awaits above: a close landing mid-read must not
-      // deliver afterwards.
-      if (closed) {
-        reading = false;
-        return;
-      }
-
-      // Keep any trailing partial line for the next tick: a shell write is not
-      // guaranteed atomic, so a half-written line must not be parsed.
-      const lines = carry.split("\n");
-      carry = lines.pop() ?? "";
-      for (const line of lines) {
-        if (line.trim().length === 0) continue;
+  return ({ onFrame, onError }) =>
+    startEndpointLineReader({
+      path: options.path,
+      ...(options.pollMs !== undefined ? { pollMs: options.pollMs } : {}),
+      onLine: (line) => {
         let frame: CaptureGateFrame | null = null;
         try {
           const parsed = JSON.parse(line) as unknown;
@@ -122,26 +69,14 @@ export function createFifoCaptureGateReader(
         if (frame !== null) {
           onFrame(frame);
         } else {
-          onError(new Error(`Unrecognized capture-gate command at line ${offset}.`));
+          // An unknown op must not be silently ignored: the user believes
+          // they toggled capture, and silence would read as obedience. The
+          // diagnostic names nothing but the line itself, which never reached
+          // a frame.
+          onError(new Error("Unrecognized capture-gate command."));
         }
-      }
-      reading = false;
-    };
-
-    const timer = setInterval(() => void readAvailable(), pollMs);
-    // Read once immediately so a command written before start is honored
-    // without waiting a whole poll interval.
-    void readAvailable();
-
-    return {
-      close: () => {
-        closed = true;
-        clearInterval(timer);
       },
-    };
-  };
+      onError,
+    });
 }
 
-function isMissingFile(error: unknown): boolean {
-  return error instanceof Error && "code" in error && error.code === "ENOENT";
-}

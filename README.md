@@ -244,6 +244,11 @@ against a type that no longer existed and still pass.
   word is user text — `./deploy-to-prod-acme-corp.sh` names a client and
   `psql postgres://user:pw@host/db` is a credential. `succeeded` is derived from the
   exit code rather than trusted, and an unreadable exit code counts as failure.
+- `src/endpoint-transport.ts` — the transport seam the FIFO-shaped readers share:
+  an endpoint names its transport by spelling, POSIX-absolute path or Windows
+  named pipe, and one line-reader call serves either. The pipe dialect exists
+  because `mkfifo` has no Windows equivalent — without it the three
+  FIFO-backed capabilities were unusable on the platform the product ships to.
 - `src/terminal-command-reader-fifo.ts` — reads one JSON completion per line from a path
   a shell hook appends to. A file rather than a wrapper process, so a crashed
   integration cannot take the user's terminal with it. The module doc carries a working
@@ -590,13 +595,17 @@ and stops observers, except the last running observer (the session needs one)
 and the capture gate (which is a pause switch, not a source).
 
 The three FIFO-backed capabilities — capture gate, terminal commands, editor
-saves — each take a backend and the absolute path it reads, and both halves are
+saves — each take a backend and the endpoint path it reads, and both halves are
 rows in the same form. They have to be: each backend offers exactly one value,
 and that value is refused at startup without its path, so a form that offered
 the backend alone could write a setting that stopped the brain from starting —
-and with no brain there is no dump, so no form to undo it in. The path rows are
-judged by POSIX rules on every host, because the config file is written in one
-dialect no matter which platform reads it.
+and with no brain there is no dump, so no form to undo it in. An endpoint names
+its transport by its spelling — a POSIX-absolute path is tailed as an
+append-only file, the Windows named-pipe spelling `\\.\pipe\<name>` is served
+as a pipe listener — and the path rows accept both dialects on every host,
+because the config file is written in one dialect no matter which platform
+reads it. The pipe dialect is what makes the three capabilities exist on
+Windows at all: `mkfifo` has no equivalent there.
 
 You can still run `squid` by hand. Its panel child attaches normally. You can
 also start `squid-ui` with a non-empty `SQUID_PANEL_SOCKET` to attach to a session

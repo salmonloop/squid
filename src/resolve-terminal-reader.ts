@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { parsePipeEndpoint } from "./endpoint-transport.js";
 import { createFifoTerminalCommandReader } from "./terminal-command-reader-fifo.js";
 import type { TerminalCommandReaderFactory } from "./terminal-command-source.js";
 
@@ -19,7 +20,7 @@ export type TerminalReaderResolution =
   | { readonly enabled: false }
   | {
       readonly enabled: true;
-      readonly readerKind: "fifo";
+      readonly readerKind: "file" | "pipe";
       readonly readerFactory: TerminalCommandReaderFactory;
     }
   | { readonly configError: string };
@@ -44,8 +45,9 @@ export function resolveTerminalReader(
       configError: "SQUID_TERMINAL=fifo requires SQUID_TERMINAL_FIFO to name a path.",
     };
   }
-  if (!isAbsolute(path)) {
-    return { configError: "SQUID_TERMINAL_FIFO must be an absolute path." };
+  const pipeEndpoint = parsePipeEndpoint(path);
+  if (pipeEndpoint === undefined && !isAbsolute(path)) {
+    return { configError: "SQUID_TERMINAL_FIFO must be an absolute path or a named pipe (\\\\.\\pipe\\<name>)." };
   }
 
   const rawPollMs = env.SQUID_TERMINAL_POLL_MS;
@@ -58,7 +60,7 @@ export function resolveTerminalReader(
 
   return {
     enabled: true,
-    readerKind: "fifo",
+    readerKind: pipeEndpoint === undefined ? "file" : "pipe",
     readerFactory: createFifoTerminalCommandReader({
       path,
       ...(pollMs === undefined ? {} : { pollMs }),

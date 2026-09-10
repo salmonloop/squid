@@ -3,7 +3,7 @@ import type {
   TerminalCommandFrame,
   TerminalCommandReaderFactory,
 } from "./terminal-command-source.js";
-import { startFifoLineReader } from "./fifo-line-reader.js";
+import { parsePipeEndpoint, startEndpointLineReader } from "./endpoint-transport.js";
 
 /**
  * Reads command completions a shell hook writes, one JSON object per line.
@@ -49,12 +49,12 @@ export interface FifoTerminalCommandReaderOptions {
 export function createFifoTerminalCommandReader(
   options: FifoTerminalCommandReaderOptions,
 ): TerminalCommandReaderFactory {
-  if (!isAbsolute(options.path)) {
-    throw new Error("Terminal command FIFO path must be absolute.");
+  if (parsePipeEndpoint(options.path) === undefined && !isAbsolute(options.path)) {
+    throw new Error("Terminal command FIFO path must be an absolute path or a named pipe (\\\\.\\pipe\\<name>).");
   }
 
   return ({ onFrame, onError }) =>
-    startFifoLineReader({
+    startEndpointLineReader({
       path: options.path,
       ...(options.pollMs !== undefined ? { pollMs: options.pollMs } : {}),
       onLine: (line) => {

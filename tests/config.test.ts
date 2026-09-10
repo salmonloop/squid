@@ -101,16 +101,26 @@ describe("config schema", () => {
     }
   });
 
-  it("judges a FIFO path by POSIX rules on every host", () => {
-    // The config file is written in one dialect, and the resolvers judge
-    // absoluteness with their own POSIX-shaped check. A host-sensitive
-    // `isAbsolute` here would accept `C:\\pipe` on Windows and then watch a
-    // resolver refuse it, moving the error past the form that could fix it.
+  it("judges a source endpoint by one dialect on every host", () => {
+    // The config file is written in one dialect, and the resolvers judge the
+    // endpoint with their own spelling check: POSIX-absolute, or the Windows
+    // named-pipe spelling `\\.\pipe\<name>`. A host-sensitive `isAbsolute`
+    // here would accept `C:\\pipe` on Windows and then watch a resolver refuse
+    // it, moving the error past the form that could fix it.
+    //
+    // The pipe spelling is accepted *because the resolvers now read it* —
+    // `mkfifo` has no Windows equivalent, so without the pipe dialect the
+    // only enum value these paths pair with would be unusable there, the
+    // trap the enum/path pairing test above exists to prevent.
     for (const id of ["captureGatePath", "terminalPath", "editorSavesPath"] as const) {
       const key = configKeyById(id)!;
       expect(key.validate("/run/squid/gate")).toEqual({ ok: true });
+      expect(key.validate("\\\\.\\pipe\\squid-gate")).toEqual({ ok: true });
+      expect(key.validate("//./pipe/squid-gate")).toEqual({ ok: true });
       expect(key.validate("gate.fifo").ok).toBe(false);
       expect(key.validate("./gate.fifo").ok).toBe(false);
+      // A drive spelling is a path, not the pipe spelling; the resolvers
+      // treat it as relative and the form must not diverge from them.
       expect(key.validate("C:\\pipe\\gate").ok).toBe(false);
       // Same whitespace rule as every other text row: a pasted newline is a
       // different path, and the file layer refuses rather than trims.

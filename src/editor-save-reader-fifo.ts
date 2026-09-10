@@ -3,7 +3,7 @@ import type {
   EditorSaveFrame,
   EditorSaveReaderFactory,
 } from "./editor-save-source.js";
-import { startFifoLineReader } from "./fifo-line-reader.js";
+import { parsePipeEndpoint, startEndpointLineReader } from "./endpoint-transport.js";
 
 /**
  * Reads save reports an editor extension writes, one JSON object per line.
@@ -60,12 +60,12 @@ export interface FifoEditorSaveReaderOptions {
 export function createFifoEditorSaveReader(
   options: FifoEditorSaveReaderOptions,
 ): EditorSaveReaderFactory {
-  if (!isAbsolute(options.path)) {
-    throw new Error("Editor save FIFO path must be absolute.");
+  if (parsePipeEndpoint(options.path) === undefined && !isAbsolute(options.path)) {
+    throw new Error("Editor save FIFO path must be an absolute path or a named pipe (\\\\.\\pipe\\<name>).");
   }
 
   return ({ onFrame, onError }) =>
-    startFifoLineReader({
+    startEndpointLineReader({
       path: options.path,
       ...(options.pollMs !== undefined ? { pollMs: options.pollMs } : {}),
       onLine: (line) => {
