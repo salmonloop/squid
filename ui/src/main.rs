@@ -1078,6 +1078,9 @@ fn clear_prompt(window: PanelWindow) {
 }
 
 #[cfg(test)]
+mod panel_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{config_verdict, dump_note, source_verdict, tray_mark, tray_tooltip, version_line};
     use crate::protocol::{ConfigResultLine, SourceResultLine};
