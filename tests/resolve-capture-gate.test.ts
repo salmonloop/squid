@@ -14,7 +14,10 @@ describe("resolveCaptureGate", () => {
     const resolved = resolveCaptureGate({
       env: { SQUID_CONTROL: "fifo", SQUID_CONTROL_FIFO: "/tmp/control.fifo" },
     });
-    expect(resolved).toMatchObject({ enabled: true, readerKind: "fifo" });
+    // A POSIX-absolute path names the file transport, and the resolution says
+    // so — the wire string changed from the static "fifo" to the transport the
+    // endpoint spelling selected, and this is the pin that keeps it honest.
+    expect(resolved).toMatchObject({ enabled: true, readerKind: "file" });
   });
 
   it("rejects a near-miss value as a config error rather than defaulting", () => {
@@ -52,5 +55,22 @@ describe("resolveCaptureGate", () => {
   it("ignores a poll interval when the gate is off", () => {
     const resolved = resolveCaptureGate({ env: { SQUID_CONTROL_POLL_MS: "bogus" } });
     expect(resolved).toEqual({ enabled: false });
+  });
+
+  it("serves a named-pipe endpoint with the pipe transport", () => {
+    // The Windows dialect: mkfifo does not exist there, so the pipe spelling is
+    // the only endpoint a Windows run can create. The spelling selects the
+    // transport, and the resolution reports which one it got.
+    const resolved = resolveCaptureGate({
+      env: { SQUID_CONTROL: "fifo", SQUID_CONTROL_FIFO: "\\\\.\\pipe\\squid-control" },
+    });
+    expect(resolved).toMatchObject({ enabled: true, readerKind: "pipe" });
+  });
+
+  it("normalizes the slash spelling of a pipe endpoint", () => {
+    const resolved = resolveCaptureGate({
+      env: { SQUID_CONTROL: "fifo", SQUID_CONTROL_FIFO: "//./pipe/squid-control" },
+    });
+    expect(resolved).toMatchObject({ enabled: true, readerKind: "pipe" });
   });
 });

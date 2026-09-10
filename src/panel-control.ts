@@ -1,4 +1,5 @@
 import { appendFile } from "node:fs/promises";
+import { parsePipeEndpoint } from "./endpoint-transport.js";
 
 /**
  * The panel's write end of the capture-gate command path.
@@ -40,8 +41,30 @@ export async function appendGateCommand(
   commandPath: string,
   op: GateCommandOp,
 ): Promise<void> {
-  // One write of one complete line. A FIFO or append-only file gives no
-  // atomicity guarantee across writes, so the newline must ride along with the
-  // object rather than arriving as a second call the reader could interleave.
-  await appendFile(commandPath, `${JSON.stringify({ op })}\n`, "utf8");
+  const line = `${JSON.stringify({ op })}\n`;
+
+  const pipeEndpoint = parsePipeEndpoint(commandPath);
+  if (pipeEndpoint !== undefined) {
+    // The pipe dialect: one connection is the whole write — connect, send
+    // the one framed line, close. The connection may outlive this function by
+    // a tick; the line has already landed in the listener by then, and a
+    // leaked unclosed socket would be the bug (Bun's GC-close errors bite).
+    const socket = await Bun.connect({
+      unix: pipeEndpoint,
+      socket: {
+        data: () => undefined,
+        close: () => undefined,
+        error: () => undefined,
+      },
+    });
+    socket.write(line);
+    socket.end();
+    return;
+  }
+
+  // The file dialect, unchanged: one write of one complete line. A FIFO or
+  // append-only file gives no atomicity guarantee across writes, so the
+  // newline must ride along with the object rather than arriving as a second
+  // call the reader could interleave.
+  await appendFile(commandPath, line, "utf8");
 }
