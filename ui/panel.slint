@@ -1,13 +1,13 @@
 import { Button, ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { SourceRow, SettingRow } from "model.slint";
+import { SourceRow, SettingRow, LlmLogRow } from "model.slint";
 import { StatusSummary } from "status.slint";
 import { SourceCard } from "source-card.slint";
 import { SettingEditor } from "settings.slint";
 import { ConfirmationCard, DeferredNotice } from "confirmation.slint";
 
 // Re-exported for the generated Rust bindings, which build these rows.
-export { SourceRow, SettingRow }
+export { SourceRow, SettingRow, LlmLogRow }
 
 // The tray lives in its own file and is re-exported here because `build.rs`
 // compiles this one document: a component the root file does not export is not
@@ -123,6 +123,8 @@ export component PanelWindow inherits Window {
     callback save-setting(string, string);
     callback refresh();
     in property <string> status;
+    in property <[LlmLogRow]> llm-logs;
+    callback request-llm-logs();
     in property <bool> prompt-pending;
     in property <string> prompt-kind;
     in property <string> prompt-summary;
@@ -427,6 +429,99 @@ export component PanelWindow inherits Window {
                                 value: root.turns-excluded + " excluded, "
                                     + root.turns-duplicate + " duplicate, "
                                     + root.turns-coalesced + " joined a running thought";
+                            }
+                        }
+                    }
+                }
+
+                // LLM requests — debug viewer for model API calls
+                VerticalLayout {
+                    spacing: Theme.gap;
+                    Heading { text: "LLM requests"; }
+
+                    if root.llm-logs.length == 0: Text {
+                        text: "No LLM requests have been made yet.";
+                        color: Theme.text-muted;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+
+                    for entry in root.llm-logs: Rectangle {
+                        background: Theme.surface;
+                        border-radius: Theme.radius;
+                        border-width: 1px;
+                        border-color: entry.outcome == "error" ? Theme.danger
+                                    : entry.outcome == "pending" ? Theme.caution
+                                    : Theme.line;
+                        VerticalLayout {
+                            padding: Theme.pad;
+                            spacing: Theme.gap-tight;
+                            HorizontalLayout {
+                                spacing: Theme.gap;
+                                Text {
+                                    text: entry.outcome == "pending" ? "Pending"
+                                        : entry.outcome == "ok" ? "OK"
+                                        : "Error";
+                                    color: entry.outcome == "pending" ? Theme.caution
+                                        : entry.outcome == "ok" ? Theme.calm
+                                        : Theme.danger;
+                                    font-size: 12px;
+                                    font-weight: 700;
+                                    width: 54px;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: entry.model == "" ? "default model" : entry.model;
+                                    color: Theme.text;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: entry.outcome == "pending" ? "in flight…"
+                                        : entry.duration-ms > 0 ? entry.duration-ms + "ms"
+                                        : "";
+                                    color: Theme.text-muted;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: Theme.gap;
+                                Text {
+                                    text: entry.message-count > 0
+                                        ? entry.message-count + " msgs"
+                                        : "";
+                                    color: Theme.text-muted;
+                                    font-size: 12px;
+                                    width: Theme.label-column;
+                                }
+                                Text {
+                                    text: entry.prompt-chars > 0
+                                        ? "~" + entry.prompt-chars + " chars"
+                                        : "";
+                                    color: Theme.text-muted;
+                                    font-size: 12px;
+                                    horizontal-stretch: 1;
+                                }
+                                if entry.http-status > 0: Text {
+                                    text: "HTTP " + entry.http-status;
+                                    color: entry.http-status >= 400 ? Theme.danger : Theme.calm;
+                                    font-size: 12px;
+                                    font-weight: 600;
+                                }
+                            }
+                            Text {
+                                text: entry.requested-at;
+                                color: Theme.text-muted;
+                                font-size: 11px;
+                            }
+                            if entry.error != "": Text {
+                                text: entry.error;
+                                color: Theme.danger;
+                                font-size: 12px;
+                                wrap: word-wrap;
                             }
                         }
                     }

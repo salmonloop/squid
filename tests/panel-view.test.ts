@@ -7,6 +7,7 @@ import {
   panelConfigLine,
   panelConfigResult,
   panelLine,
+  panelLlmLogLine,
   panelServiceLine,
   panelSourceLine,
   panelWorldState,
@@ -665,5 +666,58 @@ describe("panelSourceLine", () => {
       detail: "bad\u0007 title\u0007",
     });
     expect(line.detail).not.toContain("\u0007");
+  });
+});
+
+describe("panelLlmLogLine", () => {
+  it("formats a pending request line with flat scalar fields", () => {
+    const line = panelLlmLogLine({
+      id: 1,
+      requestedAt: "2026-09-14T12:00:00.000Z",
+      model: "deepseek-v4-flash",
+      messageCount: 5,
+      promptChars: 1200,
+      outcome: "pending",
+    });
+    expect(line).toEqual({
+      type: "llm_log",
+      id: 1,
+      requestedAt: "2026-09-14T12:00:00.000Z",
+      model: "deepseek-v4-flash",
+      messageCount: 5,
+      promptChars: 1200,
+      outcome: "pending",
+    });
+    expect(panelLine(line)).toBe(
+      '{"type":"llm_log","id":1,"requestedAt":"2026-09-14T12:00:00.000Z","model":"deepseek-v4-flash","messageCount":5,"promptChars":1200,"outcome":"pending"}\n',
+    );
+  });
+
+  it("formats a completed response line with duration and status", () => {
+    const line = panelLlmLogLine({
+      id: 1,
+      requestedAt: "2026-09-14T12:00:00.000Z",
+      respondedAt: "2026-09-14T12:00:02.500Z",
+      model: "deepseek-v4-flash",
+      httpStatus: 200,
+      durationMs: 2500,
+      outcome: "ok",
+    });
+    expect(line.respondedAt).toBe("2026-09-14T12:00:02.500Z");
+    expect(line.httpStatus).toBe(200);
+    expect(line.durationMs).toBe(2500);
+    expect(line.outcome).toBe("ok");
+  });
+
+  it("sanitizes model and error strings as diagnostics", () => {
+    const line = panelLlmLogLine({
+      id: 2,
+      requestedAt: "2026-09-14T12:00:00.000Z",
+      model: "model\u0007bad",
+      error: "Error\u001b[31m message",
+      outcome: "error",
+    });
+    expect(line.model).not.toContain("\u0007");
+    expect(line.error).not.toContain("\u001b");
   });
 });

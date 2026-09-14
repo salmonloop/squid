@@ -55,3 +55,23 @@ export struct SettingRow {
     // form must not turn it back into a claim that the user never set a key.
     secret-present: bool,
 }
+
+// One LLM request log entry for the debug viewer. Every field is a flat
+// scalar — no nesting, no arrays — because it rides the same wire and the
+// same hand parser as everything else. Default-zero integers mean "not
+// reported yet" (a pending request has no duration), not "measured as zero".
+export struct LlmLogRow {
+    id: int,
+    requested-at: string,
+    responded-at: string,
+    model: string,
+    message-count: int,
+    prompt-chars: int,
+    http-status: int,
+    duration-ms: int,
+    // "pending" | "ok" | "error". Kept as the string the brain sent, like
+    // every other enum the panel renders — so this side does not need a list
+    // of outcomes to go stale against the brain's.
+    outcome: string,
+    error: string,
+}

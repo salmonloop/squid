@@ -244,6 +244,31 @@ export interface PanelSourceResult {
   readonly error?: string;
 }
 
+/**
+ * One LLM request log entry for the debug viewer.
+ *
+ * Sent twice per request: once with `outcome: "pending"` when the request
+ * fires, and once with `"ok"` or `"error"` when the response arrives. The
+ * `id` correlates the two: the panel upserts the pending row in place.
+ *
+ * Privacy: metadata only — model, message count, payload size, HTTP status,
+ * duration. No message content, no API keys, no response bodies. The same
+ * sanitizer every other wire string takes.
+ */
+export interface PanelLlmLogLine {
+  readonly type: "llm_log";
+  readonly id: number;
+  readonly requestedAt: string;
+  readonly respondedAt?: string;
+  readonly model?: string;
+  readonly messageCount?: number;
+  readonly promptChars?: number;
+  readonly httpStatus?: number;
+  readonly durationMs?: number;
+  readonly outcome: string;
+  readonly error?: string;
+}
+
 export type PanelMessage =
   | PanelWorldState
   | PanelAgentLine
@@ -257,7 +282,8 @@ export type PanelMessage =
   | PanelConfigResult
   | PanelSourceLine
   | PanelSourceEnd
-  | PanelSourceResult;
+  | PanelSourceResult
+  | PanelLlmLogLine;
 
 /**
  * Projects the world state into the panel's view of it.
@@ -506,6 +532,37 @@ export function panelSourceResult(result: {
     ...(result.requestId === undefined ? {} : { requestId: sanitizeAuditText(result.requestId, "diagnostic").text }),
     ok: result.ok ? 1 : 0,
     ...(result.error === undefined ? {} : { error: sanitizeAuditText(result.error, "diagnostic").text }),
+  };
+}
+
+/**
+ * Builds one LLM request log wire line. Sanitizes model and error strings
+ * as diagnostics so untrusted model strings cannot smuggle control characters.
+ */
+export function panelLlmLogLine(entry: {
+  readonly id: number;
+  readonly requestedAt: string;
+  readonly respondedAt?: string;
+  readonly model?: string;
+  readonly messageCount?: number;
+  readonly promptChars?: number;
+  readonly httpStatus?: number;
+  readonly durationMs?: number;
+  readonly outcome: string;
+  readonly error?: string;
+}): PanelLlmLogLine {
+  return {
+    type: "llm_log",
+    id: entry.id,
+    requestedAt: entry.requestedAt,
+    ...(entry.respondedAt === undefined ? {} : { respondedAt: entry.respondedAt }),
+    ...(entry.model === undefined ? {} : { model: sanitizeAuditText(entry.model, "diagnostic").text }),
+    ...(entry.messageCount === undefined ? {} : { messageCount: entry.messageCount }),
+    ...(entry.promptChars === undefined ? {} : { promptChars: entry.promptChars }),
+    ...(entry.httpStatus === undefined ? {} : { httpStatus: entry.httpStatus }),
+    ...(entry.durationMs === undefined ? {} : { durationMs: entry.durationMs }),
+    outcome: entry.outcome,
+    ...(entry.error === undefined ? {} : { error: sanitizeAuditText(entry.error, "diagnostic").text }),
   };
 }
 

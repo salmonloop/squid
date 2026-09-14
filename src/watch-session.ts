@@ -41,6 +41,7 @@ import {
   panelConfigEnd,
   panelConfigLine,
   panelConfigResult,
+  panelLlmLogLine,
   panelServiceLine,
   panelSourceEnd,
   panelSourceLine,
@@ -50,6 +51,7 @@ import {
 } from "./panel-view.js";
 import { heartbeatExtension, type HeartbeatSink } from "./heartbeat-extension.js";
 import { appendGateCommand } from "./panel-control.js";
+import { llmLogExtension, type LlmLogEntry } from "./llm-log-extension.js";
 
 /**
  * The whole watch pipeline minus the sources: store and runtime construction,
@@ -324,18 +326,31 @@ export async function startWatchSession(
   };
 
   /**
-   * Builds the agent. Extracted from the eager path so the same recipe serves
-   * needs_config recovery: a panel set saving the missing model configuration
-   * starts the agent in-session rather than demanding a process restart.
-   *
-   * The heartbeat extension rides in with the agent's own extensions: Pi emits
-   * `turn_start`/`turn_end` for every turn it runs — including turns this
-   * module did not ask for — and the sink turns those edges into the panel's
-   * "is it thinking" line. The server is read through a ref because the panel
-   * starts after the agent, and a closure over `panelServer` at build time
-   * would freeze `undefined` for the eager path.
+   * The heartbeat and LLM log extensions ride in with the agent's own extensions.
+   * The server is read through a ref because the panel starts after the agent,
+   * and a closure over `panelServer` at build time would freeze `undefined` for
+   * the eager path.
    */
   const panelServerRef: { server: PanelServer | undefined } = { server: undefined };
+
+  /**
+   * In-memory ring buffer of the most recent LLM requests for the debug viewer.
+   * Capped so long-running sessions don't leak memory.
+   */
+  const LLM_LOG_RING_SIZE = 50;
+  const llmLogRing: LlmLogEntry[] = [];
+
+  const llmLogExt = llmLogExtension((entry) => {
+    const existing = llmLogRing.findIndex((e) => e.id === entry.id);
+    if (existing >= 0) {
+      llmLogRing[existing] = entry;
+    } else {
+      if (llmLogRing.length >= LLM_LOG_RING_SIZE) llmLogRing.shift();
+      llmLogRing.push(entry);
+    }
+    panelServerRef.server?.broadcast(panelLlmLogLine(entry));
+  });
+
   const heartbeatSink: HeartbeatSink = {
     turnStarted: () => panelServerRef.server?.broadcast(panelAgentThinking(true)),
     turnEnded: () => panelServerRef.server?.broadcast(panelAgentThinking(false)),
@@ -349,7 +364,7 @@ export async function startWatchSession(
       // one custom tool per store-backed query, executed in Pi's sandbox and
       // recorded in the session history like every other action.
       customTools: agentCustomTools(watch.store),
-      extensionFactories: [heartbeatExtension(heartbeatSink)],
+      extensionFactories: [heartbeatExtension(heartbeatSink), llmLogExt],
       ...(options.createAgentSession !== undefined
         ? { createSession: options.createAgentSession }
         : {}),
@@ -575,6 +590,11 @@ export async function startWatchSession(
             },
           );
         },
+        onLlmLogGet: () => {
+          for (const entry of llmLogRing) {
+            panelServer?.broadcast(panelLlmLogLine(entry));
+          }
+        },
         onSubscribe: () => {
           // Standing state, replayed per subscriber rather than broadcast once:
           // broadcast reaches only whoever is registered at that instant, and
@@ -598,6 +618,9 @@ export async function startWatchSession(
           // anything. A fresh session sends the all-zero line, which is itself
           // information — nothing has been seen yet, not "the counts are lost".
           panelServer?.broadcast(panelAgentTriggers(triggers));
+          for (const entry of llmLogRing) {
+            panelServer?.broadcast(panelLlmLogLine(entry));
+          }
         },
       });
     } catch (error) {
