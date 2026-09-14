@@ -70,6 +70,19 @@ pub enum Incoming {
     AgentThinking {
         thinking: bool,
     },
+    /// The trigger ledger: how many turns the agent was asked for, and where
+    /// every event since went. Counts of decisions made, not scores — the
+    /// brain deliberately has no confidence numbers to send, and this line is
+    /// the arithmetically true answer to "is it doing anything".
+    AgentTriggers {
+        triggered: i64,
+        excluded: i64,
+        duplicate: i64,
+        coalesced: i64,
+        /// Where the newest event went. Optional because before any event
+        /// there is nothing to attribute.
+        last: Option<String>,
+    },
     /// One settings row. The schema rides on the wire (`kind`, `label`,
     /// `applies`, enum `values`), so this side holds no key names and renders
     /// every row the same generic way — a key hardcoded here would be a second
@@ -282,6 +295,13 @@ pub fn parse_incoming(line: &str) -> Option<Incoming> {
         }),
         "agent_thinking" => Some(Incoming::AgentThinking {
             thinking: flag_field(&fields, "thinking")? == 1,
+        }),
+        "agent_triggers" => Some(Incoming::AgentTriggers {
+            triggered: int_field(&fields, "triggered")?,
+            excluded: int_field(&fields, "excluded")?,
+            duplicate: int_field(&fields, "duplicate")?,
+            coalesced: int_field(&fields, "coalesced")?,
+            last: optional_text_field(&fields, "last"),
         }),
         "config" => Some(Incoming::Config(ConfigLine {
             id: text_field(&fields, "id")?,
@@ -1151,6 +1171,57 @@ mod tests {
         assert_eq!(parse_incoming("{\"type\":\"agent_thinking\",\"thinking\":2}"), None);
         // Nothing to default to: a thinking line with no flag says nothing.
         assert_eq!(parse_incoming("{\"type\":\"agent_thinking\"}"), None);
+    }
+
+    #[test]
+    fn parses_an_agent_triggers_line() {
+        assert_eq!(
+            parse_incoming(
+                "{\"type\":\"agent_triggers\",\"triggered\":3,\"excluded\":1,\"duplicate\":2,\"coalesced\":0,\"last\":\"duplicate\"}"
+            ),
+            Some(Incoming::AgentTriggers {
+                triggered: 3,
+                excluded: 1,
+                duplicate: 2,
+                coalesced: 0,
+                last: Some("duplicate".to_owned()),
+            })
+        );
+        // Before the first event there is no `last` to attribute: absent, not
+        // null, and the all-zero counts still parse.
+        assert_eq!(
+            parse_incoming(
+                "{\"type\":\"agent_triggers\",\"triggered\":0,\"excluded\":0,\"duplicate\":0,\"coalesced\":0}"
+            ),
+            Some(Incoming::AgentTriggers {
+                triggered: 0,
+                excluded: 0,
+                duplicate: 0,
+                coalesced: 0,
+                last: None,
+            })
+        );
+        // The counts are required — a line that cannot say how much of what
+        // happened says nothing, and half a ledger is worse than none.
+        assert_eq!(
+            parse_incoming("{\"type\":\"agent_triggers\",\"triggered\":1,\"excluded\":0,\"duplicate\":0}"),
+            None
+        );
+        // `last` stays a string this side never folds onto a local enum, like
+        // the service state: a token this build has not met reaches the window
+        // as itself.
+        assert_eq!(
+            parse_incoming(
+                "{\"type\":\"agent_triggers\",\"triggered\":1,\"excluded\":0,\"duplicate\":0,\"coalesced\":0,\"last\":\"invented\"}"
+            ),
+            Some(Incoming::AgentTriggers {
+                triggered: 1,
+                excluded: 0,
+                duplicate: 0,
+                coalesced: 0,
+                last: Some("invented".to_owned()),
+            })
+        );
     }
 
     #[test]

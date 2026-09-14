@@ -1056,6 +1056,68 @@ describe("the control panel on a watch session", () => {
     }
   });
 
+  /**
+   * The ledger behind the panel's "why has it not moved" question. Each event
+   * lands on exactly one line, written at the gate that stopped it — the test
+   * asserts the attribution, not just the totals, because a run where every
+   * event is attributed to the wrong gate would still add up.
+   */
+  it("attributes every event to the gate that handled it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+    const socketPath = panelEndpoint(dir);
+    const source = new ScriptedSource("alpha", []);
+    const { result } = await startSession({
+      sources: [source],
+      env: { SQUID_PANEL_SOCKET: socketPath },
+    });
+    if ("configError" in result) throw new Error(result.configError);
+    try {
+      const client = new PanelTestClient(socketPath);
+      await client.ready();
+      // The subscribe replay carries the all-zero ledger: nothing seen yet is
+      // itself information, not a lost count.
+      const zero = await waitForLine(() =>
+        client.lines.map(parsePanelLine).find((p) => p.type === "agent_triggers"),
+      );
+      expect(zero.last).toBeUndefined();
+
+      await source.emit!(fileSavedAt("fs-1", "2026-09-14T10:00:00.000Z"));
+      const first = await waitForLine(() =>
+        client.lines
+          .map(parsePanelLine)
+          .find((p) => p.type === "agent_triggers" && p.triggered === 1),
+      );
+      expect(first.last).toBe("triggered");
+
+      // The same save reported again — a fresh event id, but the same
+      // source-local identity (same sequence, same instant), so the chronicle
+      // reads it as the same fact arriving twice: duplicate, no further turn.
+      await source.emit!(
+        createActivityEvent({
+          kind: "file_saved",
+          eventId: "fs-2",
+          source: { kind: "filesystem", instanceId: "fs-1" },
+          sessionId: "fs-session",
+          sequence: 0,
+          occurredAt: "2026-09-14T10:00:00.000Z",
+          payload: { path: "src/ancient.test.ts", applicationId: null },
+        }),
+      );
+      const second = await waitForLine(() =>
+        client.lines
+          .map(parsePanelLine)
+          .find((p) => p.type === "agent_triggers" && p.duplicate === 1),
+      );
+      expect(second.last).toBe("duplicate");
+      expect(second.triggered).toBe(1);
+
+      await client.close();
+    } finally {
+      await result.session.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("announces a replied agent turn on the panel", async () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
     const socketPath = panelEndpoint(dir);

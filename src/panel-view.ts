@@ -81,6 +81,58 @@ export function panelAgentThinking(thinking: boolean): PanelAgentThinking {
   return { type: "agent_thinking", thinking: thinking ? 1 : 0 };
 }
 
+/**
+ * Which gate an event stopped at, as a token rather than a sentence. The panel
+ * owns the wording; the brain only says which of its own gates it was. The
+ * vocabulary is the ingest path's own decision points, nothing invented here.
+ */
+export type TriggerDisposition = "triggered" | "excluded" | "duplicate" | "no_agent" | "coalesced";
+
+/**
+ * The trigger ledger: how many times the agent was actually asked to think,
+ * and where every event since has gone.
+ *
+ * These are counts of what happened, not scores of what might — the architecture
+ * deleted confidence numbers because a stochastic proposer's numbers cannot be
+ * trusted to rank anything, and nothing here ranks anything. `triggered` counts
+ * turns; the other three count events that reached a gate and stopped there.
+ *
+ * `last` says where the most recent event went, so a silent panel is readable:
+ * "it is not that nothing is happening — the last event repeated what was
+ * already seen." Absent before the first event, because no gate has been met
+ * and there is nothing to attribute.
+ */
+export interface PanelAgentTriggers {
+  readonly type: "agent_triggers";
+  readonly triggered: number;
+  readonly excluded: number;
+  readonly duplicate: number;
+  readonly coalesced: number;
+  readonly last?: TriggerDisposition;
+}
+
+/**
+ * Builds the ledger line. All integers and fixed tokens — no free text, no
+ * sanitizer needed. `last` may be `undefined` because that is the pre-first-
+ * event state; it is omitted on the wire rather than sent as `null`.
+ */
+export function panelAgentTriggers(counts: {
+  readonly triggered: number;
+  readonly excluded: number;
+  readonly duplicate: number;
+  readonly coalesced: number;
+  readonly last: TriggerDisposition | undefined;
+}): PanelAgentTriggers {
+  return {
+    type: "agent_triggers",
+    triggered: counts.triggered,
+    excluded: counts.excluded,
+    duplicate: counts.duplicate,
+    coalesced: counts.coalesced,
+    ...(counts.last === undefined ? {} : { last: counts.last }),
+  };
+}
+
 /** The kinds a settings form can render; `secret` renders masked and never echoes. */
 export type PanelConfigKind = "text" | "int" | "enum" | "secret";
 
@@ -197,6 +249,7 @@ export type PanelMessage =
   | PanelAgentLine
   | PanelServiceLine
   | PanelAgentThinking
+  | PanelAgentTriggers
   | PanelConfirmationPrompt
   | PanelConfirmationCancel
   | PanelConfigLine

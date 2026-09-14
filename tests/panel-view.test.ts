@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
   panelAgentLine,
   panelAgentThinking,
+  panelAgentTriggers,
   panelConfigEnd,
   panelConfigLine,
   panelConfigResult,
@@ -358,6 +359,56 @@ describe("panelAgentThinking", () => {
 
   it("carries nothing but the flag — the line is one bit wide", () => {
     expect(Object.keys(panelAgentThinking(true))).toEqual(["type", "thinking"]);
+  });
+});
+
+describe("panelAgentTriggers", () => {
+  it("counts what happened, never scores", () => {
+    const line = panelAgentTriggers({
+      triggered: 3,
+      excluded: 1,
+      duplicate: 2,
+      coalesced: 0,
+      last: "duplicate",
+    });
+    expect(line).toEqual({
+      type: "agent_triggers",
+      triggered: 3,
+      excluded: 1,
+      duplicate: 2,
+      coalesced: 0,
+      last: "duplicate",
+    });
+  });
+
+  it("omits last before any event, per the wire's absence rule", () => {
+    const line = panelAgentTriggers({
+      triggered: 0,
+      excluded: 0,
+      duplicate: 0,
+      coalesced: 0,
+      last: undefined,
+    });
+    expect("last" in line).toBe(false);
+    expect("last" in JSON.parse(panelLine(line))).toBe(false);
+  });
+
+  it("carries only the four counts and the disposition token", () => {
+    const line = panelAgentTriggers({
+      triggered: 1,
+      excluded: 0,
+      duplicate: 0,
+      coalesced: 0,
+      last: "triggered",
+    });
+    expect(Object.keys(line)).toEqual([
+      "type",
+      "triggered",
+      "excluded",
+      "duplicate",
+      "coalesced",
+      "last",
+    ]);
   });
 });
 
