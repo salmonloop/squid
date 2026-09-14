@@ -86,6 +86,14 @@ export component PanelWindow inherits Window {
     // A turn is in flight right now, from the brain's own turn edges. The
     // answer to "is it alive", one heartbeat wide.
     in property <bool> agent-thinking;
+    // The trigger ledger: counts of turns asked and events gated, plus where
+    // the newest event went. Counts, never scores — the brain has no confidence
+    // numbers, by design, and this window must not invent any.
+    in property <int> turns-triggered: -1;
+    in property <int> turns-excluded: -1;
+    in property <int> turns-duplicate: -1;
+    in property <int> turns-coalesced: -1;
+    in property <string> last-disposition;
     callback pause();
     callback resume();
     in property <string> agent-state;
@@ -388,6 +396,37 @@ export component PanelWindow inherits Window {
                                 wrap: word-wrap;
                                 max-height: 84px;
                                 overflow: elide;
+                            }
+                            // The trigger ledger. Counts of what the agent's gates
+                            // did, and where the newest event went — the answer to
+                            // "is it doing anything" that a quiet window otherwise
+                            // leaves the reader to guess at. The dispositions are
+                            // the brain's own gate tokens; this side only translates
+                            // them, and one it has not met reads as itself.
+                            if root.turns-triggered >= 0: EvidenceRow {
+                                label: "Thoughts";
+                                value: root.turns-triggered + " asked of it"
+                                    + (root.last-disposition == "" ? ""
+                                        : "; latest event " + (root.last-disposition == "triggered"
+                                            ? "started one"
+                                            : root.last-disposition == "excluded"
+                                                ? "was kept out on purpose"
+                                                : root.last-disposition == "duplicate"
+                                                    ? "repeated what was already seen"
+                                                    : root.last-disposition == "coalesced"
+                                                        ? "joined the thought already running"
+                                                        : root.last-disposition == "no_agent"
+                                                            ? "waited for a model to be configured"
+                                                            : root.last-disposition));
+                            }
+                            // The gated events behind the counts, so the number a
+                            // skeptical reader distrusts can be checked against the
+                            // dispositions that produced it.
+                            if root.turns-excluded + root.turns-duplicate + root.turns-coalesced > 0: EvidenceRow {
+                                label: "Held back";
+                                value: root.turns-excluded + " excluded, "
+                                    + root.turns-duplicate + " duplicate, "
+                                    + root.turns-coalesced + " joined a running thought";
                             }
                         }
                     }

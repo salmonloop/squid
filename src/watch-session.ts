@@ -37,6 +37,7 @@ import { PanelConfirmationSurface } from "./panel-confirmation-surface.js";
 import {
   panelAgentLine,
   panelAgentThinking,
+  panelAgentTriggers,
   panelConfigEnd,
   panelConfigLine,
   panelConfigResult,
@@ -45,6 +46,7 @@ import {
   panelSourceLine,
   panelSourceResult,
   panelWorldState,
+  type TriggerDisposition,
 } from "./panel-view.js";
 import { heartbeatExtension, type HeartbeatSink } from "./heartbeat-extension.js";
 import { appendGateCommand } from "./panel-control.js";
@@ -591,6 +593,11 @@ export async function startWatchSession(
           // while a thought is in flight, and silence is what it was showing
           // before — the exact anxiety this line exists to remove.
           panelServer?.broadcast(panelAgentThinking(turnRunning));
+          // The ledger, replayed for the same reason: totals the panel cannot
+          // reconstruct and a `last` that says why the newest event did not move
+          // anything. A fresh session sends the all-zero line, which is itself
+          // information — nothing has been seen yet, not "the counts are lost".
+          panelServer?.broadcast(panelAgentTriggers(triggers));
         },
       });
     } catch (error) {
@@ -809,6 +816,43 @@ export async function startWatchSession(
   }
 
   /**
+   * The trigger ledger: what happened to the events the sensors produced.
+   *
+   * Counts of decisions already made, never scores of decisions pending — the
+   * architecture deleted confidence numbers because a stochastic proposer's
+   * numbers could not be trusted to rank anything, and nothing here ranks. What
+   * a count answers is the question a silent panel raises: "is it doing
+   * anything at all?" — and the answer is arithmetically true by construction,
+   * because each line is written at the gate that produced it.
+   *
+   * `last` carries where the newest event went, because the totals alone cannot
+   * say why nothing has moved *recently*: a run where the world is quiet and a
+   * run where every event is a duplicate of its predecessor read the same from
+   * the counts alone.
+   */
+  const triggers: {
+    triggered: number;
+    excluded: number;
+    duplicate: number;
+    coalesced: number;
+    last: TriggerDisposition | undefined;
+  } = {
+    triggered: 0,
+    excluded: 0,
+    duplicate: 0,
+    coalesced: 0,
+    last: undefined,
+  };
+  const announceTriggers = (disposition: TriggerDisposition): void => {
+    // `no_agent` is counted only in `last`: the service line already carries
+    // the standing fact it names, and a second spelling of it on this line
+    // would be a count the header outranks.
+    if (disposition !== "no_agent") triggers[disposition] += 1;
+    triggers.last = disposition;
+    panelServerRef.server?.broadcast(panelAgentTriggers(triggers));
+  };
+
+  /**
    * The closed loop, in three lines: capture and project, hand the projection to
    * the agent's senses, let it think.
    *
@@ -824,6 +868,7 @@ export async function startWatchSession(
     // more — naming the event would record what the user asked to hide.
     if (result.ingest === null) {
       log(JSON.stringify({ kind: event.kind, disposition: "excluded" }));
+      announceTriggers("excluded");
       return;
     }
     const ingested = result as PredictionRuntimeIngestResult & {
@@ -835,11 +880,22 @@ export async function startWatchSession(
     lastState = ingested.ingest.state;
     // A duplicate changed nothing about the world, so there is nothing new for
     // the agent to see and no reason to spend a turn on it.
-    if (ingested.ingest.disposition === "duplicate") return;
+    if (ingested.ingest.disposition === "duplicate") {
+      announceTriggers("duplicate");
+      return;
+    }
     // Headless mode has no agent tail: nothing to observe into, nothing to
     // prompt. The projection below still runs — the world keeps being seen;
     // only the thinking about it waits.
-    if (agent !== undefined) await agent.observe(ingested.ingest.state);
+    if (agent === undefined) {
+      announceTriggers("no_agent");
+      const panelMessage = panelWorldState(ingested.ingest.state);
+      if (panelServer !== undefined && panelMessage !== null) {
+        panelServer.broadcast(panelMessage);
+      }
+      return;
+    }
+    await agent.observe(ingested.ingest.state);
     // The panel reads the same projection the senses do — one view of the world,
     // two windows onto it. `panelWorldState` returns null when there is nothing
     // to report, and a null is skipped rather than sent: the wire format has no
@@ -848,6 +904,12 @@ export async function startWatchSession(
     if (panelServer !== undefined && panelMessage !== null) {
       panelServer.broadcast(panelMessage);
     }
+    // The ledger entry is written here, not inside `promptAgent`, because the
+    // gate that produced it is this call site: no agent is `no_agent`, a turn
+    // already in flight is `coalesced`, and otherwise a turn will start and the
+    // event is what `triggered` counts.
+    if (turnRunning) announceTriggers("coalesced");
+    else announceTriggers("triggered");
     promptAgent();
   };
 

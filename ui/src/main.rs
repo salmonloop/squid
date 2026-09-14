@@ -727,6 +727,21 @@ fn apply(
                 window.set_agent_thinking(thinking);
             });
         }
+        Incoming::AgentTriggers {
+            triggered,
+            excluded,
+            duplicate,
+            coalesced,
+            last,
+        } => {
+            let _ = window.upgrade_in_event_loop(move |window| {
+                window.set_turns_triggered(count(Some(triggered)));
+                window.set_turns_excluded(count(Some(excluded)));
+                window.set_turns_duplicate(count(Some(duplicate)));
+                window.set_turns_coalesced(count(Some(coalesced)));
+                window.set_last_disposition(text(last));
+            });
+        }
         Incoming::Service { agent_state } => {
             let _ = window.upgrade_in_event_loop(move |window| {
                 window.set_agent_state(agent_state.into());
