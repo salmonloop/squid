@@ -108,6 +108,8 @@ pub enum Incoming {
     /// with it, so this is the trigger to pull a fresh dump rather than to
     /// flip the row locally — optimism here would drift from the catalog.
     SourceResult(SourceResultLine),
+    /// One LLM request log entry for the debug viewer.
+    LlmLog(LlmLogLine),
 }
 
 /// The projection as the panel is allowed to see it.
@@ -239,6 +241,21 @@ pub struct SourceResultLine {
     pub error: Option<String>,
 }
 
+/// One LLM request log entry for the debug viewer.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct LlmLogLine {
+    pub id: i64,
+    pub requested_at: String,
+    pub responded_at: Option<String>,
+    pub model: Option<String>,
+    pub message_count: Option<i64>,
+    pub prompt_chars: Option<i64>,
+    pub http_status: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub outcome: String,
+    pub error: Option<String>,
+}
+
 /// One field value. The protocol only uses strings and integers; `Other` exists
 /// so an unrecognized value type in some future field is skipped rather than
 /// poisoning the whole line.
@@ -340,6 +357,18 @@ pub fn parse_incoming(line: &str) -> Option<Incoming> {
         "source_result" => Some(Incoming::SourceResult(SourceResultLine {
             id: optional_text_field(&fields, "id"),
             ok: flag_field(&fields, "ok")?,
+            error: optional_text_field(&fields, "error"),
+        })),
+        "llm_log" => Some(Incoming::LlmLog(LlmLogLine {
+            id: int_field(&fields, "id")?,
+            requested_at: text_field(&fields, "requestedAt")?,
+            responded_at: optional_text_field(&fields, "respondedAt"),
+            model: optional_text_field(&fields, "model"),
+            message_count: optional_int_field(&fields, "messageCount"),
+            prompt_chars: optional_int_field(&fields, "promptChars"),
+            http_status: optional_int_field(&fields, "httpStatus"),
+            duration_ms: optional_int_field(&fields, "durationMs"),
+            outcome: text_field(&fields, "outcome")?,
             error: optional_text_field(&fields, "error"),
         })),
         _ => None,
@@ -490,6 +519,11 @@ pub fn source_toggle_line(id: &str, on: bool) -> String {
         escape_json_string(id),
         i32::from(on)
     )
+}
+
+/// Serializes an `llm_log_get`. Fieldless like [`config_get_line`].
+pub fn llm_log_get_line() -> String {
+    "{\"type\":\"llm_log_get\"}\n".to_owned()
 }
 
 /// Escapes a string for a JSON string body.
@@ -1610,5 +1644,30 @@ mod tests {
             Incoming::WorldState(state) => assert_eq!(state.gate, Some("open".to_owned())),
             other => panic!("expected a world_state, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_an_llm_log_line() {
+        let line = "{\"type\":\"llm_log\",\"id\":1,\"requestedAt\":\"2026-09-14T12:00:00.000Z\",\"respondedAt\":\"2026-09-14T12:00:02.000Z\",\"model\":\"deepseek-v4-flash\",\"messageCount\":5,\"promptChars\":1200,\"httpStatus\":200,\"durationMs\":2000,\"outcome\":\"ok\"}";
+        assert_eq!(
+            parse_incoming(line),
+            Some(Incoming::LlmLog(LlmLogLine {
+                id: 1,
+                requested_at: "2026-09-14T12:00:00.000Z".to_owned(),
+                responded_at: Some("2026-09-14T12:00:02.000Z".to_owned()),
+                model: Some("deepseek-v4-flash".to_owned()),
+                message_count: Some(5),
+                prompt_chars: Some(1200),
+                http_status: Some(200),
+                duration_ms: Some(2000),
+                outcome: "ok".to_owned(),
+                error: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn serializes_llm_log_get_line() {
+        assert_eq!(llm_log_get_line(), "{\"type\":\"llm_log_get\"}\n");
     }
 }

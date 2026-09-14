@@ -47,9 +47,9 @@ use std::thread;
 use std::time::Duration;
 
 use protocol::{
-    answer_line, config_get_line, config_set_line, control_line, source_get_line,
-    source_toggle_line, AgentLine, Answer, ConfigLine, ConfigResultLine, Control, Incoming, Prompt,
-    SourceLine, SourceResultLine, WorldState,
+    answer_line, config_get_line, config_set_line, control_line, llm_log_get_line, source_get_line,
+    source_toggle_line, AgentLine, Answer, ConfigLine, ConfigResultLine, Control, Incoming,
+    LlmLogLine, Prompt, SourceLine, SourceResultLine, WorldState,
 };
 use slint::{ComponentHandle, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 use startup::Startup;
@@ -115,6 +115,7 @@ struct Dumps {
 struct ViewState {
     settings: RefCell<Vec<ConfigLine>>,
     sources: RefCell<Vec<SourceLine>>,
+    llm_logs: RefCell<Vec<LlmLogLine>>,
     /// The tray icon, once it exists.
     ///
     /// Here rather than passed around because the reader thread is spawned before
@@ -423,6 +424,13 @@ fn main() {
         window.on_refresh(move || {
             outgoing.send(&config_get_line());
             outgoing.send(&source_get_line());
+            outgoing.send(&llm_log_get_line());
+        });
+    }
+    {
+        let outgoing = outgoing.clone();
+        window.on_request_llm_logs(move || {
+            outgoing.send(&llm_log_get_line());
         });
     }
     {
@@ -756,6 +764,7 @@ fn apply(
             // where re-pulling is exactly right: the model keys just changed.
             outgoing.send(&config_get_line());
             outgoing.send(&source_get_line());
+            outgoing.send(&llm_log_get_line());
         }
         Incoming::Config(row) => dumps.settings.push(row),
         Incoming::ConfigEnd { count } => {
@@ -797,6 +806,9 @@ fn apply(
             if refresh {
                 outgoing.send(&source_get_line());
             }
+        }
+        Incoming::LlmLog(entry) => {
+            let _ = window.upgrade_in_event_loop(move |window| show_llm_log(&window, entry));
         }
     }
 
@@ -924,6 +936,38 @@ fn show_sources(window: &PanelWindow, rows: Vec<SourceLine>, count: i64) {
     refresh_groups(window);
     if let Some(note) = note {
         window.set_status(note.into());
+    }
+}
+
+/// Updates or appends one LLM request log entry in the debug viewer.
+fn show_llm_log(window: &PanelWindow, entry: LlmLogLine) {
+    with_view(|state| {
+        let mut logs = state.llm_logs.borrow_mut();
+        if let Some(pos) = logs.iter().position(|r| r.id == entry.id) {
+            logs[pos] = entry;
+        } else {
+            if logs.len() >= 50 {
+                logs.remove(0);
+            }
+            logs.push(entry);
+        }
+        let rows: Vec<LlmLogRow> = logs.iter().map(llm_log_row).collect();
+        window.set_llm_logs(ModelRc::new(VecModel::from(rows)));
+    });
+}
+
+fn llm_log_row(row: &LlmLogLine) -> LlmLogRow {
+    LlmLogRow {
+        id: row.id as i32,
+        requested_at: row.requested_at.clone().into(),
+        responded_at: row.responded_at.clone().unwrap_or_default().into(),
+        model: row.model.clone().unwrap_or_default().into(),
+        message_count: row.message_count.unwrap_or(0) as i32,
+        prompt_chars: row.prompt_chars.unwrap_or(0) as i32,
+        http_status: row.http_status.unwrap_or(0) as i32,
+        duration_ms: row.duration_ms.unwrap_or(0) as i32,
+        outcome: row.outcome.clone().into(),
+        error: row.error.clone().unwrap_or_default().into(),
     }
 }
 

@@ -101,6 +101,7 @@ export interface PanelServerOptions {
   readonly onConfigSet?: (id: string, value: string, requestId?: string) => void;
   readonly onSourceGet?: (requestId?: string) => void;
   readonly onSourceToggle?: (id: string, on: boolean, requestId?: string) => void;
+  readonly onLlmLogGet?: (requestId?: string) => void;
   readonly onDiagnostic?: (line: string) => void;
   /**
    * Runs once per newly *subscribed* client, after it can receive broadcasts.
@@ -181,7 +182,7 @@ interface Client {
 }
 
 export async function startPanelServer(options: PanelServerOptions): Promise<PanelServer> {
-  const { socketPath, onControl, onServiceControl, onAnswer, onConfigGet, onConfigSet, onSourceGet, onSourceToggle, onDiagnostic, onSubscribe } = options;
+  const { socketPath, onControl, onServiceControl, onAnswer, onConfigGet, onConfigSet, onSourceGet, onSourceToggle, onLlmLogGet, onDiagnostic, onSubscribe } = options;
   const diagnostic = (line: string): void => {
     onDiagnostic?.(line);
   };
@@ -396,6 +397,14 @@ export async function startPanelServer(options: PanelServerOptions): Promise<Pan
         return;
       }
       onAnswer(promptId, answer, requestIdOf(record));
+      return;
+    }
+    if (record.type === "llm_log_get") {
+      if (onLlmLogGet === undefined) {
+        diagnostic("Panel llm_log_get refused: no llm-log handler is wired.");
+        return;
+      }
+      onLlmLogGet(requestIdOf(record));
       return;
     }
     diagnostic("Panel line refused: unrecognized type.");

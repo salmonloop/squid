@@ -434,6 +434,36 @@ is still a prompt and must still render; the panel reads both through the same
 tolerant optional-text path as every other display field, so an absent
 explanation costs a line of the dialog and never the ability to answer.
 
+### `llm_log`
+
+One LLM provider request log entry for the debug viewer. Sent twice per request:
+once with `outcome: "pending"` when the request fires, and once with `"ok"` or
+`"error"` when the response arrives. The `id` correlates the two: the panel
+updates the pending row in place.
+
+Privacy: captures metadata only — model id, message count, payload size, HTTP
+status, duration. No prompt content, API keys, or response bodies.
+
+```jsonc
+{"type":"llm_log","id":1,"requestedAt":"2026-09-14T12:30:00.000Z","model":"deepseek-v4-flash","messageCount":7,"promptChars":4200,"outcome":"pending"}
+{"type":"llm_log","id":1,"requestedAt":"2026-09-14T12:30:00.000Z","respondedAt":"2026-09-14T12:30:02.500Z","httpStatus":200,"durationMs":2500,"outcome":"ok"}
+{"type":"llm_log","id":2,"requestedAt":"2026-09-14T12:31:00.000Z","respondedAt":"2026-09-14T12:31:01.200Z","httpStatus":401,"durationMs":1200,"outcome":"error","error":"HTTP 401"}
+```
+
+| field | type | required | notes |
+|---|---|---|---|
+| `type` | `"llm_log"` | yes | |
+| `id` | integer | yes | monotonically increasing request id |
+| `requestedAt` | string | yes | ISO timestamp of dispatch |
+| `respondedAt` | string | no | ISO timestamp of response |
+| `model` | string | no | model id, **sanitized** |
+| `messageCount` | integer | no | number of messages in prompt |
+| `promptChars` | integer | no | approximate payload size |
+| `httpStatus` | integer | no | HTTP status code |
+| `durationMs` | integer | no | round-trip latency in ms |
+| `outcome` | `"pending"` \| `"ok"` \| `"error"` | yes | |
+| `error` | string | no | error summary if failed, **sanitized** |
+
 ## Panel → TS
 
 ```jsonc
@@ -447,6 +477,7 @@ explanation costs a line of the dialog and never the ability to answer.
 {"type":"source_get"}
 {"type":"source_toggle","id":"browser-page-host","on":0}
 {"type":"answer","promptId":1,"answer":"approved"}
+{"type":"llm_log_get"}
 ```
 
 `op` is exactly `pause`, `resume`, `restart`, or `stop`. `answer` is exactly
