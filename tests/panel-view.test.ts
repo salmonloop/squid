@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   panelAgentLine,
+  panelAgentThinking,
   panelConfigEnd,
   panelConfigLine,
   panelConfigResult,
@@ -343,6 +344,20 @@ describe("panelLine", () => {
   it("frames a world_state with its type discriminator", () => {
     const state: WorldState = { ...emptyWorldState(), updatedAt: "2026-08-27T10:00:00.000Z" };
     expect(JSON.parse(panelLine(panelWorldState(state)!)).type).toBe("world_state");
+  });
+});
+
+describe("panelAgentThinking", () => {
+  it("spells the flag as 1 and 0, never as booleans", () => {
+    expect(panelAgentThinking(true)).toEqual({ type: "agent_thinking", thinking: 1 });
+    expect(panelAgentThinking(false)).toEqual({ type: "agent_thinking", thinking: 0 });
+    // The wire carries integers only; `true` here would be a whole line the
+    // Rust parser drops.
+    expect(JSON.parse(panelLine(panelAgentThinking(true))).thinking).toBe(1);
+  });
+
+  it("carries nothing but the flag — the line is one bit wide", () => {
+    expect(Object.keys(panelAgentThinking(true))).toEqual(["type", "thinking"]);
   });
 });
 

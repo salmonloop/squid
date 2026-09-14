@@ -36,6 +36,7 @@ import type { DesktopNotifierFactory } from "./desktop-notice.js";
 import { PanelConfirmationSurface } from "./panel-confirmation-surface.js";
 import {
   panelAgentLine,
+  panelAgentThinking,
   panelConfigEnd,
   panelConfigLine,
   panelConfigResult,
@@ -45,6 +46,7 @@ import {
   panelSourceResult,
   panelWorldState,
 } from "./panel-view.js";
+import { heartbeatExtension, type HeartbeatSink } from "./heartbeat-extension.js";
 import { appendGateCommand } from "./panel-control.js";
 
 /**
@@ -323,7 +325,19 @@ export async function startWatchSession(
    * Builds the agent. Extracted from the eager path so the same recipe serves
    * needs_config recovery: a panel set saving the missing model configuration
    * starts the agent in-session rather than demanding a process restart.
+   *
+   * The heartbeat extension rides in with the agent's own extensions: Pi emits
+   * `turn_start`/`turn_end` for every turn it runs — including turns this
+   * module did not ask for — and the sink turns those edges into the panel's
+   * "is it thinking" line. The server is read through a ref because the panel
+   * starts after the agent, and a closure over `panelServer` at build time
+   * would freeze `undefined` for the eager path.
    */
+  const panelServerRef: { server: PanelServer | undefined } = { server: undefined };
+  const heartbeatSink: HeartbeatSink = {
+    turnStarted: () => panelServerRef.server?.broadcast(panelAgentThinking(true)),
+    turnEnded: () => panelServerRef.server?.broadcast(panelAgentThinking(false)),
+  };
   const buildAgent = async (): Promise<ResidentAgent> =>
     createResidentAgent({
       systemPrompt: residentAgentSystemPrompt(),
@@ -333,6 +347,7 @@ export async function startWatchSession(
       // one custom tool per store-backed query, executed in Pi's sandbox and
       // recorded in the session history like every other action.
       customTools: agentCustomTools(watch.store),
+      extensionFactories: [heartbeatExtension(heartbeatSink)],
       ...(options.createAgentSession !== undefined
         ? { createSession: options.createAgentSession }
         : {}),
@@ -428,7 +443,7 @@ export async function startWatchSession(
   if (panel.enabled) {
     const commandPath = env.SQUID_CONTROL_FIFO;
     try {
-      panelServer = await startPanelServer({
+      panelServer = panelServerRef.server = await startPanelServer({
         socketPath: panel.socketPath,
         onControl: (op) => {
           if (commandPath === undefined) {
@@ -571,6 +586,11 @@ export async function startWatchSession(
           panelServer?.broadcast(
             panelServiceLine({ agentState: agent === undefined ? "needs_config" : "ready" }),
           );
+          // The thinking flag is a standing fact the same way the service line
+          // is: a panel attaching mid-turn would otherwise show "not thinking"
+          // while a thought is in flight, and silence is what it was showing
+          // before — the exact anxiety this line exists to remove.
+          panelServer?.broadcast(panelAgentThinking(turnRunning));
         },
       });
     } catch (error) {
@@ -731,6 +751,11 @@ export async function startWatchSession(
         // flags clear — a wake-up raised there would be lost with no turn to
         // serve it and no later turn obliged to start.
         turnRunning = false;
+        // The authoritative "not thinking". Pi's turn_end usually said it
+        // already; this also covers the turn the watchdog aborted, whose
+        // session-side end may never arrive, and it is what a panel attaching
+        // mid-gap would have been told by the subscribe replay.
+        panelServerRef.server?.broadcast(panelAgentThinking(false));
       }
     })();
     agentTurns.add(chain);

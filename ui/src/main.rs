@@ -722,6 +722,11 @@ fn apply(
         }
         Incoming::Prompt(prompt) => show_prompt(window, pending, prompt),
         Incoming::Cancel { prompt_id } => cancel(window, pending, prompt_id),
+        Incoming::AgentThinking { thinking } => {
+            let _ = window.upgrade_in_event_loop(move |window| {
+                window.set_agent_thinking(thinking);
+            });
+        }
         Incoming::Service { agent_state } => {
             let _ = window.upgrade_in_event_loop(move |window| {
                 window.set_agent_state(agent_state.into());

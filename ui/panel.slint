@@ -83,6 +83,9 @@ export component PanelWindow inherits Window {
     in property <string> agent-status;
     in property <string> agent-text;
     in property <string> agent-at;
+    // A turn is in flight right now, from the brain's own turn edges. The
+    // answer to "is it alive", one heartbeat wide.
+    in property <bool> agent-thinking;
     callback pause();
     callback resume();
     in property <string> agent-state;
@@ -190,6 +193,7 @@ export component PanelWindow inherits Window {
             detail: root.service-detail;
             decision-pending: root.prompt-pending;
             link-lost: root.link-lost;
+            thinking: root.agent-thinking;
             // The header's "Watching" is a claim about observers, so it reads the
             // catalog rather than inferring from a timestamp. `sources.length` is
             // computed here instead of handing the model across the boundary:

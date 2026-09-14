@@ -63,6 +63,13 @@ pub enum Incoming {
     Service {
         agent_state: String,
     },
+    /// A turn opened or closed: the panel's answer to "is it thinking right
+    /// now". Edges from Pi's own `turn_start`/`turn_end` events, so a turn
+    /// this panel cannot otherwise see still moves the flag. Not "working" —
+    /// the panel cannot know that; only that a thought is in progress.
+    AgentThinking {
+        thinking: bool,
+    },
     /// One settings row. The schema rides on the wire (`kind`, `label`,
     /// `applies`, enum `values`), so this side holds no key names and renders
     /// every row the same generic way — a key hardcoded here would be a second
@@ -272,6 +279,9 @@ pub fn parse_incoming(line: &str) -> Option<Incoming> {
         }),
         "service" => Some(Incoming::Service {
             agent_state: text_field(&fields, "agentState")?,
+        }),
+        "agent_thinking" => Some(Incoming::AgentThinking {
+            thinking: flag_field(&fields, "thinking")? == 1,
         }),
         "config" => Some(Incoming::Config(ConfigLine {
             id: text_field(&fields, "id")?,
@@ -1122,6 +1132,25 @@ mod tests {
         // A service line with no state says nothing; there is no default that
         // would be honest here.
         assert_eq!(parse_incoming("{\"type\":\"service\"}"), None);
+    }
+
+    #[test]
+    fn parses_an_agent_thinking_line() {
+        assert_eq!(
+            parse_incoming("{\"type\":\"agent_thinking\",\"thinking\":1}"),
+            Some(Incoming::AgentThinking { thinking: true })
+        );
+        assert_eq!(
+            parse_incoming("{\"type\":\"agent_thinking\",\"thinking\":0}"),
+            Some(Incoming::AgentThinking { thinking: false })
+        );
+        // The flag is strictly 1/0 — a boolean spelling the wire never sends is
+        // refused, like every other flag: a line the panel half-understands is
+        // worse than one it drops.
+        assert_eq!(parse_incoming("{\"type\":\"agent_thinking\",\"thinking\":true}"), None);
+        assert_eq!(parse_incoming("{\"type\":\"agent_thinking\",\"thinking\":2}"), None);
+        // Nothing to default to: a thinking line with no flag says nothing.
+        assert_eq!(parse_incoming("{\"type\":\"agent_thinking\"}"), None);
     }
 
     #[test]
