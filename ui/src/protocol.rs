@@ -1167,8 +1167,14 @@ mod tests {
         // The flag is strictly 1/0 — a boolean spelling the wire never sends is
         // refused, like every other flag: a line the panel half-understands is
         // worse than one it drops.
-        assert_eq!(parse_incoming("{\"type\":\"agent_thinking\",\"thinking\":true}"), None);
-        assert_eq!(parse_incoming("{\"type\":\"agent_thinking\",\"thinking\":2}"), None);
+        assert_eq!(
+            parse_incoming("{\"type\":\"agent_thinking\",\"thinking\":true}"),
+            None
+        );
+        assert_eq!(
+            parse_incoming("{\"type\":\"agent_thinking\",\"thinking\":2}"),
+            None
+        );
         // Nothing to default to: a thinking line with no flag says nothing.
         assert_eq!(parse_incoming("{\"type\":\"agent_thinking\"}"), None);
     }
@@ -1204,7 +1210,9 @@ mod tests {
         // The counts are required — a line that cannot say how much of what
         // happened says nothing, and half a ledger is worse than none.
         assert_eq!(
-            parse_incoming("{\"type\":\"agent_triggers\",\"triggered\":1,\"excluded\":0,\"duplicate\":0}"),
+            parse_incoming(
+                "{\"type\":\"agent_triggers\",\"triggered\":1,\"excluded\":0,\"duplicate\":0}"
+            ),
             None
         );
         // `last` stays a string this side never folds onto a local enum, like
