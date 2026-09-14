@@ -964,6 +964,98 @@ describe("the control panel on a watch session", () => {
     }
   });
 
+  /**
+   * The heartbeat, end to end: Pi's own turn events → the panel's thinking
+   * line. The fake factory drives the heartbeat extension it was handed the way
+   * Pi would — `turn_start` when `prompt` opens a turn, `turn_end` when it
+   * closes — because the point under test is the wiring, not the extension
+   * itself (which is Pi's event bus by construction).
+   *
+   * The stop-order assertion matters as much as the arrival: a `thinking: 0`
+   * that never lands leaves the panel claiming a thought in progress forever,
+   * which is worse than the silence this line replaced.
+   */
+  it("announces thinking when a turn opens and closes, and clears it on stop", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
+    const socketPath = panelEndpoint(dir);
+    const source = new ScriptedSource("alpha", []);
+    const agentLog = emptyAgentLog();
+    const factory: ResidentSessionFactory = async (spec) => {
+      // The fake session Pi-shape: build the extensions exactly as
+      // `createResidentAgent` hands them over, then drive the heartbeat's
+      // hooks from prompt/waitForIdle the way Pi's turn loop would.
+      let started = false;
+      const session = await fakeAgentFactory(agentLog, {})(spec);
+      return {
+        prompt: async (text) => {
+          if (!started) {
+            started = true;
+            for (const extension of spec.extensionFactories ?? []) {
+              if (typeof extension === "object" && extension.name === "squid-heartbeat") {
+                // The factory receives Pi's ExtensionAPI; this fake calls only
+                // the two turn hooks, which is all the extension registers.
+                const hooks: Record<string, () => void> = {};
+                const api = {
+                  on: (name: string, handler: () => void) => {
+                    hooks[name] = handler;
+                  },
+                };
+                extension.factory(api as never);
+                await hooks["turn_start"]!();
+              }
+            }
+          }
+          await session.prompt(text);
+        },
+        waitForIdle: session.waitForIdle,
+        abort: session.abort,
+        getLastAssistantText: session.getLastAssistantText,
+        observe: session.observe,
+        dispose: () => {
+          if (started) {
+            started = false;
+          }
+          session.dispose();
+        },
+      };
+    };
+    const { result } = await startSession({
+      sources: [source],
+      env: { SQUID_PANEL_SOCKET: socketPath },
+      createAgentSession: factory,
+    });
+    if ("configError" in result) throw new Error(result.configError);
+    try {
+      const client = new PanelTestClient(socketPath);
+      await client.ready();
+      // The standing state arrives with the subscribe replay: not thinking
+      // before any turn has run.
+      const standing = await waitForLine(() =>
+        client.lines.map(parsePanelLine).find((p) => p.type === "agent_thinking"),
+      );
+      expect(standing.thinking).toBe(0);
+
+      await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
+      const on = await waitForLine(() =>
+        client.lines.map(parsePanelLine).find((p) => p.type === "agent_thinking" && p.thinking === 1),
+      );
+      expect(on.thinking).toBe(1);
+
+      // Turn closed: Pi said turn_end, and the loop's own finally said it
+      // again — one of them reaching the wire is enough, both is fine.
+      await result.session.runtime.runtime.awaitIdle();
+      const off = await waitForLine(() =>
+        client.lines.map(parsePanelLine).find((p) => p.type === "agent_thinking" && p.thinking === 0 && p !== standing),
+      );
+      expect(off.thinking).toBe(0);
+
+      await client.close();
+    } finally {
+      await result.session.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("announces a replied agent turn on the panel", async () => {
     const dir = await mkdtemp(join(tmpdir(), "squid-panel-"));
     const socketPath = panelEndpoint(dir);

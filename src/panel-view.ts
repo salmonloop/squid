@@ -58,6 +58,29 @@ export interface PanelServiceLine {
   readonly agentState: "ready" | "needs_config";
 }
 
+export interface PanelAgentThinking {
+  readonly type: "agent_thinking";
+  readonly thinking: 0 | 1;
+}
+
+/**
+ * Announces that the resident agent started or finished thinking — the one
+ * fact this line carries. `thinking: 1` when a turn opens, `0` when it closes.
+ *
+ * The word is deliberate: this is not "working" or "busy", because the panel
+ * has no basis for those claims — a turn may be a long read that acts on
+ * nothing, and the answer to "is it doing anything" belongs to the agent line
+ * that follows. What this line answers is the narrower question it can answer
+ * truthfully: is a thought in progress right now.
+ *
+ * Reuses Pi's own `turn_start`/`turn_end` events via `heartbeatExtension`;
+ * the count and the watchdog know things this boolean does not, but for the
+ * question "is it alive" the turn's own edges are the most honest source.
+ */
+export function panelAgentThinking(thinking: boolean): PanelAgentThinking {
+  return { type: "agent_thinking", thinking: thinking ? 1 : 0 };
+}
+
 /** The kinds a settings form can render; `secret` renders masked and never echoes. */
 export type PanelConfigKind = "text" | "int" | "enum" | "secret";
 
@@ -173,6 +196,7 @@ export type PanelMessage =
   | PanelWorldState
   | PanelAgentLine
   | PanelServiceLine
+  | PanelAgentThinking
   | PanelConfirmationPrompt
   | PanelConfirmationCancel
   | PanelConfigLine

@@ -139,6 +139,11 @@ export component StatusSummary inherits Rectangle {
     // about itself, and it is what stops the readings from being narrated as
     // current after there is nobody left to send new ones.
     in property <bool> link-lost;
+    // A turn is in flight on the brain, from Pi's own turn edges. Below the
+    // decision, the failures, and the pause, because a thought in progress
+    // does not outrank something the person must act on — but above "watching",
+    // which is what the header would otherwise claim while the agent works.
+    in property <bool> thinking;
 
     // Which reading of `limited` applies, named once rather than spelled out in
     // three places. The state, the title, and the sentence must never disagree
@@ -172,6 +177,11 @@ export component StatusSummary inherits Rectangle {
         // would read that as watching while nothing is being recorded.
         : root.gate == "paused" ? PanelState.paused
         : root.service-state == "restarting" ? PanelState.working
+        // A turn in flight, below everything a person must act on and above
+        // every steady-state reading. The same shape `restarting` uses — the
+        // three-quarter ring — because it is the same claim about time: this
+        // will end, and the ending is not a decision the person owes.
+        : root.thinking ? PanelState.working
         // Nothing switched on, ahead of the no-reading case: it is the more
         // specific of the two and the only one a person can act on. Not a
         // defensive guard for an impossible state — the startup floor counts the
@@ -188,7 +198,7 @@ export component StatusSummary inherits Rectangle {
         root.state == PanelState.waiting ? "Waiting for you"
         : root.state == PanelState.needs-hand ? (root.service-state == "failed" ? "Squid has stopped" : root.link-lost ? "Lost contact with Squid" : "Finish setup to begin")
         : root.state == PanelState.paused ? "Paused"
-        : root.state == PanelState.working ? "Starting up"
+        : root.state == PanelState.working ? (root.thinking ? "Thinking" : "Starting up")
         // Two readings, and neither may claim what this component cannot see.
         // "Nothing reported yet" is reached before the first reading arrives —
         // which includes a panel that has never reached a session at all — so it
@@ -210,6 +220,7 @@ export component StatusSummary inherits Rectangle {
         : root.state == PanelState.needs-hand && root.link-lost ? "Nothing here is current. Squid may have stopped; this window keeps trying to reach it."
         : root.state == PanelState.needs-hand ? "Squid is watching, but it cannot think yet."
         : root.state == PanelState.paused ? "Squid will not record anything new until you resume."
+        : root.state == PanelState.working && root.thinking ? "A thought is in progress. What it concludes will appear in the evidence below."
         : root.state == PanelState.working ? "Squid is coming back up."
         : root.state == PanelState.limited && root.nothing-switched-on ? "Nothing is being watched until you turn a sense on below."
         : root.state == PanelState.limited ? "Squid has not reported anything it has seen."
