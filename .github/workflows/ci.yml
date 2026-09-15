@@ -71,6 +71,14 @@ jobs:
         with:
           persist-credentials: false
 
+      # Compilation is ~90% of this job's wall clock; the tests themselves run
+      # in seconds. Caching the build against `Cargo.lock` means the common PR
+      # (dependency graph unchanged) recompiles only the working tree, not the
+      # 595-entry lockfile tree from nothing.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ui
+
       # femtovg links fontconfig and freetype; winit needs xkbcommon. Without
       # these headers the panel does not link on a clean runner.
       - name: Install build dependencies
@@ -111,6 +119,17 @@ jobs:
           bun-version: 1.4.2
 
       - run: bun install --frozen-lockfile
+
+      # Same cache rationale as the `ui` job: without it every PR pays the
+      # full MSVC compile of the Slint/winit tree — the dominant cost here —
+      # and the `#[cfg(windows)]` code is linked so rarely that a build-cache
+      # miss would leave it gated mostly by wait, not by evidence.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ui
+          # Separate key from the Linux cache: the target triple differs, so
+          # the two halves must never share an artifact.
+          key: windows
 
       # The whole suite, not just the pipe tests. A path assembled with
       # `node:path` behaves differently under a drive letter and a backslash
