@@ -92,6 +92,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # Same cache as the pull-request gate — a release gate that recompiles the
+      # whole tree from nothing on every tag buys no extra certainty over
+      # `--locked` + the same `Cargo.lock` the PR cache was keyed on.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ui
+
       # Slint's femtovg renderer links fontconfig and freetype, and winit needs
       # xkbcommon. A clean runner has none of the headers, so this is not
       # optional tidiness — the build does not link without it.
@@ -243,6 +250,14 @@ jobs:
             libfreetype-dev \
             libxkbcommon-dev
 
+      # The release profile compiles fresh (a different profile than the gate's),
+      # but the dependency tree beneath it is unchanged — caching the release
+      # build means a re-run or a dry run pays only the working tree again.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ui
+          key: linux-release
+
       # The release profile in `ui/Cargo.toml` strips and LTOs, so this is the
       # binary as users get it, not a debug build with the same name.
       - name: Build the control panel
@@ -329,6 +344,14 @@ jobs:
           Copy-Item "$ws\stamped-manifests\package.json" "$ws\package.json"
           Copy-Item "$ws\stamped-manifests\ui\Cargo.toml" "$ws\ui\Cargo.toml"
           Copy-Item "$ws\stamped-manifests\ui\Cargo.lock" "$ws\ui\Cargo.lock"
+
+      # Same rationale as the Linux build job; `key` keeps this cache from
+      # colliding with the CI job's Windows dev-profile cache (different target
+      # triple profile on the same runner image).
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ui
+          key: windows-release
 
       - name: Build the control panel
         run: cargo build --release --locked
