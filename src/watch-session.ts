@@ -707,6 +707,13 @@ export async function startWatchSession(
       await live.prompt(AGENT_TURN_PROMPT);
       await live.waitForIdle();
       const reply = live.getLastAssistantText();
+      // Whether the turn did anything the user would want pulled to the front.
+      // The resident model wakes on background file I/O it did not ask for, and
+      // a small model often narrates "nothing to act on" — sometimes after a
+      // read-only orientation call — rather than staying silent as its prompt
+      // asks. Neither pure narration nor a read runs a world-changing tool;
+      // `actedInLastTurn` is how a real action is told apart from both.
+      const acted = live.actedInLastTurn();
       // Reported, not interpreted. Whether the agent acted, and how, is in its
       // session history; this line is the operator's window into a loop that is
       // otherwise silent.
@@ -719,11 +726,14 @@ export async function startWatchSession(
         // what the agent said. `panelAgentLine` caps and redacts it and strips
         // the control characters, which is also why the body is safely one line.
         //
-        // Replies only. A failed turn broadcasts an agent line too, and
-        // announcing those would turn one misconfigured model into a popup every
-        // few seconds — a loud way to say something the log already said. The
-        // panel and the log stay the place a failure is read.
-        if (line.text !== undefined && line.text.length > 0) {
+        // Gated twice, for the same reason. A failed turn broadcasts an agent
+        // line too, and so does an idle turn the model narrated instead of
+        // ending in silence; announcing either would turn one misconfigured or
+        // chatty model into a popup every few seconds — a loud way to say
+        // something the log already said. Only a turn that acted earns the
+        // desktop's one interruption. The panel and the log stay the place a
+        // failure, or a no-op, is read.
+        if (acted && line.text !== undefined && line.text.length > 0) {
           notifier?.notify({ title: "Squid replied", body: line.text });
         }
       }

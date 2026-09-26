@@ -76,6 +76,8 @@ interface AgentLog {
 interface FakeAgentOptions {
   readonly promptError?: Error;
   readonly reply?: string;
+  /** What `actedInLastTurn` reports: whether the turn invoked a tool. */
+  readonly acted?: boolean;
   /** A session whose turn never settles — the wedge the watchdog exists to break. */
   readonly neverIdle?: boolean;
   /**
@@ -130,6 +132,9 @@ function fakeAgentFactory(
       },
       getLastAssistantText(): string | undefined {
         return options.reply;
+      },
+      actedInLastTurn(): boolean {
+        return options.acted ?? false;
       },
       dispose(): void {
         log.calls.push("dispose");
@@ -1010,6 +1015,7 @@ describe("the control panel on a watch session", () => {
         waitForIdle: session.waitForIdle,
         abort: session.abort,
         getLastAssistantText: session.getLastAssistantText,
+        actedInLastTurn: session.actedInLastTurn,
         observe: session.observe,
         dispose: () => {
           if (started) {
@@ -1163,7 +1169,7 @@ describe("the control panel on a watch session", () => {
     const source = new ScriptedSource("alpha", []);
     const { result } = await startSession({
       sources: [source],
-      agentOptions: { reply: "ran the tests; they pass" },
+      agentOptions: { reply: "ran the tests; they pass", acted: true },
       notifierFactory: () => ({
         notify: (notice) => notices.push(notice),
         close: async () => undefined,
@@ -1176,6 +1182,44 @@ describe("the control panel on a watch session", () => {
       expect(notice.title).toBe("Squid replied");
       expect(notice.body).toBe("ran the tests; they pass");
       expect(notices).toHaveLength(1);
+    } finally {
+      await result.session.stop();
+    }
+  });
+
+  /**
+   * A turn that acted on nothing reaches the panel and the log, and stops there.
+   *
+   * The resident model wakes on background file I/O and, being small, often
+   * narrates "nothing to act on" instead of ending in the silence its prompt
+   * asks for. That reply called no tool, so it is not worth the desktop's one
+   * interruption — the same restraint a failed turn already gets. The panel row
+   * (asserted separately) and the log line remain where a no-op turn is read.
+   */
+  it("stays quiet on the desktop when the turn acted on nothing", async () => {
+    const notices: DesktopNotice[] = [];
+    const diagnostics: string[] = [];
+    const logged: string[] = [];
+    const source = new ScriptedSource("alpha", []);
+    const { result } = await startSession({
+      sources: [source],
+      log: (line) => logged.push(line),
+      logError: (line) => diagnostics.push(line),
+      agentOptions: { reply: "no user request; nothing to act on", acted: false },
+      notifierFactory: () => ({
+        notify: (notice) => notices.push(notice),
+        close: async () => undefined,
+      }),
+    });
+    if ("configError" in result) throw new Error(result.configError);
+    try {
+      await source.emit!(fileSaved("fs-1", "src/x.test.ts"));
+      // Wait for the reply to be logged: that is what turns the silence below
+      // into an assertion rather than a race the notifier happened to lose.
+      await waitForLine(() =>
+        logged.some((line) => line.includes("nothing to act on")) ? { seen: true } : undefined,
+      );
+      expect(notices).toEqual([]);
     } finally {
       await result.session.stop();
     }

@@ -42,12 +42,75 @@ export interface ResidentSession {
   abort(): Promise<void>;
   getLastAssistantText(): string | undefined;
   /**
+   * True when the agent ran a world-changing tool — a command or a file edit,
+   * not a read-only orientation call — during the most recent `prompt()` turn.
+   * A turn that only produced assistant text, or that only read to orient
+   * before narrating "nothing to do", is false. Lets a caller tell an action
+   * worth announcing apart from an idle narration.
+   */
+  actedInLastTurn(): boolean;
+  /**
    * Append an observation to the session history without triggering a turn.
    * The agent sees it as context on its next prompt — this is how senses feed
    * memory: a running log of what happened, not an interruption.
    */
   observe(customType: string, content: string): Promise<void>;
   dispose(): void;
+}
+
+/**
+ * Remembers whether the current prompt turn changed anything.
+ *
+ * Squid's watch loop announces a reply on the desktop, but the resident model
+ * often wakes to background file I/O, finds nothing to do, and narrates that
+ * anyway — a toast for every no-op turn. Whether the agent *acted* is the
+ * distinction that gate needs, and Pi already fires `tool_call` before each
+ * tool runs. So this counts nothing: it only latches that at least one
+ * *world-changing* call fired since the last `reset()`, which the real session
+ * calls at the start of every `prompt()`. O(1) per event — deliberately not
+ * `getSessionStats().toolCalls`, which rescans the whole (unbounded,
+ * `continue`d) history on every read.
+ *
+ * Read-only calls do not count. Orienting — `query_recent_events` (whose own
+ * description invites "check what happened while you were thinking"), or Pi's
+ * `read`/`grep`/`find`/`ls` — is the model looking around, not doing something
+ * worth pulling a person back to a window they closed. Only a call that runs a
+ * command or edits a file earns the desktop's one interruption.
+ */
+export interface TurnActionTracker {
+  readonly extension: InlineExtension;
+  acted(): boolean;
+  reset(): void;
+}
+
+/**
+ * The tool names that count as acting: Pi's side-effecting built-ins. Anything
+ * else — Squid's read-only `query_recent_events`, Pi's `read`, and any future
+ * sensory tool — is orientation, not action, so the default is "does not toast".
+ *
+ * ponytail: hardcoded to Pi's built-in names; if the agent gains another
+ * world-changing tool (or Pi renames one), add it here — a call not in this set
+ * fails safe toward silence, which is the behavior this whole change is for.
+ */
+const ACTING_TOOL_NAMES: ReadonlySet<string> = new Set(["bash", "edit", "write"]);
+
+export function turnActionTracker(): TurnActionTracker {
+  let acted = false;
+  return {
+    extension: {
+      name: "squid-turn-action",
+      hidden: true,
+      factory: (pi) => {
+        pi.on("tool_call", (event) => {
+          if (ACTING_TOOL_NAMES.has(event.toolName)) acted = true;
+        });
+      },
+    },
+    acted: () => acted,
+    reset: () => {
+      acted = false;
+    },
+  };
 }
 
 /**
@@ -79,6 +142,10 @@ export const createDefaultResidentSession: ResidentSessionFactory = async (spec)
   if (model === null) {
     throw new Error(`No resident-agent model is configured: ${provider}/${modelId}`);
   }
+  // First among the extensions so its `tool_call` hook sees every call. The
+  // real session owns the tracker; the adapter resets it per prompt and reads
+  // it back through `actedInLastTurn`.
+  const tracker = turnActionTracker();
   const handle = await createPiSession({
     model,
     modelRuntime,
@@ -88,13 +155,11 @@ export const createDefaultResidentSession: ResidentSessionFactory = async (spec)
     // why is in there — so a real run persists it. `continue` rather than
     // `persist`: a restarted watch should resume the agent it already had.
     history: spec.history ?? "continue",
-    ...(spec.extensionFactories !== undefined
-      ? { extensionFactories: spec.extensionFactories }
-      : {}),
+    extensionFactories: [tracker.extension, ...(spec.extensionFactories ?? [])],
     ...(spec.customTools !== undefined ? { customTools: spec.customTools } : {}),
     ...(spec.noTools === true ? { noTools: "all" as const } : {}),
   });
-  return adaptHandle(handle);
+  return adaptHandle(handle, tracker);
 };
 
 /**
@@ -113,12 +178,18 @@ export function residentAgentConfigured(): boolean {
 }
 
 /** Adapts a `PiSessionHandle` to the narrowed `ResidentSession` surface. */
-function adaptHandle(handle: PiSessionHandle): ResidentSession {
+function adaptHandle(handle: PiSessionHandle, tracker: TurnActionTracker): ResidentSession {
   return {
-    prompt: (text) => handle.session.prompt(text),
+    prompt: (text) => {
+      // Cleared before the turn so `actedInLastTurn` reflects this prompt only;
+      // the tracker's `tool_call` hook latches it back on as the turn runs.
+      tracker.reset();
+      return handle.session.prompt(text);
+    },
     waitForIdle: () => handle.session.waitForIdle(),
     abort: () => handle.session.abort(),
     getLastAssistantText: () => handle.session.getLastAssistantText(),
+    actedInLastTurn: () => tracker.acted(),
     observe: (customType, content) =>
       handle.session.sendCustomMessage(
         { customType, content, display: false },
@@ -213,6 +284,12 @@ export interface ResidentAgent {
   /** The agent's last assistant reply, if any. */
   getLastAssistantText(): string | undefined;
   /**
+   * True when the agent ran a world-changing tool during the most recent
+   * `prompt()` turn — the signal that tells a real action apart from the model
+   * reading to orient and then narrating that it found nothing to do.
+   */
+  actedInLastTurn(): boolean;
+  /**
    * Feed the agent a new world-state snapshot. Updates the live sense buffer
    * (so the next LLM call sees it) and appends a one-line observation to the
    * session history (so the agent remembers the event happened). Does not
@@ -277,6 +354,10 @@ export async function createResidentAgent(
     getLastAssistantText(): string | undefined {
       guardLive();
       return session.getLastAssistantText();
+    },
+    actedInLastTurn(): boolean {
+      guardLive();
+      return session.actedInLastTurn();
     },
     async observe(state: WorldState): Promise<void> {
       guardLive();

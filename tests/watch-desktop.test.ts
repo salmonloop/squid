@@ -37,6 +37,9 @@ function silentAgent(): ResidentSession {
     getLastAssistantText(): string | undefined {
       return undefined;
     },
+    actedInLastTurn(): boolean {
+      return false;
+    },
     async observe(): Promise<void> {},
     dispose(): void {},
   };
