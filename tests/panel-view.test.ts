@@ -720,4 +720,26 @@ describe("panelLlmLogLine", () => {
     expect(line.model).not.toContain("\u0007");
     expect(line.error).not.toContain("\u001b");
   });
+
+  it("carries the preview verbatim, not re-capped to the 200-char audit ceiling", () => {
+    // The preview is already scrubbed and bounded upstream by sanitizeLlmPreview;
+    // re-running it through the 200-char diagnostic cap would defeat the point.
+    const preview = "(3 msgs) [user] " + "z".repeat(1000);
+    const line = panelLlmLogLine({
+      id: 3,
+      requestedAt: "2026-09-14T12:00:00.000Z",
+      outcome: "pending",
+      preview,
+    });
+    expect(line.preview).toBe(preview);
+  });
+
+  it("omits the preview when none was captured", () => {
+    const line = panelLlmLogLine({
+      id: 4,
+      requestedAt: "2026-09-14T12:00:00.000Z",
+      outcome: "pending",
+    });
+    expect("preview" in line).toBe(false);
+  });
 });

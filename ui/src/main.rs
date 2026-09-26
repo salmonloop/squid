@@ -434,6 +434,45 @@ fn main() {
         });
     }
     {
+        // Opening a request's details is entirely local, like opening a settings
+        // group: the row is already here from the last log line, so this only
+        // copies the selected entry's fields into the `detail-*` scalars the
+        // dialog renders. Rust does the lookup because Slint cannot filter a model
+        // to one row — the same reason `group-settings` is filtered here.
+        let handle = window.as_weak();
+        window.on_select_llm(move |id| {
+            let Some(window) = handle.upgrade() else {
+                return;
+            };
+            with_view(|state| {
+                let logs = state.llm_logs.borrow();
+                let Some(row) = logs.iter().find(|r| r.id == id as i64) else {
+                    return;
+                };
+                window.set_detail_id(row.id as i32);
+                window.set_detail_model(row.model.clone().unwrap_or_default().into());
+                window.set_detail_outcome(row.outcome.clone().into());
+                window.set_detail_requested_at(row.requested_at.clone().into());
+                window.set_detail_responded_at(row.responded_at.clone().unwrap_or_default().into());
+                window.set_detail_duration_ms(row.duration_ms.unwrap_or(0) as i32);
+                window.set_detail_http_status(row.http_status.unwrap_or(0) as i32);
+                window.set_detail_message_count(row.message_count.unwrap_or(0) as i32);
+                window.set_detail_prompt_chars(row.prompt_chars.unwrap_or(0) as i32);
+                window.set_detail_error(row.error.clone().unwrap_or_default().into());
+                window.set_detail_preview(row.preview.clone().unwrap_or_default().into());
+                window.set_detail_open(true);
+            });
+        });
+    }
+    {
+        let handle = window.as_weak();
+        window.on_close_llm_detail(move || {
+            if let Some(window) = handle.upgrade() {
+                window.set_detail_open(false);
+            }
+        });
+    }
+    {
         // Opening a capability's settings is entirely local: the rows are already
         // here from the last dump, so a disclosure costs no round trip and cannot
         // fail. Toggling closed is the same call with the same name, which is why
@@ -968,6 +1007,7 @@ fn llm_log_row(row: &LlmLogLine) -> LlmLogRow {
         duration_ms: row.duration_ms.unwrap_or(0) as i32,
         outcome: row.outcome.clone().into(),
         error: row.error.clone().unwrap_or_default().into(),
+        preview: row.preview.clone().unwrap_or_default().into(),
     }
 }
 

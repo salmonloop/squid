@@ -254,6 +254,8 @@ pub struct LlmLogLine {
     pub duration_ms: Option<i64>,
     pub outcome: String,
     pub error: Option<String>,
+    /// Bounded, scrubbed excerpt of the request content for the details dialog.
+    pub preview: Option<String>,
 }
 
 /// One field value. The protocol only uses strings and integers; `Other` exists
@@ -370,6 +372,7 @@ pub fn parse_incoming(line: &str) -> Option<Incoming> {
             duration_ms: optional_int_field(&fields, "durationMs"),
             outcome: text_field(&fields, "outcome")?,
             error: optional_text_field(&fields, "error"),
+            preview: optional_text_field(&fields, "preview"),
         })),
         _ => None,
     }
@@ -1648,7 +1651,7 @@ mod tests {
 
     #[test]
     fn parses_an_llm_log_line() {
-        let line = "{\"type\":\"llm_log\",\"id\":1,\"requestedAt\":\"2026-09-14T12:00:00.000Z\",\"respondedAt\":\"2026-09-14T12:00:02.000Z\",\"model\":\"deepseek-v4-flash\",\"messageCount\":5,\"promptChars\":1200,\"httpStatus\":200,\"durationMs\":2000,\"outcome\":\"ok\"}";
+        let line = "{\"type\":\"llm_log\",\"id\":1,\"requestedAt\":\"2026-09-14T12:00:00.000Z\",\"respondedAt\":\"2026-09-14T12:00:02.000Z\",\"model\":\"deepseek-v4-flash\",\"messageCount\":5,\"promptChars\":1200,\"httpStatus\":200,\"durationMs\":2000,\"outcome\":\"ok\",\"preview\":\"(5 msgs) [user] hi\"}";
         assert_eq!(
             parse_incoming(line),
             Some(Incoming::LlmLog(LlmLogLine {
@@ -1662,6 +1665,7 @@ mod tests {
                 duration_ms: Some(2000),
                 outcome: "ok".to_owned(),
                 error: None,
+                preview: Some("(5 msgs) [user] hi".to_owned()),
             }))
         );
     }

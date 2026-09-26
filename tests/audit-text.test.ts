@@ -1,9 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import {
   AUDIT_TEXT_MAX_LENGTH,
+  LLM_PREVIEW_MAX_LENGTH,
   auditTextDigest,
   describeErrorForAudit,
   sanitizeAuditText,
+  sanitizeLlmPreview,
 } from "../src/audit-text.js";
 
 describe("sanitizeAuditText", () => {
@@ -129,5 +131,30 @@ describe("auditTextDigest", () => {
     expect(auditTextDigest("same", key)).not.toBe(auditTextDigest("same"));
     expect(auditTextDigest("same", key)).toBe(auditTextDigest("same", key));
     expect(auditTextDigest("same", key).startsWith("hmac:")).toBe(true);
+  });
+});
+
+describe("sanitizeLlmPreview", () => {
+  it("strips control characters and collapses whitespace to one line", () => {
+    const out = sanitizeLlmPreview("line1\n\tline2\u0000x");
+    expect(out).not.toMatch(/[\u0000-\u001F\u007F]/u);
+    expect(out).toBe("line1 line2 x");
+  });
+
+  it("redacts credentials the same way the audit sanitizer does", () => {
+    expect(sanitizeLlmPreview("token: supersecretvalue1")).toBe("[redacted]");
+  });
+
+  it("caps at the preview ceiling, not the 200-char audit ceiling", () => {
+    const out = sanitizeLlmPreview("y".repeat(LLM_PREVIEW_MAX_LENGTH + 500));
+    // Capped at the preview ceiling plus the one-character truncation marker,
+    // and — the point of a preview — far past the 200-char audit ceiling.
+    expect(out.length).toBe(LLM_PREVIEW_MAX_LENGTH + 1);
+    expect(out.endsWith("…")).toBe(true);
+    expect(out.length).toBeGreaterThan(AUDIT_TEXT_MAX_LENGTH);
+  });
+
+  it("leaves a short preview untruncated", () => {
+    expect(sanitizeLlmPreview("(2 msgs) [user] hi")).toBe("(2 msgs) [user] hi");
   });
 });

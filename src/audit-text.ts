@@ -22,6 +22,20 @@ import { createHmac } from "node:crypto";
  */
 export const AUDIT_TEXT_MAX_LENGTH = 200;
 
+/**
+ * Length ceiling for the LLM-request *content preview* — deliberately larger
+ * than `AUDIT_TEXT_MAX_LENGTH`, because this one field exists to show a person a
+ * usable excerpt of what a request actually sent.
+ *
+ * It is a real, bounded widening of the panel's "metadata only" rule, and it
+ * lives here on purpose: the taxonomy below forbids previewing `selection`/
+ * `summary` because their content *is* the payload, and request content is
+ * exactly that kind of text. `sanitizeLlmPreview` is the one sanctioned path
+ * that previews it — still control-stripped, credential-redacted, and capped —
+ * so the exception is auditable in the module that governs what text leaves.
+ */
+export const LLM_PREVIEW_MAX_LENGTH = 2000;
+
 /** What kind of text went in, which decides whether a preview may exist. */
 export type AuditTextClass =
   | "selection"
@@ -104,6 +118,23 @@ export function sanitizeAuditText(
     text: truncated ? `${redacted.slice(0, AUDIT_TEXT_MAX_LENGTH)}…` : redacted,
     previewAllowed: true,
   };
+}
+
+/**
+ * Scrubs and bounds an LLM-request content preview for the debug viewer.
+ *
+ * Same control-character strip, whitespace collapse, and credential redaction as
+ * `sanitizeAuditText`, but capped at `LLM_PREVIEW_MAX_LENGTH` rather than the
+ * 200-char audit ceiling — this field is the excerpt, not a one-line label. The
+ * result is a single line (newlines collapse to spaces) with a trailing `…` when
+ * truncated. See `LLM_PREVIEW_MAX_LENGTH` for why this preview is allowed at all.
+ */
+export function sanitizeLlmPreview(text: string): string {
+  const stripped = text.replace(/[\u0000-\u001F\u007F]/gu, " ").replace(/\s+/gu, " ").trim();
+  const redacted = redactCredentials(stripped);
+  return redacted.length > LLM_PREVIEW_MAX_LENGTH
+    ? `${redacted.slice(0, LLM_PREVIEW_MAX_LENGTH)}…`
+    : redacted;
 }
 
 /**

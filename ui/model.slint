@@ -74,4 +74,8 @@ export struct LlmLogRow {
     // of outcomes to go stale against the brain's.
     outcome: string,
     error: string,
+    // Bounded, scrubbed excerpt of the request content, shown in the details
+    // dialog. Empty when the wire had none (a legacy brain, or a request with no
+    // messages); the dialog renders empty as "no preview" rather than a blank.
+    preview: string,
 }

@@ -251,9 +251,11 @@ export interface PanelSourceResult {
  * fires, and once with `"ok"` or `"error"` when the response arrives. The
  * `id` correlates the two: the panel upserts the pending row in place.
  *
- * Privacy: metadata only — model, message count, payload size, HTTP status,
- * duration. No message content, no API keys, no response bodies. The same
- * sanitizer every other wire string takes.
+ * Privacy: metadata, plus one bounded exception — `preview`, a capped,
+ * control-stripped, credential-redacted excerpt of the request content for the
+ * details dialog (scrubbed upstream by `sanitizeLlmPreview`, so it is carried
+ * verbatim here rather than re-run through the 200-char diagnostic cap). No full
+ * payload, no API keys, no response bodies.
  */
 export interface PanelLlmLogLine {
   readonly type: "llm_log";
@@ -267,6 +269,8 @@ export interface PanelLlmLogLine {
   readonly durationMs?: number;
   readonly outcome: string;
   readonly error?: string;
+  /** Bounded, scrubbed excerpt of the request content for the details dialog. */
+  readonly preview?: string;
 }
 
 export type PanelMessage =
@@ -538,6 +542,9 @@ export function panelSourceResult(result: {
 /**
  * Builds one LLM request log wire line. Sanitizes model and error strings
  * as diagnostics so untrusted model strings cannot smuggle control characters.
+ * `preview` is already scrubbed and bounded by `sanitizeLlmPreview` upstream, so
+ * it is carried verbatim — re-running it through the 200-char diagnostic cap
+ * would defeat the whole point of a preview.
  */
 export function panelLlmLogLine(entry: {
   readonly id: number;
@@ -550,6 +557,7 @@ export function panelLlmLogLine(entry: {
   readonly durationMs?: number;
   readonly outcome: string;
   readonly error?: string;
+  readonly preview?: string;
 }): PanelLlmLogLine {
   return {
     type: "llm_log",
@@ -563,6 +571,7 @@ export function panelLlmLogLine(entry: {
     ...(entry.durationMs === undefined ? {} : { durationMs: entry.durationMs }),
     outcome: entry.outcome,
     ...(entry.error === undefined ? {} : { error: sanitizeAuditText(entry.error, "diagnostic").text }),
+    ...(entry.preview === undefined ? {} : { preview: entry.preview }),
   };
 }
 
