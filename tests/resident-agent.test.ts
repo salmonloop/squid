@@ -3,6 +3,7 @@ import {
   createResidentAgent,
   residentAgentSystemPrompt,
   senseExtension,
+  turnActionTracker,
   type ResidentSession,
   type SenseBuffer,
 } from "../src/resident-agent.js";
@@ -35,6 +36,7 @@ function extensionFactory(extension: InlineExtension): (pi: ExtensionAPI) => voi
 function fakeSession(opts: {
   readonly assistantText?: string;
   readonly promptError?: Error;
+  readonly acted?: boolean;
 }): ResidentSession & {
   readonly calls: {
     prompt: string[];
@@ -72,6 +74,9 @@ function fakeSession(opts: {
     getLastAssistantText(): string | undefined {
       return opts.assistantText;
     },
+    actedInLastTurn(): boolean {
+      return opts.acted ?? false;
+    },
     dispose(): void {
       disposed = true;
       calls.dispose += 1;
@@ -85,6 +90,48 @@ describe("residentAgentSystemPrompt", () => {
     expect(prompt).toContain("resident agent");
     expect(prompt).toContain("stay alive");
     expect(prompt).toContain("smallest change");
+  });
+});
+
+describe("turnActionTracker", () => {
+  function wireTracker() {
+    const tracker = turnActionTracker();
+    const handlers: Record<string, (event: unknown) => void> = {};
+    const pi = {
+      on: (name: string, handler: (event: unknown) => void) => {
+        handlers[name] = handler;
+      },
+    };
+    extensionFactory(tracker.extension)(pi as unknown as ExtensionAPI);
+    const toolCall = (toolName: string) =>
+      handlers["tool_call"]!({ type: "tool_call", toolName, input: {}, toolCallId: "1" });
+    return { tracker, toolCall };
+  }
+
+  it("latches on a world-changing tool call and clears on reset", () => {
+    const { tracker, toolCall } = wireTracker();
+    // A turn that never touched a tool: pure narration.
+    expect(tracker.acted()).toBe(false);
+    // Running a command or editing a file is the action worth a toast.
+    toolCall("bash");
+    expect(tracker.acted()).toBe(true);
+    // Reset is what the real session calls at the top of each prompt, so the
+    // flag reports this turn and not a stale one.
+    tracker.reset();
+    expect(tracker.acted()).toBe(false);
+  });
+
+  it("does not latch on read-only orientation calls", () => {
+    const { tracker, toolCall } = wireTracker();
+    // The model looking around — Squid's history query, or Pi's file read —
+    // before narrating "nothing to do" is not an action. Counting these would
+    // reinstate the toast spam this whole change removes, one read behind it.
+    toolCall("query_recent_events");
+    toolCall("read");
+    expect(tracker.acted()).toBe(false);
+    // A real edit in the same turn still counts.
+    toolCall("edit");
+    expect(tracker.acted()).toBe(true);
   });
 });
 
@@ -103,6 +150,21 @@ describe("createResidentAgent", () => {
 
     agent.dispose();
     expect(session.calls.dispose).toBe(1);
+  });
+
+  it("reports actedInLastTurn straight from the session", async () => {
+    const acting = await createResidentAgent({
+      systemPrompt: "p",
+      cwd: ".",
+      createSession: async () => fakeSession({ acted: true }),
+    });
+    const idle = await createResidentAgent({
+      systemPrompt: "p",
+      cwd: ".",
+      createSession: async () => fakeSession({ acted: false }),
+    });
+    expect(acting.actedInLastTurn()).toBe(true);
+    expect(idle.actedInLastTurn()).toBe(false);
   });
 
   it("preserves history: the second prompt reaches the same session", async () => {
