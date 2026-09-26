@@ -225,6 +225,7 @@ describe("config schema", () => {
       ["decisionCuratorBaseUrl", "Decision curation"],
       ["decisionCuratorModel", "Decision curation"],
       ["decisionCuratorThreshold", "Decision curation"],
+      ["attentionWindowMinutes", "Decision curation"],
       ["notify", "Notifications"],
       ["watchRoot", "Files"],
       ["screenReader", "Screen"],

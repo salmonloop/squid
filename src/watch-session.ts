@@ -6,6 +6,7 @@ import { describeErrorForAudit } from "./audit-text.js";
 import { CaptureGateActivitySource } from "./capture-gate-source.js";
 import { resolveCaptureGate } from "./resolve-capture-gate.js";
 import { resolveAgentTurnTimeout } from "./resolve-agent-turn-timeout.js";
+import { resolveAttentionWindow } from "./resolve-attention-window.js";
 import { HOUR_MS, resolveRetention } from "./resolve-retention.js";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { resolvePiModel } from "./pi-session-factory.js";
@@ -53,6 +54,7 @@ import { heartbeatExtension, type HeartbeatSink } from "./heartbeat-extension.js
 import { appendGateCommand } from "./panel-control.js";
 import { llmLogExtension, type LlmLogEntry } from "./llm-log-extension.js";
 import { decisionCuratorExtension } from "./decision-curator-extension.js";
+import { attentionWindowExtension } from "./attention-window-extension.js";
 
 /**
  * The whole watch pipeline minus the sources: store and runtime construction,
@@ -241,6 +243,14 @@ export async function startWatchSession(
   const turnTimeout = resolveAgentTurnTimeout(env);
   if ("configError" in turnTimeout) return { configError: turnTimeout.configError };
 
+  // The attention window resolves with the other capability variables for the
+  // same reason: a malformed SQUID_ATTENTION_WINDOW_MINUTES must fail startup
+  // rather than silently leave the agent reading an unbounded breadcrumb log.
+  // Unlike the others, unset is not off — an unbounded view is the failure this
+  // exists to prevent, so a run that sets nothing still gets the default bound.
+  const attentionWindow = resolveAttentionWindow({ env });
+  if ("configError" in attentionWindow) return { configError: attentionWindow.configError };
+
   const watch = createWatchRuntime({
     ...(options.databasePath === undefined ? {} : { databasePath: options.databasePath }),
     // Resolved inside createWatchRuntime, but the raw value passes through so
@@ -373,6 +383,11 @@ export async function startWatchSession(
       // recorded in the session history like every other action.
       customTools: agentCustomTools(watch.store),
       extensionFactories: [
+        // First among the context handlers so the curator (and any downstream
+        // token accounting) see the already-bounded breadcrumb set rather than
+        // the whole unbounded log. `on("context")` handlers chain in order —
+        // this deterministic cut runs, then the curator trims what remains.
+        attentionWindowExtension(attentionWindow.windowMs),
         heartbeatExtension(heartbeatSink),
         llmLogExt,
         ...(decisionCurator === undefined ? [] : [decisionCurator]),
@@ -996,6 +1011,7 @@ export async function startWatchSession(
       control: gate.enabled ? gate.readerKind : "off",
       retention: retention.enabled ? retention.hours : "off",
       agentTurnTimeoutMs: turnTimeout.timeoutMs,
+      attentionWindowMinutes: attentionWindow.minutes,
       ...(pruneSummary === undefined ? {} : { prunedEvents: pruneSummary.removedEvents }),
       restoredActions: restored.recentActions.length,
     },

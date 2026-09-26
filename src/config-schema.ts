@@ -294,6 +294,18 @@ const CONFIG_KEY_TABLE: readonly Omit<ConfigKey, "validate">[] = [
     },
   },
   {
+    id: "attentionWindowMinutes",
+    env: "SQUID_ATTENTION_WINDOW_MINUTES",
+    label: "Attention window (minutes)",
+    // The same question the curator answers — what the agent needs to see —
+    // decided by the clock instead of a model: how far back the observation
+    // breadcrumbs it reads reach. Left empty it uses the default bound (unset
+    // is not off here; an unbounded view is the failure it prevents).
+    group: "Decision curation",
+    description: "How far back in time the agent still reads events it saw. Older ones stay recorded but leave its view.",
+    kind: "int",
+  },
+  {
     id: "notify",
     env: "SQUID_NOTIFY",
     label: "Desktop notices",
