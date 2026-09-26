@@ -79,13 +79,15 @@ describe("MODEL_CONFIG_KEYS", () => {
 });
 
 describe("configDumpEntries", () => {
-  it("lists the three model keys first, then every file key in schema order", () => {
+  it("lists the three model keys first, then every file key in schema order, then the decision key", () => {
     const dir = tempDir("dump");
     const result = configDumpEntries(options(dir));
     if (!result.ok) throw new Error(result.error);
     expect(result.entries.map((entry) => entry.id)).toEqual([
       ...MODEL_CONFIG_KEYS.map((key) => key.id),
       ...CONFIG_KEYS.map((key) => key.id),
+      // The decision-model key: a secret in neither store above, dumped last.
+      "decisionKey",
     ]);
     rmSync(dir, { recursive: true, force: true });
   });
@@ -129,16 +131,19 @@ describe("configDumpEntries", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("carries a group and a description for every one of the 23 settings", () => {
+  it("carries a group and a description for every setting", () => {
     // The panel groups by what the wire tells it, so an entry that reached the
     // form without a group would be a row the user has to place themselves. The
-    // count is asserted too: the two tables are joined here, and a setting that
-    // silently stopped being dumped would otherwise still pass every field
-    // check below.
+    // count is asserted too: the two tables plus the decision key are joined
+    // here, and a setting that silently stopped being dumped would otherwise
+    // still pass every field check below.
     const dir = tempDir("dump");
     const result = configDumpEntries(options(dir));
     if (!result.ok) throw new Error(result.error);
-    expect(result.entries).toHaveLength(23);
+    // Model rows + file-backed rows + the one decision-key secret that lives in
+    // neither store. Counted from the schema, not a literal, so adding a
+    // setting is not a test failure.
+    expect(result.entries).toHaveLength(MODEL_CONFIG_KEYS.length + CONFIG_KEYS.length + 1);
     for (const entry of result.entries) {
       expect(entry.group.length).toBeGreaterThan(0);
       expect(entry.group).not.toBe("Advanced");

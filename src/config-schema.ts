@@ -109,6 +109,8 @@ export type ConfigValueKind = "text" | "int" | "enum";
 export type ConfigGroup =
   /** Which model answers, under which login, and how long it may take. */
   | "Model"
+  /** Deciding what the agent needs to see. */
+  | "Decision curation"
   /** Whether Squid can reach you with the panel closed. */
   | "Notifications"
   /** Which part of the filesystem is watched. */
@@ -182,9 +184,9 @@ function validateEnum(raw: string, values: readonly string[]): ConfigValidation 
  * directory. Never called with `""` — unset is decided before validation.
  */
 function validateText(raw: string): ConfigValidation {
-  return raw.trim() !== raw
-    ? { ok: false, error: "Value has leading or trailing whitespace." }
-    : { ok: true };
+  return raw.trim() === raw
+    ? { ok: true }
+    : { ok: false, error: "Value has leading or trailing whitespace." };
 }
 
 /**
@@ -239,6 +241,57 @@ const CONFIG_KEY_TABLE: readonly Omit<ConfigKey, "validate">[] = [
       /^[A-Za-z0-9_-]+$/.test(raw)
         ? { ok: true }
         : { ok: false, error: "Model provider must be letters, digits, dashes, or underscores." },
+  },
+  {
+    id: "decisionCuration",
+    env: "SQUID_DECISION_CURATOR",
+    label: "Decision curation",
+    group: "Decision curation",
+    // Default on, per the repo's "ships in the state most people want" rule:
+    // unset means the curator runs, and with no reachable decision endpoint it
+    // fails open to a no-op — harmless. `off` is the explicit decline, offered
+    // as a value so turning it off is a choice the form can show.
+    description:
+      "Whether a fast decision model trims what the agent reads before each thought. Left empty, it does when a decision endpoint is reachable.",
+    kind: "enum",
+    values: ["on", "off"],
+  },
+  {
+    id: "decisionCuratorBaseUrl",
+    env: "SQUID_DECISION_BASE_URL",
+    label: "Decision model endpoint",
+    group: "Decision curation",
+    // The Jev-shaped endpoint. The paid hosted Jev is the default when unset;
+    // point it at a free self-hosted OpenJev/Kev (e.g. http://127.0.0.1:8009)
+    // to run at no cost. Any /v1/systemone server works.
+    description: "Where Squid reaches the decision model. A local replica costs nothing to run.",
+    kind: "text",
+  },
+  {
+    id: "decisionCuratorModel",
+    env: "SQUID_DECISION_MODEL",
+    label: "Decision model id",
+    group: "Decision curation",
+    description: "Which decision model does the trimming (for example jev-latest, openjev, or kev-4b).",
+    kind: "text",
+  },
+  {
+    id: "decisionCuratorThreshold",
+    env: "SQUID_DECISION_THRESHOLD",
+    label: "Decision keep threshold",
+    group: "Decision curation",
+    // How sure the model must be that a piece of context matters before it is
+    // kept. Higher trims more aggressively. A float in [0,1]; refined here
+    // because the schema has no float kind and a bad value would silently
+    // sit in the file until the extension defaulted around it.
+    description: "How sure the model must be a detail matters before keeping it, from 0 to 1. Higher trims more.",
+    kind: "text",
+    refine: (raw) => {
+      const n = Number(raw);
+      return /^\d*\.?\d+$/.test(raw) && Number.isFinite(n) && n >= 0 && n <= 1
+        ? { ok: true }
+        : { ok: false, error: "Decision keep threshold must be a number from 0 to 1." };
+    },
   },
   {
     id: "notify",

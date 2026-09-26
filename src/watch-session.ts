@@ -52,6 +52,7 @@ import {
 import { heartbeatExtension, type HeartbeatSink } from "./heartbeat-extension.js";
 import { appendGateCommand } from "./panel-control.js";
 import { llmLogExtension, type LlmLogEntry } from "./llm-log-extension.js";
+import { decisionCuratorExtension } from "./decision-curator-extension.js";
 
 /**
  * The whole watch pipeline minus the sources: store and runtime construction,
@@ -355,8 +356,15 @@ export async function startWatchSession(
     turnStarted: () => panelServerRef.server?.broadcast(panelAgentThinking(true)),
     turnEnded: () => panelServerRef.server?.broadcast(panelAgentThinking(false)),
   };
-  const buildAgent = async (): Promise<ResidentAgent> =>
-    createResidentAgent({
+  const buildAgent = async (): Promise<ResidentAgent> => {
+    // The decision curator trims what the agent reads before each thought,
+    // asking a fast Jev-shaped model which context a future turn will need. It
+    // reads the merged env (so a config-file or GUI setting reaches it the same
+    // way every resolver's does) and its own key store, and it is undefined
+    // when turned off — spread away, no placeholder. Everything about it fails
+    // open, so it never costs the agent a turn.
+    const decisionCurator = decisionCuratorExtension({ env, log: logError });
+    return createResidentAgent({
       systemPrompt: residentAgentSystemPrompt(),
       cwd: options.workingDirectory,
       tools: options.tools ?? [],
@@ -364,11 +372,16 @@ export async function startWatchSession(
       // one custom tool per store-backed query, executed in Pi's sandbox and
       // recorded in the session history like every other action.
       customTools: agentCustomTools(watch.store),
-      extensionFactories: [heartbeatExtension(heartbeatSink), llmLogExt],
-      ...(options.createAgentSession !== undefined
-        ? { createSession: options.createAgentSession }
-        : {}),
+      extensionFactories: [
+        heartbeatExtension(heartbeatSink),
+        llmLogExt,
+        ...(decisionCurator === undefined ? [] : [decisionCurator]),
+      ],
+      ...(options.createAgentSession === undefined
+        ? {}
+        : { createSession: options.createAgentSession }),
     });
+  };
 
   let agent: ResidentAgent | undefined;
   if (!needsConfig) {

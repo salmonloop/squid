@@ -12,6 +12,17 @@ import {
   writeModelConfiguration,
   writeModelEndpoint,
 } from "./app-model.js";
+import { hasDecisionKey, writeDecisionKey } from "./decision-keystore.js";
+
+/**
+ * The decision curator's API key. A secret like `apiKey`, but it lives in its
+ * own 0600 file (`decision-keystore.ts`), not Pi's `auth.json`: the decision
+ * model and the chat model can point at different providers, so their
+ * credentials are two secrets, not one. It is grouped under "Decision curation"
+ * beside the four file-backed rows that configure the same feature, and — like
+ * every secret here — its value never leaves this module's callers' sight.
+ */
+export const DECISION_KEY_ID = "decisionKey";
 
 /**
  * The semantics between the panel and the stores.
@@ -161,6 +172,10 @@ export function isModelConfigKey(id: string): boolean {
   return MODEL_CONFIG_KEYS.some((key) => key.id === id);
 }
 
+export function isDecisionKeyId(id: string): boolean {
+  return id === DECISION_KEY_ID;
+}
+
 export interface ConfigServiceOptions {
   /** Where the Squid config file lives; undefined disables file-backed sets. */
   readonly configPath: string | undefined;
@@ -239,6 +254,22 @@ export function configDumpEntries(options: ConfigServiceOptions): ConfigDump {
     });
   }
 
+  // The decision key, last: a secret that lives in neither store above. Its
+  // value is structurally empty like `apiKey`, and `secretPresent` says whether
+  // one can be read from env or the 0600 file. `applies: restart` because the
+  // curator reads it once when the agent's session is built.
+  entries.push({
+    id: DECISION_KEY_ID,
+    label: "Decision model API key",
+    group: "Decision curation",
+    description: "The secret for a decision model that needs one. Leave empty for a keyless local replica.",
+    kind: "secret",
+    value: "",
+    applies: "restart",
+    overridden: overriddenEnv("SQUID_DECISION_KEY"),
+    ...(hasDecisionKey({ env: options.env }) ? { secretPresent: true } : {}),
+  });
+
   return { ok: true, entries };
 }
 
@@ -252,9 +283,33 @@ export function applyConfigSet(
   id: string,
   value: string,
 ): ConfigSetResult {
-  return isModelConfigKey(id)
-    ? applyModelSet(options, id, value)
-    : applyFileSet(options, id, value);
+  if (isModelConfigKey(id)) return applyModelSet(options, id, value);
+  if (isDecisionKeyId(id)) return applyDecisionKeySet(options, value);
+  return applyFileSet(options, id, value);
+}
+
+/**
+ * Writes (or clears) the decision key to its own 0600 file. Never the Squid
+ * config file. Empty clears it — unlike `apiKey`, a keyless local replica is a
+ * supported deployment, so an empty field is a legal "no key needed", not a
+ * refusal. Always `restart`: the curator reads the key when the agent session
+ * is built, and a live session already holds the old one.
+ */
+function applyDecisionKeySet(
+  options: ConfigServiceOptions,
+  value: string,
+): ConfigSetResult {
+  // Env wins over the file at read time, so writing the file while an env var
+  // overrides it would save a value the run never uses. Say so rather than
+  // write a key that silently does nothing.
+  if (options.env.SQUID_DECISION_KEY !== undefined) {
+    return {
+      ok: false,
+      error: "SQUID_DECISION_KEY is set in the environment and overrides this; unset it to save a key here.",
+    };
+  }
+  writeDecisionKey(value);
+  return { ok: true, applies: "restart" };
 }
 
 function applyFileSet(

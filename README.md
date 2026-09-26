@@ -181,6 +181,60 @@ against a type that no longer existed and still pass.
   explicit `modelId` still outranks both — a caller that knows which model it
   means is not second-guessed by a file.
 
+### Deciding what the agent reads
+
+A fast decision model (TypeSafe's [Jev](https://typesafe.ai), or a free
+self-hosted replica like OpenJev/Kev) trims the resident agent's context before
+each thought, so the model spends attention on what a future turn will actually
+need. It answers the two questions the design started from — "is this worth
+recording" and "is this high value" — as one: worth the agent's view, or not.
+
+The gate lives on the agent's context, **never on capture**. Capture is the
+irreversible boundary (`capture-policy.ts`); the store keeps everything, and a
+wrong "drop" here costs the agent a fact it can re-derive, never a lost
+observation. This is the same posture the egress side already has: bound the
+view, not the record.
+
+- `src/decision-curator-extension.ts` — a headless inline extension wired into
+  the resident agent's session beside the heartbeat and LLM-log ones. On every
+  `context` event it groups messages into units, asks the decision model which
+  new units a future response needs (`noul` questions), and drops the ones it
+  says no to. Every failure path fails **open**: no key on a keyless replica,
+  any HTTP error, a timeout, or the switch turned off all leave the context
+  untouched, so the agent never loses a turn to it. Off is `on`-by-default with
+  a visible switch, per this repo's rule.
+- `src/jev-curator/` — the decision logic itself, vendored near-verbatim from
+  the MIT `pi-jev-context-curator` package with the TUI stripped and config
+  injected. See `src/jev-curator/README.md` for exactly what changed and why it
+  is in-tree rather than a dependency.
+- `src/decision-keystore.ts` — the decision model's API key, resolved from
+  `SQUID_DECISION_KEY` or a 0600 `~/.pi/squid-decision.json` (never the Squid
+  config file). It is a *separate* secret from the chat model's: the two can
+  point at different providers, and a local Kev needs no key while the chat
+  model does.
+
+The curator is configured through five settings that all appear in the panel's
+settings form under **Decision curation** and all read from the merged env, so
+either an environment variable or the GUI works:
+
+```bash
+# Free, local, no API key: run kev (or openjev) and point Squid at it.
+SQUID_DECISION_BASE_URL=http://127.0.0.1:8009 \
+SQUID_DECISION_MODEL=kev-4b \
+  bun run start
+
+# Turn it off entirely (the switch, not a variable, is the front door):
+SQUID_DECISION_CURATOR=off bun run start
+```
+
+| Setting (`SQUID_*`) | Config id | What it does |
+| --- | --- | --- |
+| `SQUID_DECISION_CURATOR` | `decisionCuration` | `on`/`off`. Unset is on; fails open to a no-op when no endpoint is reachable. |
+| `SQUID_DECISION_BASE_URL` | `decisionCuratorBaseUrl` | The `/v1/systemone` endpoint. Hosted Jev by default; a local replica costs nothing. |
+| `SQUID_DECISION_MODEL` | `decisionCuratorModel` | Model id: `jev-latest`, `openjev`, `kev-4b`, … |
+| `SQUID_DECISION_THRESHOLD` | `decisionCuratorThreshold` | Keep threshold `0`–`1`; higher trims more. |
+| `SQUID_DECISION_KEY` | `decisionKey` (secret) | The key, for an endpoint that needs one. Stored 0600, never in the config file. |
+
 ### Capture and the watch loop
 
 - `src/activity-source.ts` — the source contract every capture adapter implements.
