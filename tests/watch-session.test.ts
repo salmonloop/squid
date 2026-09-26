@@ -1859,17 +1859,19 @@ describe("the control panel on a watch session", () => {
       try {
         h.client.send(JSON.stringify({ type: "config_get" }));
         const configs = await awaitConfigEnd(h.client);
-        // Three model rows lead, then every file-backed row in schema order —
-        // the form IS the dump, so the panel never hardcodes a key name.
+        // Three model rows lead, then every file-backed row in schema order,
+        // then the decision-model key (a secret in neither store) — the form
+        // IS the dump, so the panel never hardcodes a key name.
         //
         // Counted from the schema, not written as a literal: the assertion worth
-        // keeping is "the dump is exactly the two tables, model rows first", and
-        // a hard-coded total made adding a setting look like a test failure.
-        const expectedCount = MODEL_CONFIG_KEYS.length + CONFIG_KEYS.length;
+        // keeping is "the dump is exactly the tables in order", and a hard-coded
+        // total made adding a setting look like a test failure.
+        const expectedCount = MODEL_CONFIG_KEYS.length + CONFIG_KEYS.length + 1;
         expect(configs).toHaveLength(expectedCount);
         expect(configs.map((row) => row.id)).toEqual([
           ...MODEL_CONFIG_KEYS.map((key) => key.id),
           ...CONFIG_KEYS.map((key) => key.id),
+          "decisionKey",
         ]);
         const baseUrlRow = configs[0];
         if (baseUrlRow === undefined) throw new Error("the dump is missing the modelBaseUrl row");
@@ -1886,7 +1888,7 @@ describe("the control panel on a watch session", () => {
         expect(apiKeyRow.kind).toBe("secret");
         // The stored value is nothing the panel may hold; the dump strips it.
         expect(apiKeyRow.value).toBe("");
-        expect(lastRow.id).toBe("excludeApplications");
+        expect(lastRow.id).toBe("decisionKey");
         const end = h.client.lines.map(parsePanelLine).find((p) => p.type === "config_end");
         expect(end?.count).toBe(expectedCount);
       } finally {
