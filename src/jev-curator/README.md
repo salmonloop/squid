@@ -1,10 +1,12 @@
 # `src/jev-curator/` — vendored curator core
 
-These four files are copied, near-verbatim, from
+These files are copied, near-verbatim, from
 [`pi-jev-context-curator`](https://www.npmjs.com/package/pi-jev-context-curator)
 v1.1.0 (MIT, © 2026 Shashank H — see `LICENSE`). They are the pure decision
-logic: message → units, a per-session judgment checkpoint, and the one
-`/v1/systemone` HTTP call.
+logic: message → units, a per-session judgment checkpoint, and the config
+constants. The `/v1/systemone` call is no longer here — it goes through Pi's
+own classifier transport (`ctx.modelRegistry.classify`) in
+`../decision-curator-extension.ts`.
 
 **Why vendored rather than depended on.** The upstream package is a full Pi TUI
 extension — it imports `pi-tui` for a removed-context dialog, reads
@@ -18,11 +20,16 @@ plain `CuratorConfig` shape with no `loadConfig()`, and the extension wrapper
 (`../decision-curator-extension.ts`) is written against Squid's own
 `InlineExtension` + injected keystore.
 
-**Wire contract, unchanged.** The request is `POST {baseUrl}/v1/systemone` with
-`{state, model, questions:{u0:{type:"noul",…}}}` and reads back
-`answers[k].noul`. That is the hosted Jev API's shape, which OpenJev and Kev
-also serve — so pointing this at a free self-hosted replica is two settings
-(`decisionCuratorBaseUrl`, `decisionCuratorModel`), no code change.
+**Wire contract.** The request is Pi-ai's `typesafe-system-one` transport:
+`POST {baseUrl}/v1/systemone` with `{model, state, questions:{u0:{type:"noul",…}}}`
+and answers read back as `answers[k].noul`. That is the hosted Jev API's shape,
+which OpenJev and Kev also serve — so pointing this at a free self-hosted
+replica is two settings (`decisionCuratorBaseUrl`, `decisionCuratorModel`), no
+code change. One delta from the old vendored client: `state` is the JSON object
+`{"transcript": "…"}` (Pi's `ClassifierContext.state` is a `JsonObject`) where
+the vendored client sent the transcript as a bare string — a self-hosted
+replica that greps the state for a plain string will need the field read
+instead.
 
 **What changed from upstream, exactly:**
 
@@ -32,9 +39,9 @@ also serve — so pointing this at a free self-hosted replica is two settings
   `@earendil-works/pi-coding-agent`'s `ContextEvent["messages"][number]` (the
   package this repo already pins) instead of importing `pi-agent-core`; added
   bounds guards for `noUncheckedIndexedAccess`.
-- `jev.ts` — imports use `.js` extensions (NodeNext); added the same bounds
-  guards. Logic byte-for-byte otherwise.
 - `checkpoint.ts` — verbatim.
 
 Not vendored: `index.ts` (the TUI wiring), `keystore.ts` (Squid has its own —
-see `../decision-keystore.ts`), `stats.ts`, `removed-context*.ts` (TUI dialog).
+see `../decision-keystore.ts`), `stats.ts`, `removed-context*.ts` (TUI dialog),
+and `jev.ts` (the HTTP client — replaced by Pi's `classify`, which speaks the
+same endpoint natively).
