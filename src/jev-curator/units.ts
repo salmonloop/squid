@@ -123,10 +123,6 @@ export function describeMessage(m: AgentMessage): {
   };
 }
 
-export function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
-
 /**
  * Content fingerprint identifying a unit across `context` events.
  * Identical units (same label and text) share a fingerprint, so a unit Jev
