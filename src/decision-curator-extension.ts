@@ -1,7 +1,8 @@
-import type {
-  ContextEvent,
-  InlineExtension,
-  ModelRegistry,
+import {
+  estimateTokens,
+  type ContextEvent,
+  type InlineExtension,
+  type ModelRegistry,
 } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_BASE_URL,
@@ -14,13 +15,7 @@ import {
   MAX_UNIT_CHARS,
   type CuratorConfig,
 } from "./jev-curator/config.js";
-import {
-  describeMessage,
-  estimateTokens,
-  fingerprintUnit,
-  groupIntoUnits,
-  type Unit,
-} from "./jev-curator/units.js";
+import { fingerprintUnit, groupIntoUnits, type Unit } from "./jev-curator/units.js";
 import { JudgmentCheckpoint } from "./jev-curator/checkpoint.js";
 import { resolveDecisionKey } from "./decision-keystore.js";
 
@@ -252,9 +247,9 @@ export function decisionCuratorExtension(
         if (messages.length <= 2) return;
 
         const usage = ctx.getContextUsage();
-        const estTokens =
-          usage?.tokens ??
-          messages.reduce((n, m) => n + estimateTokens(describeMessage(m).text), 0);
+        // Pi's own chars/4 estimate, which knows every message shape (images,
+        // tool calls, prompt sections) — not just the flattened text.
+        const estTokens = usage?.tokens ?? messages.reduce((n, m) => n + estimateTokens(m), 0);
         if (estTokens < cfg.minTokens) return;
 
         const units = groupIntoUnits(messages);
