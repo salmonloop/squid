@@ -17,7 +17,6 @@ import {
 } from "./jev-curator/config.js";
 import { fingerprintUnit, groupIntoUnits, type Unit } from "./jev-curator/units.js";
 import { JudgmentCheckpoint } from "./jev-curator/checkpoint.js";
-import { resolveDecisionKey } from "./decision-keystore.js";
 
 /**
  * The decision curator: a headless inline extension that trims the resident
@@ -34,7 +33,7 @@ import { resolveDecisionKey } from "./decision-keystore.js";
  * The decision call goes through Pi's own classifier transport
  * (`ctx.modelRegistry.classify` on the `typesafe-system-one` API) — the same
  * `/v1/systemone` endpoint the vendored HTTP client used, with Pi owning the
- * wire, the bearer, and the timeout. Three things stay Squid's:
+ * wire, the bearer, and the timeout. Two things stay Squid's:
  *   - **No TUI.** The resident agent is headless; diagnostics go to the
  *     injected `log` callback, on the same channel every other Squid sensor's
  *     do.
@@ -42,13 +41,17 @@ import { resolveDecisionKey } from "./decision-keystore.js";
  *     env (config file under process env) by `resolveCuratorConfig`, not read
  *     from `process.env` here. That keeps the one contract this repo enforces —
  *     resolvers read the merged env — unbroken.
- *   - **Injected key.** The decision key comes from `decision-keystore.ts` (env
- *     or the 0600 file) and is passed per-request, never Pi's `auth.json`: the
- *     decision model and the chat model are separate logins.
  *
- * Fail-open is total: no key on a keyless endpoint is fine, any classifier
- * error keeps everything, and a throw is caught by Pi's context runner and
- * logged. The agent never loses a turn to this.
+ * The credential is not Squid's at all: the model declares `provider:
+ * "typesafe"`, so Pi resolves the key itself from its own store — the
+ * `typesafe` entry in `auth.json`, or `TYPESAFE_API_KEY` when nothing is
+ * stored. A keyless replica still needs *some* value there (Pi's transport
+ * refuses to post without a key); any placeholder works, and a run with none
+ * fails open.
+ *
+ * Fail-open is total: a missing key, any classifier error, and a throw all
+ * keep everything, and Pi's context runner catches what escapes. The agent
+ * never loses a turn to this.
  */
 
 /** Off unless the enum says otherwise; unset ("") is on, per the schema. */
@@ -129,7 +132,6 @@ async function classifyNewUnits(
   newUnits: Unit[],
   model: JevClassifierModel,
   cfg: CuratorConfig,
-  apiKey: string,
   registry: ModelRegistry,
   signal: AbortSignal | undefined,
 ): Promise<ClassifierDecision | null> {
@@ -181,9 +183,11 @@ async function classifyNewUnits(
       state: { transcript: selected.map((i) => lines[i]).join("\n\n") },
       questions,
     },
-    // The options object is exactOptionalPropertyTypes-clean: `signal` is
-    // spread only when the session actually has one.
-    { apiKey, timeoutMs: JEV_TIMEOUT_MS, maxRetries: 0, ...(signal ? { signal } : {}) },
+    // No `apiKey`: the model declares `provider: "typesafe"`, so Pi resolves
+    // the credential itself from its own store. The options object is
+    // exactOptionalPropertyTypes-clean: `signal` is spread only when the
+    // session actually has one.
+    { timeoutMs: JEV_TIMEOUT_MS, maxRetries: 0, ...(signal ? { signal } : {}) },
   );
   if (result.stopReason !== "stop") return null;
 
@@ -273,16 +277,10 @@ export function decisionCuratorExtension(
 
         const queryDue = contextCalls % cfg.frequency === 0;
         if (newUnits.length > 0 && queryDue) {
-          // Keyless endpoints (a local Kev with auth off) are supported: the
-          // transport refuses to post without a key, so a placeholder bearer
-          // is sent, which such a replica ignores. Only a paid endpoint that
-          // requires a real key will 401 — and that path fails open like
-          // every other error.
           const decision = await classifyNewUnits(
             newUnits.map((n) => n.unit),
             model,
             cfg,
-            resolveDecisionKey({ env: options.env }) ?? "keyless",
             ctx.modelRegistry,
             ctx.signal,
           );

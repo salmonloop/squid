@@ -11,18 +11,22 @@ import {
   readModelEntry,
   writeModelConfiguration,
   writeModelEndpoint,
+  writeProviderCredential,
 } from "./app-model.js";
-import { hasDecisionKey, writeDecisionKey } from "./decision-keystore.js";
 
 /**
- * The decision curator's API key. A secret like `apiKey`, but it lives in its
- * own 0600 file (`decision-keystore.ts`), not Pi's `auth.json`: the decision
- * model and the chat model can point at different providers, so their
- * credentials are two secrets, not one. It is grouped under "Decision curation"
- * beside the four file-backed rows that configure the same feature, and — like
- * every secret here — its value never leaves this module's callers' sight.
+ * The decision curator's API key. A secret like `apiKey`, and like it stored
+ * in Pi's `auth.json` — under the `typesafe` provider, which is what the
+ * classifier model declares and therefore the id Pi's own auth resolution
+ * looks the key up by. The decision model and the chat model stay separate
+ * logins (different provider ids in the same file), and the value never
+ * leaves this module's callers' sight. Grouped under "Decision curation"
+ * beside the four file-backed rows that configure the same feature.
  */
 export const DECISION_KEY_ID = "decisionKey";
+
+/** The provider id Pi resolves the decision key under. */
+const DECISION_PROVIDER = "typesafe";
 
 /**
  * The semantics between the panel and the stores.
@@ -254,20 +258,30 @@ export function configDumpEntries(options: ConfigServiceOptions): ConfigDump {
     });
   }
 
-  // The decision key, last: a secret that lives in neither store above. Its
-  // value is structurally empty like `apiKey`, and `secretPresent` says whether
-  // one can be read from env or the 0600 file. `applies: restart` because the
-  // curator reads it once when the agent's session is built.
+  // The decision key, last: a secret in Pi's own auth store, under the
+  // provider id the classifier model declares. Its value is structurally
+  // empty like `apiKey`, and `secretPresent` says whether one can be read.
+  // `overridden` means "the env fallback is what this run uses" — Pi resolves
+  // a stored credential first and consults `TYPESAFE_API_KEY` only when
+  // nothing is stored, so an env var beside a stored key governs nothing and
+  // must not be reported as if it did. `applies: restart` because the
+  // curator's classify calls resolve auth at request time, but a live session
+  // already logged the resolution it started with.
   entries.push({
     id: DECISION_KEY_ID,
     label: "Decision model API key",
     group: "Decision curation",
-    description: "The secret for a decision model that needs one. Leave empty for a keyless local replica.",
+    description:
+      "The secret for a decision model that needs one. A keyless local replica needs any placeholder here. Empty clears it.",
     kind: "secret",
     value: "",
     applies: "restart",
-    overridden: overriddenEnv("SQUID_DECISION_KEY"),
-    ...(hasDecisionKey({ env: options.env }) ? { secretPresent: true } : {}),
+    overridden:
+      overriddenEnv("TYPESAFE_API_KEY") &&
+      !hasReadableCredential(options.agentDir, DECISION_PROVIDER),
+    ...(hasReadableCredential(options.agentDir, DECISION_PROVIDER)
+      ? { secretPresent: true }
+      : {}),
   });
 
   return { ok: true, entries };
@@ -289,26 +303,33 @@ export function applyConfigSet(
 }
 
 /**
- * Writes (or clears) the decision key to its own 0600 file. Never the Squid
- * config file. Empty clears it — unlike `apiKey`, a keyless local replica is a
- * supported deployment, so an empty field is a legal "no key needed", not a
- * refusal. Always `restart`: the curator reads the key when the agent session
- * is built, and a live session already holds the old one.
+ * Writes (or clears) the decision key into Pi's `auth.json` under the
+ * `typesafe` provider — the id the classifier model declares, so Pi's own
+ * request-time auth resolution finds it. Never the Squid config file. Empty
+ * clears it — unlike `apiKey`, a keyless local replica is a supported
+ * deployment, so an empty field is a legal "no key needed", not a refusal.
+ * Always `restart`: a live session already holds the resolution it started
+ * with.
  */
 function applyDecisionKeySet(
   options: ConfigServiceOptions,
   value: string,
 ): ConfigSetResult {
-  // Env wins over the file at read time, so writing the file while an env var
-  // overrides it would save a value the run never uses. Say so rather than
-  // write a key that silently does nothing.
-  if (options.env.SQUID_DECISION_KEY !== undefined) {
+  // Pi resolves a stored credential before the env fallback, so writing while
+  // nothing is stored and TYPESAFE_API_KEY is set would save a key the run
+  // never consults. Say so rather than write a key that silently does
+  // nothing — the same refusal the old env-first keystore owed, inverted to
+  // match the precedence the store actually has.
+  if (
+    options.env.TYPESAFE_API_KEY !== undefined &&
+    !hasReadableCredential(options.agentDir, DECISION_PROVIDER)
+  ) {
     return {
       ok: false,
-      error: "SQUID_DECISION_KEY is set in the environment and overrides this; unset it to save a key here.",
+      error: "TYPESAFE_API_KEY is set in the environment and used because nothing is stored; unset it to save a key here.",
     };
   }
-  writeDecisionKey(value);
+  writeProviderCredential(options.agentDir, DECISION_PROVIDER, value.trim());
   return { ok: true, applies: "restart" };
 }
 

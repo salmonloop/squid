@@ -199,28 +199,30 @@ view, not the record.
   the resident agent's session beside the heartbeat and LLM-log ones. On every
   `context` event it groups messages into units, asks the decision model which
   new units a future response needs (`noul` questions), and drops the ones it
-  says no to. Every failure path fails **open**: no key on a keyless replica,
-  any HTTP error, a timeout, or the switch turned off all leave the context
-  untouched, so the agent never loses a turn to it. Off is `on`-by-default with
-  a visible switch, per this repo's rule.
+  says no to. Every failure path fails **open**: no key stored, any HTTP
+  error, a timeout, or the switch turned off all leave the context untouched,
+  so the agent never loses a turn to it. Off is `on`-by-default with a visible
+  switch, per this repo's rule.
 - `src/jev-curator/` — the decision logic itself, vendored near-verbatim from
   the MIT `pi-jev-context-curator` package with the TUI stripped and config
   injected. See `src/jev-curator/README.md` for exactly what changed and why it
   is in-tree rather than a dependency.
-- `src/decision-keystore.ts` — the decision model's API key, resolved from
-  `SQUID_DECISION_KEY` or a 0600 `~/.pi/squid-decision.json` (never the Squid
-  config file). It is a *separate* secret from the chat model's: the two can
-  point at different providers, and a local Kev needs no key while the chat
-  model does.
 
-The curator is configured through five settings that all appear in the panel's
+The curator is configured through four settings that all appear in the panel's
 settings form under **Decision curation** and all read from the merged env, so
-either an environment variable or the GUI works:
+either an environment variable or the GUI works. The decision model's
+credential is not one of them: it is Pi's own, stored under the `typesafe`
+provider in `~/.pi/agent/auth.json` (a stored key wins) or `TYPESAFE_API_KEY`
+(consulted only when nothing is stored) — the same resolution Pi uses for
+every provider, with no Squid-side parallel store.
 
 ```bash
-# Free, local, no API key: run kev (or openjev) and point Squid at it.
+# Free, local: run kev (or openjev) and point Squid at it. Pi's transport
+# refuses to post without a key, so a keyless replica still needs *some*
+# value stored — any placeholder works (GUI row or TYPESAFE_API_KEY).
 SQUID_DECISION_BASE_URL=http://127.0.0.1:8009 \
 SQUID_DECISION_MODEL=kev-4b \
+TYPESAFE_API_KEY=placeholder \
   bun run start
 
 # Turn it off entirely (the switch, not a variable, is the front door):
@@ -233,7 +235,10 @@ SQUID_DECISION_CURATOR=off bun run start
 | `SQUID_DECISION_BASE_URL` | `decisionCuratorBaseUrl` | The `/v1/systemone` endpoint. Hosted Jev by default; a local replica costs nothing. |
 | `SQUID_DECISION_MODEL` | `decisionCuratorModel` | Model id: `jev-latest`, `openjev`, `kev-4b`, … |
 | `SQUID_DECISION_THRESHOLD` | `decisionCuratorThreshold` | Keep threshold `0`–`1`; higher trims more. |
-| `SQUID_DECISION_KEY` | `decisionKey` (secret) | The key, for an endpoint that needs one. Stored 0600, never in the config file. |
+
+The panel's **Decision model API key** row (config id `decisionKey`) writes
+that `typesafe` credential: empty clears it, and the row is the front door —
+`TYPESAFE_API_KEY` is the rescue-when-headless fallback, per this repo's rule.
 
 ### Capture and the watch loop
 

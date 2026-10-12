@@ -68,7 +68,6 @@ describe("decisionCuratorExtension reducer", () => {
     model: { id: string; baseUrl: string; provider: string; api: string; type: string };
     state: { transcript?: string };
     questions: Record<string, { type: string }>;
-    apiKey: string | undefined;
     timeoutMs: number | undefined;
     maxRetries: number | undefined;
   }
@@ -114,7 +113,7 @@ describe("decisionCuratorExtension reducer", () => {
               const call = {
                 model: model as ClassifyCall["model"],
                 ...(context as { state: ClassifyCall["state"]; questions: ClassifyCall["questions"] }),
-                ...(options as Pick<ClassifyCall, "apiKey" | "timeoutMs" | "maxRetries">),
+                ...(options as Pick<ClassifyCall, "timeoutMs" | "maxRetries">),
               };
               calls.push(call);
               const answers: Record<string, { type: string; probability: number }> = {};
@@ -155,7 +154,6 @@ describe("decisionCuratorExtension reducer", () => {
         SQUID_DECISION_BASE_URL: "http://127.0.0.1:8009",
         SQUID_DECISION_MODEL: "kev-4b",
         SQUID_DECISION_THRESHOLD: "0.5",
-        SQUID_DECISION_KEY: "k",
       },
     });
     const { fire, calls } = captureContextHandler(ext, (call) => {
@@ -188,9 +186,10 @@ describe("decisionCuratorExtension reducer", () => {
     expect(call.model.provider).toBe("typesafe");
     expect(call.model.api).toBe("typesafe-system-one");
     expect(call.model.type).toBe("classifier");
-    // Options: injected key, the 15s timeout, and no retries — a slow
-    // endpoint must not stall the LLM call this sits ahead of.
-    expect(call.apiKey).toBe("k");
+    // Options: no `apiKey` (Pi resolves the `typesafe` credential itself at
+    // request time), the 15s timeout, and no retries — a slow endpoint must
+    // not stall the LLM call this sits ahead of.
+    expect("apiKey" in call).toBe(false);
     expect(call.timeoutMs).toBe(15000);
     expect(call.maxRetries).toBe(0);
     // State is the JSON-object transcript; questions are bool-framed per unit.
@@ -239,7 +238,7 @@ describe("decisionCuratorExtension reducer", () => {
 
   it("fails open (keeps everything, records nothing) when classify errors", async () => {
     const ext = decisionCuratorExtension({
-      env: { SQUID_DECISION_KEY: "k" },
+      env: {},
     });
     const { fire, calls } = captureContextHandler(ext, () => ({
       stopReason: "error",
@@ -256,13 +255,6 @@ describe("decisionCuratorExtension reducer", () => {
     // The next query turn re-asks: the failed judgment was not checkpointed.
     for (let i = 0; i < 5; i++) await fire(messages, 9000);
     expect(calls.length).toBe(2);
-  });
-
-  it("sends a placeholder key for a keyless endpoint", async () => {
-    const ext = decisionCuratorExtension({ env: {} });
-    const { fire, calls } = captureContextHandler(ext);
-    for (let i = 0; i < 5; i++) await fire([userMessage("zero"), userMessage("one"), userMessage("two")], 9000);
-    expect(calls[0]?.apiKey).toBe("keyless");
   });
 
   it("caps the state at the newest units that fit the budget", async () => {
