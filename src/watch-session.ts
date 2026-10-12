@@ -10,6 +10,7 @@ import { resolveAttentionWindow } from "./resolve-attention-window.js";
 import { HOUR_MS, resolveRetention } from "./resolve-retention.js";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { resolvePiModel } from "./pi-session-factory.js";
+import { readModelEntry } from "./app-model.js";
 import {
   DEFAULT_BASE_URL,
   applyConfigSet,
@@ -316,6 +317,12 @@ export async function startWatchSession(
   // exists to break.
   const agentDir = options.agentDir ?? getAgentDir();
 
+  // The chat model's provider, one answer for every consumer that must name
+  // it — the settings service (which reads and writes Pi's own files) and the
+  // decision curator (which declares it, so the decision call carries the
+  // same credential chat already uses).
+  const modelProvider = options.modelProvider ?? resolvePiModel({ env }).provider;
+
   /**
    * The settings service the panel talks to. Built once, after the env is
    * resolved and before the panel server wires its hooks; every read and write
@@ -330,7 +337,7 @@ export async function startWatchSession(
     // file-backed `modelProvider` reaches this the same way every resolver's
     // setting does. Reading `process.env` instead would make the row writable
     // and inert.
-    provider: options.modelProvider ?? resolvePiModel({ env }).provider,
+    provider: modelProvider,
     defaultModelId: options.defaultModelId ?? resolvePiModel({ env }).modelId,
     defaultBaseUrl: options.defaultBaseUrl ?? DEFAULT_BASE_URL,
     agentLive: () => agent !== undefined,
@@ -370,10 +377,20 @@ export async function startWatchSession(
     // The decision curator trims what the agent reads before each thought,
     // asking a fast Jev-shaped model which context a future turn will need. It
     // reads the merged env (so a config-file or GUI setting reaches it the same
-    // way every resolver's does) and its own key store, and it is undefined
-    // when turned off — spread away, no placeholder. Everything about it fails
-    // open, so it never costs the agent a turn.
-    const decisionCurator = decisionCuratorExtension({ env, log: logError });
+    // way every resolver's does), declares the chat model's provider — so the
+    // decision call rides the same credential chat already uses, with no
+    // second key anywhere — and is undefined when turned off, spread away, no
+    // placeholder. Everything about it fails open, so it never costs the
+    // agent a turn.
+    const decisionCurator = decisionCuratorExtension({
+      env,
+      provider: modelProvider,
+      defaultBaseUrl:
+        readModelEntry(agentDir, modelProvider)?.baseUrl
+        ?? options.defaultBaseUrl
+        ?? DEFAULT_BASE_URL,
+      log: logError,
+    });
     return createResidentAgent({
       systemPrompt: residentAgentSystemPrompt(),
       cwd: options.workingDirectory,

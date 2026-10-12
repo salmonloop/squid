@@ -41,8 +41,9 @@ instead.
   bounds guards for `noUncheckedIndexedAccess`.
 - `checkpoint.ts` — verbatim.
 
-Not vendored: `index.ts` (the TUI wiring), `keystore.ts` (the credential is
-Pi's own, resolved from `~/.pi/agent/auth.json` or `TYPESAFE_API_KEY` —
-see `../decision-curator-extension.ts`), `stats.ts`, `removed-context*.ts`
+Not vendored: `index.ts` (the TUI wiring), `keystore.ts` (there is no
+decision-specific credential — the classifier declares the chat model's
+provider, so Pi resolves the chat provider's own key at request time; see
+`../decision-curator-extension.ts`), `stats.ts`, `removed-context*.ts`
 (TUI dialog), and `jev.ts` (the HTTP client — replaced by Pi's `classify`,
 which speaks the same endpoint natively).

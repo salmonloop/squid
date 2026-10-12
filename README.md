@@ -210,19 +210,20 @@ view, not the record.
 
 The curator is configured through four settings that all appear in the panel's
 settings form under **Decision curation** and all read from the merged env, so
-either an environment variable or the GUI works. The decision model's
-credential is not one of them: it is Pi's own, stored under the `typesafe`
-provider in `~/.pi/agent/auth.json` (a stored key wins) or `TYPESAFE_API_KEY`
-(consulted only when nothing is stored) — the same resolution Pi uses for
-every provider, with no Squid-side parallel store.
+either an environment variable or the GUI works. The decision model has no
+provider, credential, or login of its own: it declares the *chat* model's
+provider, so Pi resolves the one credential the run already has — the same
+`auth.json` entry the chat model's requests carry, with no second key anywhere.
+The extension registers Pi's own `typesafe-system-one` classifier transport
+onto that provider at session start, so even a models.json-only provider
+learns to speak the `/v1/systemone` wire.
 
 ```bash
-# Free, local: run kev (or openjev) and point Squid at it. Pi's transport
-# refuses to post without a key, so a keyless replica still needs *some*
-# value stored — any placeholder works (GUI row or TYPESAFE_API_KEY).
+# Free, local: run kev (or openjev) and point Squid at it. The decision call
+# carries the chat provider's key; a keyless local replica answers without
+# checking it, so nothing extra needs to be set.
 SQUID_DECISION_BASE_URL=http://127.0.0.1:8009 \
 SQUID_DECISION_MODEL=kev-4b \
-TYPESAFE_API_KEY=placeholder \
   bun run start
 
 # Turn it off entirely (the switch, not a variable, is the front door):
@@ -232,13 +233,9 @@ SQUID_DECISION_CURATOR=off bun run start
 | Setting (`SQUID_*`) | Config id | What it does |
 | --- | --- | --- |
 | `SQUID_DECISION_CURATOR` | `decisionCuration` | `on`/`off`. Unset is on; fails open to a no-op when no endpoint is reachable. |
-| `SQUID_DECISION_BASE_URL` | `decisionCuratorBaseUrl` | The `/v1/systemone` endpoint. Hosted Jev by default; a local replica costs nothing. |
+| `SQUID_DECISION_BASE_URL` | `decisionCuratorBaseUrl` | The `/v1/systemone` endpoint. Defaults to the chat provider's own base URL; a local replica costs nothing. |
 | `SQUID_DECISION_MODEL` | `decisionCuratorModel` | Model id: `jev-latest`, `openjev`, `kev-4b`, … |
 | `SQUID_DECISION_THRESHOLD` | `decisionCuratorThreshold` | Keep threshold `0`–`1`; higher trims more. |
-
-The panel's **Decision model API key** row (config id `decisionKey`) writes
-that `typesafe` credential: empty clears it, and the row is the front door —
-`TYPESAFE_API_KEY` is the rescue-when-headless fallback, per this repo's rule.
 
 ### Capture and the watch loop
 

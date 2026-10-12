@@ -13,7 +13,6 @@ import {
 } from "../src/config-service.js";
 import { CONFIG_KEYS, configKeyById } from "../src/config-schema.js";
 import { writeModelConfiguration } from "../src/app-model.js";
-import { readStoredCredential } from "@earendil-works/pi-coding-agent";
 
 /**
  * The service's two stores are real files in a temp dir: the Squid config file
@@ -80,15 +79,13 @@ describe("MODEL_CONFIG_KEYS", () => {
 });
 
 describe("configDumpEntries", () => {
-  it("lists the three model keys first, then every file key in schema order, then the decision key", () => {
+  it("lists the three model keys first, then every file key in schema order", () => {
     const dir = tempDir("dump");
     const result = configDumpEntries(options(dir));
     if (!result.ok) throw new Error(result.error);
     expect(result.entries.map((entry) => entry.id)).toEqual([
       ...MODEL_CONFIG_KEYS.map((key) => key.id),
       ...CONFIG_KEYS.map((key) => key.id),
-      // The decision-model key: a secret in neither store above, dumped last.
-      "decisionKey",
     ]);
     rmSync(dir, { recursive: true, force: true });
   });
@@ -135,16 +132,15 @@ describe("configDumpEntries", () => {
   it("carries a group and a description for every setting", () => {
     // The panel groups by what the wire tells it, so an entry that reached the
     // form without a group would be a row the user has to place themselves. The
-    // count is asserted too: the two tables plus the decision key are joined
-    // here, and a setting that silently stopped being dumped would otherwise
-    // still pass every field check below.
+    // count is asserted too: the two tables are joined here, and a setting
+    // that silently stopped being dumped would otherwise still pass every
+    // field check below.
     const dir = tempDir("dump");
     const result = configDumpEntries(options(dir));
     if (!result.ok) throw new Error(result.error);
-    // Model rows + file-backed rows + the one decision-key secret that lives in
-    // neither store. Counted from the schema, not a literal, so adding a
-    // setting is not a test failure.
-    expect(result.entries).toHaveLength(MODEL_CONFIG_KEYS.length + CONFIG_KEYS.length + 1);
+    // Model rows + file-backed rows. Counted from the schema, not a literal,
+    // so adding a setting is not a test failure.
+    expect(result.entries).toHaveLength(MODEL_CONFIG_KEYS.length + CONFIG_KEYS.length);
     for (const entry of result.entries) {
       expect(entry.group.length).toBeGreaterThan(0);
       expect(entry.group).not.toBe("Advanced");
@@ -430,57 +426,6 @@ describe("applyConfigSet on the endpoint keys", () => {
       "brand-new",
       "kept-model",
     ]);
-    rmSync(dir, { recursive: true, force: true });
-  });
-});
-
-describe("applyConfigSet on the decision key", () => {
-  // The decision key is Pi's own credential, stored under the `typesafe`
-  // provider the classifier model declares — written through the same
-  // read-modify-write as every other auth.json entry, and read back through
-  // Pi's own `readStoredCredential` so the test asserts what Pi will resolve,
-  // not a file shape Squid happens to write.
-  it("stores the key under the typesafe provider beside other providers' credentials", () => {
-    const dir = tempDir("decision-key");
-    const opts = options(dir);
-    seedCredential(opts.agentDir, "bifrost");
-    const outcome = applyConfigSet(opts, "decisionKey", `  ${API_KEY}  `);
-    expect(outcome).toEqual({ ok: true, applies: "restart" });
-
-    expect(readStoredCredential("typesafe", join(opts.agentDir, "auth.json"))?.key).toBe(API_KEY);
-    // The chat provider's credential survives the write untouched.
-    expect(readStoredCredential("bifrost", join(opts.agentDir, "auth.json"))?.key).toBe(API_KEY);
-    // And the dump reports presence without ever carrying the value.
-    const dump = configDumpEntries(opts);
-    if (!dump.ok) throw new Error(dump.error);
-    expect(entryOf(dump, "decisionKey").secretPresent).toBe(true);
-    expect(JSON.stringify(dump.entries)).not.toContain(API_KEY);
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("clears on empty, and refuses while TYPESAFE_API_KEY would govern", () => {
-    const dir = tempDir("decision-key");
-    const opts = options(dir);
-    // Empty is a legal "no key needed" for a keyless replica, not a refusal:
-    // it clears the stored entry.
-    applyConfigSet(opts, "decisionKey", API_KEY);
-    expect(applyConfigSet(opts, "decisionKey", "  ")).toEqual({ ok: true, applies: "restart" });
-    expect(readStoredCredential("typesafe", join(opts.agentDir, "auth.json"))).toBeUndefined();
-
-    // Pi consults the env var only when nothing is stored, so with the env
-    // set and no stored key, a save would write a value the run never uses.
-    const envGoverns = options(dir, { env: { TYPESAFE_API_KEY: "from-env" } });
-    const refused = applyConfigSet(envGoverns, "decisionKey", API_KEY);
-    expect(refused.ok).toBe(false);
-    if (refused.ok) return;
-    expect(refused.error).toContain("TYPESAFE_API_KEY");
-
-    // Once a key is stored, the env var governs nothing: the save goes
-    // through, and the dump must not claim the env is overriding it.
-    applyConfigSet(opts, "decisionKey", API_KEY);
-    const dump = configDumpEntries(envGoverns);
-    if (!dump.ok) throw new Error(dump.error);
-    expect(entryOf(dump, "decisionKey").overridden).toBe(false);
     rmSync(dir, { recursive: true, force: true });
   });
 });
