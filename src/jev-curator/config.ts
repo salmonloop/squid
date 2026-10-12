@@ -8,7 +8,6 @@
  * `loadConfig()` (which read `process.env` directly) is deliberately gone.
  */
 
-export const DEFAULT_BASE_URL = "https://api.typesafe.ai";
 export const DEFAULT_MODEL = "jev-latest";
 export const DEFAULT_THRESHOLD = 0.5;
 export const DEFAULT_MIN_TOKENS = 8000;

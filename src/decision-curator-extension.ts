@@ -1,3 +1,4 @@
+import { typesafeSystemOneApi } from "@earendil-works/pi-ai/api/typesafe-system-one.lazy";
 import {
   estimateTokens,
   type ContextEvent,
@@ -5,7 +6,6 @@ import {
   type ModelRegistry,
 } from "@earendil-works/pi-coding-agent";
 import {
-  DEFAULT_BASE_URL,
   DEFAULT_FREQUENCY,
   DEFAULT_MIN_TOKENS,
   DEFAULT_MODEL,
@@ -42,12 +42,13 @@ import { JudgmentCheckpoint } from "./jev-curator/checkpoint.js";
  *     from `process.env` here. That keeps the one contract this repo enforces —
  *     resolvers read the merged env — unbroken.
  *
- * The credential is not Squid's at all: the model declares `provider:
- * "typesafe"`, so Pi resolves the key itself from its own store — the
- * `typesafe` entry in `auth.json`, or `TYPESAFE_API_KEY` when nothing is
- * stored. A keyless replica still needs *some* value there (Pi's transport
- * refuses to post without a key); any placeholder works, and a run with none
- * fails open.
+ * The decision model is not a separate login: it declares the *chat* model's
+ * provider, so Pi resolves the one credential the run already has — the same
+ * `auth.json` entry the chat model's requests carry, with no second key
+ * anywhere. The endpoint stays its own setting (a gateway can route
+ * `/v1/systemone` to a different server than chat) but defaults to the chat
+ * provider's own base URL, so a run that set nothing sends the decision call
+ * where it sends every other call, under the same key.
  *
  * Fail-open is total: a missing key, any classifier error, and a throw all
  * keep everything, and Pi's context runner catches what escapes. The agent
@@ -60,14 +61,20 @@ export function decisionCuratorEnabled(env: Record<string, string | undefined>):
 }
 
 /**
- * Builds the `CuratorConfig` from the merged env. Every value has a schema
- * default, so a run that set nothing gets the hosted-Jev defaults and a run
- * that set only the endpoint keeps the rest.
+ * Builds the `CuratorConfig` from the merged env. `defaultBaseUrl` is the
+ * chat provider's own base URL, so a run that set nothing sends the decision
+ * call where it sends chat — one provider, one endpoint, one key. An explicit
+ * `SQUID_DECISION_BASE_URL` still overrides it (an endpoint is not a
+ * provider: a gateway can serve `/v1/systemone` from elsewhere, and a local
+ * replica is the free option). Every other value has a schema default.
  */
-export function resolveCuratorConfig(env: Record<string, string | undefined>): CuratorConfig {
+export function resolveCuratorConfig(
+  env: Record<string, string | undefined>,
+  defaultBaseUrl: string,
+): CuratorConfig {
   const threshold = Number.parseFloat(env.SQUID_DECISION_THRESHOLD ?? "");
   return {
-    baseUrl: (env.SQUID_DECISION_BASE_URL || DEFAULT_BASE_URL).replace(/\/+$/, ""),
+    baseUrl: decisionEndpoint(env.SQUID_DECISION_BASE_URL, defaultBaseUrl),
     model: env.SQUID_DECISION_MODEL || DEFAULT_MODEL,
     threshold: Number.isFinite(threshold)
       ? Math.min(1, Math.max(0, threshold))
@@ -78,18 +85,30 @@ export function resolveCuratorConfig(env: Record<string, string | undefined>): C
 }
 
 /**
+ * The base the classifier transport appends `systemone` to, so it must end
+ * in `/v1`. Both the chat provider's URL and a hand-entered replica base may
+ * already carry it, so strip one trailing `/v1` before adding it back —
+ * never twice.
+ */
+function decisionEndpoint(override: string | undefined, fallback: string): string {
+  const base = (override || fallback).replace(/\/+$/, "").replace(/\/v1$/, "");
+  return `${base}/v1`;
+}
+
+/**
  * Pi-ai's `ClassifierModel` is not re-exported through pi-coding-agent, so the
- * entry is built structurally: the same fields as Pi's `typesafe` catalog entry
- * for `jev-latest`, pointed at the configured endpoint. `baseUrl` gets `/v1`
- * because the transport appends `systemone` to it, so the wire URL stays
- * `{baseUrl}/v1/systemone` — the endpoint OpenJev and Kev replicas serve.
+ * entry is built structurally: the same fields as Pi's catalog classifiers,
+ * pointed at the configured endpoint. The provider is the chat model's own —
+ * Pi's request-time auth then resolves the credential the chat model already
+ * uses, and `baseUrl` carries `/v1` because the transport appends `systemone`
+ * to it, so the wire URL is `{baseUrl}/systemone`.
  */
 interface JevClassifierModel {
   readonly type: "classifier";
   readonly id: string;
   readonly name: string;
   readonly api: "typesafe-system-one";
-  readonly provider: "typesafe";
+  readonly provider: string;
   readonly baseUrl: string;
   readonly input: ("text" | "image")[];
   readonly cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
@@ -183,10 +202,10 @@ async function classifyNewUnits(
       state: { transcript: selected.map((i) => lines[i]).join("\n\n") },
       questions,
     },
-    // No `apiKey`: the model declares `provider: "typesafe"`, so Pi resolves
-    // the credential itself from its own store. The options object is
-    // exactOptionalPropertyTypes-clean: `signal` is spread only when the
-    // session actually has one.
+    // No `apiKey`: the model declares the chat provider, so Pi resolves the
+    // credential the chat model already uses from its own store. The options
+    // object is exactOptionalPropertyTypes-clean: `signal` is spread only when
+    // the session actually has one.
     { timeoutMs: JEV_TIMEOUT_MS, maxRetries: 0, ...(signal ? { signal } : {}) },
   );
   if (result.stopReason !== "stop") return null;
@@ -202,8 +221,16 @@ async function classifyNewUnits(
 }
 
 export interface DecisionCuratorOptions {
-  /** The merged env (config file under process env), for config + key. */
+  /** The merged env (config file under process env), for config. */
   readonly env: Record<string, string | undefined>;
+  /**
+   * The chat model's provider — the one the decision model declares, so the
+   * decision call carries the same credential chat already uses. There is no
+   * decision-provider setting on purpose: the two are one provider.
+   */
+  readonly provider: string;
+  /** The chat provider's base URL, the default the decision endpoint takes. */
+  readonly defaultBaseUrl: string;
   /** One JSON line per curation pass; wired to the session's stderr logger. */
   readonly log?: (line: string) => void;
 }
@@ -217,14 +244,14 @@ export function decisionCuratorExtension(
 ): InlineExtension | undefined {
   if (!decisionCuratorEnabled(options.env)) return undefined;
 
-  const cfg = resolveCuratorConfig(options.env);
+  const cfg = resolveCuratorConfig(options.env, options.defaultBaseUrl);
   const model: JevClassifierModel = {
     type: "classifier",
     id: cfg.model,
     name: "Jev",
     api: "typesafe-system-one",
-    provider: "typesafe",
-    baseUrl: `${cfg.baseUrl}/v1`,
+    provider: options.provider,
+    baseUrl: cfg.baseUrl,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 64000,
@@ -238,10 +265,19 @@ export function decisionCuratorExtension(
     hidden: true,
     factory: (pi) => {
       // Judgments are per-session so a resumed session never reuses a stale
-      // verdict about a unit whose meaning has since changed.
-      pi.on("session_start", () => {
+      // verdict about a unit whose meaning has since changed. The same event
+      // wires the classifier transport onto the chat provider — Pi's own
+      // `typesafe-system-one` implementation, registered through Pi's public
+      // provider API, so a models.json provider (which has no builtin
+      // classifiers) learns to speak the wire and every request thereafter
+      // resolves the provider's own credential at request time. Re-registering
+      // per session merges, leaving the chat models and auth untouched.
+      pi.on("session_start", (_event, ctx) => {
         checkpoint.clear();
         contextCalls = 0;
+        ctx.modelRegistry.registerProvider(options.provider, {
+          classifiers: { "typesafe-system-one": typesafeSystemOneApi() },
+        });
       });
 
       pi.on("context", async (event: ContextEvent, ctx) => {

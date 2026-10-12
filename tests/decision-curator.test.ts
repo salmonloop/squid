@@ -6,7 +6,7 @@ import {
   resolveCuratorConfig,
 } from "../src/decision-curator-extension.js";
 import { groupIntoUnits } from "../src/jev-curator/units.js";
-import { DEFAULT_BASE_URL, DEFAULT_MODEL } from "../src/jev-curator/config.js";
+import { DEFAULT_MODEL } from "../src/jev-curator/config.js";
 
 type AgentMessage = ContextEvent["messages"][number];
 
@@ -38,27 +38,30 @@ describe("decisionCuratorEnabled", () => {
 });
 
 describe("resolveCuratorConfig", () => {
-  it("defaults to hosted Jev and clamps a bad threshold", () => {
-    const cfg = resolveCuratorConfig({});
-    expect(cfg.baseUrl).toBe(DEFAULT_BASE_URL);
+  it("defaults the endpoint to the chat provider's base URL and clamps a bad threshold", () => {
+    const cfg = resolveCuratorConfig({}, "https://chat.example/v1");
+    expect(cfg.baseUrl).toBe("https://chat.example/v1");
     expect(cfg.model).toBe(DEFAULT_MODEL);
     expect(cfg.threshold).toBe(0.5);
   });
 
-  it("reads a self-hosted endpoint and model from the merged env, trimming trailing slashes", () => {
-    const cfg = resolveCuratorConfig({
-      SQUID_DECISION_BASE_URL: "http://127.0.0.1:8009/",
-      SQUID_DECISION_MODEL: "kev-4b",
-      SQUID_DECISION_THRESHOLD: "0.8",
-    });
-    expect(cfg.baseUrl).toBe("http://127.0.0.1:8009");
+  it("reads a self-hosted endpoint and model from the merged env, never doubling /v1", () => {
+    const cfg = resolveCuratorConfig(
+      {
+        SQUID_DECISION_BASE_URL: "http://127.0.0.1:8009/",
+        SQUID_DECISION_MODEL: "kev-4b",
+        SQUID_DECISION_THRESHOLD: "0.8",
+      },
+      "https://chat.example/v1",
+    );
+    expect(cfg.baseUrl).toBe("http://127.0.0.1:8009/v1");
     expect(cfg.model).toBe("kev-4b");
     expect(cfg.threshold).toBe(0.8);
   });
 
   it("clamps an out-of-range threshold into [0,1]", () => {
-    expect(resolveCuratorConfig({ SQUID_DECISION_THRESHOLD: "5" }).threshold).toBe(1);
-    expect(resolveCuratorConfig({ SQUID_DECISION_THRESHOLD: "-1" }).threshold).toBe(0);
+    expect(resolveCuratorConfig({ SQUID_DECISION_THRESHOLD: "5" }, "https://x/v1").threshold).toBe(1);
+    expect(resolveCuratorConfig({ SQUID_DECISION_THRESHOLD: "-1" }, "https://x/v1").threshold).toBe(0);
   });
 });
 
@@ -84,16 +87,20 @@ describe("decisionCuratorExtension reducer", () => {
     ) => { stopReason: string; answers?: Record<string, unknown> },
   ): {
     calls: ClassifyCall[];
+    registeredOn: string[] | undefined;
     fire: (messages: AgentMessage[], usageTokens?: number) => Promise<AgentMessage[]>;
     sessionStart: () => void;
   } {
     if (ext === undefined) throw new Error("extension was disabled");
     const factory = typeof ext === "function" ? ext : ext.factory;
     const calls: ClassifyCall[] = [];
+    let registeredOn: string[] | undefined;
     let contextHandler:
       | ((event: ContextEvent, ctx: unknown) => Promise<{ messages: AgentMessage[] } | void>)
       | undefined;
-    let sessionStartHandler: (() => void) | undefined;
+    let sessionStartHandler:
+      | ((event: unknown, ctx: unknown) => void)
+      | undefined;
     const pi = {
       on: (event: string, handler: unknown) => {
         if (event === "context") contextHandler = handler as typeof contextHandler;
@@ -103,6 +110,7 @@ describe("decisionCuratorExtension reducer", () => {
     void factory(pi);
     return {
       calls,
+      get registeredOn() { return registeredOn; },
       fire: async (messages, usageTokens) => {
         if (contextHandler === undefined) throw new Error("no context handler registered");
         const ctx = {
@@ -129,16 +137,50 @@ describe("decisionCuratorExtension reducer", () => {
         const result = await contextHandler({ type: "context", messages }, ctx);
         return result?.messages ?? messages;
       },
-      sessionStart: () => sessionStartHandler?.(),
+      sessionStart: () => sessionStartHandler?.(
+        {},
+        {
+          modelRegistry: {
+            registerProvider: (provider: string, config: unknown) => {
+              const classifiers = (config as { classifiers?: Record<string, unknown> }).classifiers;
+              registeredOn = [provider, ...Object.keys(classifiers ?? {})];
+            },
+          },
+        },
+      ),
     };
   }
 
   it("is disabled (undefined) when the switch is off", () => {
-    expect(decisionCuratorExtension({ env: { SQUID_DECISION_CURATOR: "off" } })).toBeUndefined();
+    expect(decisionCuratorExtension({
+      env: { SQUID_DECISION_CURATOR: "off" },
+      provider: "bifrost",
+      defaultBaseUrl: "https://chat.example/v1",
+    })).toBeUndefined();
+  });
+
+  it("registers the classifier transport on the chat provider at session start", () => {
+    const ext = decisionCuratorExtension({
+      env: {},
+      provider: "bifrost",
+      defaultBaseUrl: "https://chat.example/v1",
+    });
+    const { registeredOn } = captureContextHandler(ext);
+    // The wire implementation is Pi's own, registered through Pi's public
+    // provider API onto the chat provider — so the classifier rides the chat
+    // credential with no second login anywhere.
+    expect(registeredOn).toBeUndefined();
+    const h = captureContextHandler(ext);
+    h.sessionStart();
+    expect(h.registeredOn).toEqual(["bifrost", "typesafe-system-one"]);
   });
 
   it("passes context through untouched below the min-token floor", async () => {
-    const ext = decisionCuratorExtension({ env: {} });
+    const ext = decisionCuratorExtension({
+      env: {},
+      provider: "bifrost",
+      defaultBaseUrl: "https://chat.example/v1",
+    });
     const { fire, calls } = captureContextHandler(ext);
     const messages = [userMessage("sys"), assistantMessage("a"), userMessage("b")];
     // Tiny context (well under 8000 tokens): the reducer returns nothing, so
@@ -155,6 +197,8 @@ describe("decisionCuratorExtension reducer", () => {
         SQUID_DECISION_MODEL: "kev-4b",
         SQUID_DECISION_THRESHOLD: "0.5",
       },
+      provider: "bifrost",
+      defaultBaseUrl: "https://chat.example/v1",
     });
     const { fire, calls } = captureContextHandler(ext, (call) => {
       // Drop every unit: probability 0 < 0.5.
@@ -179,15 +223,16 @@ describe("decisionCuratorExtension reducer", () => {
     // Exactly one classify call happened, on the query turn.
     expect(calls.length).toBe(1);
     const call = calls[0]!;
-    // The model points at the configured replica: baseUrl + /v1, the
-    // configured id, Pi's typesafe-system-one classifier shape.
+    // The model points at the configured replica: base + /v1 (the transport
+    // appends `systemone`), the configured id, and — the point of the unification
+    // — the chat provider, so Pi resolves the chat credential for the call.
     expect(call.model.baseUrl).toBe("http://127.0.0.1:8009/v1");
     expect(call.model.id).toBe("kev-4b");
-    expect(call.model.provider).toBe("typesafe");
+    expect(call.model.provider).toBe("bifrost");
     expect(call.model.api).toBe("typesafe-system-one");
     expect(call.model.type).toBe("classifier");
-    // Options: no `apiKey` (Pi resolves the `typesafe` credential itself at
-    // request time), the 15s timeout, and no retries — a slow endpoint must
+    // Options: no `apiKey` (Pi resolves the chat provider's credential itself
+    // at request time), the 15s timeout, and no retries — a slow endpoint must
     // not stall the LLM call this sits ahead of.
     expect("apiKey" in call).toBe(false);
     expect(call.timeoutMs).toBe(15000);
@@ -207,6 +252,8 @@ describe("decisionCuratorExtension reducer", () => {
   it("keeps units at or above threshold and drops those below", async () => {
     const ext = decisionCuratorExtension({
       env: { SQUID_DECISION_THRESHOLD: "0.5" },
+      provider: "bifrost",
+      defaultBaseUrl: "https://chat.example/v1",
     });
     const { fire } = captureContextHandler(ext, (call) => {
       const answers: Record<string, { type: string; probability: number }> = {};
@@ -239,6 +286,8 @@ describe("decisionCuratorExtension reducer", () => {
   it("fails open (keeps everything, records nothing) when classify errors", async () => {
     const ext = decisionCuratorExtension({
       env: {},
+      provider: "bifrost",
+      defaultBaseUrl: "https://chat.example/v1",
     });
     const { fire, calls } = captureContextHandler(ext, () => ({
       stopReason: "error",
@@ -258,7 +307,11 @@ describe("decisionCuratorExtension reducer", () => {
   });
 
   it("caps the state at the newest units that fit the budget", async () => {
-    const ext = decisionCuratorExtension({ env: {} });
+    const ext = decisionCuratorExtension({
+      env: {},
+      provider: "bifrost",
+      defaultBaseUrl: "https://chat.example/v1",
+    });
     let questionCount = 0;
     const { fire } = captureContextHandler(ext, (call) => {
       questionCount = Object.keys(call.questions).length;

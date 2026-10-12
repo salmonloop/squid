@@ -11,22 +11,7 @@ import {
   readModelEntry,
   writeModelConfiguration,
   writeModelEndpoint,
-  writeProviderCredential,
 } from "./app-model.js";
-
-/**
- * The decision curator's API key. A secret like `apiKey`, and like it stored
- * in Pi's `auth.json` — under the `typesafe` provider, which is what the
- * classifier model declares and therefore the id Pi's own auth resolution
- * looks the key up by. The decision model and the chat model stay separate
- * logins (different provider ids in the same file), and the value never
- * leaves this module's callers' sight. Grouped under "Decision curation"
- * beside the four file-backed rows that configure the same feature.
- */
-export const DECISION_KEY_ID = "decisionKey";
-
-/** The provider id Pi resolves the decision key under. */
-const DECISION_PROVIDER = "typesafe";
 
 /**
  * The semantics between the panel and the stores.
@@ -176,10 +161,6 @@ export function isModelConfigKey(id: string): boolean {
   return MODEL_CONFIG_KEYS.some((key) => key.id === id);
 }
 
-export function isDecisionKeyId(id: string): boolean {
-  return id === DECISION_KEY_ID;
-}
-
 export interface ConfigServiceOptions {
   /** Where the Squid config file lives; undefined disables file-backed sets. */
   readonly configPath: string | undefined;
@@ -258,32 +239,6 @@ export function configDumpEntries(options: ConfigServiceOptions): ConfigDump {
     });
   }
 
-  // The decision key, last: a secret in Pi's own auth store, under the
-  // provider id the classifier model declares. Its value is structurally
-  // empty like `apiKey`, and `secretPresent` says whether one can be read.
-  // `overridden` means "the env fallback is what this run uses" — Pi resolves
-  // a stored credential first and consults `TYPESAFE_API_KEY` only when
-  // nothing is stored, so an env var beside a stored key governs nothing and
-  // must not be reported as if it did. `applies: restart` because the
-  // curator's classify calls resolve auth at request time, but a live session
-  // already logged the resolution it started with.
-  entries.push({
-    id: DECISION_KEY_ID,
-    label: "Decision model API key",
-    group: "Decision curation",
-    description:
-      "The secret for a decision model that needs one. A keyless local replica needs any placeholder here. Empty clears it.",
-    kind: "secret",
-    value: "",
-    applies: "restart",
-    overridden:
-      overriddenEnv("TYPESAFE_API_KEY") &&
-      !hasReadableCredential(options.agentDir, DECISION_PROVIDER),
-    ...(hasReadableCredential(options.agentDir, DECISION_PROVIDER)
-      ? { secretPresent: true }
-      : {}),
-  });
-
   return { ok: true, entries };
 }
 
@@ -298,39 +253,7 @@ export function applyConfigSet(
   value: string,
 ): ConfigSetResult {
   if (isModelConfigKey(id)) return applyModelSet(options, id, value);
-  if (isDecisionKeyId(id)) return applyDecisionKeySet(options, value);
   return applyFileSet(options, id, value);
-}
-
-/**
- * Writes (or clears) the decision key into Pi's `auth.json` under the
- * `typesafe` provider — the id the classifier model declares, so Pi's own
- * request-time auth resolution finds it. Never the Squid config file. Empty
- * clears it — unlike `apiKey`, a keyless local replica is a supported
- * deployment, so an empty field is a legal "no key needed", not a refusal.
- * Always `restart`: a live session already holds the resolution it started
- * with.
- */
-function applyDecisionKeySet(
-  options: ConfigServiceOptions,
-  value: string,
-): ConfigSetResult {
-  // Pi resolves a stored credential before the env fallback, so writing while
-  // nothing is stored and TYPESAFE_API_KEY is set would save a key the run
-  // never consults. Say so rather than write a key that silently does
-  // nothing — the same refusal the old env-first keystore owed, inverted to
-  // match the precedence the store actually has.
-  if (
-    options.env.TYPESAFE_API_KEY !== undefined &&
-    !hasReadableCredential(options.agentDir, DECISION_PROVIDER)
-  ) {
-    return {
-      ok: false,
-      error: "TYPESAFE_API_KEY is set in the environment and used because nothing is stored; unset it to save a key here.",
-    };
-  }
-  writeProviderCredential(options.agentDir, DECISION_PROVIDER, value.trim());
-  return { ok: true, applies: "restart" };
 }
 
 function applyFileSet(
