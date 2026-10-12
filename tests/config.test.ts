@@ -165,12 +165,6 @@ describe("config schema", () => {
       // read by `resolveConfiguredModel` -- a file-backed copy of it would be
       // the parallel store `app-model.ts` exists to prevent.
       ["PI_MODEL_ID", "a write-time default; the stored entry is the answer"],
-      // The decision curator's API key. A secret like the model `apiKey`: it
-      // lives in its own 0600 file (`decision-keystore.ts`), never the Squid
-      // config file, and the settings service offers it as the `decisionKey`
-      // secret row — so it is a configurable setting, just not a file-backed
-      // one, exactly like the three model rows in `MODEL_CONFIG_KEYS`.
-      ["SQUID_DECISION_KEY", "decision-model credential; own 0600 file, GUI secret row"],
     ]);
 
     const names = new Set<string>();

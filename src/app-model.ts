@@ -248,19 +248,30 @@ function writeProviderEntry(
   writeJsonAtomic(modelsPath, models);
 }
 
+/**
+ * The credential half alone: one provider's `auth.json` entry, rewritten while
+ * every other provider the user has configured is preserved. An empty key
+ * removes the entry — the one write that can undo a credential, so it is the
+ * settings row for a keyless deployment, never a silent side effect.
+ */
+export function writeProviderCredential(agentDir: string, provider: string, key: string): void {
+  mkdirSync(agentDir, { recursive: true });
+  const authPath = join(agentDir, "auth.json");
+  const auth: Record<string, unknown> = existsSync(authPath)
+    ? (JSON.parse(readFileSync(authPath, "utf8")) as Record<string, unknown>)
+    : {};
+  if (key.length === 0) delete auth[provider];
+  else auth[provider] = { type: "api_key", key };
+  writeJsonAtomic(authPath, auth);
+}
+
 export function writeModelConfiguration(
   agentDir: string,
   provider: string,
   answers: FirstRunAnswers,
 ): void {
   writeProviderEntry(agentDir, provider, answers.baseUrl, answers.modelId);
-
-  const authPath = join(agentDir, "auth.json");
-  const auth: Record<string, unknown> = existsSync(authPath)
-    ? (JSON.parse(readFileSync(authPath, "utf8")) as Record<string, unknown>)
-    : {};
-  auth[provider] = { type: "api_key", key: answers.apiKey };
-  writeJsonAtomic(authPath, auth);
+  writeProviderCredential(agentDir, provider, answers.apiKey);
 }
 
 /**
