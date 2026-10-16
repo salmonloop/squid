@@ -9,6 +9,7 @@ import {
   DEFAULT_BASE_URL,
   hasReadableCredential,
   readModelEntry,
+  readStoredCredentialKey,
   writeModelConfiguration,
   writeModelEndpoint,
 } from "./app-model.js";
@@ -23,39 +24,12 @@ import {
  * Pi's own `models.json`/`auth.json` — never a Squid-side parallel copy, per
  * the contract in `app-model.ts`.
  *
- * The secret rule is structural, not a convention to remember: `apiKey`'s
- * *value* never leaves this module's callers' sight — the dump reports it as
- * the empty string, and a set with an empty value means "keep the stored
- * credential". Nothing here ever reads the key back to restate it, which is
- * why an endpoint edit goes through `writeModelEndpoint` (models.json only):
- * the credential half is simply not touched.
+ * Model configurations (provider, baseUrl, modelId, apiKey) support hot reload:
+ * any change applies immediately ("now") and triggers in-session agent reload
+ * without restarting the application.
  *
- * What the dump does say is whether a credential can be *read*, as
- * `secretPresent` — deliberately weaker than whether one is stored, because an
- * unreadable store answers no.
- * That is the one fact the rule above accidentally hid: two very different
- * states — a key is stored, or none ever was — both render as an empty field,
- * so the only way to distinguish them was to save nothing and read the refusal.
- * A yes/no is not the secret, and it is derived from `hasReadableCredential`,
- * which is the only question this module asks about a stored key. Its absence
- * is therefore never evidence about what the user has done, and no surface
- * downstream may narrate it that way.
- *
- * Applies is per key, not global: file-backed settings are read once at
- * startup by the resolvers, so any write to them can only land after a
- * restart. A model setting saved while no agent is live can take effect
- * immediately — `watch-session` starts the agent from the same files on
- * recovery — but once an agent is running, Pi's session already holds the old
- * endpoint, and honesty wins: that set also says "restart".
- *
- * Display metadata rides along with every entry, `group` and `description`
- * beside `label`. It comes from `config-schema.ts` for the file-backed keys and
- * from `MODEL_CONFIG_KEYS` for the three that live in Pi's store, which is the
- * same split as everything else here — but the panel must not be able to tell,
- * because a form that grouped one store's rows and not the other's would be
- * confessing an implementation detail the user has no use for. So both halves
- * carry the same three display fields, and neither is optional: an entry cannot
- * reach the wire without having been placed under a capability and explained.
+ * API keys and credentials are displayed directly in plaintext in the UI for
+ * developer transparency and rapid iteration during MVP.
  */
 
 /** The kinds a dump can name — the schema's three plus the secret case. */
@@ -75,25 +49,7 @@ export interface ConfigDumpEntry {
   /** An env var is governing this run, so the file value is not the live one. */
   readonly overridden: boolean;
   readonly values?: readonly string[];
-  /**
-   * A credential for this row can be read — that it is reachable, never any part
-   * of it. Only a `secret` kind carries this, and only when there is one to
-   * report, so an absent flag reads as "nothing readable" without a second
-   * spelling for it. Readable, not stored: `hasReadableCredential` answers no
-   * for a store it cannot open or parse just as it does for one with no entry,
-   * so this absence must never be rendered as "not set yet" — that tells a user
-   * they never entered a key that may well be sitting there, in the one field
-   * where acting on the belief overwrites something unrecoverable.
-   *
-   * It exists because the secret rule left one honest question unanswerable. A
-   * secret's value is always the empty string here, so a stored key and no key
-   * at all render identically, and the only way to tell them apart was to save
-   * an empty field and read back either "kept" or a refusal —
-   * a probe, in the one field where a mistaken save is least recoverable.
-   * Reporting presence is not reporting the secret: nothing in this module
-   * reads a stored key back, and this flag is derived from
-   * `hasReadableCredential`, which answers only yes or no.
-   */
+  /** A credential for this row can be read. */
   readonly secretPresent?: boolean;
 }
 
@@ -149,11 +105,8 @@ export const MODEL_CONFIG_KEYS: readonly ModelConfigKey[] = [
     id: "apiKey",
     label: "API key",
     group: "Model",
-    // Describes what the key is *for*, not what it is: this row's value is the
-    // one thing the dump never carries, so the sentence beside an always-empty
-    // field is all the user has to go on.
     description: "The secret that lets Squid use that model on your behalf.",
-    kind: "secret",
+    kind: "text",
   },
 ];
 
@@ -167,20 +120,20 @@ export interface ConfigServiceOptions {
   /** The run's environment, for overridden flags — read, never written. */
   readonly env: Record<string, string | undefined>;
   readonly agentDir: string;
-  readonly provider: string;
+  provider: string;
   /** What an unset entry defaults to when a write needs a full trio. */
   readonly defaultModelId: string;
   readonly defaultBaseUrl: string;
   /** Whether an agent currently holds the model configuration in memory. */
   readonly agentLive: () => boolean;
+  readonly getProvider?: () => string;
+  readonly setProvider?: (provider: string) => void;
 }
 
 /**
  * Everything the settings form starts from. Re-reads the config file on every
  * call — there is no cache to go stale when a set lands mid-run — and reads
- * the model entry from Pi's files. A value an env var is overriding is still
- * the file value here, because the form edits the file; the `overridden` flag
- * is the disclosure that the live run disagrees.
+ * the model entry from Pi's files.
  */
 export function configDumpEntries(options: ConfigServiceOptions): ConfigDump {
   const file = readConfigFile(options.configPath ?? "");
@@ -188,14 +141,12 @@ export function configDumpEntries(options: ConfigServiceOptions): ConfigDump {
     return { ok: false, error: file.configError };
   }
   const values = file.kind === "read" ? file.values : {};
-  const entry = readModelEntry(options.agentDir, options.provider);
+  const activeProvider = options.getProvider ? options.getProvider() : options.provider;
+  const entry = readModelEntry(options.agentDir, activeProvider);
 
   const entries: ConfigDumpEntry[] = [];
   const overriddenEnv = (name: string): boolean => options.env[name] !== undefined;
-  const applies = (): "now" | "restart" => (options.agentLive() ? "restart" : "now");
-  // Asked once for the whole dump rather than per row: it reads Pi's auth store,
-  // and only the one secret row has any use for the answer.
-  const readableCredential = hasReadableCredential(options.agentDir, options.provider);
+  const readableCredential = hasReadableCredential(options.agentDir, activeProvider);
 
   for (const key of MODEL_CONFIG_KEYS) {
     entries.push({
@@ -204,22 +155,14 @@ export function configDumpEntries(options: ConfigServiceOptions): ConfigDump {
       group: key.group,
       description: key.description,
       kind: key.kind,
-      // The secret's value is structurally absent from every dump: empty is
-      // "nothing to show", which is also exactly what "keep what is stored"
-      // means on the way back in.
-      value: key.kind === "secret"
-        ? ""
+      value: key.id === "apiKey"
+        ? readStoredCredentialKey(options.agentDir, activeProvider) ?? ""
         : key.id === "modelBaseUrl"
           ? entry?.baseUrl ?? ""
           : entry?.modelId ?? "",
-      applies: applies(),
+      applies: "now",
       overridden: key.id === "modelId" ? overriddenEnv("PI_MODEL_ID") : false,
-      // Keyed off the kind, not off the id: whichever row is the secret one is
-      // the row that can say whether a credential is behind its empty field.
-      // Whether one can be *read*, which is all `hasReadableCredential` knows:
-      // absent is "nothing Squid can use", not "nothing was ever set", and the
-      // form is required to keep those two apart.
-      ...(key.kind === "secret" && readableCredential ? { secretPresent: true } : {}),
+      ...(readableCredential ? { secretPresent: true } : {}),
     });
   }
 
@@ -227,13 +170,11 @@ export function configDumpEntries(options: ConfigServiceOptions): ConfigDump {
     entries.push({
       id: key.id,
       label: key.label,
-      // Copied from the table, not decided here: this module owns *where a
-      // setting lives*, and how it is presented is the schema's business.
       group: key.group,
       description: key.description,
       kind: key.kind,
       value: values[key.id] ?? "",
-      applies: "restart",
+      applies: key.id === "modelProvider" ? "now" : "restart",
       overridden: overriddenEnv(key.env),
       ...(key.values === undefined ? {} : { values: key.values }),
     });
@@ -253,7 +194,16 @@ export function applyConfigSet(
   value: string,
 ): ConfigSetResult {
   if (isModelConfigKey(id)) return applyModelSet(options, id, value);
-  return applyFileSet(options, id, value);
+  const fileResult = applyFileSet(options, id, value);
+  if (fileResult.ok && id === "modelProvider") {
+    if (options.setProvider) {
+      options.setProvider(value);
+    } else {
+      options.provider = value;
+    }
+    return { ok: true, applies: "now" };
+  }
+  return fileResult;
 }
 
 function applyFileSet(
@@ -272,9 +222,8 @@ function applyFileSet(
   if ("configError" in written) {
     return { ok: false, error: written.configError };
   }
-  // Every file-backed value is read once at startup, so a write can only take
-  // effect when the process that reads it is next started.
-  return { ok: true, applies: "restart" };
+  // Model provider hot reloads; other file-backed settings apply on restart.
+  return { ok: true, applies: id === "modelProvider" ? "now" : "restart" };
 }
 
 function applyModelSet(
@@ -284,26 +233,21 @@ function applyModelSet(
 ): ConfigSetResult {
   const key = MODEL_CONFIG_KEYS.find((entry) => entry.id === id)!;
   const trimmed = value.trim();
+  const activeProvider = options.getProvider ? options.getProvider() : options.provider;
 
-  if (key.kind === "secret") {
-    // Empty means "keep the stored credential" — the only meaning an empty
-    // field can carry when the value is never displayed back. Refusing when
-    // none can be read keeps the two cases ("nothing entered" and "nothing
-    // here works") from being mistaken for each other. The refusal names what
-    // Squid can do rather than what the user did: a store this process cannot
-    // open must not be reported back as a key they never entered.
+  if (id === "apiKey") {
     if (trimmed.length === 0) {
-      return hasReadableCredential(options.agentDir, options.provider)
-        ? { ok: true, applies: appliesForModel(options) }
+      return hasReadableCredential(options.agentDir, activeProvider)
+        ? { ok: true, applies: "now" }
         : { ok: false, error: "No API key is stored yet; enter one to save." };
     }
-    const entry = readModelEntry(options.agentDir, options.provider);
-    writeModelConfiguration(options.agentDir, options.provider, {
+    const entry = readModelEntry(options.agentDir, activeProvider);
+    writeModelConfiguration(options.agentDir, activeProvider, {
       baseUrl: entry?.baseUrl ?? options.defaultBaseUrl,
       modelId: entry?.modelId ?? options.defaultModelId,
       apiKey: trimmed,
     });
-    return { ok: true, applies: appliesForModel(options) };
+    return { ok: true, applies: "now" };
   }
 
   if (trimmed.length === 0) {
@@ -312,24 +256,18 @@ function applyModelSet(
   // An endpoint is worthless without the credential half beside it, and this
   // layer has no way to prompt for one — so the gate is here, before the
   // write, where the refusal can name what is missing.
-  if (!hasReadableCredential(options.agentDir, options.provider)) {
+  if (!hasReadableCredential(options.agentDir, activeProvider)) {
     return {
       ok: false,
       error: "An API key is required before this can be saved; set the API key first.",
     };
   }
-  const entry = readModelEntry(options.agentDir, options.provider);
-  writeModelEndpoint(options.agentDir, options.provider, {
+  const entry = readModelEntry(options.agentDir, activeProvider);
+  writeModelEndpoint(options.agentDir, activeProvider, {
     baseUrl: id === "modelBaseUrl" ? trimmed : entry?.baseUrl ?? options.defaultBaseUrl,
     modelId: id === "modelId" ? trimmed : entry?.modelId ?? options.defaultModelId,
   });
-  return { ok: true, applies: appliesForModel(options) };
-}
-
-function appliesForModel(options: ConfigServiceOptions): "now" | "restart" {
-  // A live agent already holds the old endpoint in memory; only an agent not
-  // yet started can pick the new files up in-session (needs_config recovery).
-  return options.agentLive() ? "restart" : "now";
+  return { ok: true, applies: "now" };
 }
 
 /** The default base URL, re-exported for callers composing options. */

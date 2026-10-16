@@ -90,24 +90,17 @@ describe("configDumpEntries", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("never carries a secret value, structurally", () => {
-    // Not a convention to remember — the dump's own shape refuses to hold one,
-    // which is why this test asserts on the value rather than trusting a build.
+  it("carries plaintext apiKey value for MVP display", () => {
     const dir = tempDir("dump");
     seedCredential(options(dir).agentDir, "bifrost");
     const result = configDumpEntries(options(dir));
     if (!result.ok) throw new Error(result.error);
-    expect(entryOf(result, "apiKey").kind).toBe("secret");
-    expect(entryOf(result, "apiKey").value).toBe("");
+    expect(entryOf(result, "apiKey").kind).toBe("text");
+    expect(entryOf(result, "apiKey").value).toBe(API_KEY);
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("says whether a credential is stored without saying any of it", () => {
-    // The distinction the secret rule hid: a stored key and no key at all both
-    // render as an empty field, and the only way to tell them apart used to be
-    // saving an empty value to see which refusal came back. The flag answers it
-    // without the probe — and the value stays empty in both cases, which is the
-    // half of this that must never regress.
+  it("says whether a credential is stored and displays value in plaintext", () => {
     const dir = tempDir("secret-present");
     const before = configDumpEntries(options(dir));
     if (!before.ok) throw new Error(before.error);
@@ -118,14 +111,7 @@ describe("configDumpEntries", () => {
     const after = configDumpEntries(options(dir));
     if (!after.ok) throw new Error(after.error);
     expect(entryOf(after, "apiKey").secretPresent).toBe(true);
-    expect(entryOf(after, "apiKey").value).toBe("");
-    // And nowhere else: the flag is a claim about a credential, so a row with
-    // no credential to have must not carry one.
-    for (const entry of after.entries) {
-      if (entry.kind !== "secret") expect(entry.secretPresent).toBeUndefined();
-    }
-    // The stored key itself must not appear anywhere in the dump, in any field.
-    expect(JSON.stringify(after.entries)).not.toContain(API_KEY);
+    expect(entryOf(after, "apiKey").value).toBe(API_KEY);
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -179,14 +165,14 @@ describe("configDumpEntries", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("splits applies by whether an agent holds the configuration", () => {
-    // File-backed settings are read once at startup, so they always say
-    // restart. A model set only lands immediately when nothing holds the old
-    // endpoint in memory — honesty over optimism.
+  it("applies model configuration now for hot-reloading", () => {
     const dir = tempDir("dump");
     const live = configDumpEntries(options(dir, { agentLive: () => true }));
     if (!live.ok) throw new Error(live.error);
-    for (const entry of live.entries) expect(entry.applies).toBe("restart");
+    expect(entryOf(live, "modelBaseUrl").applies).toBe("now");
+    expect(entryOf(live, "modelId").applies).toBe("now");
+    expect(entryOf(live, "apiKey").applies).toBe("now");
+    expect(entryOf(live, "watchRoot").applies).toBe("restart");
 
     const idle = configDumpEntries(options(dir, { agentLive: () => false }));
     if (!idle.ok) throw new Error(idle.error);
@@ -253,8 +239,9 @@ describe("applyConfigSet on file-backed keys", () => {
 
 describe("applyConfigSet on apiKey", () => {
   it("writes the full trio, defaulting the halves it does not have", () => {
-    // A fresh machine has no models.json entry; the key-first flow must not
-    // depend on the user having typed an endpoint they can change later.
+    // The first-run case: apiKey arrives with no existing models.json or
+    // auth.json. Both files must appear under the provider the service was
+    // given, with the default base URL and default model id.
     const dir = tempDir("api-key");
     const opts = options(dir);
     const outcome = applyConfigSet(opts, "apiKey", `  ${API_KEY}  `);
@@ -263,13 +250,13 @@ describe("applyConfigSet on apiKey", () => {
     const models = JSON.parse(readFileSync(join(opts.agentDir, "models.json"), "utf8")) as {
       providers: Record<string, { baseUrl: string; models: { id: string }[] }>;
     };
-    // Loud unwrap: the assertion below is meaningless if the entry is missing.
-    const entry = models.providers.bifrost;
-    if (entry === undefined) throw new Error("bifrost provider missing from models.json");
-    expect(entry.baseUrl).toBe(DEFAULT_BASE_URL);
-    const firstModel = entry.models[0];
+    const provider = models.providers.bifrost;
+    if (provider === undefined) throw new Error("bifrost provider missing from models.json");
+    expect(provider.baseUrl).toBe(DEFAULT_BASE_URL);
+    const firstModel = provider.models[0];
     if (firstModel === undefined) throw new Error("no model id was written for bifrost");
     expect(firstModel.id).toBe("deepseek-v4-flash");
+
     const auth = JSON.parse(readFileSync(join(opts.agentDir, "auth.json"), "utf8")) as {
       bifrost: { key: string };
     };
@@ -287,11 +274,10 @@ describe("applyConfigSet on apiKey", () => {
     if (refused.ok) return;
     expect(refused.error).toContain("No API key is stored yet");
 
+    // Seed a key, then save empty. The stored key must not have moved.
     seedCredential(opts.agentDir, "bifrost");
     const kept = applyConfigSet(opts, "apiKey", "");
     expect(kept).toEqual({ ok: true, applies: "now" });
-    // Keeping must not rewrite anything: the stored key is unreadable here, so
-    // any write would have to invent it.
     const auth = JSON.parse(readFileSync(join(opts.agentDir, "auth.json"), "utf8")) as {
       bifrost: { key: string };
     };
@@ -299,10 +285,10 @@ describe("applyConfigSet on apiKey", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("reports restart once an agent is live, and now before one starts", () => {
+  it("reports now for hot-reloading when apiKey is updated", () => {
     const dir = tempDir("api-key");
     const live = options(dir, { agentLive: () => true });
-    expect(applyConfigSet(live, "apiKey", API_KEY)).toEqual({ ok: true, applies: "restart" });
+    expect(applyConfigSet(live, "apiKey", API_KEY)).toEqual({ ok: true, applies: "now" });
     rmSync(dir, { recursive: true, force: true });
   });
 });

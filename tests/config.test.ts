@@ -165,6 +165,7 @@ describe("config schema", () => {
       // read by `resolveConfiguredModel` -- a file-backed copy of it would be
       // the parallel store `app-model.ts` exists to prevent.
       ["PI_MODEL_ID", "a write-time default; the stored entry is the answer"],
+      ["SQUID_AGENT_DIR", "names the agent directory override, env-only"],
     ]);
 
     const names = new Set<string>();

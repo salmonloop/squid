@@ -304,11 +304,6 @@ export async function startWatchSession(
    * that fact — the factory is the authority on whether a session can open —
    * so the probe guards only the default Pi-backed one.
    */
-  const agentConfigured = (): boolean =>
-    options.agentConfigured
-    ?? (options.createAgentSession !== undefined || residentAgentConfigured());
-  const needsConfig = panel.enabled && !agentConfigured();
-
   // One answer to "where does Pi live", computed once and handed to both
   // consumers — the settings service (which reads and writes Pi's own files)
   // and the source factories (which must not observe them). Computing it in
@@ -317,11 +312,14 @@ export async function startWatchSession(
   // exists to break.
   const agentDir = options.agentDir ?? getAgentDir();
 
-  // The chat model's provider, one answer for every consumer that must name
-  // it — the settings service (which reads and writes Pi's own files) and the
-  // decision curator (which declares it, so the decision call carries the
-  // same credential chat already uses).
-  const modelProvider = options.modelProvider ?? resolvePiModel({ env }).provider;
+  // The chat model's provider, dynamic so that changing modelProvider in the panel
+  // can hot-reload the agent and update curator/sessions in-flight.
+  let currentProvider = options.modelProvider ?? resolvePiModel({ env }).provider;
+
+  const agentConfigured = (): boolean =>
+    options.agentConfigured
+    ?? (options.createAgentSession !== undefined || residentAgentConfigured({ agentDir, provider: currentProvider }));
+  const needsConfig = panel.enabled && !agentConfigured();
 
   /**
    * The settings service the panel talks to. Built once, after the env is
@@ -337,7 +335,11 @@ export async function startWatchSession(
     // file-backed `modelProvider` reaches this the same way every resolver's
     // setting does. Reading `process.env` instead would make the row writable
     // and inert.
-    provider: modelProvider,
+    provider: currentProvider,
+    getProvider: () => currentProvider,
+    setProvider: (newProvider: string) => {
+      currentProvider = newProvider;
+    },
     defaultModelId: options.defaultModelId ?? resolvePiModel({ env }).modelId,
     defaultBaseUrl: options.defaultBaseUrl ?? DEFAULT_BASE_URL,
     agentLive: () => agent !== undefined,
@@ -384,9 +386,9 @@ export async function startWatchSession(
     // agent a turn.
     const decisionCurator = decisionCuratorExtension({
       env,
-      provider: modelProvider,
+      provider: currentProvider,
       defaultBaseUrl:
-        readModelEntry(agentDir, modelProvider)?.baseUrl
+        readModelEntry(agentDir, currentProvider)?.baseUrl
         ?? options.defaultBaseUrl
         ?? DEFAULT_BASE_URL,
       log: logError,
@@ -409,6 +411,8 @@ export async function startWatchSession(
         llmLogExt,
         ...(decisionCurator === undefined ? [] : [decisionCurator]),
       ],
+      agentDir,
+      provider: currentProvider,
       ...(options.createAgentSession === undefined
         ? {}
         : { createSession: options.createAgentSession }),
@@ -459,6 +463,29 @@ export async function startWatchSession(
         agentStarting = false;
       }
     })();
+  };
+
+  const restartAgent = async (): Promise<void> => {
+    if (agentStarting) return;
+    agentStarting = true;
+    try {
+      if (agent !== undefined) {
+        const oldAgent = agent;
+        await drainAgentTurns();
+        oldAgent.dispose();
+        agent = undefined;
+      }
+      const created = await buildAgent();
+      agent = created;
+      if (lastState !== null) await created.observe(lastState);
+      panelServer?.broadcast(panelServiceLine({ agentState: "ready" }));
+      log(JSON.stringify({ agent: "resident", hotReloaded: "config_set" }));
+    } catch (error) {
+      logError(JSON.stringify({ agentRestartError: describeErrorForAudit(error) }));
+      panelServer?.broadcast(panelAgentLine({ status: "failed", text: describeErrorForAudit(error) }));
+    } finally {
+      agentStarting = false;
+    }
   };
 
   /**
@@ -554,8 +581,12 @@ export async function startWatchSession(
           // needs_config: the agent starts in-session, immediately, on the
           // files just written. The result above already told the panel the
           // set landed; this is what makes its "applies: now" true.
-          if (outcome.ok && isModelConfigKey(id) && agent === undefined) {
-            tryStartAgent();
+          if (outcome.ok && (isModelConfigKey(id) || id === "modelProvider")) {
+            if (agent === undefined) {
+              tryStartAgent();
+            } else {
+              void restartAgent();
+            }
           }
         },
         onSourceGet: (requestId) => {

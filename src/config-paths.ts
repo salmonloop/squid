@@ -46,6 +46,32 @@ export function resolveConfigPath(
   return { path: defaultConfigPath(env, platform, home) };
 }
 
+/**
+ * Dedicated, isolated agent directory for Squid's PI Agent configuration.
+ *
+ * Defaults to `<squid-config-dir>/agent` to guarantee complete isolation
+ * from any pre-existing local PI Agent installation (`~/.pi/agent`).
+ * Can be overridden by SQUID_AGENT_DIR or PI_CODING_AGENT_DIR.
+ */
+export function resolveAgentDirPath(
+  options: ResolveConfigPathOptions = {},
+): string {
+  const env = options.env ?? process.env;
+  if (env.SQUID_AGENT_DIR && env.SQUID_AGENT_DIR.length > 0) {
+    return env.SQUID_AGENT_DIR;
+  }
+  if (env.PI_CODING_AGENT_DIR && env.PI_CODING_AGENT_DIR.length > 0) {
+    return env.PI_CODING_AGENT_DIR;
+  }
+  const resolution = resolveConfigPath(options);
+  const configPath = "path" in resolution
+    ? resolution.path
+    : defaultConfigPath(env, options.platform ?? process.platform, options.home ?? homedir());
+  const platform = options.platform ?? process.platform;
+  const pathMod = platform === "win32" ? win32 : posix;
+  return pathMod.join(pathMod.dirname(configPath), "agent");
+}
+
 function isAbsoluteFor(platform: NodeJS.Platform, value: string): boolean {
   return platform === "win32" ? win32.isAbsolute(value) : posix.isAbsolute(value);
 }
