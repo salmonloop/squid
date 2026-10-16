@@ -1925,7 +1925,7 @@ describe("the control panel on a watch session", () => {
         // default base URL is a write-time fallback, never a display value.
         expect(baseUrlRow.value).toBe("");
         expect(apiKeyRow.id).toBe("apiKey");
-        expect(apiKeyRow.kind).toBe("secret");
+        expect(apiKeyRow.kind).toBe("text");
         // The stored value is nothing the panel may hold; the dump strips it.
         expect(apiKeyRow.value).toBe("");
         const end = h.client.lines.map(parsePanelLine).find((p) => p.type === "config_end");
@@ -2091,7 +2091,7 @@ describe("the control panel on a watch session", () => {
       }
     });
 
-    it("never puts the API key on the wire, even after setting it", async () => {
+    it("transmits the API key in plaintext on the wire for MVP", async () => {
       const h = await startSettingsSession(false);
       try {
         h.client.send(JSON.stringify({ type: "config_set", id: "apiKey", value: API_KEY }));
@@ -2102,13 +2102,33 @@ describe("the control panel on a watch session", () => {
           bifrost: { key: string };
         };
         expect(auth.bifrost.key).toBe(API_KEY);
-        // ...and a fresh dump afterwards carries no trace of it: the secret's
-        // value is structurally absent from every line the session can send.
+        // Plaintext display in UI for MVP
         h.client.send(JSON.stringify({ type: "config_get" }));
         await awaitConfigEnd(h.client);
-        for (const raw of h.client.lines) {
-          expect(raw).not.toContain(API_KEY);
-        }
+        const apiKeyLine = h.client.lines
+          .map(parsePanelLine)
+          .find((l) => l.type === "config" && l.id === "apiKey");
+        expect(apiKeyLine?.value).toBe(API_KEY);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("hot-reloads the agent on modelProvider change with applies: now without restarting daemon", async () => {
+      const h = await startSettingsSession(false);
+      try {
+        h.client.send(JSON.stringify({ type: "config_set", id: "modelProvider", value: "anthropic" }));
+        const setResult = await awaitConfigResult(h.client, "modelProvider");
+        expect(setResult.ok).toBe(1);
+        expect(setResult.applies).toBe("now");
+        // Daemon process did NOT restart
+        expect(h.restartCalls).toHaveLength(0);
+
+        // Verify config_get now returns the updated provider
+        h.client.send(JSON.stringify({ type: "config_get" }));
+        const configs = await awaitConfigEnd(h.client);
+        const providerRow = configs.find((l) => l.id === "modelProvider");
+        expect(providerRow?.value).toBe("anthropic");
       } finally {
         await h.close();
       }

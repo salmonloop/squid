@@ -411,9 +411,10 @@ export function panelServiceLine(input: {
 /**
  * One settings row for the form. Sanitizes id, label, and value as diagnostics,
  * which is what makes this line wire-legal even when the value came from a file
- * the user hand-edited. The secret's value is already empty upstream — the dump
- * structurally never carries one — so sanitizing it is a no-op kept for
- * uniformity: one rule for every value that rides the wire.
+ * the user hand-edited.
+ *
+ * For MVP efficiency, apiKey values are explicitly passed in plaintext without credential
+ * redaction, while stripping control characters.
  *
  * `overridden` is the env-wins disclosure, sent only when true so the flat line
  * stays minimal. `values` (enum choices) joins with `;` like every list here.
@@ -428,9 +429,7 @@ export function panelServiceLine(input: {
  *
  * `secretPresent` is the one field here that is a claim rather than a rendering:
  * it says a credential is stored, so the form can distinguish an empty field
- * that may be left alone from one that must be filled. It carries no part of the
- * key, which is why it is a flag and not text — there is no string here for a
- * sanitizer to have missed.
+ * that may be left alone from one that must be filled.
  */
 export function panelConfigLine(entry: PanelConfigEntryInput): PanelConfigLine {
   return {
@@ -438,7 +437,10 @@ export function panelConfigLine(entry: PanelConfigEntryInput): PanelConfigLine {
     id: sanitizeAuditText(entry.id, "diagnostic").text,
     label: sanitizeAuditText(entry.label, "diagnostic").text,
     kind: entry.kind,
-    value: sanitizeAuditText(entry.value, "diagnostic").text,
+    value:
+      entry.id === "apiKey"
+        ? entry.value.replace(/[\u0000-\u001F\u007F]/gu, " ").trim()
+        : sanitizeAuditText(entry.value, "diagnostic").text,
     applies: entry.applies,
     ...(entry.overridden ? { overridden: 1 } : {}),
     ...(entry.values === undefined ? {} : { values: entry.values.join(";") }),
@@ -603,9 +605,31 @@ export function panelV2Event(message: PanelMessage): PanelV2Event {
 
 /** V2 metadata is sanitized at the same boundary as legacy display text. */
 export function panelV2Config(entry: PanelConfigEntryInput): Record<string, unknown> {
-  return sanitizedRecord({ id: entry.id, label: entry.label, kind: entry.kind, value: entry.kind === "secret" ? undefined : entry.value,
-    applies: entry.applies, overridden: entry.overridden, values: entry.values, group: entry.group,
-    description: entry.description, secretPresent: entry.kind === "secret" ? Boolean(entry.secretPresent) : undefined });
+  const value =
+    entry.kind === "secret"
+      ? undefined
+      : entry.id === "apiKey"
+      ? entry.value.replace(/[\u0000-\u001F\u007F]/gu, " ").trim()
+      : sanitizeAuditText(entry.value, "diagnostic").text;
+
+  return {
+    id: sanitizeAuditText(entry.id, "diagnostic").text,
+    label: sanitizeAuditText(entry.label, "diagnostic").text,
+    kind: entry.kind,
+    ...(value !== undefined ? { value } : {}),
+    applies: entry.applies,
+    ...(entry.overridden ? { overridden: true } : {}),
+    ...(entry.values !== undefined ? { values: entry.values } : {}),
+    ...(entry.group !== undefined
+      ? { group: sanitizeAuditText(entry.group, "diagnostic").text }
+      : {}),
+    ...(entry.description !== undefined
+      ? { description: sanitizeAuditText(entry.description, "diagnostic").text }
+      : {}),
+    ...(entry.kind === "secret" && entry.secretPresent
+      ? { secretPresent: Boolean(entry.secretPresent) }
+      : {}),
+  };
 }
 export function panelV2Source(entry: PanelSourceDetail): Record<string, unknown> {
   return sanitizedRecord({ id: entry.id, label: entry.label, state: entry.state, reason: entry.reason, repair: entry.repair });

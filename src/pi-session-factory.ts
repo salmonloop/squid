@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -90,8 +91,13 @@ export function resolveConfiguredModel(
 }
 
 /** Starts the long-lived model runtime. One per provider instance. */
-export function startPiModelRuntime(): Promise<ModelRuntime> {
-  return ModelRuntime.create({ allowModelNetwork: false });
+export function startPiModelRuntime(options?: { agentDir?: string }): Promise<ModelRuntime> {
+  const agentDir = options?.agentDir ?? getAgentDir();
+  return ModelRuntime.create({
+    allowModelNetwork: false,
+    authPath: join(agentDir, "auth.json"),
+    modelsPath: join(agentDir, "models.json"),
+  });
 }
 
 /** The model a resolved runtime exposes, or null when it is not configured. */
@@ -110,6 +116,7 @@ export interface PiSessionSpec {
   readonly modelRuntime: ModelRuntime;
   readonly cwd: string;
   readonly systemPrompt: string;
+  readonly agentDir?: string;
   /**
    * Prediction and belief close the ecosystem; execution leaves it open. Default
    * (omitted) is open — matching the executor, where skills/extensions/context
@@ -169,9 +176,10 @@ export interface PiSessionHandle {
  * module's to choose.
  */
 export async function createPiSession(spec: PiSessionSpec): Promise<PiSessionHandle> {
+  const agentDir = spec.agentDir ?? getAgentDir();
   const loader = new DefaultResourceLoader({
     cwd: spec.cwd,
-    agentDir: getAgentDir(),
+    agentDir,
     noPromptTemplates: true,
     noThemes: true,
     ...(spec.noExtensions === true ? { noExtensions: true } : {}),
@@ -190,6 +198,7 @@ export async function createPiSession(spec: PiSessionSpec): Promise<PiSessionHan
     modelRuntime: spec.modelRuntime,
     resourceLoader: loader,
     thinkingLevel: "low",
+    agentDir,
     ...(spec.tools !== undefined ? { tools: [...spec.tools] } : {}),
     ...(spec.noTools !== undefined ? { noTools: spec.noTools } : {}),
     ...(spec.customTools !== undefined ? { customTools: [...spec.customTools] } : {}),
@@ -221,23 +230,8 @@ export async function createPiSession(spec: PiSessionSpec): Promise<PiSessionHan
   return { session, dispose };
 }
 
-/**
- * Picks the session store for one spec.
- *
- * `continue` reopens the most recent session under `cwd`, which is what a restart
- * of a long-running watch wants: the agent picks up the history it already has
- * rather than waking up amnesiac. `persist` always starts a fresh durable one.
- * Both write under Pi's own session directory — Squid does not choose the path,
- * because a second opinion about where sessions live is how two processes end up
- * disagreeing about which file is the record.
- */
 function resolveSessionManager(spec: PiSessionSpec): SessionManager {
-  switch (spec.history ?? "memory") {
-    case "persist":
-      return SessionManager.create(spec.cwd);
-    case "continue":
-      return SessionManager.continueRecent(spec.cwd);
-    default:
-      return SessionManager.inMemory(spec.cwd);
-  }
+  if (spec.history === "persist") return SessionManager.create(spec.cwd);
+  if (spec.history === "continue") return SessionManager.continueRecent(spec.cwd);
+  return SessionManager.inMemory();
 }

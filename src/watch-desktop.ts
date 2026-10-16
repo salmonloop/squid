@@ -61,6 +61,7 @@ export interface StartDesktopWatchOptions {
   readonly env?: Record<string, string | undefined>;
   readonly log?: (line: string) => void;
   readonly logError?: (line: string) => void;
+  readonly agentDir?: string;
   /** Injected in tests so no suite starts a real model runtime. */
   readonly createAgentSession?: WatchSessionOptions["createAgentSession"];
 }
@@ -142,6 +143,7 @@ export async function startDesktopWatch(
     env,
     log,
     logError,
+    ...(options.agentDir === undefined ? {} : { agentDir: options.agentDir }),
     ...(options.createAgentSession === undefined
       ? {}
       : { createAgentSession: options.createAgentSession }),

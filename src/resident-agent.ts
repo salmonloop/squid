@@ -128,16 +128,23 @@ export type ResidentSessionFactory = (spec: {
   readonly noTools?: boolean;
   /** Where the conversation is kept. See `PiSessionSpec.history`. */
   readonly history?: "memory" | "persist" | "continue";
+  readonly agentDir?: string;
+  readonly provider?: string;
+  readonly modelId?: string;
 }) => Promise<ResidentSession>;
 
 /** The default factory: resolves the model and builds the agent's live session. */
 export const createDefaultResidentSession: ResidentSessionFactory = async (spec) => {
-  const modelRuntime = await startPiModelRuntime();
+  const agentDir = spec.agentDir ?? getAgentDir();
+  const modelRuntime = await startPiModelRuntime({ agentDir });
   // The stored entry, not the env default: the settings form writes the model id
   // into Pi's `models.json`, and looking up the default instead would miss any
   // id the user saved — reporting "no model configured" for the one they just
   // configured.
-  const { provider, modelId } = resolveConfiguredModel(getAgentDir());
+  const { provider, modelId } = resolveConfiguredModel(agentDir, {
+    ...(spec.provider !== undefined ? { provider: spec.provider } : {}),
+    ...(spec.modelId !== undefined ? { modelId: spec.modelId } : {}),
+  });
   const model = resolveModel(modelRuntime, provider, modelId);
   if (model === null) {
     throw new Error(`No resident-agent model is configured: ${provider}/${modelId}`);
@@ -151,6 +158,7 @@ export const createDefaultResidentSession: ResidentSessionFactory = async (spec)
     modelRuntime,
     cwd: spec.cwd,
     systemPrompt: spec.systemPrompt,
+    agentDir,
     // The session history is the audit trail — every tool the agent called and
     // why is in there — so a real run persists it. `continue` rather than
     // `persist`: a restarted watch should resume the agent it already had.
@@ -170,10 +178,12 @@ export const createDefaultResidentSession: ResidentSessionFactory = async (spec)
  *
  * Only the default Pi-backed factory needs this probe. An injected session
  * factory is by definition usable (tests must not depend on the developer
- * machine's Pi configuration), so callers that inject one pass `true`.
+ * machine's Pi configuration), so callers that inject one pass `true``.
  */
-export function residentAgentConfigured(): boolean {
-  const status = modelConfigurationStatus(getAgentDir(), resolvePiModel({}).provider);
+export function residentAgentConfigured(options?: { agentDir?: string; provider?: string }): boolean {
+  const agentDir = options?.agentDir ?? getAgentDir();
+  const provider = options?.provider ?? resolvePiModel({}).provider;
+  const status = modelConfigurationStatus(agentDir, provider);
   return status.kind === "ready";
 }
 
@@ -200,23 +210,13 @@ function adaptHandle(handle: PiSessionHandle, tracker: TurnActionTracker): Resid
 }
 
 export interface CreateResidentAgentOptions {
-  /** The system prompt that defines the agent's identity and posture. */
   readonly systemPrompt: string;
-  /** The working directory the agent acts in. */
   readonly cwd: string;
-  /** Inline extensions (guards, senses, audit) wired at creation. Phase 0: empty. */
+  /** Inline extensions injected into the session (senses, guards, audit). */
   readonly extensionFactories?: readonly InlineExtension[];
-  /**
-   * Custom Pi tools the agent may call (e.g. sensory-history queries). Executed
-   * by Pi's own runtime; the session history records each call.
-   */
+  /** Custom Pi tools (e.g. the sensory-history queries) wired into the session. */
   readonly customTools?: readonly ToolDefinition[];
-  /**
-   * Start the session with no tools enabled; see `PiSessionSpec.noTools`. A
-   * reading-only agent answers from its senses, and a tool call in that shape
-   * is a wrong answer the runtime now cannot perform, not merely one it was
-   * asked not to.
-   */
+  /** Start the session with no tools enabled; see `PiSessionSpec.noTools`. */
   readonly noTools?: boolean;
   /** The tool catalog the agent sees in every context injection. */
   readonly tools?: readonly ToolSummary[];
@@ -227,6 +227,9 @@ export interface CreateResidentAgentOptions {
   readonly history?: "memory" | "persist" | "continue";
   /** Injected in tests; defaults to the real Pi-backed factory. */
   readonly createSession?: ResidentSessionFactory;
+  readonly agentDir?: string;
+  readonly provider?: string;
+  readonly modelId?: string;
 }
 
 /**
@@ -331,6 +334,9 @@ export async function createResidentAgent(
     ...(options.customTools !== undefined ? { customTools: options.customTools } : {}),
     ...(options.noTools === true ? { noTools: true } : {}),
     ...(options.history !== undefined ? { history: options.history } : {}),
+    ...(options.agentDir !== undefined ? { agentDir: options.agentDir } : {}),
+    ...(options.provider !== undefined ? { provider: options.provider } : {}),
+    ...(options.modelId !== undefined ? { modelId: options.modelId } : {}),
   });
 
   let disposed = false;

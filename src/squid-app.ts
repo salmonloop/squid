@@ -2,7 +2,6 @@ import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as readline from "node:readline/promises";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   panelExecutablePath,
   resolveAppPanel,
@@ -15,6 +14,7 @@ import {
   type FirstRunIO,
 } from "./app-model.js";
 import { ensureDefaultConfigFile } from "./config-file.js";
+import { resolveAgentDirPath } from "./config-paths.js";
 import { loadConfiguredEnvironment } from "./effective-env.js";
 import { resolvePiModel } from "./pi-session-factory.js";
 import { startDesktopWatch } from "./watch-desktop.js";
@@ -38,12 +38,6 @@ import { installWatchSignalHandlers } from "./watch-session.js";
  * passes through the same resolvers a CLI run uses. This file owns only the
  * order and the two things genuinely new to a packaged run: the first-run
  * conversation and launching the panel.
- *
- * The panel launch is best-effort on purpose, and not defensively: the panel
- * is an observer, and "a dead panel must not take down the watch session" is
- * the standing rule the panel server itself is written against. A zip missing
- * its `squid-ui` still leaves a working capture session; it just reports why
- * nothing opened.
  */
 
 export interface LaunchPreparation {
@@ -266,7 +260,10 @@ function consoleFirstRunIO(): FirstRunIO {
 if (import.meta.main) {
   const platform = process.platform;
   const env = process.env;
-  const agentDir = getAgentDir();
+  const agentDir = resolveAgentDirPath({ env, platform });
+  if (!process.env.PI_CODING_AGENT_DIR) {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+  }
 
   // No provider is passed: `prepareLaunch` resolves it after its own step 0, so
   // the config file's `modelProvider` decides. Resolving it here would read the
@@ -318,6 +315,7 @@ if (import.meta.main) {
   const started = await startDesktopWatch({
     root: prepared.ready.root,
     env: prepared.ready.env,
+    agentDir,
   });
   if ("configError" in started) {
     console.error(started.configError);
