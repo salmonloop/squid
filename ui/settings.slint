@@ -3,10 +3,6 @@ import { Theme } from "theme.slint";
 import { SettingRow } from "model.slint";
 
 // A small trailing marker beside a settings row.
-//
-// A real chip rather than the old bare 10px text: two of those on one row
-// pushed the Save button sideways and changed the field's width relative to its
-// neighbours, so rows visibly misaligned depending on override state.
 component Marker inherits Rectangle {
     in property <string> text;
     in property <brush> tint;
@@ -29,13 +25,67 @@ component Marker inherits Rectangle {
     }
 }
 
+// Tooltip card with rich guidance and realistic examples shown when hovering over the help icon.
+component HelpTooltip inherits Rectangle {
+    in property <string> setting-id;
+    in property <string> description;
+
+    background: Theme.surface;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Theme.focus;
+
+    VerticalLayout {
+        padding: Theme.gap;
+        spacing: 4px;
+
+        if root.setting-id == "modelBaseUrl": VerticalLayout {
+            spacing: 2px;
+            Text { text: "Base URL Examples & Configuration:"; font-weight: 700; color: Theme.focus; font-size: 11px; }
+            Text { text: "• OpenAI / Proxy: https://api.openai.com/v1"; color: Theme.text; font-size: 11px; }
+            Text { text: "• DeepSeek: https://api.deepseek.com/v1"; color: Theme.text; font-size: 11px; }
+            Text { text: "• OpenRouter: https://openrouter.ai/api/v1"; color: Theme.text; font-size: 11px; }
+            Text { text: "• Ollama (Local): http://localhost:11434/v1"; color: Theme.text; font-size: 11px; }
+            Text { text: "• LM Studio: http://localhost:1234/v1"; color: Theme.text; font-size: 11px; }
+            Text { text: "• Default Gateway: http://127.0.0.1:8000/v1"; color: Theme.text-muted; font-size: 11px; }
+        }
+
+        if root.setting-id == "modelId": VerticalLayout {
+            spacing: 2px;
+            Text { text: "Model ID Examples:"; font-weight: 700; color: Theme.focus; font-size: 11px; }
+            Text { text: "• OpenAI: gpt-4o, gpt-4o-mini, o1-mini"; color: Theme.text; font-size: 11px; }
+            Text { text: "• DeepSeek: deepseek-chat, deepseek-coder"; color: Theme.text; font-size: 11px; }
+            Text { text: "• Anthropic (via proxy): claude-3-5-sonnet-20241022"; color: Theme.text; font-size: 11px; }
+            Text { text: "• Ollama: llama3.1, qwen2.5-coder"; color: Theme.text; font-size: 11px; }
+        }
+
+        if root.setting-id == "apiKey": VerticalLayout {
+            spacing: 2px;
+            Text { text: "API Key Examples & Notice:"; font-weight: 700; color: Theme.focus; font-size: 11px; }
+            Text { text: "• OpenAI: sk-proj-..."; color: Theme.text; font-size: 11px; }
+            Text { text: "• DeepSeek: sk-..."; color: Theme.text; font-size: 11px; }
+            Text { text: "• OpenRouter: sk-or-v1-..."; color: Theme.text; font-size: 11px; }
+            Text { text: "• Local / Ollama: leave empty or any dummy string"; color: Theme.text; font-size: 11px; }
+            Text { text: "• Plaintext: Displayed in plaintext without masking for fast development."; color: Theme.caution; font-size: 11px; }
+        }
+
+        if root.setting-id == "modelProvider": VerticalLayout {
+            spacing: 2px;
+            Text { text: "Model Provider (Profile Key/Slug):"; font-weight: 700; color: Theme.focus; font-size: 11px; }
+            Text { text: "• Examples: openai, deepseek, openrouter, anthropic, ollama"; color: Theme.text; font-size: 11px; }
+            Text { text: "• Key indexing your credentials in models.json & auth.json."; color: Theme.text-muted; font-size: 11px; }
+            Text { text: "• Changing this switches Squid to that provider profile immediately."; color: Theme.text-muted; font-size: 11px; }
+        }
+
+        if root.setting-id != "modelBaseUrl" && root.setting-id != "modelId" && root.setting-id != "apiKey" && root.setting-id != "modelProvider": VerticalLayout {
+            spacing: 2px;
+            Text { text: "Information:"; font-weight: 700; color: Theme.focus; font-size: 11px; }
+            Text { text: root.description; color: Theme.text; font-size: 11px; wrap: word-wrap; }
+        }
+    }
+}
+
 // One setting, named for what it does rather than for the variable behind it.
-//
-// `description` and `group` ride the wire from the brain's own schema; this file
-// holds no key names and no idea which setting belongs to which capability. That
-// is what keeps the panel a form renderer instead of a second copy of the
-// schema — and it is why a new setting appears here correctly without a Rust
-// change.
 export component SettingEditor inherits Rectangle {
     in property <SettingRow> setting;
     callback save(string, string);
@@ -55,12 +105,35 @@ export component SettingEditor inherits Rectangle {
                 color: Theme.text;
                 font-size: 13px;
                 font-weight: 600;
-                horizontal-stretch: 1;
+                vertical-alignment: center;
                 wrap: word-wrap;
             }
-            // An environment variable is winning. Disclosed rather than hidden:
-            // without it, a value that saves and visibly does not apply looks
-            // like a bug in the save.
+
+            // Interactive Help / Tooltip Icon
+            help-icon := Rectangle {
+                width: 16px;
+                height: 16px;
+                border-radius: 8px;
+                background: help-touch.has-hover ? Theme.focus : Theme.surface;
+                border-width: 1px;
+                border-color: help-touch.has-hover ? Theme.focus : Theme.line;
+
+                Text {
+                    text: "?";
+                    font-size: 10px;
+                    font-weight: 700;
+                    color: help-touch.has-hover ? Theme.surface : Theme.text-muted;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                help-touch := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
             if root.setting.overridden: Marker {
                 text: "set elsewhere";
                 tint: Theme.caution;
@@ -71,9 +144,14 @@ export component SettingEditor inherits Rectangle {
             }
         }
 
-        // What the setting is for, in one sentence. The label alone could not
-        // explain `retentionHours` to anyone who had not read the source.
-        if root.setting.description != "": Text {
+        // Expanded hover card when hovering over the help icon
+        if help-touch.has-hover: HelpTooltip {
+            setting-id: root.setting.id;
+            description: root.setting.description;
+        }
+
+        // Setting description in one sentence
+        if !help-touch.has-hover && root.setting.description != "": Text {
             text: root.setting.description;
             color: Theme.text-muted;
             font-size: 12px;
@@ -85,11 +163,11 @@ export component SettingEditor inherits Rectangle {
 
             editor := LineEdit {
                 text: root.setting.value;
-                // For MVP development efficiency, all settings are displayed in plaintext.
-                placeholder-text: root.setting.kind == "secret"
-                    ? (root.setting.secret-present
-                        ? "Saved. Type to replace it."
-                        : "No key Squid can use. Type one to save it.")
+                // For MVP development efficiency, all settings are displayed in plaintext with clear examples.
+                placeholder-text: root.setting.id == "modelBaseUrl" ? "https://api.openai.com/v1"
+                    : root.setting.id == "modelId" ? "gpt-4o"
+                    : root.setting.id == "apiKey" ? "sk-..."
+                    : root.setting.id == "modelProvider" ? "openai"
                     : "";
                 input-type: InputType.text;
                 horizontal-stretch: 1;
@@ -99,13 +177,36 @@ export component SettingEditor inherits Rectangle {
             }
             Button {
                 text: "Save";
-                // Nothing typed is nothing to save. The old form kept all
-                // eighteen Save buttons live at all times, so the control gave
-                // no signal about which row had actually been edited.
                 enabled: editor.text != root.setting.value;
                 accessible-description: "Save " + root.setting.label;
                 clicked => { root.save(root.setting.id, editor.text); }
             }
+        }
+
+        // Compact realistic examples line directly below input
+        if root.setting.id == "modelBaseUrl": Text {
+            text: "Examples: OpenAI: https://api.openai.com/v1 | DeepSeek: https://api.deepseek.com/v1 | Ollama: http://localhost:11434/v1";
+            color: Theme.text-muted;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+        if root.setting.id == "modelId": Text {
+            text: "Examples: OpenAI: gpt-4o | DeepSeek: deepseek-chat | Anthropic: claude-3-5-sonnet | Ollama: llama3.1";
+            color: Theme.text-muted;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+        if root.setting.id == "apiKey": Text {
+            text: "Examples: OpenAI: sk-proj-... | DeepSeek: sk-... | Local/Ollama: leave empty (stored in plaintext)";
+            color: Theme.text-muted;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+        if root.setting.id == "modelProvider": Text {
+            text: "Examples: openai | deepseek | openrouter | anthropic | ollama (provider profile key in models.json)";
+            color: Theme.text-muted;
+            font-size: 11px;
+            wrap: word-wrap;
         }
 
         if root.setting.values != "": Text {

@@ -231,7 +231,7 @@ const CONFIG_KEY_TABLE: readonly Omit<ConfigKey, "validate">[] = [
     env: "PI_MODEL_PROVIDER",
     label: "Model provider",
     group: "Model",
-    description: "Which of your saved model logins this Squid answers with.",
+    description: "Active provider profile key/slug in auth.json & models.json (e.g. openai, deepseek, openrouter, anthropic, ollama).",
     kind: "text",
     // Pi keys `models.json` and `auth.json` by this string, so it has to be
     // usable as an object key and recognizable in a file a user may open. A

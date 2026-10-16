@@ -294,23 +294,27 @@ describe("applyConfigSet on apiKey", () => {
 });
 
 describe("applyConfigSet on the endpoint keys", () => {
-  it("refuses an empty value and refuses before a credential exists", () => {
+  it("refuses an empty value and permits saving without a prior credential", () => {
     const dir = tempDir("endpoint");
     const opts = options(dir);
     const empty = applyConfigSet(opts, "modelBaseUrl", "   ");
     if (empty.ok) throw new Error("empty endpoint was accepted");
-    expect(empty.error).toBe("Model API base URL cannot be empty.");
+    expect(empty.error).toBe("Base URL cannot be empty.");
 
-    // Without a stored key the endpoint is worthless — the refusal names the
-    // fix instead of writing a half a model configuration.
-    const gated = applyConfigSet(opts, "modelBaseUrl", "https://new.example/v1");
-    if (gated.ok) throw new Error("endpoint accepted without a credential");
-    expect(gated.error).toContain("An API key is required");
+    // Developer efficiency first: endpoint fields can be saved freely without
+    // artificially demanding an existing API key first.
+    const urlSet = applyConfigSet(opts, "modelBaseUrl", "https://new.example/v1");
+    expect(urlSet).toEqual({ ok: true, applies: "now" });
 
-    const modelGate = applyConfigSet(opts, "modelId", "new-model");
-    if (modelGate.ok) throw new Error("model id accepted without a credential");
-    expect(modelGate.error).toContain("An API key is required");
-    expect(existsSync(join(opts.agentDir, "models.json"))).toBe(false);
+    const modelSet = applyConfigSet(opts, "modelId", "new-model");
+    expect(modelSet).toEqual({ ok: true, applies: "now" });
+    expect(existsSync(join(opts.agentDir, "models.json"))).toBe(true);
+
+    const models = JSON.parse(readFileSync(join(opts.agentDir, "models.json"), "utf8")) as {
+      providers: Record<string, { baseUrl: string; models: { id: string }[] }>;
+    };
+    expect(models.providers.bifrost?.baseUrl).toBe("https://new.example/v1");
+    expect(models.providers.bifrost?.models[0]?.id).toBe("new-model");
     rmSync(dir, { recursive: true, force: true });
   });
 
