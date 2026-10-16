@@ -1,10 +1,4 @@
-import {
-  configKeyById,
-  CONFIG_KEYS,
-  type ConfigGroup,
-  type ConfigValueKind,
-} from "./config-schema.js";
-import { readConfigFile, updateConfigFile } from "./config-file.js";
+import { readFileSync } from "node:fs";
 import {
   DEFAULT_BASE_URL,
   hasReadableCredential,
@@ -13,14 +7,13 @@ import {
   writeModelConfiguration,
   writeModelEndpoint,
 } from "./app-model.js";
+import { readConfigFile, updateConfigFile } from "./config-file.js";
+import { CONFIG_KEYS } from "./config-schema.js";
 
 /**
- * The semantics between the panel and the stores.
+ * The settings service the control panel talks to.
  *
- * The panel sends `{id, value}` and draws whatever a dump tells it; every
- * decision about *what a setting is and where it lives* lives here. Two stores
- * answer to it, and the split is not ours to blur: the fifteen file-backed
- * settings go to the Squid config file, and the three model settings go to
+ * Sits over the two persistent configuration stores — the Squid config file and
  * Pi's own `models.json`/`auth.json` — never a Squid-side parallel copy, per
  * the contract in `app-model.ts`.
  *
@@ -33,17 +26,14 @@ import {
  */
 
 /** The kinds a dump can name — the schema's three plus the secret case. */
-export type ConfigSettingKind = ConfigValueKind | "secret";
+export type ConfigKind = "text" | "int" | "enum" | "secret";
 
 export interface ConfigDumpEntry {
   readonly id: string;
   readonly label: string;
-  /** The capability the form files this row under. Never decided in the panel. */
-  readonly group: ConfigGroup;
-  /** One sentence on what this changes for the user, shown beside the field. */
+  readonly group: string;
   readonly description: string;
-  readonly kind: ConfigSettingKind;
-  /** Empty string means unset — the form starts from empty, not from a guess. */
+  readonly kind: ConfigKind;
   readonly value: string;
   readonly applies: "now" | "restart";
   /** An env var is governing this run, so the file value is not the live one. */
@@ -62,61 +52,61 @@ export type ConfigSetResult =
   | { readonly ok: false; readonly error: string };
 
 export interface ModelConfigKey {
-  readonly id: string;
+  readonly id: "modelBaseUrl" | "modelId" | "apiKey";
   readonly label: string;
-  /**
-   * Typed as the schema's own union rather than a loose string, so these three
-   * cannot invent a tenth capability that the nineteen file-backed rows have no
-   * way to join. The vocabulary is one vocabulary even though the table is two.
-   */
-  readonly group: ConfigGroup;
+  readonly group: string;
   readonly description: string;
-  readonly kind: ConfigSettingKind;
+  readonly kind: ConfigKind;
 }
 
 /**
- * The three model settings, in dump order (first, so the panel's model section
- * reads top-down). They are deliberately not in CONFIG_KEYS: they validate by
- * their own rules and write to Pi's store, and a key that names the wrong
- * store in the shared table would be one subtle bug away from writing a
- * credential into the Squid config file.
- *
- * All three group under "Model" alongside `modelProvider`, which does live in
- * the shared table — the store a setting is written to is not a fact the form
- * organizes by. The user asks one question here ("what answers me, and with
- * what login"), and four rows answer it from two files.
+ * Standard endpoints and models for well-known providers to streamline setup
+ * without clearing fields to blank.
+ */
+export const KNOWN_PROVIDER_DEFAULTS: Record<string, { baseUrl: string; modelId: string }> = {
+  openai: { baseUrl: "https://api.openai.com/v1", modelId: "gpt-4o" },
+  deepseek: { baseUrl: "https://api.deepseek.com/v1", modelId: "deepseek-chat" },
+  openrouter: { baseUrl: "https://openrouter.ai/api/v1", modelId: "openai/gpt-4o" },
+  anthropic: { baseUrl: "https://api.anthropic.com/v1", modelId: "claude-3-5-sonnet-20241022" },
+  ollama: { baseUrl: "http://localhost:11434/v1", modelId: "llama3.1" },
+  bifrost: { baseUrl: "http://127.0.0.1:8000/v1", modelId: "deepseek-v4-flash" },
+};
+
+/**
+ * The three keys that belong to the model connection. They do not appear in
+ * `config-schema.ts` because they live in Pi's stores, but they render in the
+ * same form, grouped under "Model" alongside `modelProvider`.
  */
 export const MODEL_CONFIG_KEYS: readonly ModelConfigKey[] = [
   {
     id: "modelBaseUrl",
-    label: "Model API base URL",
+    label: "Base URL",
     group: "Model",
-    description: "Where Squid reaches the model it asks.",
+    description: "The HTTP endpoint Squid talks to (e.g. https://api.openai.com/v1, https://api.deepseek.com/v1, http://localhost:11434/v1).",
     kind: "text",
   },
   {
     id: "modelId",
-    label: "Model id",
+    label: "Model ID",
     group: "Model",
-    description: "Which model does the thinking.",
+    description: "The model Squid asks for (e.g. gpt-4o, deepseek-chat, claude-3-5-sonnet, llama3.1).",
     kind: "text",
   },
   {
     id: "apiKey",
     label: "API key",
     group: "Model",
-    description: "The secret that lets Squid use that model on your behalf.",
+    description: "The API key for authentication (e.g. sk-..., or leave blank for local models). Displayed in plaintext.",
     kind: "text",
   },
 ];
 
-export function isModelConfigKey(id: string): boolean {
+export function isModelConfigKey(id: string): id is ModelConfigKey["id"] {
   return MODEL_CONFIG_KEYS.some((key) => key.id === id);
 }
 
 export interface ConfigServiceOptions {
-  /** Where the Squid config file lives; undefined disables file-backed sets. */
-  readonly configPath: string | undefined;
+  readonly configPath?: string;
   /** The run's environment, for overridden flags — read, never written. */
   readonly env: Record<string, string | undefined>;
   readonly agentDir: string;
@@ -184,9 +174,7 @@ export function configDumpEntries(options: ConfigServiceOptions): ConfigDump {
 }
 
 /**
- * One set, one decision. The panel never batches; a form with five edits sends
- * five messages and sees five results, which keeps every refusal attributable
- * to exactly the field the user was editing.
+ * Modifies one configuration setting and persists it.
  */
 export function applyConfigSet(
   options: ConfigServiceOptions,
@@ -196,10 +184,22 @@ export function applyConfigSet(
   if (isModelConfigKey(id)) return applyModelSet(options, id, value);
   const fileResult = applyFileSet(options, id, value);
   if (fileResult.ok && id === "modelProvider") {
+    const trimmed = value.trim();
     if (options.setProvider) {
-      options.setProvider(value);
+      options.setProvider(trimmed);
     } else {
-      options.provider = value;
+      options.provider = trimmed;
+    }
+    // Seed new provider with known defaults if it has no models.json entry yet
+    const existing = readModelEntry(options.agentDir, trimmed);
+    if (!existing) {
+      const known = KNOWN_PROVIDER_DEFAULTS[trimmed.toLowerCase()];
+      if (known) {
+        writeModelEndpoint(options.agentDir, trimmed, {
+          baseUrl: known.baseUrl,
+          modelId: known.modelId,
+        });
+      }
     }
     return { ok: true, applies: "now" };
   }
@@ -214,11 +214,13 @@ function applyFileSet(
   if (options.configPath === undefined) {
     return { ok: false, error: "No configuration file is available for this session." };
   }
-  const key = configKeyById(id);
+  const key = CONFIG_KEYS.find((entry) => entry.id === id);
   if (key === undefined) {
     return { ok: false, error: `Unknown setting "${id}".` };
   }
-  const written = updateConfigFile(options.configPath, { [id]: value });
+  const checked = key.validate(value);
+  if (!checked.ok) return checked;
+  const written = updateConfigFile(options.configPath ?? "", { [id]: value });
   if ("configError" in written) {
     return { ok: false, error: written.configError };
   }
@@ -253,15 +255,9 @@ function applyModelSet(
   if (trimmed.length === 0) {
     return { ok: false, error: `${key.label} cannot be empty.` };
   }
-  // An endpoint is worthless without the credential half beside it, and this
-  // layer has no way to prompt for one — so the gate is here, before the
-  // write, where the refusal can name what is missing.
-  if (!hasReadableCredential(options.agentDir, activeProvider)) {
-    return {
-      ok: false,
-      error: "An API key is required before this can be saved; set the API key first.",
-    };
-  }
+
+  // Developer efficiency first: endpoint fields can be saved freely without
+  // artificially demanding an existing API key first.
   const entry = readModelEntry(options.agentDir, activeProvider);
   writeModelEndpoint(options.agentDir, activeProvider, {
     baseUrl: id === "modelBaseUrl" ? trimmed : entry?.baseUrl ?? options.defaultBaseUrl,

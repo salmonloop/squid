@@ -813,7 +813,7 @@ fn apply(
             let _ = window.upgrade_in_event_loop(move |window| show_settings(&window, rows, count));
         }
         Incoming::ConfigResult(result) => {
-            let refresh = result.id.is_some();
+            let refresh = result.ok != 0 && result.id.is_some();
             let _ = window.upgrade_in_event_loop(move |window| {
                 window.set_status(config_verdict(&result).into());
             });
