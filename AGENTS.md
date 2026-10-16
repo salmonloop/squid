@@ -69,7 +69,7 @@ needed repair. Two things worth knowing anyway:
 
 ## Windows: things that are not obvious
 
-**`node:net` cannot bind a named pipe.** `createServer().listen('\\\\.\\pipe\\x')`
+**`node:net` cannot bind a named pipe.** `createServer().listen('\\\\\\\\.\\\\pipe\\\\x')`
 mangles the path and refuses. Use `Bun.listen({ unix })`, which inspects the string
 and takes its named-pipe branch — the same call that binds a Unix socket. This is
 already the production path (`src/panel-server.ts`); the smoke fixture rediscovered
@@ -85,7 +85,7 @@ what it can watch, while the server's log says it answered.
 
 **`new URL(import.meta.url).pathname` is POSIX-shaped on Windows.** It yields
 `/C:/Users/...`, and `resolve(dirname(that))` reads it as a directory below the
-current drive: `C:\C:\Users\...`. Use `fileURLToPath`.
+current drive: `C:\\C:\\Users\\...`. Use `fileURLToPath`.
 
 **`powershell.exe` is not reliably on `PATH`.** A POSIX-flavoured parent (Git Bash,
 MSYS) hands the child a `PATH` that often omits `System32`. Resolve it from
@@ -101,12 +101,14 @@ screen. That is why the Windows screen reader streams from one long-lived child
 (`streamingScreenTextReaderFactory`) instead of using the shared poll loop. If you
 add a Windows sensor, do the arithmetic before choosing the shape.
 
-**FIFO-backed capabilities do not work on Windows.** The capture gate, terminal
-commands, and editor saves each need an absolute FIFO path, and `validateFifoPath`
-judges by POSIX rules on every host — deliberately, because the config file is one
-dialect everywhere. A Windows run therefore cannot enable pause control, terminal
-observation, or editor saves at all. Making them work means named-pipe support in
-`fifo-line-reader.ts`, not a looser validator.
+**FIFO-shaped capabilities on Windows use Named Pipes.** The capture gate, terminal
+commands, and editor saves were originally POSIX FIFO-only, but `mkfifo` has no
+Windows equivalent. They now share the transport seam in `src/endpoint-transport.ts`:
+an endpoint string names its own transport by spelling. A POSIX-absolute path is tailed
+as a file, while a Windows named pipe (`\\\\.\\pipe\\<name>` or `//./pipe/<name>`) is served
+by `Bun.listen({ unix })` as a pipe listener (the same transport `parsePanelPipeName`
+accepts for the panel wire). A hook or alias connects, writes one newline-terminated line,
+and closes.
 
 **Browser page reading is macOS-only.** There is no Windows or Linux
 implementation; the synthetic backend covers the code path anywhere.
@@ -165,6 +167,13 @@ named (Notification Center attributes a notice to the bundle that sent it, and
 the panel ships no bundle), because a run that asked to be interrupted and
 silently was not looks exactly like one whose daemon is asleep. `off` is the
 explicit decline, and it wins on every host.
+
+**Notices toast only when the agent acts.** The resident agent wakes on every
+surviving event, and models often narrate "no action needed" instead of staying
+silent. The watch loop gates notifications on `ResidentSession.actedInLastTurn()`
+(latched on side-effecting tool calls like bash/edit/write, ignoring read-only
+orientation like `query_recent_events` and `read`), so passive narration stays in
+the panel and JSON log without ringing the desktop doorbell.
 
 ## The tray, and what Slint 1.17 will and will not tell you
 

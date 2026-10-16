@@ -235,6 +235,36 @@ Pushed when the agent finishes a turn.
 | `status` | `"replied"` \| `"failed"` | yes | |
 | `text` | string | no | **sanitized** assistant text or error |
 
+### `agent_thinking`
+
+Pushed to announce the agent's active thinking/processing state. Used by the panel to render an animated thinking indicator while a prompt turn is in flight.
+
+```jsonc
+{"type":"agent_thinking","thinking":1}
+```
+
+| field | type | required | notes |
+|---|---|---|---|
+| `type` | `"agent_thinking"` | yes | |
+| `thinking` | `0` \| `1` | yes | `1` when prompt turn is active, `0` when completed or aborted |
+
+### `agent_triggers`
+
+Pushed to report decision counts and gate attribution from the resident watch loop (explaining "what has Squid reacted to or filtered?").
+
+```jsonc
+{"type":"agent_triggers","triggered":5,"duplicate":2,"excluded":1,"coalesced":3,"last":"triggered"}
+```
+
+| field | type | required | notes |
+|---|---|---|---|
+| `type` | `"agent_triggers"` | yes | |
+| `triggered` | integer | yes | count of events that provoked an agent turn |
+| `duplicate` | integer | yes | count of events dropped as duplicates |
+| `excluded` | integer | yes | count of events dropped by capture exclusion |
+| `coalesced` | integer | yes | count of events coalesced during an active turn |
+| `last` | `"triggered"` \| `"duplicate"` \| `"excluded"` \| `"coalesced"` \| `"no_agent"` | no | most recent disposition token |
+
 ### `service`
 
 The brain's own standing state, announced to each panel **as it subscribes** —
@@ -441,12 +471,15 @@ once with `outcome: "pending"` when the request fires, and once with `"ok"` or
 `"error"` when the response arrives. The `id` correlates the two: the panel
 updates the pending row in place.
 
-Privacy: captures metadata only — model id, message count, payload size, HTTP
-status, duration. No prompt content, API keys, or response bodies.
+Privacy: captures request metadata, plus one bounded, scrubbed exception —
+`preview`, a capped, control-stripped, credential-redacted excerpt of prompt messages
+(`sanitizeLlmPreview` in `src/audit-text.ts`), allowing users to inspect the context
+sent to the provider without exposing secrets or unbounded payloads.
+No API keys or raw response bodies.
 
 ```jsonc
-{"type":"llm_log","id":1,"requestedAt":"2026-09-14T12:30:00.000Z","model":"deepseek-v4-flash","messageCount":7,"promptChars":4200,"outcome":"pending"}
-{"type":"llm_log","id":1,"requestedAt":"2026-09-14T12:30:00.000Z","respondedAt":"2026-09-14T12:30:02.500Z","httpStatus":200,"durationMs":2500,"outcome":"ok"}
+{"type":"llm_log","id":1,"requestedAt":"2026-09-14T12:30:00.000Z","model":"deepseek-v4-flash","messageCount":7,"promptChars":4200,"preview":"user: run test suite...","outcome":"pending"}
+{"type":"llm_log","id":1,"requestedAt":"2026-09-14T12:30:00.000Z","respondedAt":"2026-09-14T12:30:02.500Z","model":"deepseek-v4-flash","messageCount":7,"promptChars":4200,"preview":"user: run test suite...","httpStatus":200,"durationMs":2500,"outcome":"ok"}
 {"type":"llm_log","id":2,"requestedAt":"2026-09-14T12:31:00.000Z","respondedAt":"2026-09-14T12:31:01.200Z","httpStatus":401,"durationMs":1200,"outcome":"error","error":"HTTP 401"}
 ```
 
@@ -463,6 +496,7 @@ status, duration. No prompt content, API keys, or response bodies.
 | `durationMs` | integer | no | round-trip latency in ms |
 | `outcome` | `"pending"` \| `"ok"` \| `"error"` | yes | |
 | `error` | string | no | error summary if failed, **sanitized** |
+| `preview` | string | no | bounded, sanitized prompt preview excerpt |
 
 ## Panel → TS
 
@@ -617,16 +651,45 @@ export interface PanelAgentLine {
   readonly status: "replied" | "failed";
   readonly text?: string;
 }
+export interface PanelAgentThinking {
+  readonly type: "agent_thinking";
+  readonly thinking: 0 | 1;
+}
+export interface PanelAgentTriggers {
+  readonly type: "agent_triggers";
+  readonly triggered: number;
+  readonly duplicate: number;
+  readonly excluded: number;
+  readonly coalesced: number;
+  readonly last?: "triggered" | "duplicate" | "excluded" | "coalesced" | "no_agent";
+}
+export interface PanelLlmLogLine {
+  readonly type: "llm_log";
+  readonly id: number;
+  readonly requestedAt: string;
+  readonly outcome: "pending" | "ok" | "error";
+  readonly respondedAt?: string;
+  readonly model?: string;
+  readonly messageCount?: number;
+  readonly promptChars?: number;
+  readonly httpStatus?: number;
+  readonly durationMs?: number;
+  readonly error?: string;
+  readonly preview?: string;
+}
 export type PanelMessage =
   | PanelWorldState
   | PanelAgentLine
+  | PanelAgentThinking
+  | PanelAgentTriggers
   | PanelServiceLine
   | PanelConfigLine
   | PanelConfigEnd
   | PanelConfigResult
   | PanelSourceLine
   | PanelSourceEnd
-  | PanelSourceResult;
+  | PanelSourceResult
+  | PanelLlmLogLine;
 export interface PanelServiceLine {
   readonly type: "service";
   readonly agentState: "ready" | "needs_config";
