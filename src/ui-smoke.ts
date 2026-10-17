@@ -88,6 +88,7 @@ const CONFIG_ROWS: readonly Record<string, unknown>[] = [
   { type: "config", id: "watchRoot", label: "Watched folder", kind: "text", value: "/home/you/project", applies: "restart", group: "Files", description: "The folder Squid notices changes in." },
   { type: "config", id: "retentionHours", label: "Keep activity for", kind: "int", value: "24", applies: "restart", group: "History", description: "How long Squid keeps what it recorded before deleting it." },
   { type: "config", id: "screenReader", label: "Screen reading", kind: "enum", value: "", applies: "restart", group: "Screen", description: "How Squid reads the words on screen.", values: "linux" },
+  { type: "config", id: "inputSuggestions", label: "Input suggestions", kind: "enum", value: "on", applies: "now", group: "Screen", description: "Suggests text when focusing an input field and auto-types on accept.", values: "on;off" }, 
   { type: "config", id: "excludeApplications", label: "Never watch these apps", kind: "text", value: "1Password", applies: "restart", group: "Privacy", description: "Squid records nothing at all from the apps you list." },
   { type: "config", id: "databasePath", label: "Where history is kept", kind: "text", value: "", applies: "restart", group: "History", description: "The file Squid writes its record to. Empty keeps it in memory only." },
 ];

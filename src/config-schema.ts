@@ -391,6 +391,16 @@ const CONFIG_KEY_TABLE: readonly Omit<ConfigKey, "validate">[] = [
     kind: "int",
   },
   {
+    id: "inputSuggestions",
+    env: "SQUID_INPUT_SUGGESTIONS",
+    label: "Input suggestions",
+    group: "Screen",
+    description:
+      "Whether Squid proactively proposes text suggestions when focusing on an input field. Defaults to on.",
+    kind: "enum",
+    values: ["on", "off"],
+  },
+  {
     id: "browser",
     env: "SQUID_BROWSER",
     label: "Browser pages",

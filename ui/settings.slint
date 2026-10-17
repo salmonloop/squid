@@ -1,4 +1,4 @@
-import { Button, LineEdit } from "std-widgets.slint";
+import { Button, LineEdit, Switch } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { SettingRow } from "model.slint";
 
@@ -158,7 +158,21 @@ export component SettingEditor inherits Rectangle {
             wrap: word-wrap;
         }
 
-        HorizontalLayout {
+        if root.setting.values == "on;off" || root.setting.values == "off;on": HorizontalLayout {
+            spacing: Theme.gap;
+            toggle-switch := Switch {
+                text: toggle-switch.checked ? "Enabled" : "Disabled";
+                checked: root.setting.value != "off";
+                accessible-label: root.setting.label;
+                accessible-description: root.setting.description;
+                toggled => {
+                    root.save(root.setting.id, self.checked ? "on" : "off");
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+
+        if root.setting.values != "on;off" && root.setting.values != "off;on": HorizontalLayout {
             spacing: Theme.gap-tight;
 
             editor := LineEdit {
@@ -209,7 +223,14 @@ export component SettingEditor inherits Rectangle {
             wrap: word-wrap;
         }
 
-        if root.setting.values != "": Text {
+        if root.setting.id == "inputSuggestions": Text {
+            text: "When enabled, Squid pops up intelligent suggestions and auto-types them upon acceptance.";
+            color: Theme.text-muted;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+
+        if root.setting.values != "" && root.setting.values != "on;off" && root.setting.values != "off;on": Text {
             text: "Choose one of: " + root.setting.values;
             color: Theme.text-muted;
             font-size: 11px;

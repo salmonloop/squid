@@ -228,6 +228,7 @@ async function startSession(options: {
   readonly stopExit?: () => void;
   /** A notifier that records instead of interrupting whoever runs the suite. */
   readonly notifierFactory?: DesktopNotifierFactory;
+  readonly inputSuggestionService?: any;
 }) {
   const seenContexts: WatchSourceContext[] = [];
   const agentLog = options.agentLog ?? emptyAgentLog();
@@ -246,6 +247,7 @@ async function startSession(options: {
     ...(options.restartExit === undefined ? {} : { restartExit: options.restartExit }),
     ...(options.stopExit === undefined ? {} : { stopExit: options.stopExit }),
     ...(options.notifierFactory === undefined ? {} : { notifierFactory: options.notifierFactory }),
+    ...(options.inputSuggestionService === undefined ? {} : { inputSuggestionService: options.inputSuggestionService }),
     createSources: async (context) => {
       seenContexts.push(context);
       if (options.sourceEntries !== undefined) return options.sourceEntries;
@@ -2131,6 +2133,64 @@ describe("the control panel on a watch session", () => {
         expect(providerRow?.value).toBe("anthropic");
       } finally {
         await h.close();
+      }
+    });
+
+    it("updates inputSuggestions on config_set and applies now", async () => {
+      const h = await startSettingsSession(false);
+      try {
+        h.client.send(JSON.stringify({ type: "config_set", id: "inputSuggestions", value: "off" }));
+        const setResult = await awaitConfigResult(h.client, "inputSuggestions");
+        expect(setResult.ok).toBe(1);
+        expect(setResult.applies).toBe("now");
+        expect(h.restartCalls).toHaveLength(0);
+
+        h.client.send(JSON.stringify({ type: "config_get" }));
+        const configs = await awaitConfigEnd(h.client);
+        const sugRow = configs.find((l) => l.id === "inputSuggestions");
+        expect(sugRow?.value).toBe("off");
+        expect(sugRow?.applies).toBe("now");
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("dispatches focus_changed event to inputSuggestionService", async () => {
+      let focusReceived = false;
+      const mockSuggestionService: any = {
+        async onFocusChanged(payload: any) {
+          if (payload.role === "text_input") {
+            focusReceived = true;
+          }
+        },
+      };
+
+      const source = new ScriptedSource("synth-focus", []);
+      const { result } = await startSession({
+        sources: [source],
+        inputSuggestionService: mockSuggestionService,
+      });
+      if ("configError" in result) throw new Error(result.configError);
+      try {
+        await source.emit!(createActivityEvent({
+          kind: "focus_changed",
+          eventId: "fc-1",
+          source: { kind: "synthetic", instanceId: "s-1" },
+          sessionId: "s1",
+          sequence: 1,
+          payload: {
+            applicationId: "terminal",
+            windowTitle: "bash",
+            role: "text_input",
+            label: null,
+          },
+        }));
+
+        // Yield to allow async dispatch to complete
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(focusReceived).toBe(true);
+      } finally {
+        await result.session.stop();
       }
     });
   });

@@ -163,7 +163,7 @@ export function configDumpEntries(options: ConfigServiceOptions): ConfigDump {
       description: key.description,
       kind: key.kind,
       value: values[key.id] ?? "",
-      applies: key.id === "modelProvider" ? "now" : "restart",
+      applies: key.id === "modelProvider" || key.id === "inputSuggestions" ? "now" : "restart",
       overridden: overriddenEnv(key.env),
       ...(key.values === undefined ? {} : { values: key.values }),
     });
@@ -223,8 +223,8 @@ function applyFileSet(
   if ("configError" in written) {
     return { ok: false, error: written.configError };
   }
-  // Model provider hot reloads; other file-backed settings apply on restart.
-  return { ok: true, applies: id === "modelProvider" ? "now" : "restart" };
+  // Model provider and input suggestions hot reload; other file-backed settings apply on restart.
+  return { ok: true, applies: id === "modelProvider" || id === "inputSuggestions" ? "now" : "restart" };
 }
 
 function applyModelSet(
