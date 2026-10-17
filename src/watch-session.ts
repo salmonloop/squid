@@ -27,7 +27,7 @@ import {
 } from "./resident-agent.js";
 import type { ActivitySourceDiagnostic, SourceEntry } from "./activity-source.js";
 import { SourceManager } from "./source-manager.js";
-import type { ActivityEvent, WorldState } from "./protocol.js";
+import type { ActivityEvent, FocusChangedPayload, WorldState } from "./protocol.js";
 import type { PredictionRuntimeIngestResult } from "./prediction-runtime.js";
 import { runRetentionPrune, type RetentionPruneResult } from "./retention-prune.js";
 import { sqliteWatchExclusions } from "./sqlite-event-store.js";
@@ -36,6 +36,9 @@ import { resolvePanel } from "./resolve-panel.js";
 import { startPanelServer, type PanelServer } from "./panel-server.js";
 import type { DesktopNotifierFactory } from "./desktop-notice.js";
 import { PanelConfirmationSurface } from "./panel-confirmation-surface.js";
+import { SerialConfirmationPolicy } from "./action-confirmation.js";
+import { TextTypingService } from "./text-typing-service.js";
+import { InputSuggestionService } from "./input-suggestion.js";
 import {
   panelAgentLine,
   panelAgentThinking,
@@ -182,6 +185,8 @@ export interface WatchSessionOptions {
    * tests inject a spy instead of ending the process.
    */
   readonly stopExit?: () => void;
+  readonly textTypingService?: TextTypingService;
+  readonly inputSuggestionService?: InputSuggestionService;
 }
 
 export interface WatchSession {
@@ -518,6 +523,21 @@ export async function startWatchSession(
   // The adapter is deliberately inert until a future execution seam calls it:
   // current custom tools are read-only and Pi's sandbox owns tool safety.
   const panelConfirmation = new PanelConfirmationSurface({ server: () => panelServer });
+  const textTypingService = options.textTypingService ?? new TextTypingService({ env });
+  const confirmationPolicy = new SerialConfirmationPolicy({
+    surface: panelConfirmation,
+    timeoutMs: 30_000,
+  });
+  let inputSuggestionsEnabled = env.SQUID_INPUT_SUGGESTIONS !== "off";
+  const inputSuggestionService =
+    options.inputSuggestionService ??
+    new InputSuggestionService({
+      isEnabled: () => inputSuggestionsEnabled,
+      confirmationPolicy,
+      textTypingService,
+      log,
+      logError,
+    });
   /**
    * Echoes a command's own correlation id back on its verdict.
    *
@@ -581,6 +601,9 @@ export async function startWatchSession(
           // needs_config: the agent starts in-session, immediately, on the
           // files just written. The result above already told the panel the
           // set landed; this is what makes its "applies: now" true.
+          if (outcome.ok && id === "inputSuggestions") {
+            inputSuggestionsEnabled = value !== "off";
+          }
           if (outcome.ok && (isModelConfigKey(id) || id === "modelProvider")) {
             if (agent === undefined) {
               tryStartAgent();
@@ -987,6 +1010,11 @@ export async function startWatchSession(
     // The newest projection, kept for needs_config recovery: an agent started
     // later observes this instead of waking up blind to the world it missed.
     lastState = ingested.ingest.state;
+    if (event.kind === "focus_changed") {
+      void inputSuggestionService.onFocusChanged(event.payload as FocusChangedPayload, ingested.ingest.state).catch((error: unknown) => {
+        logError(JSON.stringify({ inputSuggestionError: describeErrorForAudit(error) }));
+      });
+    }
     // A duplicate changed nothing about the world, so there is nothing new for
     // the agent to see and no reason to spend a turn on it.
     if (ingested.ingest.disposition === "duplicate") {
@@ -1085,6 +1113,7 @@ export async function startWatchSession(
       // order. Hot-toggled sources are simply wherever `running` left them.
       if (gateSource !== undefined) await gateSource.stop();
       await sourceManager.stopAll();
+      await confirmationPolicy.close();
       // Then the agent's turns, while its session is still open: a turn cut off
       // mid-flight loses whatever the agent was doing, and its session history is
       // the only record that it happened. The panel closes after that drain, so

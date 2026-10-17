@@ -39,6 +39,8 @@ describe("config schema", () => {
     expect(configKeyById("watchRoot")?.env).toBe("SQUID_WATCH_ROOT");
     expect(configKeyById("databasePath")?.env).toBe("SQUID_DB");
     expect(configKeyByEnv("SQUID_SCREEN_POLL_MS")?.id).toBe("screenPollMs");
+    expect(configKeyById("inputSuggestions")?.env).toBe("SQUID_INPUT_SUGGESTIONS");
+    expect(configKeyByEnv("SQUID_INPUT_SUGGESTIONS")?.id).toBe("inputSuggestions");
     expect(configKeyByEnv("SQUID_PANEL_SOCKET")).toBeUndefined();
   });
 
@@ -56,6 +58,12 @@ describe("config schema", () => {
     expect(reader.validate("synthetic")).toEqual({ ok: true });
     expect(reader.validate("Synthetic").ok).toBe(false);
     expect(reader.validate("vision").ok).toBe(false);
+
+    const inputSug = configKeyById("inputSuggestions")!;
+    expect(inputSug.validate("on")).toEqual({ ok: true });
+    expect(inputSug.validate("off")).toEqual({ ok: true });
+    expect(inputSug.validate("true").ok).toBe(false);
+    expect(inputSug.validate("false").ok).toBe(false);
 
     const root = configKeyById("watchRoot")!;
     expect(root.validate("/home/me")).toEqual({ ok: true });
@@ -225,6 +233,7 @@ describe("config schema", () => {
       ["watchRoot", "Files"],
       ["screenReader", "Screen"],
       ["screenPollMs", "Screen"],
+      ["inputSuggestions", "Screen"],
       ["browser", "Browser"],
       ["browserPollMs", "Browser"],
       ["terminal", "Terminal"],

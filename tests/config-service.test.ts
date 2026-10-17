@@ -172,11 +172,13 @@ describe("configDumpEntries", () => {
     expect(entryOf(live, "modelBaseUrl").applies).toBe("now");
     expect(entryOf(live, "modelId").applies).toBe("now");
     expect(entryOf(live, "apiKey").applies).toBe("now");
+    expect(entryOf(live, "inputSuggestions").applies).toBe("now");
     expect(entryOf(live, "watchRoot").applies).toBe("restart");
 
     const idle = configDumpEntries(options(dir, { agentLive: () => false }));
     if (!idle.ok) throw new Error(idle.error);
     expect(entryOf(idle, "modelBaseUrl").applies).toBe("now");
+    expect(entryOf(idle, "inputSuggestions").applies).toBe("now");
     expect(entryOf(idle, "watchRoot").applies).toBe("restart");
     rmSync(dir, { recursive: true, force: true });
   });
@@ -201,6 +203,15 @@ describe("applyConfigSet on file-backed keys", () => {
     expect(outcome).toEqual({ ok: true, applies: "restart" });
     const onDisk = JSON.parse(readFileSync(join(dir, "config.json"), "utf8")) as Record<string, string>;
     expect(onDisk.watchRoot).toBe("/new/root");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("writes inputSuggestions and reports now", () => {
+    const dir = tempDir("input-sug-set");
+    const outcome = applyConfigSet(options(dir), "inputSuggestions", "off");
+    expect(outcome).toEqual({ ok: true, applies: "now" });
+    const onDisk = JSON.parse(readFileSync(join(dir, "config.json"), "utf8")) as Record<string, string>;
+    expect(onDisk.inputSuggestions).toBe("off");
     rmSync(dir, { recursive: true, force: true });
   });
 
