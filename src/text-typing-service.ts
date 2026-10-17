@@ -16,11 +16,20 @@ export interface TextTypingTarget {
   readonly targetWindowId?: string;
   readonly targetWindowTitle?: string;
   readonly targetApplicationId?: string;
+  readonly signal?: AbortSignal | undefined;
 }
 
 export interface TextTypingResult {
   readonly ok: boolean;
   readonly error?: string;
+}
+
+/**
+ * Abstraction for text typing execution.
+ * Decouples consumers (e.g. InputSuggestionService, typeTextTool) from concrete OS runners.
+ */
+export interface TextTypingExecutor {
+  typeText(target: TextTypingTarget): Promise<TextTypingResult>;
 }
 
 export interface SubprocessExecutionResult {
@@ -89,7 +98,7 @@ export function escapeSendKeys(text: string): string {
     .replace(/\r?\n/g, "{ENTER}");
 }
 
-export class TextTypingService {
+export class TextTypingService implements TextTypingExecutor {
   private readonly platform: NodeJS.Platform;
   private readonly runner: SubprocessRunner;
   private readonly timeoutMs: number;
@@ -110,6 +119,9 @@ export class TextTypingService {
    * Types the specified text into the focused target input.
    */
   async typeText(target: TextTypingTarget): Promise<TextTypingResult> {
+    if (target.signal?.aborted) {
+      return { ok: false, error: "Aborted" };
+    }
     const { text, targetWindowId, targetWindowTitle, targetApplicationId } = target;
     if (text.length === 0) {
       return { ok: true };
