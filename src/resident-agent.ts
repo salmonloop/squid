@@ -92,7 +92,7 @@ export interface TurnActionTracker {
  * world-changing tool (or Pi renames one), add it here — a call not in this set
  * fails safe toward silence, which is the behavior this whole change is for.
  */
-const ACTING_TOOL_NAMES: ReadonlySet<string> = new Set(["bash", "edit", "write"]);
+const ACTING_TOOL_NAMES: ReadonlySet<string> = new Set(["bash", "edit", "write", "type_text"]);
 
 export function turnActionTracker(): TurnActionTracker {
   let acted = false;
