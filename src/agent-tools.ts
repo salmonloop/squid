@@ -7,6 +7,10 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { EventStore } from "./event-store.js";
+import { createTypeTextTool } from "./type-text-tool.js";
+import type { TextTypingService } from "./text-typing-service.js";
+
+export { createTypeTextTool, typeTextParams, type TypeTextArgs, type TypeTextToolDetails } from "./type-text-tool.js";
 
 /**
  * The agent's window onto its own sensory record.
@@ -68,7 +72,7 @@ export function queryRecentEventsTool(
 ): ToolDefinition<typeof recentEventsParams, { count: number }> {
   // `defineTool` is Pi's own shim for exactly this: a concrete tool kept intact
   // when it joins a `ToolDefinition[]`, where the array's default type parameters
-  // would otherwise widen the schema and the details to `unknown`.
+  // would otherwise widen the schema and the details to `unknown``.
   return defineTool({
     name: "query_recent_events",
     label: "Query recent events",
@@ -98,7 +102,14 @@ export function queryRecentEventsTool(
   });
 }
 
-/** The custom tools a resident agent gets for its own store. */
-export function agentCustomTools(store: EventStore): readonly ToolDefinition<any, any, any>[] {
-  return [queryRecentEventsTool(store)];
+/** The custom tools a resident agent gets for its own store and capabilities. */
+export function agentCustomTools(
+  store: EventStore,
+  typingService?: TextTypingService,
+): readonly ToolDefinition<any, any, any>[] {
+  const tools: ToolDefinition<any, any, any>[] = [queryRecentEventsTool(store)];
+  if (typingService !== undefined) {
+    tools.push(createTypeTextTool(typingService));
+  }
+  return tools;
 }

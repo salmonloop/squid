@@ -5,17 +5,23 @@
  * editor, or terminal). Infers/predicts what the user likely intends to enter,
  * presents the proposed text to the user via Squid's native ConfirmationCard,
  * and upon user acceptance ("Allow"), automatically types the suggested text
- * into the target field using TextTypingService.
+ * into the target field using the standard Pi Agent `type_text` tool.
  *
  * Honors the GUI switch / environment variable (SQUID_INPUT_SUGGESTIONS !== "off").
  */
 
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type {
   ActionConfirmationPolicy,
   ActionConfirmationRequest,
 } from "./action-confirmation.js";
 import type { FocusChangedPayload, WorldState } from "./protocol.js";
-import type { TextTypingService } from "./text-typing-service.js";
+import { TextTypingService } from "./text-typing-service.js";
+import {
+  createTypeTextTool,
+  type typeTextParams,
+  type TypeTextToolDetails,
+} from "./type-text-tool.js";
 
 export interface InputSuggestion {
   readonly text: string;
@@ -30,7 +36,8 @@ export interface SuggestionContext {
 export interface InputSuggestionServiceOptions {
   readonly isEnabled: () => boolean;
   readonly confirmationPolicy: ActionConfirmationPolicy;
-  readonly textTypingService: TextTypingService;
+  readonly textTypingService?: TextTypingService | undefined;
+  readonly typeTextTool?: ToolDefinition<typeof typeTextParams, TypeTextToolDetails> | undefined;
   readonly predictSuggestion?: ((context: SuggestionContext) => Promise<InputSuggestion | null> | InputSuggestion | null) | undefined;
   readonly cooldownMs?: number | undefined;
   readonly promptTimeoutMs?: number | undefined;
@@ -138,7 +145,7 @@ export function heuristicSuggestInput(context: SuggestionContext): InputSuggesti
 export class InputSuggestionService {
   private readonly isEnabled: () => boolean;
   private readonly confirmationPolicy: ActionConfirmationPolicy;
-  private readonly textTypingService: TextTypingService;
+  private readonly typeTextTool: ToolDefinition<typeof typeTextParams, TypeTextToolDetails>;
   private readonly predictSuggestion: (context: SuggestionContext) => Promise<InputSuggestion | null>;
   private readonly cooldownMs: number;
   private readonly promptTimeoutMs: number;
@@ -153,7 +160,13 @@ export class InputSuggestionService {
   constructor(options: InputSuggestionServiceOptions) {
     this.isEnabled = options.isEnabled;
     this.confirmationPolicy = options.confirmationPolicy;
-    this.textTypingService = options.textTypingService;
+    if (options.typeTextTool !== undefined) {
+      this.typeTextTool = options.typeTextTool;
+    } else if (options.textTypingService !== undefined) {
+      this.typeTextTool = createTypeTextTool(options.textTypingService);
+    } else {
+      this.typeTextTool = createTypeTextTool(new TextTypingService());
+    }
     const predictor = options.predictSuggestion ?? heuristicSuggestInput;
     this.predictSuggestion = async (ctx) => predictor(ctx);
     this.cooldownMs = options.cooldownMs ?? 4_000;
@@ -161,6 +174,13 @@ export class InputSuggestionService {
     this.log = options.log;
     this.logError = options.logError;
     this.now = options.now ?? Date.now;
+  }
+
+  /**
+   * Returns the registered Pi Agent ToolDefinition.
+   */
+  getTypeTextTool(): ToolDefinition<typeof typeTextParams, TypeTextToolDetails> {
+    return this.typeTextTool;
   }
 
   /**
@@ -233,19 +253,25 @@ export class InputSuggestionService {
           }),
         );
 
-        // 6. User accepted: auto-type into target window
-        const typingResult = await this.textTypingService.typeText({
-          text: suggestion.text,
-          targetWindowTitle: payload.windowTitle,
-          targetApplicationId: payload.applicationId,
-        });
+        // 6. User accepted: auto-type into target window via standard Pi Agent tool
+        const toolResult = await this.typeTextTool.execute(
+          `suggest-${nowMs}`,
+          {
+            text: suggestion.text,
+            ...(payload.windowTitle !== undefined ? { targetWindowTitle: payload.windowTitle } : {}),
+            ...(payload.applicationId !== undefined ? { targetApplicationId: payload.applicationId } : {}),
+          },
+          undefined,
+          undefined,
+          {} as any,
+        );
 
-        if (!typingResult.ok) {
+        if (toolResult.details?.ok === false) {
           this.logError?.(
             JSON.stringify({
               inputSuggestionTypingFailed: {
                 target: targetKey,
-                error: typingResult.error,
+                error: toolResult.details.error,
               },
             }),
           );

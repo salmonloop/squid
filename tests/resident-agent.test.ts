@@ -115,6 +115,9 @@ describe("turnActionTracker", () => {
     // Running a command or editing a file is the action worth a toast.
     toolCall("bash");
     expect(tracker.acted()).toBe(true);
+    tracker.reset();
+    toolCall("type_text");
+    expect(tracker.acted()).toBe(true);
     // Reset is what the real session calls at the top of each prompt, so the
     // flag reports this turn and not a stale one.
     tracker.reset();

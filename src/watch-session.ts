@@ -39,6 +39,7 @@ import { PanelConfirmationSurface } from "./panel-confirmation-surface.js";
 import { SerialConfirmationPolicy } from "./action-confirmation.js";
 import { TextTypingService } from "./text-typing-service.js";
 import { InputSuggestionService } from "./input-suggestion.js";
+import { inputSuggestionExtension } from "./input-suggestion-extension.js";
 import {
   panelAgentLine,
   panelAgentThinking,
@@ -380,6 +381,26 @@ export async function startWatchSession(
     turnStarted: () => panelServerRef.server?.broadcast(panelAgentThinking(true)),
     turnEnded: () => panelServerRef.server?.broadcast(panelAgentThinking(false)),
   };
+  let panelServer: PanelServer | undefined;
+  // The adapter is deliberately inert until a future execution seam calls it:
+  // current custom tools are read-only and Pi's sandbox owns tool safety.
+  const panelConfirmation = new PanelConfirmationSurface({ server: () => panelServer });
+  const textTypingService = options.textTypingService ?? new TextTypingService({ env });
+  const confirmationPolicy = new SerialConfirmationPolicy({
+    surface: panelConfirmation,
+    timeoutMs: 30_000,
+  });
+  let inputSuggestionsEnabled = env.SQUID_INPUT_SUGGESTIONS !== "off";
+  const inputSuggestionService =
+    options.inputSuggestionService ??
+    new InputSuggestionService({
+      isEnabled: () => inputSuggestionsEnabled,
+      confirmationPolicy,
+      textTypingService,
+      log,
+      logError,
+    });
+
   const buildAgent = async (): Promise<ResidentAgent> => {
     // The decision curator trims what the agent reads before each thought,
     // asking a fast Jev-shaped model which context a future turn will need. It
@@ -414,6 +435,10 @@ export async function startWatchSession(
         attentionWindowExtension(attentionWindow.windowMs),
         heartbeatExtension(heartbeatSink),
         llmLogExt,
+        inputSuggestionExtension({
+          service: inputSuggestionService,
+          typeTextTool: inputSuggestionService.getTypeTextTool?.(),
+        }),
         ...(decisionCurator === undefined ? [] : [decisionCurator]),
       ],
       agentDir,
@@ -519,25 +544,7 @@ export async function startWatchSession(
    */
   const sourceManagerRef: { manager: SourceManager | undefined } = { manager: undefined };
 
-  let panelServer: PanelServer | undefined;
-  // The adapter is deliberately inert until a future execution seam calls it:
-  // current custom tools are read-only and Pi's sandbox owns tool safety.
-  const panelConfirmation = new PanelConfirmationSurface({ server: () => panelServer });
-  const textTypingService = options.textTypingService ?? new TextTypingService({ env });
-  const confirmationPolicy = new SerialConfirmationPolicy({
-    surface: panelConfirmation,
-    timeoutMs: 30_000,
-  });
-  let inputSuggestionsEnabled = env.SQUID_INPUT_SUGGESTIONS !== "off";
-  const inputSuggestionService =
-    options.inputSuggestionService ??
-    new InputSuggestionService({
-      isEnabled: () => inputSuggestionsEnabled,
-      confirmationPolicy,
-      textTypingService,
-      log,
-      logError,
-    });
+  // panelServer and confirmation/suggestion services moved above buildAgent
   /**
    * Echoes a command's own correlation id back on its verdict.
    *
