@@ -252,11 +252,14 @@ export component PanelWindow inherits Window {
             reopen => { root.deferred = false; }
         }
 
-        ScrollView {
+        sv := ScrollView {
             horizontal-stretch: 1;
             vertical-stretch: 1;
+            content-width: sv.visible-width;
+            horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
 
             VerticalLayout {
+                width: sv.visible-width;
                 spacing: Theme.gap-loose;
 
                 // What Squid can see, and the only place its configuration
@@ -654,9 +657,12 @@ export component PanelWindow inherits Window {
                 EvidenceRow { label: "Chars"; value: root.detail-prompt-chars > 0 ? "~" + root.detail-prompt-chars : ""; }
                 if root.detail-error != "": EvidenceRow { label: "Error"; value: root.detail-error; }
                 Text { text: "Content preview"; color: Theme.text-muted; font-size: 13px; font-weight: 600; }
-                ScrollView {
+                preview-sv := ScrollView {
                     vertical-stretch: 1;
+                    content-width: preview-sv.visible-width;
+                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
                     Text {
+                        width: preview-sv.visible-width;
                         text: root.detail-preview == "" ? "No preview available." : root.detail-preview;
                         color: root.detail-preview == "" ? Theme.text-muted : Theme.text;
                         font-size: 12px;
