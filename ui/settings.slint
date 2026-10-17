@@ -41,45 +41,45 @@ component HelpTooltip inherits Rectangle {
 
         if root.setting-id == "modelBaseUrl": VerticalLayout {
             spacing: 2px;
-            Text { text: "Base URL Examples & Configuration:"; font-weight: 700; color: Theme.focus; font-size: 11px; }
-            Text { text: "• OpenAI / Proxy: https://api.openai.com/v1"; color: Theme.text; font-size: 11px; }
-            Text { text: "• DeepSeek: https://api.deepseek.com/v1"; color: Theme.text; font-size: 11px; }
-            Text { text: "• OpenRouter: https://openrouter.ai/api/v1"; color: Theme.text; font-size: 11px; }
-            Text { text: "• Ollama (Local): http://localhost:11434/v1"; color: Theme.text; font-size: 11px; }
-            Text { text: "• LM Studio: http://localhost:1234/v1"; color: Theme.text; font-size: 11px; }
-            Text { text: "• Default Gateway: http://127.0.0.1:8000/v1"; color: Theme.text-muted; font-size: 11px; }
+            Text { text: "Base URL Examples & Configuration:"; font-weight: 700; color: Theme.focus; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• OpenAI / Proxy: https://api.openai.com/v1"; color: Theme.text; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• DeepSeek: https://api.deepseek.com/v1"; color: Theme.text; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• OpenRouter: https://openrouter.ai/api/v1"; color: Theme.text; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• Ollama (Local): http://localhost:11434/v1"; color: Theme.text; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• LM Studio: http://localhost:1234/v1"; color: Theme.text; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• Default Gateway: http://127.0.0.1:8000/v1"; color: Theme.text-muted; font-size: 11px; wrap: word-wrap; }
         }
 
         if root.setting-id == "modelId": VerticalLayout {
             spacing: 2px;
-            Text { text: "Model ID Examples:"; font-weight: 700; color: Theme.focus; font-size: 11px; }
-            Text { text: "• OpenAI: gpt-4o, gpt-4o-mini, o1-mini"; color: Theme.text; font-size: 11px; }
-            Text { text: "• DeepSeek: deepseek-chat, deepseek-coder"; color: Theme.text; font-size: 11px; }
-            Text { text: "• Anthropic (via proxy): claude-3-5-sonnet-20241022"; color: Theme.text; font-size: 11px; }
-            Text { text: "• Ollama: llama3.1, qwen2.5-coder"; color: Theme.text; font-size: 11px; }
+            Text { text: "Model ID Examples:"; font-weight: 700; color: Theme.focus; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• OpenAI: gpt-4o, gpt-4o-mini, o1-mini"; color: Theme.text; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• DeepSeek: deepseek-chat, deepseek-coder"; color: Theme.text; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• Anthropic (via proxy): claude-3-5-sonnet-20241022"; color: Theme.text; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• Ollama: llama3.1, qwen2.5-coder"; color: Theme.text; font-size: 11px; wrap: word-wrap; }
         }
 
         if root.setting-id == "apiKey": VerticalLayout {
             spacing: 2px;
-            Text { text: "API Key Examples & Notice:"; font-weight: 700; color: Theme.focus; font-size: 11px; }
-            Text { text: "• OpenAI: sk-proj-..."; color: Theme.text; font-size: 11px; }
-            Text { text: "• DeepSeek: sk-..."; color: Theme.text; font-size: 11px; }
-            Text { text: "• OpenRouter: sk-or-v1-..."; color: Theme.text; font-size: 11px; }
-            Text { text: "• Local / Ollama: leave empty or any dummy string"; color: Theme.text; font-size: 11px; }
-            Text { text: "• Plaintext: Displayed in plaintext without masking for fast development."; color: Theme.caution; font-size: 11px; }
+            Text { text: "API Key Examples & Notice:"; font-weight: 700; color: Theme.focus; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• OpenAI: sk-proj-..."; color: Theme.text; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• DeepSeek: sk-..."; color: Theme.text; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• OpenRouter: sk-or-v1-..."; color: Theme.text; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• Local / Ollama: leave empty or any dummy string"; color: Theme.text; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• Plaintext: Displayed in plaintext without masking for fast development."; color: Theme.caution; font-size: 11px; wrap: word-wrap; }
         }
 
         if root.setting-id == "modelProvider": VerticalLayout {
             spacing: 2px;
-            Text { text: "Model Provider (Profile Key/Slug):"; font-weight: 700; color: Theme.focus; font-size: 11px; }
-            Text { text: "• Examples: openai, deepseek, openrouter, anthropic, ollama"; color: Theme.text; font-size: 11px; }
-            Text { text: "• Key indexing your credentials in models.json & auth.json."; color: Theme.text-muted; font-size: 11px; }
-            Text { text: "• Changing this switches Squid to that provider profile immediately."; color: Theme.text-muted; font-size: 11px; }
+            Text { text: "Model Provider (Profile Key/Slug):"; font-weight: 700; color: Theme.focus; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• Examples: openai, deepseek, openrouter, anthropic, ollama"; color: Theme.text; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• Key indexing your credentials in models.json & auth.json."; color: Theme.text-muted; font-size: 11px; wrap: word-wrap; }
+            Text { text: "• Changing this switches Squid to that provider profile immediately."; color: Theme.text-muted; font-size: 11px; wrap: word-wrap; }
         }
 
         if root.setting-id != "modelBaseUrl" && root.setting-id != "modelId" && root.setting-id != "apiKey" && root.setting-id != "modelProvider": VerticalLayout {
             spacing: 2px;
-            Text { text: "Information:"; font-weight: 700; color: Theme.focus; font-size: 11px; }
+            Text { text: "Information:"; font-weight: 700; color: Theme.focus; font-size: 11px; wrap: word-wrap; }
             Text { text: root.description; color: Theme.text; font-size: 11px; wrap: word-wrap; }
         }
     }
