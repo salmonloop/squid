@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import {
   DEFAULT_BASE_URL,
   hasReadableCredential,
@@ -106,7 +105,7 @@ export function isModelConfigKey(id: string): id is ModelConfigKey["id"] {
 }
 
 export interface ConfigServiceOptions {
-  readonly configPath?: string;
+  readonly configPath?: string | undefined;
   /** The run's environment, for overridden flags — read, never written. */
   readonly env: Record<string, string | undefined>;
   readonly agentDir: string;
@@ -116,8 +115,8 @@ export interface ConfigServiceOptions {
   readonly defaultBaseUrl: string;
   /** Whether an agent currently holds the model configuration in memory. */
   readonly agentLive: () => boolean;
-  readonly getProvider?: () => string;
-  readonly setProvider?: (provider: string) => void;
+  readonly getProvider?: (() => string) | undefined;
+  readonly setProvider?: ((provider: string) => void) | undefined;
 }
 
 /**
