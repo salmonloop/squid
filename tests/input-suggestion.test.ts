@@ -291,4 +291,46 @@ describe("InputSuggestionService", () => {
     await suggestionService.onFocusChanged(payload, null);
     expect(confirmedRequests.length).toBe(2);
   });
+
+  it("supports deprecated typeTextTool option as fallback executor", async () => {
+    const { policy } = createMockPolicy({
+      outcome: "accepted",
+      reason: "user_accepted",
+    });
+    const executedParams: any[] = [];
+    const fakeTool = {
+      name: "type_text",
+      async execute(_id: string, params: any) {
+        executedParams.push(params);
+        return {
+          content: [{ type: "text", text: "ok" }],
+          details: { ok: true, charsTyped: params.text.length },
+        };
+      },
+    } as any;
+
+    const service = new InputSuggestionService({
+      isEnabled: () => true,
+      confirmationPolicy: policy,
+      typeTextTool: fakeTool,
+      predictSuggestion: async () => ({
+        text: "git status",
+        why: "Check repo status",
+      }),
+    });
+
+    await service.onFocusChanged(
+      {
+        role: "text_input",
+        applicationId: "terminal",
+        windowTitle: "bash",
+        label: null,
+      },
+      null,
+    );
+
+    expect(executedParams.length).toBe(1);
+    expect(executedParams[0].text).toBe("git status");
+    expect(executedParams[0].targetWindowTitle).toBe("bash");
+  });
 });

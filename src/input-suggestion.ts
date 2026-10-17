@@ -5,7 +5,7 @@
  * editor, or terminal). Infers/predicts what the user likely intends to enter,
  * presents the proposed text to the user via Squid's native ConfirmationCard,
  * and upon user acceptance ("Allow"), automatically types the suggested text
- * into the target field using the standard Pi Agent `type_text` tool.
+ * into the target field using the TextTypingExecutor.
  *
  * Honors the GUI switch / environment variable (SQUID_INPUT_SUGGESTIONS !== "off").
  */
@@ -16,7 +16,11 @@ import type {
   ActionConfirmationRequest,
 } from "./action-confirmation.js";
 import type { FocusChangedPayload, WorldState } from "./protocol.js";
-import { TextTypingService } from "./text-typing-service.js";
+import {
+  TextTypingService,
+  type TextTypingExecutor,
+  type TextTypingTarget,
+} from "./text-typing-service.js";
 import {
   createTypeTextTool,
   type typeTextParams,
@@ -33,12 +37,22 @@ export interface SuggestionContext {
   readonly worldState: WorldState | null;
 }
 
+export type InputPredictor = (
+  context: SuggestionContext,
+) => Promise<InputSuggestion | null> | InputSuggestion | null;
+
+export interface Resettable {
+  reset(): void;
+}
+
 export interface InputSuggestionServiceOptions {
   readonly isEnabled: () => boolean;
   readonly confirmationPolicy: ActionConfirmationPolicy;
-  readonly textTypingService?: TextTypingService | undefined;
+  readonly textTypingService?: TextTypingExecutor | undefined;
+  /** @deprecated Pass textTypingService instead. Retained for backward compatibility. */
   readonly typeTextTool?: ToolDefinition<typeof typeTextParams, TypeTextToolDetails> | undefined;
-  readonly predictSuggestion?: ((context: SuggestionContext) => Promise<InputSuggestion | null> | InputSuggestion | null) | undefined;
+  readonly predictSuggestion?: InputPredictor | undefined;
+  readonly onSuggestionAccepted?: ((suggestion: InputSuggestion, payload: FocusChangedPayload) => void) | undefined;
   readonly cooldownMs?: number | undefined;
   readonly promptTimeoutMs?: number | undefined;
   readonly log?: ((line: string) => void) | undefined;
@@ -142,17 +156,19 @@ export function heuristicSuggestInput(context: SuggestionContext): InputSuggesti
   };
 }
 
-export class InputSuggestionService {
+export class InputSuggestionService implements Resettable {
   private readonly isEnabled: () => boolean;
   private readonly confirmationPolicy: ActionConfirmationPolicy;
-  private readonly typeTextTool: ToolDefinition<typeof typeTextParams, TypeTextToolDetails>;
+  private readonly typingExecutor: TextTypingExecutor;
   private readonly predictSuggestion: (context: SuggestionContext) => Promise<InputSuggestion | null>;
+  private readonly onSuggestionAccepted?: ((suggestion: InputSuggestion, payload: FocusChangedPayload) => void) | undefined;
   private readonly cooldownMs: number;
   private readonly promptTimeoutMs: number;
   private readonly log?: ((line: string) => void) | undefined;
   private readonly logError?: ((line: string) => void) | undefined;
   private readonly now: () => number;
 
+  private _typeTextTool?: ToolDefinition<typeof typeTextParams, TypeTextToolDetails> | undefined;
   private lastTargetKey = "";
   private lastTriggerTime = 0;
   private inFlight = false;
@@ -160,15 +176,36 @@ export class InputSuggestionService {
   constructor(options: InputSuggestionServiceOptions) {
     this.isEnabled = options.isEnabled;
     this.confirmationPolicy = options.confirmationPolicy;
-    if (options.typeTextTool !== undefined) {
-      this.typeTextTool = options.typeTextTool;
-    } else if (options.textTypingService !== undefined) {
-      this.typeTextTool = createTypeTextTool(options.textTypingService);
+    if (options.textTypingService !== undefined) {
+      this.typingExecutor = options.textTypingService;
+    } else if (options.typeTextTool !== undefined) {
+      const tool = options.typeTextTool;
+      this._typeTextTool = tool;
+      this.typingExecutor = {
+        async typeText(target: TextTypingTarget) {
+          const res = await tool.execute(
+            `exec-${Date.now()}`,
+            {
+              text: target.text,
+              ...(target.targetWindowTitle !== undefined ? { targetWindowTitle: target.targetWindowTitle } : {}),
+              ...(target.targetApplicationId !== undefined ? { targetApplicationId: target.targetApplicationId } : {}),
+            },
+            undefined,
+            undefined,
+            {} as any,
+          );
+          return {
+            ok: res.details?.ok ?? true,
+            ...(res.details?.error !== undefined ? { error: res.details.error } : {}),
+          };
+        },
+      };
     } else {
-      this.typeTextTool = createTypeTextTool(new TextTypingService());
+      this.typingExecutor = new TextTypingService();
     }
     const predictor = options.predictSuggestion ?? heuristicSuggestInput;
     this.predictSuggestion = async (ctx) => predictor(ctx);
+    this.onSuggestionAccepted = options.onSuggestionAccepted;
     this.cooldownMs = options.cooldownMs ?? 4_000;
     this.promptTimeoutMs = options.promptTimeoutMs ?? 25_000;
     this.log = options.log;
@@ -177,10 +214,20 @@ export class InputSuggestionService {
   }
 
   /**
-   * Returns the registered Pi Agent ToolDefinition.
+   * Returns the registered Pi Agent ToolDefinition adapter.
    */
   getTypeTextTool(): ToolDefinition<typeof typeTextParams, TypeTextToolDetails> {
-    return this.typeTextTool;
+    if (!this._typeTextTool) {
+      this._typeTextTool = createTypeTextTool(this.typingExecutor);
+    }
+    return this._typeTextTool;
+  }
+
+  /**
+   * Returns the underlying TextTypingExecutor.
+   */
+  getTypingExecutor(): TextTypingExecutor {
+    return this.typingExecutor;
   }
 
   /**
@@ -253,28 +300,26 @@ export class InputSuggestionService {
           }),
         );
 
-        // 6. User accepted: auto-type into target window via standard Pi Agent tool
-        const toolResult = await this.typeTextTool.execute(
-          `suggest-${nowMs}`,
-          {
-            text: suggestion.text,
-            ...(payload.windowTitle !== undefined ? { targetWindowTitle: payload.windowTitle } : {}),
-            ...(payload.applicationId !== undefined ? { targetApplicationId: payload.applicationId } : {}),
-          },
-          undefined,
-          undefined,
-          {} as any,
-        );
+        // 6. User accepted: auto-type into target window via typing executor
+        const target: TextTypingTarget = {
+          text: suggestion.text,
+          ...(payload.windowTitle !== undefined ? { targetWindowTitle: payload.windowTitle } : {}),
+          ...(payload.applicationId !== undefined ? { targetApplicationId: payload.applicationId } : {}),
+        };
 
-        if (toolResult.details?.ok === false) {
+        const result = await this.typingExecutor.typeText(target);
+
+        if (!result.ok) {
           this.logError?.(
             JSON.stringify({
               inputSuggestionTypingFailed: {
                 target: targetKey,
-                error: toolResult.details.error,
+                error: result.error ?? "unknown error",
               },
             }),
           );
+        } else {
+          this.onSuggestionAccepted?.(suggestion, payload);
         }
       } else {
         this.log?.(

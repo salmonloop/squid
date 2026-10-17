@@ -1,17 +1,18 @@
 import type { ExtensionAPI, InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { InputSuggestionService } from "./input-suggestion.js";
+import type { Resettable } from "./input-suggestion.js";
 
 export interface InputSuggestionExtensionOptions {
-  readonly service: InputSuggestionService;
   readonly typeTextTool?: ToolDefinition<any, any, any> | undefined;
+  readonly lifecycle?: Resettable | undefined;
+  readonly service?: (Resettable & { getTypeTextTool?: () => ToolDefinition<any, any, any> }) | undefined;
 }
 
 /**
- * Pi Agent InlineExtension for proactive input suggestions.
+ * Pi Agent InlineExtension for desktop text typing & proactive input suggestions.
  *
  * Adheres strictly to the `@earendil-works/pi-coding-agent` ExtensionAPI specification.
- * Integrates the suggestion service lifecycle with the Pi Agent session and registers
- * the official `type_text` tool dynamically.
+ * Dynamically registers the official `type_text` tool and ties lifecycle cleanup to
+ * `session_shutdown`.
  */
 export function inputSuggestionExtension(
   options: InputSuggestionExtensionOptions,
@@ -20,14 +21,17 @@ export function inputSuggestionExtension(
     name: "squid-input-suggestion",
     hidden: true,
     factory: (pi: ExtensionAPI) => {
-      const toolToRegister = options.typeTextTool ?? options.service.getTypeTextTool?.();
+      const toolToRegister = options.typeTextTool ?? options.service?.getTypeTextTool?.();
       if (toolToRegister !== undefined) {
         pi.registerTool(toolToRegister);
       }
 
-      pi.on("session_shutdown", () => {
-        options.service.reset?.();
-      });
+      const targetLifecycle = options.lifecycle ?? options.service;
+      if (targetLifecycle?.reset) {
+        pi.on("session_shutdown", () => {
+          targetLifecycle.reset();
+        });
+      }
     },
   };
 }

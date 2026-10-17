@@ -1,7 +1,7 @@
 import { realpath } from "node:fs/promises";
 import { relative, sep } from "node:path";
 import { createWatchRuntime, type WatchRuntime } from "./create-watch-runtime.js";
-import { agentCustomTools } from "./agent-tools.js";
+import { agentCustomTools, createTypeTextTool } from "./agent-tools.js";
 import { describeErrorForAudit } from "./audit-text.js";
 import { CaptureGateActivitySource } from "./capture-gate-source.js";
 import { resolveCaptureGate } from "./resolve-capture-gate.js";
@@ -37,7 +37,7 @@ import { startPanelServer, type PanelServer } from "./panel-server.js";
 import type { DesktopNotifierFactory } from "./desktop-notice.js";
 import { PanelConfirmationSurface } from "./panel-confirmation-surface.js";
 import { SerialConfirmationPolicy } from "./action-confirmation.js";
-import { TextTypingService } from "./text-typing-service.js";
+import { TextTypingService, type TextTypingExecutor } from "./text-typing-service.js";
 import { InputSuggestionService } from "./input-suggestion.js";
 import { inputSuggestionExtension } from "./input-suggestion-extension.js";
 import {
@@ -186,7 +186,7 @@ export interface WatchSessionOptions {
    * tests inject a spy instead of ending the process.
    */
   readonly stopExit?: () => void;
-  readonly textTypingService?: TextTypingService;
+  readonly textTypingService?: TextTypingExecutor;
   readonly inputSuggestionService?: InputSuggestionService;
 }
 
@@ -386,6 +386,7 @@ export async function startWatchSession(
   // current custom tools are read-only and Pi's sandbox owns tool safety.
   const panelConfirmation = new PanelConfirmationSurface({ server: () => panelServer });
   const textTypingService = options.textTypingService ?? new TextTypingService({ env });
+  const typeTextTool = createTypeTextTool(textTypingService);
   const confirmationPolicy = new SerialConfirmationPolicy({
     surface: panelConfirmation,
     timeoutMs: 30_000,
@@ -436,8 +437,8 @@ export async function startWatchSession(
         heartbeatExtension(heartbeatSink),
         llmLogExt,
         inputSuggestionExtension({
-          service: inputSuggestionService,
-          typeTextTool: inputSuggestionService.getTypeTextTool?.(),
+          typeTextTool,
+          lifecycle: inputSuggestionService,
         }),
         ...(decisionCurator === undefined ? [] : [decisionCurator]),
       ],
