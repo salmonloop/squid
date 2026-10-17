@@ -267,13 +267,31 @@ async function main(): Promise<void> {
   // host's path dialect, which is exactly why every entry point must use it here
   // instead of shaving the slash itself.
   const root = resolve(dirname(fileURLToPath(new URL(import.meta.url))), "..");
-  const defaultBinary = join(root, "ui", "target", "release", process.platform === "win32" ? "squid-ui.exe" : "squid-ui");
-  const binary = process.argv[2] ?? defaultBinary;
+  const binaryName = process.platform === "win32" ? "squid-ui.exe" : "squid-ui";
+  const releaseBinary = join(root, "ui", "target", "release", binaryName);
+  const debugBinary = join(root, "ui", "target", "debug", binaryName);
+
+  let binary = process.argv[2];
+  if (binary === undefined) {
+    try {
+      await access(releaseBinary);
+      binary = releaseBinary;
+    } catch {
+      try {
+        await access(debugBinary);
+        binary = debugBinary;
+        log(`ui:smoke using debug binary at ${binary}`);
+      } catch {
+        binary = releaseBinary;
+      }
+    }
+  }
+
   try {
     await access(binary);
   } catch {
     smokeFailure(
-      `compiled panel missing at ${binary}; run \`cargo build --release --manifest-path ui/Cargo.toml\`, or pass its path after \`bun run ui:smoke --\`.`,
+      `compiled panel missing at ${binary}; run \`cargo build --manifest-path ui/Cargo.toml\` (or with \`--release\`), or pass its path after \`bun run ui:smoke --\`.`,
     );
   }
 

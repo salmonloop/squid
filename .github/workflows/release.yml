@@ -22,10 +22,9 @@ name: release
 on:
   push:
     tags:
-      # Semver with a mandatory pre-release suffix. A stable `v1.0.0` would not
-      # match, which is deliberate: this repository has never shipped, and the
-      # first tag that claims stability should have to change this file.
-      - "v[0-9]+.[0-9]+.[0-9]+-*"
+      # Semver matching either pre-releases (e.g. `v0.1.0-alpha.1`) or stable
+      # releases (e.g. `v1.0.0`).
+      - "v[0-9]+.[0-9]+.[0-9]+*"
   # A dry run that does everything except publish. Useful for proving the build
   # works on a clean runner without spending a tag on it.
   workflow_dispatch:
@@ -166,8 +165,8 @@ jobs:
           # type. The shape is asserted rather than trusted: a tag that is not
           # `v` + semver-with-prerelease would stamp a version no tool accepts.
           case "$tag" in
-            v[0-9]*.[0-9]*.[0-9]*-*) version="${tag#v}" ;;
-            *) echo "::error::$tag is not v<semver with a pre-release suffix>" >&2; exit 1 ;;
+            v[0-9]*.[0-9]*.[0-9]*) version="${tag#v}" ;;
+            *) echo "::error::$tag is not v<semver>" >&2; exit 1 ;;
           esac
 
           # The package version, written with the tool that parses JSON properly.
@@ -417,7 +416,7 @@ jobs:
   # not test, and does not run on `workflow_dispatch` — so a dry run exercises
   # the whole pipeline with nothing published at the end.
   publish:
-    name: publish pre-release
+    name: publish release
     needs: [build-linux, build-windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
@@ -433,18 +432,16 @@ jobs:
         with:
           path: artifacts
 
-      # The tag says what this is. A tag matching the trigger pattern always has
-      # a `-` suffix, so `--prerelease` is not a guess — but it is asserted here
-      # rather than assumed, because a stable tag reaching this step by some
-      # future edit should fail loudly instead of being quietly published as one.
-      - name: Verify the tag is a pre-release
+      # Inspect whether the tag carries a pre-release suffix (e.g. `v0.1.0-alpha.1` vs `v1.0.0`).
+      - name: Inspect release type
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          case "$tag" in
-            *-*) echo "pre-release tag: $tag" ;;
-            *)   echo "::error::$tag has no pre-release suffix" >&2; exit 1 ;;
-          esac
+          if [[ "$tag" == *-* ]]; then
+            echo "Publishing pre-release for $tag"
+          else
+            echo "Publishing stable release for $tag"
+          fi
 
       # Idempotent, and the reason the first alpha publish failed: `gh release
       # create` hard-fails when the tag already has a release, which is exactly
@@ -452,7 +449,7 @@ jobs:
       # the tag has no release; otherwise reuse it. Uploading is a separate
       # step with `--clobber`, so a retried asset replaces its stale
       # counterpart instead of failing on the name.
-      - name: Create or reuse the pre-release
+      - name: Create or reuse the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
@@ -470,10 +467,16 @@ jobs:
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             echo "release for $TAG already exists; uploading into it"
           else
+            EXTRA_ARGS=()
+            if [[ "$TAG" == *-* ]]; then
+              EXTRA_ARGS+=("--prerelease")
+            else
+              EXTRA_ARGS+=("--latest")
+            fi
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --title "$TAG" \
-              --prerelease \
+              "${EXTRA_ARGS[@]}" \
               --generate-notes
           fi
 
