@@ -1265,10 +1265,12 @@ fn cancel(panel: &slint::Weak<PanelWindow>, pending: &Pending, prompt_id: i64) {
         state.current = None;
         state.deferred = None;
     }
-    let _ = panel.upgrade_in_event_loop(|panel| {
-        suggestion::hide();
-        clear_prompt(panel);
-    });
+    // Outside the closure for the reason the other two give: the floating card
+    // is not the panel's to keep alive, and a cancel that arrives after the panel
+    // is gone must still take the card down.
+    suggestion::hide();
+
+    let _ = panel.upgrade_in_event_loop(clear_prompt);
 }
 
 /// Writes one answer for the pending prompt, then closes both surfaces.
@@ -1307,8 +1309,21 @@ fn answer(
     // consumed here would be the worse surface.
     outgoing.send(&answer_line(prompt_id, answer));
 
+    // Hidden before the panel is looked for, and outside that lookup on purpose:
+    // the floating card is a window of its own, so it can outlive the panel's
+    // strong reference. Leaving the hide inside `if let Some(panel)` made the two
+    // coupled, and the case they diverge — the tray's Quit, which answers and
+    // then ends the event loop — would leave the card on screen showing buttons
+    // for a prompt whose id has already been spent. A click on it would then do
+    // nothing at all, which is the exact failure `answer` exists to make
+    // impossible.
+    //
+    // Safe to call from here: every caller of this function is a Slint callback
+    // or a posted closure, so this already is the UI thread, and
+    // `suggestion::hide` requires nothing more than that.
+    suggestion::hide();
+
     if let Some(panel) = panel.upgrade() {
-        suggestion::hide();
         clear_prompt(panel);
     }
 }
@@ -1335,8 +1350,13 @@ fn defer(pending: &Pending, panel: &slint::Weak<PanelWindow>) {
         };
         state.deferred = Some(current);
     }
+    // Outside the posted closure, for the same reason `answer` hides there: the
+    // card must go away even when there is no panel left to post to, or a
+    // closed panel leaves a floating window asking a question nobody can see the
+    // answer to anywhere.
+    suggestion::hide();
+
     let _ = panel.upgrade_in_event_loop(|panel| {
-        suggestion::hide();
         // One rendering of a deferred prompt, not two: the notice replaces the
         // card, so the card's buttons go away with it.
         panel.set_prompt_floating(false);
