@@ -454,6 +454,26 @@ without redesigning the transport.
 `promptId` is an integer. There is **no** `arguments` field and never will be: the
 selection must not be able to reach this process at all.
 
+`kind` is the sender's, and the wire does not enumerate it — but the panel reads
+one value out of it, and that is a rule rather than a detail. A prompt whose
+`kind` is `input_suggestion` (or `input_suggestion.` followed by anything)
+leaves the resident panel and is asked on a frameless, always-on-top card in the
+bottom-right corner of the work area, inset 16 logical pixels. Every other kind
+stays on the panel's own confirmation card. The reason is the one thing a
+suggestion has that a decision does not: it names text for the field somebody is
+typing in *right now*, so it is worthless anywhere they have to go and look.
+
+Two consequences the sender can rely on:
+
+- **The same three answers, from either surface.** `approved`, `declined`, and
+  setting it aside all use this wire unchanged. Setting a suggestion aside leaves
+  the request live and puts a standing notice on the panel; it does not answer.
+- **When the card cannot be placed, the panel asks.** A desktop with no work
+  area — off Windows there is none, and a headless session has none either — or a
+  screen too small for a 360-pixel card gets the prompt on the panel instead. A
+  suggestion is never silently dropped for want of a corner, and a sender never
+  has to know which surface answered.
+
 `why` and `denyConsequence` exist because a dialog that states only what will
 happen makes approval the cheaper answer: the user can see the command but not
 what refusing costs, and "just approve it" is what that asymmetry teaches. Both

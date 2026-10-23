@@ -15,6 +15,12 @@ export { SourceRow, SettingRow, LlmLogRow }
 // component, not an element inside the window — the icon has no window of its own.
 export { SquidTray } from "tray.slint";
 
+// Same re-export rule, second top-level window. The floating suggestion surface
+// is a window of its own for the reason `suggestion.slint` records: a prompt
+// about the field somebody is typing in is only useful where their attention
+// already is, and this window is how it gets there.
+export { SuggestionWindow } from "suggestion.slint";
+
 // A section heading. More space above than below, so a heading belongs to what
 // follows it rather than floating between two groups.
 component Heading inherits Text {
@@ -150,6 +156,14 @@ export component PanelWindow inherits Window {
     in property <string> prompt-expires-at;
     in property <string> prompt-why;
     in property <string> prompt-deny-consequence;
+    // The floating suggestion window is showing this prompt instead of the card
+    // below. Rust sets it with the other `prompt-*` inputs because it is the
+    // same fact — where this prompt is being asked — and it is Rust that knows
+    // whether this run can place a window at a corner at all (see
+    // `src/placement.rs`). While it is set the card and the standing notice both
+    // stay out of the window: the header's "Waiting for you" is the panel's whole
+    // record of a decision that is being asked elsewhere.
+    in property <bool> prompt-floating;
     callback approve();
     callback decline();
 
@@ -159,11 +173,14 @@ export component PanelWindow inherits Window {
     // group opened here without them would render an empty door.
     in-out property <string> open-group;
     callback select-group(string);
-    // A decision the person set aside. Local to the window on purpose — the
-    // request is still live on the brain's side, and the engine's own deadline
-    // still decides it. Deferring changes what this surface shows, never what
-    // was answered.
-    property <bool> deferred: false;
+    // A decision the person set aside. Rust owns the value — the same prompt can
+    // also be set aside from the floating suggestion window, and the two
+    // surfaces must agree about whether it is still showing without either
+    // holding a second copy of the flag. The request stays live on the brain's
+    // side either way: deferring changes what is shown, never what was answered.
+    in property <bool> deferred: false;
+    callback defer();
+    callback reopen();
 
     // Counted in Rust rather than tracked here: the session refuses to stop the
     // last running observer, so each card needs to know whether it is that one.
@@ -236,20 +253,28 @@ export component PanelWindow inherits Window {
         // region, so it cannot be pushed off the bottom by a long settings list.
         // This is the defect a real smoke run caught: the confirmation used to
         // sit last inside the scroll view, below twenty-two settings rows, while
-        // the header cheerfully said "Squid is ready".
-        if root.prompt-pending && !root.deferred: ConfirmationCard {
+        // the header cheerfully said "Squid is ready". An input suggestion is the
+        // one exception, and it is not rendered here at all — the floating
+        // suggestion window is asking it, and a second copy of the same decision
+        // with its own Allow button would be a second chance to answer a question
+        // the other surface has already taken.
+        if root.prompt-pending && !root.deferred && !root.prompt-floating: ConfirmationCard {
             kind: root.prompt-kind;
             summary: root.prompt-summary;
             expires-at: root.prompt-expires-at;
             why: root.prompt-why;
             deny-consequence: root.prompt-deny-consequence;
-            allow => { root.deferred = false; root.approve(); }
-            decline => { root.deferred = false; root.decline(); }
-            defer => { root.deferred = true; }
+            allow => { root.approve(); }
+            decline => { root.decline(); }
+            defer => { root.defer(); }
         }
 
+        // The standing notice stays even when the floating window is the surface
+        // that was set aside: the panel is where a person comes back to, and
+        // "a decision is still waiting" is the one sentence that must survive
+        // the suggestion window closing.
         if root.prompt-pending && root.deferred: DeferredNotice {
-            reopen => { root.deferred = false; }
+            reopen => { root.reopen(); }
         }
 
         sv := ScrollView {

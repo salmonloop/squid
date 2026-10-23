@@ -34,10 +34,14 @@
 //! as `timed_out`, never as consent — so every error path in this file is allowed
 //! to simply do nothing.
 
+mod keyboard;
+mod placement;
 mod protocol;
 mod startup;
+mod suggestion;
 mod supervisor;
 mod transport;
+mod workarea;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -63,7 +67,39 @@ slint::include_modules!();
 /// id or no id at all, which is what makes it impossible for a stale window to
 /// authorize the plan that replaced it. Taking the value out on answer also
 /// makes "one answer per prompt" structural rather than a rule to remember.
-type Pending = Arc<Mutex<Option<i64>>>;
+type Pending = Arc<Mutex<PromptState>>;
+
+/// Everything this side remembers about the one prompt on screen.
+///
+/// One lock rather than three, because the three fields are one fact: a prompt
+/// that is on screen, the same prompt set aside, and an id left over from a
+/// prompt that is gone are states that cannot legally coexist. Splitting them
+/// would let two of them drift.
+#[derive(Default)]
+struct PromptState {
+    /// The id of the prompt currently on screen, or `None` when nothing is
+    /// pending.
+    ///
+    /// This is the whole correlation mechanism on this side. A click answers
+    /// *this* id or no id at all, which is what makes it impossible for a stale
+    /// window to authorize the plan that replaced it. Taking the value out on
+    /// answer also makes "one answer per prompt" structural rather than a rule
+    /// to remember.
+    pending: Option<i64>,
+    /// The prompt currently on screen, kept whole.
+    ///
+    /// Held rather than reconstructed from the widgets that happen to be showing
+    /// it so that Later is a move, not a re-read of five properties across two
+    /// surfaces. It also means a set-aside prompt comes back with exactly the
+    /// text it arrived with, whatever either surface has done since.
+    current: Option<Prompt>,
+    /// The prompt a person set aside with Later.
+    ///
+    /// The request stays live on the brain's side either way — deferring changes
+    /// what is shown, never what was answered, and the engine's own deadline is
+    /// still what decides an unanswered prompt.
+    deferred: Option<Prompt>,
+}
 
 /// A poisoned lock means another thread panicked while holding this slot, so the
 /// pending id can no longer be trusted to name the plan on screen. Answering
@@ -386,10 +422,63 @@ fn main() {
         Ok(window) => window,
         Err(error) => startup::abort(Startup::Platform(error.to_string())),
     };
-    let pending: Pending = Arc::new(Mutex::new(None));
+    let pending: Pending = Arc::new(Mutex::new(PromptState::default()));
     // One outgoing half, shared. The reader thread hands it a socket on connect
     // and takes it back on disconnect; the callbacks below only ever write.
     let outgoing = Outgoing::new();
+
+    // The second top-level window, created once and reused for every prompt that
+    // belongs on it. Created before `run()`, because a window made after the
+    // event loop has started would be made from another thread; a failure here is
+    // not fatal — the panel's own card is a surface too, and `suggestion::show`
+    // says so by returning false.
+    //
+    // `adopt` takes ownership of the component, because the surface has to be
+    // able to show the window again after every hide: a `Weak` kept here would be
+    // the window dying on the first `Later`.
+    match SuggestionWindow::new() {
+        Ok(floating) => {
+            {
+                let pending = Arc::clone(&pending);
+                let outgoing = outgoing.clone();
+                let panel = window.as_weak();
+                floating.on_allow(move || answer(&pending, &outgoing, &panel, Answer::Approved));
+            }
+            {
+                let pending = Arc::clone(&pending);
+                let outgoing = outgoing.clone();
+                let panel = window.as_weak();
+                floating.on_decline(move || answer(&pending, &outgoing, &panel, Answer::Declined));
+            }
+            {
+                let pending = Arc::clone(&pending);
+                let panel = window.as_weak();
+                floating.on_defer(move || defer(&pending, &panel));
+            }
+            // A frameless card has no close button, but Alt+F4 and a window
+            // manager's own menu still ask. Hiding is the right answer to a
+            // close — the conversation has not changed — but hiding alone would
+            // leave the panel believing the card is on screen, so the close is
+            // routed through the same set-aside a `Later` click takes. The panel
+            // then keeps a notice offering to bring it back, which is the state
+            // the person can actually recover from.
+            {
+                let pending = Arc::clone(&pending);
+                let panel = window.as_weak();
+                floating.window().on_close_requested(move || {
+                    defer(&pending, &panel);
+                    slint::CloseRequestResponse::HideWindow
+                });
+            }
+            suggestion::adopt(floating);
+        }
+        Err(error) => {
+            // A desktop that could not make a second window — no display, no
+            // compositor. `suggestion::show` finds no window and reports it, so
+            // a suggestion is asked on the panel's card instead of nowhere.
+            eprintln!("squid-ui: no floating suggestion window: {error}");
+        }
+    }
 
     // Only a run that started its own brain offers to restart it. The brain
     // refuses `op:"restart"` unless it is supervised, so showing the button in
@@ -512,30 +601,39 @@ fn main() {
         let handle = window.as_weak();
         window.on_decline(move || answer(&pending, &outgoing, &handle, Answer::Declined));
     }
-
-    // Closing the panel is a decline of anything pending, not a hang.
-    //
-    // Both are refusals, so either is safe. Declining is the better one: the
-    // engine's queue is serial, and a prompt that waits out its full timeout
-    // holds every later candidate behind it. Shutting the panel should not cost
-    // the next suggestion its turn.
     {
-        {
-            // Closing is "put away", not "end". The tray menu is measured to
-            // export on Linux (see `ui/tray.slint`), so a hidden window still has
-            // a way back and a way out of its own interface. Nothing here answers
-            // a pending prompt: hiding changes nothing about the conversation,
-            // the same way walking away from an open window does not, and the
-            // engine's confirmation timeout is what an unanswered prompt meets.
-            // On a desktop with no tray host the loop dies with the hidden
-            // window — the pre-tray behavior, needing no code here. (Kept by
-            // Slint's keepalive counter: `Window::hide` releases it, and a
-            // live tray handle acquired one. See `AGENTS.md`'s tray section
-            // for what this box can and cannot measure of that chain.)
-            window
-                .window()
-                .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
-        }
+        // Both directions are the same slot seen twice: setting aside keeps the
+        // id so the card can be called back, and reopening only has to put it on
+        // a surface again. Neither answers, so neither can authorize anything.
+        let pending = Arc::clone(&pending);
+        let handle = window.as_weak();
+        window.on_defer(move || defer(&pending, &handle));
+    }
+    {
+        let pending = Arc::clone(&pending);
+        let handle = window.as_weak();
+        window.on_reopen(move || reopen(&pending, &handle));
+    }
+
+    // Closing the panel is "put away", not an answer either way.
+    //
+    // The alternative was to treat a close as a decline so the engine's serial
+    // queue is not held by a prompt nobody is looking at any more. It is the
+    // wrong trade: a window that is closed by accident would then refuse a
+    // suggestion the person never saw, and the tray is what makes a close
+    // recoverable. The engine's own confirmation timeout is what an unanswered
+    // prompt meets, and it is the only thing that should end one.
+    {
+        // A hidden window still has a way back and a way out of its own
+        // interface: the tray menu is measured to export on Linux (see
+        // `ui/tray.slint`). On a desktop with no tray host the loop dies with
+        // the hidden window — the pre-tray behavior, needing no code here.
+        // (Kept by Slint's keepalive counter: `Window::hide` releases it, and a
+        // live tray handle acquired one. See `AGENTS.md`'s tray section for what
+        // this box can and cannot measure of that chain.)
+        window
+            .window()
+            .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
     }
 
     {
@@ -1095,59 +1193,107 @@ fn count(value: Option<i64>) -> i32 {
     }
 }
 
-/// Opens the confirmation area and claims the pending slot for this prompt.
-fn show_prompt(window: &slint::Weak<PanelWindow>, pending: &Pending, prompt: Prompt) {
-    // Claim before displaying: a click can only ever settle an id that is
-    // already recorded, so there is no window in which the buttons are live but
-    // unattributed.
+/// Opens the question on the surface that can actually reach the person.
+///
+/// Runs on the reader thread, so every write to a window happens inside the one
+/// posted closure. Which surface asks is decided here rather than inside either
+/// window, because the choice belongs to the kind of prompt and not to the
+/// window: a suggestion is worth nothing on a panel the person put away hours
+/// ago, and a decision about running something is worth nothing in a card they
+/// will not look at.
+///
+/// The pending slot is claimed before either surface is touched, so a click can
+/// only ever settle an id that is already recorded.
+fn show_prompt(panel: &slint::Weak<PanelWindow>, pending: &Pending, prompt: Prompt) {
+    // A suggestion is the one kind that leaves the resident panel. Every other
+    // kind is a decision about running something, and a deliberate answer to that
+    // belongs on the resident window.
+    let floating_kind = suggestion::is_floating_kind(&prompt.kind);
+
+    // Claiming replaces any setting-aside, because a new prompt answers the
+    // notice that offered to reopen the old one. Leaving `deferred` set would put
+    // a standing notice on screen for a question nobody is asking any more.
     //
     // A prompt arriving while another is pending replaces it. The engine
     // serializes asks so this should not happen, and if it does the abandoned id
     // is one the TypeScript side has already stopped waiting for.
-    *pending.lock().expect(POISONED) = Some(prompt.prompt_id);
+    {
+        let mut state = pending.lock().expect(POISONED);
+        state.pending = Some(prompt.prompt_id);
+        state.current = Some(prompt.clone());
+        state.deferred = None;
+    }
 
-    let _ = window.upgrade_in_event_loop(move |window| {
-        window.set_prompt_kind(prompt.kind.into());
-        window.set_prompt_summary(prompt.summary.into());
-        window.set_prompt_expires_at(prompt.expires_at.into());
+    // One closure rather than two posted in sequence, because the panel must be
+    // told where the question went in the same breath as it is told there is a
+    // question. Split across two, a frame could show the panel's own Allow button
+    // while the floating card holds the same decision.
+    //
+    // `show` reports whether the floating surface could take the prompt at all:
+    // no such window on this desktop, no work area, a screen too small for the
+    // card. When it says no, the panel's card is the surface — which is why the
+    // answer is a property rather than a decision taken here.
+    let _ = panel.upgrade_in_event_loop(move |panel| {
+        let floating = floating_kind && suggestion::show(&prompt);
+        panel.set_prompt_kind(prompt.kind.into());
+        panel.set_prompt_summary(prompt.summary.into());
+        panel.set_prompt_expires_at(prompt.expires_at.into());
         // Absent reads as empty, and the card hides the line rather than printing
         // a heading with nothing under it. A request that does not explain itself
         // is shown without an explanation, never with one invented here.
-        window.set_prompt_why(prompt.why.unwrap_or_default().into());
-        window.set_prompt_deny_consequence(prompt.deny_consequence.unwrap_or_default().into());
+        panel.set_prompt_why(prompt.why.unwrap_or_default().into());
+        panel.set_prompt_deny_consequence(prompt.deny_consequence.unwrap_or_default().into());
+        panel.set_deferred(false);
+        panel.set_prompt_floating(floating);
         // Last, so the buttons appear only once the text beside them is the text
-        // of this prompt.
-        window.set_prompt_pending(true);
+        // of this prompt, and only on the surface that has it.
+        panel.set_prompt_pending(true);
     });
 }
 
 /// Withdraws a prompt the engine has given up on.
-fn cancel(window: &slint::Weak<PanelWindow>, pending: &Pending, prompt_id: i64) {
+fn cancel(panel: &slint::Weak<PanelWindow>, pending: &Pending, prompt_id: i64) {
     {
-        let mut slot = pending.lock().expect(POISONED);
+        let mut state = pending.lock().expect(POISONED);
         // A cancel for an id that is no longer pending is stale — it names a
         // prompt already answered or already replaced. Acting on it would close a
         // live confirmation and lose an answer the user is about to give.
-        if *slot != Some(prompt_id) {
+        if state.pending != Some(prompt_id) {
             return;
         }
-        *slot = None;
+        state.pending = None;
+        state.current = None;
+        state.deferred = None;
     }
-    let _ = window.upgrade_in_event_loop(clear_prompt);
+    let _ = panel.upgrade_in_event_loop(|panel| {
+        suggestion::hide();
+        clear_prompt(panel);
+    });
 }
 
-/// Writes one answer for the pending prompt, then closes the confirmation area.
+/// Writes one answer for the pending prompt, then closes both surfaces.
 ///
-/// Runs on the UI thread: both button callbacks and the close handler are Slint
-/// callbacks. Takes the pending id, so a second click after the first answer
-/// finds nothing to answer.
+/// Runs on the UI thread: every button callback and every close handler here is
+/// a Slint callback. It takes the pending id out of the slot, so a second click
+/// after the first answer finds nothing to answer — which is what makes one
+/// answer per prompt structural rather than a rule each surface has to
+/// remember.
 fn answer(
     pending: &Pending,
     outgoing: &Outgoing,
-    window: &slint::Weak<PanelWindow>,
+    panel: &slint::Weak<PanelWindow>,
     answer: Answer,
 ) {
-    let Some(prompt_id) = pending.lock().expect(POISONED).take() else {
+    // Taken out under the lock, so the id is spent the moment it is read. The
+    // setting-aside copy goes with it: a prompt that has been answered must not
+    // come back from the notice that offered to reopen it.
+    let prompt_id = {
+        let mut state = pending.lock().expect(POISONED);
+        state.deferred = None;
+        state.current = None;
+        state.pending.take()
+    };
+    let Some(prompt_id) = prompt_id else {
         // Nothing pending: a click that raced a cancel, or a second click on an
         // already-answered prompt. Writing an uncorrelated answer here is the one
         // thing that could authorize the wrong plan.
@@ -1161,24 +1307,85 @@ fn answer(
     // consumed here would be the worse surface.
     outgoing.send(&answer_line(prompt_id, answer));
 
-    if let Some(window) = window.upgrade() {
-        clear_prompt(window);
+    if let Some(panel) = panel.upgrade() {
+        suggestion::hide();
+        clear_prompt(panel);
     }
+}
+
+/// Sets the pending prompt aside so the floating card stops asking.
+///
+/// A set-aside prompt is not an answered one: the request stays live on the
+/// brain's side and its own deadline still decides it. What changes is which
+/// surface shows it — the floating card goes away and the panel keeps a standing
+/// notice offering to bring it back.
+///
+/// The slot keeps the id, because a click on the reopened card has to settle the
+/// same question. A click that arrives mid-defer therefore cannot resurrect a
+/// prompt that has just been answered; the answer path empties the slot under
+/// the same lock.
+fn defer(pending: &Pending, panel: &slint::Weak<PanelWindow>) {
+    {
+        let mut state = pending.lock().expect(POISONED);
+        // Nothing pending means nothing to set aside — a click that raced a
+        // cancel. Manufacturing a deferred prompt out of an empty slot would put
+        // a standing notice on screen for a question nobody is asking.
+        let Some(current) = state.current.clone() else {
+            return;
+        };
+        state.deferred = Some(current);
+    }
+    let _ = panel.upgrade_in_event_loop(|panel| {
+        suggestion::hide();
+        // One rendering of a deferred prompt, not two: the notice replaces the
+        // card, so the card's buttons go away with it.
+        panel.set_prompt_floating(false);
+        panel.set_deferred(true);
+    });
+}
+
+/// Puts a set-aside prompt back in front of the person.
+///
+/// A suggestion returns to the floating card, because that is the surface it is
+/// worth anything on; anything else returns to the panel's own card. Placement
+/// is retried rather than remembered — a card that could not be placed when it
+/// arrived may be placeable now, and one that could be placed may not be any
+/// more.
+fn reopen(pending: &Pending, panel: &slint::Weak<PanelWindow>) {
+    let deferred = pending.lock().expect(POISONED).deferred.take();
+    let Some(prompt) = deferred else {
+        // Nothing was set aside — a second click on the notice. Clearing the flag
+        // anyway is the honest answer: the notice should not outlive its reason.
+        let _ = panel.upgrade_in_event_loop(|panel| panel.set_deferred(false));
+        return;
+    };
+
+    let floating_kind = suggestion::is_floating_kind(&prompt.kind);
+    let _ = panel.upgrade_in_event_loop(move |panel| {
+        // The panel's card still holds this prompt's text from when it arrived,
+        // so reopening only has to take the notice away — unless the floating
+        // card can take it, in which case that is where it goes back to.
+        let floating = floating_kind && suggestion::show(&prompt);
+        panel.set_deferred(false);
+        panel.set_prompt_floating(floating);
+    });
 }
 
 /// Empties the confirmation area.
 ///
-/// The stale text is cleared as well as the flag. `panel.slint` drops the whole
+/// The stale text is cleared as well as the flags. `panel.slint` drops the whole
 /// section when nothing is pending, so this is not visible today — but a summary
 /// left behind is a command description waiting to reappear next to buttons that
 /// belong to a different plan.
-fn clear_prompt(window: PanelWindow) {
-    window.set_prompt_pending(false);
-    window.set_prompt_kind(SharedString::new());
-    window.set_prompt_summary(SharedString::new());
-    window.set_prompt_expires_at(SharedString::new());
-    window.set_prompt_why(SharedString::new());
-    window.set_prompt_deny_consequence(SharedString::new());
+fn clear_prompt(panel: PanelWindow) {
+    panel.set_prompt_pending(false);
+    panel.set_prompt_floating(false);
+    panel.set_deferred(false);
+    panel.set_prompt_kind(SharedString::new());
+    panel.set_prompt_summary(SharedString::new());
+    panel.set_prompt_expires_at(SharedString::new());
+    panel.set_prompt_why(SharedString::new());
+    panel.set_prompt_deny_consequence(SharedString::new());
 }
 
 #[cfg(test)]

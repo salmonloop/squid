@@ -24,6 +24,14 @@ import { spawn } from "node:child_process";
 /** The controls the smoke presses, named for intent rather than position. */
 export type SmokeControl = "decline" | "later" | "allow" | "review";
 
+/** A rectangle on screen, in whatever pixels the host measures in. */
+export interface SmokeRect {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
 /** A window on screen, in whatever pixels the host measures in. */
 export interface SmokeWindow {
   /** The host's own handle for it, for logging and for follow-up calls. */
@@ -61,6 +69,47 @@ export interface SmokeHost {
    * private Xvfb no such window can exist, so that host may honestly ignore it.
    */
   awaitWindow(title: string, processId: number): Promise<SmokeWindow>;
+  /**
+   * A window of this panel by title, if it exists and is visible right now.
+   *
+   * Distinct from `awaitWindow`, which waits for one that must appear. This one
+   * answers for a window that must *not* be there — the suggestion card before
+   * any suggestion, and after an answer — and a wait would turn that assertion
+   * into a two-minute stall followed by a pass for the wrong reason.
+   *
+   * Any other window of the process does not count, and neither does a window
+   * that exists but is hidden: `hide` is how this panel puts the card away, and
+   * the card is still a live window afterwards. Visibility is the property the
+   * person can see, so it is the one asserted.
+   */
+  findWindow(title: string, processId: number): Promise<SmokeWindow | null>;
+  /**
+   * The work area of the monitor `window` is on — the screen minus the taskbar,
+   * the docks, and whatever else the desktop reserves — or `null` when this
+   * platform cannot be asked.
+   *
+   * This is the same question `ui/src/workarea.rs` asks, answered by the same
+   * platform call, and that is why it belongs here rather than being computed by
+   * the smoke from a screenshot: a harness that measured the screen itself would
+   * agree with a card placed against the screen edge, which is the defect. `null`
+   * is a real answer — X11 has no implementation in the panel either — and the
+   * smoke asserts the documented consequence of it rather than skipping.
+   */
+  workArea(window: SmokeWindow): Promise<SmokeRect | null>;
+  /**
+   * The title of the window that currently has the keyboard, or `null` when this
+   * host cannot tell.
+   *
+   * A capability rather than a requirement, like `readStatus`: the panel's
+   * floating card is only on some platforms, and only some of those can be asked
+   * who holds the keyboard. A host that omits it says so, and the smoke skips the
+   * assertion out loud instead of pretending to make it.
+   *
+   * This is what makes "the card does not steal focus" a measurement rather than
+   * a claim. It is the whole reason `ui/src/keyboard.rs` exists, and a comment in
+   * that file was the only thing asserting it before.
+   */
+  foregroundWindowTitle?(): Promise<string | null>;
   activate(window: SmokeWindow, control: SmokeControl): Promise<void>;
   screenshot(window: SmokeWindow, path: string): Promise<void>;
   /**

@@ -259,6 +259,61 @@ for ($i = 0; $i -lt $lines.Count; $i++) {
 }
 
 /**
+ * The title of the window that currently has the keyboard.
+ *
+ * The measurement `ui/src/keyboard.rs` exists for. Its module comment claimed
+ * `WS_EX_NOACTIVATE` keeps the card from taking focus; a comment cannot fail, so
+ * this is what turns the claim into something a run can contradict. Empty output
+ * means no window has a caption, which the caller reads as "cannot tell" rather
+ * than "nothing has focus".
+ */
+function foregroundScript(): string {
+  return `
+Add-Type -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(System.IntPtr h, System.Text.StringBuilder s, int n);
+'@ -Name Fg -Namespace SquidSmoke
+$handle = [SquidSmoke.Fg]::GetForegroundWindow()
+if ($handle -eq [System.IntPtr]::Zero) { exit 0 }
+$text = New-Object System.Text.StringBuilder 512
+[void][SquidSmoke.Fg]::GetWindowTextW($handle, $text, 512)
+Write-Output $text.ToString()
+`;
+}
+
+/**
+ * The work area of the monitor holding the given window, in physical pixels.
+ *
+ * `rcWork` and not `rcMonitor`: the monitor is the screen, and the work area is
+ * the screen minus the taskbar and anything else the desktop reserved. The
+ * distinction is the whole point of the assertion this feeds — a card placed
+ * against the monitor's bottom edge sits under the taskbar, visible in a
+ * screenshot and unreachable in life.
+ *
+ * The window's own monitor rather than the primary one, because the card is
+ * placed relative to wherever the person is working.
+ */
+function workAreaScript(handle: string): string {
+  return `${PREAMBLE}
+Add-Type -MemberDefinition @'
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+public struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr MonitorFromWindow(System.IntPtr h, uint flags);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool GetMonitorInfoW(System.IntPtr monitor, ref MONITORINFO info);
+'@ -Name Mon -Namespace SquidSmoke
+$info = New-Object SquidSmoke.Mon+MONITORINFO
+$info.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($info)
+$monitor = [SquidSmoke.Mon]::MonitorFromWindow([System.IntPtr]${handle}, 2)
+if ($monitor -eq [System.IntPtr]::Zero) { exit 0 }
+if (-not [SquidSmoke.Mon]::GetMonitorInfoW($monitor, [ref]$info)) { exit 0 }
+Write-Output ('{0} {1} {2} {3}' -f $info.rcWork.Left, $info.rcWork.Top,
+  ($info.rcWork.Right - $info.rcWork.Left), ($info.rcWork.Bottom - $info.rcWork.Top))
+`;
+}
+
+/**
  * Windows PowerShell, by absolute path rather than by name — the one resolver
  * every PowerShell spawn in this repository answers to. The reasoning behind it
  * lives on the resolver, not here.
@@ -273,6 +328,33 @@ async function powershell(script: string, description: string): Promise<string> 
     smokeFailure(`${description}: ${result.stderr.trim() || `powershell exited ${String(result.code)}`}`);
   }
   return result.stdout.trim();
+}
+
+/**
+ * The panel's window by title, or `null` when there is none on screen.
+ *
+ * Module-level rather than a method so that `awaitWindow` can be the polling
+ * version of the same lookup instead of a second copy of it: two copies drift,
+ * and the one that drifts is the one that stops finding the window.
+ */
+async function findWindow(title: string, processId: number): Promise<SmokeWindow | null> {
+  const line = await powershell(
+    windowScript(title, processId),
+    "could not search for the panel window",
+  );
+  if (line.length === 0) return null;
+  const parts = line.split(/\s+/);
+  if (parts.length !== 5) return null;
+  const [id, x, y, width, height] = parts.map((part) => part.trim());
+  const numbers = [x, y, width, height].map(Number);
+  if (numbers.some((value) => !Number.isFinite(value))) return null;
+  return {
+    id: id ?? "",
+    x: numbers[0] ?? 0,
+    y: numbers[1] ?? 0,
+    width: numbers[2] ?? 0,
+    height: numbers[3] ?? 0,
+  };
 }
 
 export function createWindowsSmokeHost(): SmokeHost {
@@ -315,26 +397,27 @@ export function createWindowsSmokeHost(): SmokeHost {
      */
     panelEnvironment: () => ({}),
 
+    findWindow,
+
     awaitWindow: (title: string, processId: number) =>
-      eventually("a visible Squid window", async () => {
-        const line = await powershell(
-          windowScript(title, processId),
-          "could not search for the panel window",
-        );
-        if (line.length === 0) return null;
-        const parts = line.split(/\s+/);
-        if (parts.length !== 5) return null;
-        const [id, x, y, width, height] = parts.map((part) => part.trim());
-        const numbers = [x, y, width, height].map(Number);
-        if (numbers.some((value) => !Number.isFinite(value))) return null;
-        return {
-          id: id ?? "",
-          x: numbers[0] ?? 0,
-          y: numbers[1] ?? 0,
-          width: numbers[2] ?? 0,
-          height: numbers[3] ?? 0,
-        };
-      }),
+      eventually("a visible Squid window", () => findWindow(title, processId)),
+
+    workArea: async (window: SmokeWindow) => {
+      const line = await powershell(workAreaScript(window.id), "could not read the work area");
+      if (line.length === 0) return null;
+      const numbers = line.split(/\s+/).map(Number);
+      if (numbers.length !== 4 || numbers.some((value) => !Number.isFinite(value))) return null;
+      const [x, y, width, height] = numbers as [number, number, number, number];
+      return { x, y, width, height };
+    },
+
+    foregroundWindowTitle: async () => {
+      const title = await powershell(foregroundScript(), "could not read the foreground window");
+      // An empty title is a real state — a window with no caption can hold the
+      // keyboard — but it is not one this assertion can make a claim about, so
+      // it reports "cannot tell" rather than "nothing has focus".
+      return title.length === 0 ? null : title;
+    },
 
     activate: async (window: SmokeWindow, control: SmokeControl) => {
       const name = CONTROL_NAME[control];
