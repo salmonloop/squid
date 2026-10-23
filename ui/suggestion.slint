@@ -1,0 +1,151 @@
+import { Button } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+// The floating surface a proactive input suggestion arrives on.
+//
+// A suggestion is the one prompt whose value depends on *when* it is seen: it
+// names text for the field the person is typing in right now, so it is useful
+// exactly while they are somewhere else — and the resident panel is a window
+// they put away hours ago. A card inside a hidden window is a suggestion
+// nobody receives, which is why this kind alone leaves the panel: it gets its
+// own frameless, always-on-top window that appears at the corner of the work
+// area instead of at the top of a 640×780 window they have to find and raise.
+//
+// Every other prompt kind stays on the panel's `ConfirmationCard`. Those are
+// decisions about running things, and a resident window is where a deliberate
+// decision belongs; a suggestion that vanishes in twenty-five seconds is not
+// one. `main.rs` decides which surface a prompt lands on — this file only
+// renders one, and hides the lines the wire left empty rather than inventing
+// their content.
+//
+// The heading is this surface's own sentence, not the wire's `kind` token. The
+// panel card can say "Squid wants to run a command" because its kinds are
+// verbs; "input_suggestion" is a protocol word, and printing it verbatim
+// would put the vocabulary of `docs/panel-protocol.md` in front of a person.
+// The summary beside it still is, and says, exactly what would be typed.
+//
+// The three answers match the panel card's — Decline, Later, and the accept —
+// with no default and no primary button, for the measured reason that file
+// records: a prominent default moves consent, and a prompt that can be
+// approved without reading it is the thing this surface must never be. The
+// accept button names its own consequence ("Type it") rather than the
+// generic "Allow", because for once the action is the same for every prompt
+// that can appear here.
+export component SuggestionWindow inherits Window {
+    in property <string> summary;
+    in property <string> why;
+    in property <string> deny-consequence;
+    in property <string> expires-at;
+
+    // Routed to the same `answer` path the panel's buttons use, so a suggestion
+    // can only ever be settled by the one pending-id mechanism.
+    callback allow();
+    callback decline();
+    callback defer();
+
+    // Distinct from the panel's "Squid": the smoke host finds windows by exact
+    // title, and a second window answering to the same name would make its
+    // lookups ambiguous.
+    title: "Squid suggestion";
+    always-on-top: true;
+    // Frameless because this is a card that floats, not a window to manage: a
+    // title bar would spend a third of the card's height on chrome and hand the
+    // windowing system a minimize button that a twenty-five-second prompt has
+    // no use for. `main.rs` handles a close request as Later, so going
+    // frameless cannot strand an unanswered decision either.
+    no-frame: true;
+    // Transparent so the rounded card below is the window's whole silhouette;
+    // the corners would otherwise draw the window background as square.
+    background: transparent;
+    preferred-width: 360px;
+    default-font-size: 13px;
+
+    Rectangle {
+        background: Theme.surface;
+        border-radius: Theme.radius;
+        border-width: 1px;
+        border-color: Theme.line;
+        drop-shadow-blur: 24px;
+        drop-shadow-offset-y: 4px;
+        drop-shadow-color: Theme.shadow;
+
+        accessible-role: text;
+        accessible-label: "Suggestion from Squid";
+        accessible-description: root.summary;
+
+        VerticalLayout {
+            padding: Theme.pad;
+            spacing: Theme.gap;
+
+            Text {
+                text: "Squid suggests";
+                color: Theme.text-muted;
+                font-size: 12px;
+                font-weight: 700;
+            }
+
+            // What would be typed. Monospace, as on the panel card: the exact
+            // spelling is the whole content of the decision, and it is capped
+            // the same way so the buttons below survive any summary length.
+            Rectangle {
+                background: Theme.surface-sunken;
+                border-radius: 6px;
+                VerticalLayout {
+                    padding: Theme.gap;
+                    Text {
+                        text: root.summary == "" ? "No details were provided." : root.summary;
+                        color: Theme.text;
+                        font-family: "monospace";
+                        font-size: 12px;
+                        wrap: word-wrap;
+                        max-height: 96px;
+                        overflow: elide;
+                    }
+                }
+            }
+
+            if root.why != "": Text {
+                text: root.why;
+                color: Theme.text-muted;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+
+            if root.deny-consequence != "": Text {
+                text: "If you decline: " + root.deny-consequence;
+                color: Theme.text-muted;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: root.expires-at == "" ? "This suggestion has no deadline."
+                    : "Expires at " + root.expires-at;
+                color: Theme.caution;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                spacing: Theme.gap;
+                alignment: end;
+
+                Button {
+                    text: "Decline";
+                    accessible-description: "Do not type anything. The focused field is left as it is.";
+                    clicked => { root.decline(); }
+                }
+                Button {
+                    text: "Later";
+                    accessible-description: "Put this suggestion aside without answering. It stays pending on the panel until it expires.";
+                    clicked => { root.defer(); }
+                }
+                Button {
+                    text: "Type it";
+                    accessible-description: "Type the suggested text into the field that was focused.";
+                    clicked => { root.allow(); }
+                }
+            }
+        }
+    }
+}

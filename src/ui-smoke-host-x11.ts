@@ -182,6 +182,35 @@ export function createX11SmokeHost(): SmokeHost {
     return { ...process.env, DBUS_SESSION_BUS_ADDRESS: busAddress };
   };
 
+  /**
+   * A mapped window of this display by exact title, or `null` when there is none.
+   *
+   * `IsViewable` and not merely "found": a window this panel puts away is
+   * unmapped rather than destroyed, so the suggestion card exists on the root
+   * window's list of children while being invisible. Visibility is what the
+   * person can see, and visibility is what gets asserted.
+   */
+  const findByTitle = async (title: string): Promise<SmokeWindow | null> => {
+    const env = displayEnvironment();
+    const found = await run("xdotool", ["search", "--name", `^${title}$`], env);
+    for (const id of found.stdout.trim().split(/\s+/)) {
+      if (id.length === 0) continue;
+      const info = await run("xwininfo", ["-id", id], env);
+      if (info.code !== 0 || !info.stdout.includes("IsViewable")) continue;
+      const read = (label: string): number | null => {
+        const match = info.stdout.match(new RegExp(`${label}:\\s+(-?\\d+)`));
+        return match?.[1] === undefined ? null : Number(match[1]);
+      };
+      const x = read("Absolute upper-left X");
+      const y = read("Absolute upper-left Y");
+      const width = read("Width");
+      const height = read("Height");
+      if (x === null || y === null || width === null || height === null) continue;
+      return { id, x, y, width, height };
+    }
+    return null;
+  };
+
   // The last line of defence against the run that hung: if the process is
   // leaving through any path that skips dispose — an uncaught throw, a signal —
   // the two detached groups would otherwise outlive it, holding the pipes and
@@ -274,27 +303,23 @@ export function createX11SmokeHost(): SmokeHost {
      * mean reading `_NET_WM_PID` through another tool on the prerequisite list to
      * rule out a window that cannot be there.
      */
+    findWindow: (title: string, _processId: number) => findByTitle(title),
+
+    /**
+     * `null`, and that is the panel's own answer on this platform rather than a
+     * gap in the harness.
+     *
+     * `ui/src/workarea.rs` returns `None` off Windows, on purpose: the whole
+     * screen would be a guess that a desktop has no panels — true on a bare Xvfb,
+     * false on every real Linux desktop, where the card would open under the GNOME
+     * dash and be unreachable. `None` makes the panel fall back to its own card,
+     * so what the smoke asserts here is that a suggestion still has somewhere to
+     * be asked — just not on the floating surface.
+     */
+    workArea: async () => null,
+
     awaitWindow: (title: string, _processId: number) =>
-      eventually("a mapped Squid window", async () => {
-        const env = displayEnvironment();
-        const found = await run("xdotool", ["search", "--name", `^${title}$`], env);
-        for (const id of found.stdout.trim().split(/\s+/)) {
-          if (id.length === 0) continue;
-          const info = await run("xwininfo", ["-id", id], env);
-          if (info.code !== 0 || !info.stdout.includes("IsViewable")) continue;
-          const read = (label: string): number | null => {
-            const match = info.stdout.match(new RegExp(`${label}:\\s+(-?\\d+)`));
-            return match?.[1] === undefined ? null : Number(match[1]);
-          };
-          const x = read("Absolute upper-left X");
-          const y = read("Absolute upper-left Y");
-          const width = read("Width");
-          const height = read("Height");
-          if (x === null || y === null || width === null || height === null) continue;
-          return { id, x, y, width, height };
-        }
-        return null;
-      }),
+      eventually("a mapped Squid window", () => findByTitle(title)),
 
     activate: async (window: SmokeWindow, control: SmokeControl) => {
       const at = CONTROL_POSITION[control];

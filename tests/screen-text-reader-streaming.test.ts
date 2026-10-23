@@ -75,6 +75,21 @@ function harness(restartMs = 5, stallMs?: number) {
 
 const settle = (): Promise<void> => new Promise((done) => setTimeout(done, 30));
 
+/**
+ * Polls until `probe` holds, or gives up.
+ *
+ * Polling rather than one `settle` for anything that waits on a chain of timers:
+ * the platform's `setTimeout` granularity is coarser than its nominal argument —
+ * around fifteen milliseconds on Windows — so a stall deadline plus a restart
+ * deadline can land anywhere in a wide band, and a fixed sleep is a race with the
+ * clock rather than a test of the loop.
+ */
+async function waitFor(probe: () => boolean, timeoutMs = 2_000): Promise<void> {
+  for (let waited = 0; waited < timeoutMs && !probe(); waited += 5) {
+    await new Promise((done) => setTimeout(done, 5));
+  }
+}
+
 describe("streamingScreenTextReaderFactory", () => {
   it("spawns one child and turns each line into a frame", () => {
     const { children, frames, reader } = harness();
@@ -182,15 +197,29 @@ describe("streamingScreenTextReaderFactory", () => {
     // interval whether or not anything changed, so silence is a sampler that
     // stopped sampling rather than a quiet desktop. Nothing restarts it, because
     // the process is still there.
+    //
+    // The child's stall deadline is 20ms and the restart deadline 5ms, so a fixed
+    // sleep cannot be used to assert an exact total. It could not before either:
+    // this asserted `children.length === 2` after 30ms, which held only when the
+    // two platform timers happened to fire inside that window. On a host whose
+    // timers round up to the system tick the kill lands at ~30ms and the spawn at
+    // ~45ms, so the old assertion read 1 — and given a longer window it reads 7,
+    // because this loop correctly restarts a child that stalls *again*. Neither
+    // number is a property of the loop; "killed, said so, replaced" is.
     const { children, frames, errors, reader } = harness(5, 20);
     children[0]?.emit("before\n");
 
-    await settle();
+    await waitFor(() => children.length >= 2);
 
     expect(children[0]?.killed()).toBe(true);
     expect(errors.some((message) => message.includes("wrote no record for 20ms"))).toBe(true);
-    expect(children.length).toBe(2);
-    children[1]?.emit("after\n");
+    expect(children.length).toBeGreaterThanOrEqual(2);
+
+    // The newest child, whichever the loop is on: a child that stalls again is
+    // restarted again, so "the second one" is not a stable thing to address.
+    // Emitting is synchronous, so the frame is captured whichever child this is.
+    const current = children[children.length - 1];
+    current?.emit("after\n");
     expect(frames.map((frame) => frame.applicationId)).toEqual(["before", "after"]);
     reader.close();
   });

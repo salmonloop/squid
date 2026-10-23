@@ -26,8 +26,24 @@ import {
 } from "./ui-smoke-host.js";
 
 const WINDOW_TITLE = "Squid";
+/**
+ * The floating suggestion card's own title, exactly as `suggestion.slint` spells
+ * it.
+ *
+ * A second title rather than the panel's, because the point of the card is that
+ * it is a *different window* — one that can appear while the panel is hidden.
+ * The panel's title would make the two indistinguishable to the one lookup the
+ * host offers.
+ */
+const SUGGESTION_TITLE = "Squid suggestion";
 /** The prompt the fixture raises, and the only id an answer may name. */
 const PROMPT_ID = 41;
+/**
+ * The suggestion's id, kept apart from `PROMPT_ID` so that the two assertions —
+ * a decision is answered on the panel, a suggestion is offered on the card —
+ * cannot be satisfied by one another.
+ */
+const SUGGESTION_ID = 42;
 /** How long to wait for an answer that must NOT arrive. Short: absence is the assertion. */
 const NEGATIVE_WAIT_MS = 700;
 
@@ -45,6 +61,20 @@ interface Fixture {
   readonly endpoint: string;
   readonly replies: readonly PanelReply[];
   readonly close: () => Promise<void>;
+  /**
+   * Sends one more line to the panel's reader connection.
+   *
+   * The wire is a stream, not a snapshot: a prompt can arrive at any moment, and
+   * the floating card is only interesting when it arrives *after* the panel has
+   * been up for a while — which is the case the first version of this harness
+   * could not express at all, because everything it said was said in `announce`.
+   *
+   * Throws when nothing has subscribed yet, which is the only way this can be
+   * called wrongly: a line written to a connection the panel never opened is a
+   * line nobody reads, and that failure would otherwise surface as a timeout on
+   * a later assertion that names the wrong cause.
+   */
+  push(message: Record<string, unknown>): void;
   waitFor(
     description: string,
     predicate: (reply: PanelReply) => boolean,
@@ -229,6 +259,12 @@ function panelFixture(endpoint: string): Promise<Fixture> {
       // the fixture and the server cannot disagree about what this endpoint is.
       if (!isPanelNamedPipe(endpoint)) await rm(endpoint, { force: true });
     },
+    push: (message) => {
+      if (reader === undefined) {
+        smokeFailure("a line was written before the panel subscribed; nothing would have read it");
+      }
+      send(reader, message);
+    },
     waitFor: (description, predicate, timeoutMs = INTERACTION_TIMEOUT_MS) =>
       eventually(description, async () => replies.find(predicate) ?? null, timeoutMs),
   });
@@ -382,6 +418,115 @@ async function main(): Promise<void> {
       if (!/watching/i.test(whenSettled)) {
         smokeFailure(`the header does not say what the session is doing: ${whenSettled}`);
       }
+    }
+
+    // The floating suggestion card. This is the assertion the harness did not
+    // have, and its absence is why the feature shipped doing nothing: three Rust
+    // modules and a `.slint` file existed, were not declared in `main.rs`, and no
+    // run ever asked whether a suggestion got a window of its own.
+    //
+    // The card is offered only where the panel can place it. `workarea.rs`
+    // returns `None` off Windows on purpose, so on X11 the documented answer is
+    // that the suggestion stays on the panel's card — a suggestion somebody can
+    // find beats one placed under a dock nobody can reach. Whichever platform
+    // this is, the prompt must end up somewhere visible, and both branches assert
+    // that rather than skipping.
+    const workArea = await host.workArea(window);
+    const foregroundBefore = await host.foregroundWindowTitle?.();
+    fixture.push({
+      type: "prompt",
+      promptId: SUGGESTION_ID,
+      kind: "input_suggestion",
+      summary: 'Type: "const answer = 42"',
+      why: "You were about to write the same expression.",
+      denyConsequence: "Text will not be typed into the active field.",
+      expiresAt: "2026-09-01T12:05:00.000Z",
+    });
+
+    if (workArea === null) {
+      // No placement available, so no floating window: the prompt must be on the
+      // panel's card instead. The panel is the surface a suggestion falls back to.
+      await wait(INTERACTION_TIMEOUT_MS);
+      const floating = await host.findWindow(SUGGESTION_TITLE, panel.pid ?? 0);
+      if (floating !== null) {
+        smokeFailure(
+          `a suggestion card appeared at ${floating.x},${floating.y} on a host that reported no work area; a card placed by a guess is a card that may be unreachable`,
+        );
+      }
+      log("ui:smoke suggestion: no work area on this host, so the panel's own card asks it");
+    } else {
+      const card = await host.awaitWindow(SUGGESTION_TITLE, panel.pid ?? 0);
+      // The corner, computed from the work area the host reported — the same
+      // rectangle the panel read, in the same units. A card against the monitor's
+      // edge instead of the work area's is the defect this catches.
+      //
+      // The assertions below are deliberately about *containment and nearness*
+      // rather than about one exact coordinate, and the first version of this
+      // proves why: it restated the panel's `CORNER_INSET` as a bare 16 physical
+      // pixels, while the panel correctly scales that constant (16 logical is 20
+      // physical at 125%). The harness then called a correct placement wrong.
+      //
+      // Copying the constant in would not fix that — it would only make the two
+      // copies drift. The exact arithmetic is already tested, in
+      // `ui/src/placement.rs`, where it can be tested without a display. What the
+      // smoke uniquely knows is that the real window landed in the real corner of
+      // the real work area on this real desktop, and that is what it asserts.
+      const right = workArea.x + workArea.width;
+      const bottom = workArea.y + workArea.height;
+      const actualRight = card.x + card.width;
+      const actualBottom = card.y + card.height;
+
+      // Off the work area is off the screen as far as the person is concerned:
+      // the bottom edge of the work area is where the taskbar starts. A card that
+      // overhangs it is visible in a screenshot and unreachable in life, which is
+      // the defect that put the work area in this design at all.
+      if (actualRight > right) {
+        smokeFailure(
+          `the suggestion card's right edge is at ${actualRight}, past the work area's ${right}; it was placed against the screen rather than the usable area`,
+        );
+      }
+      if (actualBottom > bottom) {
+        smokeFailure(
+          `the suggestion card's bottom edge is at ${actualBottom}, past the work area's ${bottom}; it is under the taskbar`,
+        );
+      }
+
+      // Nearness, so a card parked in the middle of the screen does not pass the
+      // containment check above. A tenth of the area is loose enough to absorb
+      // every DPI and shadow choice and tight enough to fail anything that is not
+      // in the corner.
+      const slack = Math.round(Math.min(workArea.width, workArea.height) / 10);
+      if (right - actualRight > slack) {
+        smokeFailure(
+          `the suggestion card's right edge is ${right - actualRight}px from the work area's edge (max ${slack}); it is not in the corner`,
+        );
+      }
+      if (bottom - actualBottom > slack) {
+        smokeFailure(
+          `the suggestion card's bottom edge is ${bottom - actualBottom}px from the work area's edge (max ${slack}); it is not in the corner`,
+        );
+      }
+      log(`ui:smoke suggestion card: ${card.width}x${card.height}+${card.x}+${card.y} in the corner of ${workArea.width}x${workArea.height}`);
+
+      // The card must not have taken the keyboard. Asserted only where the host
+      // can say who holds it, and compared against the holder *before* the card
+      // appeared — the measuring side of the module comment in `keyboard.rs`, which
+      // until now was the only thing making that claim.
+      const foregroundAfter = await host.foregroundWindowTitle?.();
+      if (foregroundBefore !== undefined && foregroundAfter !== undefined) {
+        if (foregroundAfter === SUGGESTION_TITLE) {
+          smokeFailure(
+            "the suggestion card took the keyboard; a suggestion that interrupts typing is worse than no suggestion",
+          );
+        }
+        log(`ui:smoke suggestion kept the keyboard on "${foregroundAfter ?? ""}" (was "${foregroundBefore ?? ""}")`);
+      } else {
+        log("ui:smoke skipped the focus assertion: this host cannot report which window has the keyboard");
+      }
+
+      const cardScreenshot = join(outputDirectory, "04-suggestion-card.png");
+      await host.screenshot(card, cardScreenshot);
+      log(`ui:smoke screenshot: ${cardScreenshot}`);
     }
 
     // One prompt, one answer. Clicking where the buttons were must not produce a

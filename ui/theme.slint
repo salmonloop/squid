@@ -37,6 +37,18 @@ export global Theme {
     out property <brush> caution: dark ? #f0c274 : #8a5a00;
     out property <brush> danger: dark ? #ffb3a7 : #b3261e;
 
+    // The floating card's separation from whatever is underneath it. DESIGN.md
+    // allows an "offset soft shadow only where FemtoVG rendering demonstrates it
+    // remains legible", and this is a case it did not anticipate: the suggestion
+    // card is frameless over an arbitrary desktop, so without a shadow it is a
+    // rectangle that could belong to whichever window is behind it.
+    //
+    // A token rather than a component literal, for the same reason the status
+    // colours are tokens — a shadow dark enough to read on a white desktop is a
+    // smudge on a dark one, so it has to answer the scheme like everything else
+    // here does.
+    out property <brush> shadow: dark ? #00000099 : #0000003d;
+
     // A spacing scale, so a gap is chosen from a set rather than typed. The old
     // panel used one 10px gap for everything, which is why a section header, its
     // rows, and the next section all sat the same distance apart and nothing
